@@ -1,0 +1,29 @@
+# Example anymone bootstrap config. Copy to anymone.toml and edit.
+# Loaded once at startup; everything dynamic is then learned over p2p.
+
+identity_path = "/var/lib/anymone/identity"
+
+[network]
+listen = "/ip4/0.0.0.0/tcp/7100"
+# Every node seeds from the bootnode alone; Kademlia discovers the rest.
+bootstrap_peers = [
+    "/dns4/anymone-bootnode.example/tcp/7100/p2p/12D3KooWReplaceMe",
+]
+
+[governance]
+# Scheduling committee. Configs require >= threshold signatures. Each member
+# carries its identity pubkey and the exchange pubkey (hex) the committee's
+# internal Panetiere seals openings to.
+threshold = 2
+
+[[governance.committee]]
+pubkey = "ed25519:0000000000000000000000000000000000000000000000000000000000000000"
+exchange_pubkey = "00"
+
+[[governance.committee]]
+pubkey = "ed25519:0000000000000000000000000000000000000000000000000000000000000001"
+exchange_pubkey = "00"
+
+[[governance.committee]]
+pubkey = "ed25519:0000000000000000000000000000000000000000000000000000000000000002"
+exchange_pubkey = "00"

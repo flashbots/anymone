@@ -1,0 +1,728 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>anymone · network</title>
+<style>
+  :root {
+    --bg: #07090c; --panel: #0d1117; --panel-2: #11161d; --line: #1c2530;
+    --ink: #c9d3df; --dim: #5b6878; --accent: #1fe0c8; --accent-dim: #0d6b61;
+    --violet: #b9a6ff; --violet-dim: #4a3a8c; --blue: #6b9de0;
+    --warn: #e0a11f; --bad: #e0476b; --good: #1fe06b;
+    --mono: "SFMono-Regular","JetBrains Mono","Menlo","Consolas",monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: radial-gradient(1200px 600px at 50% -10%, #0b1a1d 0%, var(--bg) 60%), var(--bg);
+    color: var(--ink); font-family: var(--mono); font-size: 13px; line-height: 1.4;
+    padding: 18px 22px 40px; text-shadow: 0 0 1px rgba(31,224,200,0.06);
+  }
+  code { color: var(--accent); }
+
+  header { display: flex; align-items: baseline; gap: 22px;
+    border-bottom: 1px solid var(--line); padding-bottom: 12px; margin-bottom: 18px; }
+  .brand { font-size: 20px; letter-spacing: 2px; font-weight: 600;
+    color: var(--accent); text-shadow: 0 0 12px rgba(31,224,200,0.5); }
+  .brand .cursor { animation: blink 1.1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .scope { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: 2px; }
+  .vantage { margin-left: auto; }
+  .k { color: var(--dim); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
+  .dot { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--good);
+         box-shadow:0 0 6px var(--good); margin-right:6px; vertical-align: middle; }
+  .stale .dot { background: var(--bad); box-shadow: 0 0 6px var(--bad); }
+
+  .metrics { display: flex; gap: 28px; margin: 0 0 20px; }
+  .metric .n { font-size: 28px; color: var(--ink); }
+  .metric .n.accent { color: var(--accent); text-shadow: 0 0 14px rgba(31,224,200,0.4); }
+  .metric .l { color: var(--dim); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
+
+  /* live demo controls (only present in `demo` mode) */
+  .controls { display: flex; flex-wrap: wrap; gap: 14px; margin: 0 0 18px; }
+  .knob { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px 12px; min-width: 200px; }
+  .knob-label { color: var(--dim); font-size: 10px; text-transform: uppercase;
+    letter-spacing: 1px; margin-bottom: 8px; }
+  .knob-row { display: flex; align-items: center; gap: 8px; }
+  .knob-btn { width: 30px; height: 30px; border-radius: 6px; cursor: pointer;
+    background: var(--panel-2); color: var(--accent); border: 1px solid var(--line);
+    font-family: var(--mono); font-size: 18px; line-height: 1; }
+  .knob-btn:hover { border-color: var(--accent-dim); }
+  .knob-btn:active { background: var(--accent-dim); }
+  .knob-val { flex: 1; min-width: 0; text-align: center; background: var(--bg);
+    color: var(--ink); border: 1px solid var(--line); border-radius: 6px;
+    font-family: var(--mono); font-size: 20px; padding: 4px 6px; }
+  .knob-val:focus { outline: none; border-color: var(--accent); }
+  /* hide number-input spinners (we drive it with the ± buttons) */
+  .knob-val::-webkit-outer-spin-button, .knob-val::-webkit-inner-spin-button {
+    -webkit-appearance: none; margin: 0; }
+  .knob-val { -moz-appearance: textfield; }
+  /* discrete (enumerated) knob: a row of labeled buttons */
+  .seg { display: flex; gap: 6px; }
+  .seg-btn { flex: 1; padding: 7px 8px; border-radius: 6px; cursor: pointer;
+    background: var(--panel-2); color: var(--dim); border: 1px solid var(--line);
+    font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
+  .seg-btn:hover { border-color: var(--accent-dim); }
+  .seg-btn.active { color: var(--bg); background: var(--accent); border-color: var(--accent);
+    box-shadow: 0 0 10px rgba(31,224,200,0.35); }
+
+  /* per-round breakdown table in subnet cards */
+  table.rounds { width: 100%; border-collapse: collapse; margin: 4px 0 2px; font-size: 11px; }
+  table.rounds th { color: var(--dim); font-weight: 400; text-align: right; text-transform: uppercase;
+    letter-spacing: 1px; font-size: 9px; padding: 1px 6px; }
+  table.rounds th:first-child { text-align: left; }
+  table.rounds td { text-align: right; padding: 1px 6px; color: var(--ink); }
+  table.rounds td:first-child { text-align: left; color: var(--dim); }
+  table.rounds tr td:last-child { color: var(--accent); }
+
+  .layout { display: grid; grid-template-columns: 1fr 320px; gap: 20px; align-items: start; }
+  @media (max-width: 1050px) { .layout { grid-template-columns: 1fr; } }
+  .section-title { color: var(--dim); font-size: 11px; text-transform: uppercase;
+    letter-spacing: 2px; margin: 0 0 10px; }
+
+  /* participants */
+  .participants { display: flex; flex-wrap: wrap; gap: 6px; }
+  .pchip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px;
+    border: 1px solid var(--line); border-radius: 20px; font-size: 11px; }
+  .pchip i { width: 8px; height: 8px; border-radius: 50%; }
+  .pchip.dead { opacity: .45; }
+  .pcount { color: var(--dim); font-size: 11px; margin-left: 6px; }
+  /* chat */
+  .chat-feed { display: flex; flex-direction: column; gap: 6px; max-height: 320px; overflow-y: auto; }
+  .chat-msg { font-size: 12px; word-break: break-word; }
+  .chat-msg .from { color: var(--accent); font-weight: 700; margin-right: 6px; }
+
+  /* cards */
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 14px; }
+  .card { background: linear-gradient(180deg, var(--panel-2), var(--panel));
+    border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px;
+    position: relative; overflow: hidden; transition: box-shadow .3s, border-color .3s; }
+  .card.flash { box-shadow: inset 0 0 0 1px rgba(31,224,200,0.12); }
+  .card.committee { border-color: var(--violet-dim); }
+  .card.status-lagging { border-color: var(--warn); }
+  .card.status-stalled { border-color: var(--bad); }
+  .card.status-renegotiating { border-color: var(--violet); animation: pulse 1s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(185,166,255,0); } 50% { box-shadow: 0 0 16px 0 rgba(185,166,255,0.45); } }
+  .card-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .card-head .sid { color: var(--dim); }
+  .card-head .status { margin-left: auto; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
+  .status-healthy .status { color: var(--good); }
+  .status-lagging .status { color: var(--warn); }
+  .status-stalled .status { color: var(--bad); }
+  .status-renegotiating .status { color: var(--violet); }
+  .proto { font-size: 11px; padding: 1px 8px; border-radius: 4px; letter-spacing: 1px;
+    text-transform: uppercase; border: 1px solid currentColor; }
+  .proto-Panetiere { color: var(--accent); } .proto-Adcnet { color: var(--blue); } .proto-Noop { color: var(--dim); }
+  .escalated { font-size: 10px; color: var(--bad); margin-left: 4px; }
+
+  .round-row { display: flex; align-items: center; gap: 16px; margin-bottom: 12px; }
+  .ring { width: 56px; height: 56px; flex: none; }
+  .ring circle { fill: none; stroke-width: 5; }
+  .ring .track { stroke: var(--line); }
+  .ring .fill { stroke: var(--accent); stroke-linecap: round; transform: rotate(-90deg);
+    transform-origin: 50% 50%; filter: drop-shadow(0 0 4px rgba(31,224,200,0.5)); }
+  .committee .ring .fill { stroke: var(--violet); }
+  .round-num { font-size: 30px; line-height: 1; }
+  .round-num small { font-size: 11px; color: var(--dim); display: block; letter-spacing: 1px;
+    text-transform: uppercase; margin-bottom: 3px; }
+  .tput { margin-left: auto; text-align: right; }
+  .tput .big { font-size: 22px; color: var(--accent); }
+  .committee .tput .big { color: var(--violet); }
+  .tput .l { color: var(--dim); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
+
+  .spark { width: 100%; height: 34px; display: block; margin-bottom: 10px; }
+  .spark path { fill: none; stroke: var(--accent); stroke-width: 1.5; filter: drop-shadow(0 0 3px rgba(31,224,200,0.4)); }
+  .spark .area { fill: rgba(31,224,200,0.08); stroke: none; }
+  .spark .esc { stroke: var(--bad); stroke-width: 1; stroke-dasharray: 2 2; }
+
+  .stats { display: flex; gap: 16px; margin-bottom: 10px; }
+  .stats .sv { color: var(--ink); } .stats .sl { color: var(--dim); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
+  .gap-ok { color: var(--good); } .gap-warn { color: var(--warn); } .gap-bad { color: var(--bad); }
+
+  .roster-title { color: var(--dim); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; margin: 10px 0 6px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 5px; }
+  .chip { font-size: 11px; padding: 2px 7px; border-radius: 4px; background: var(--panel);
+    border: 1px solid var(--line); color: var(--ink); transition: opacity .3s; }
+  .chip.leader { border-color: var(--accent-dim); color: var(--accent); }
+  .chip.leader::before { content: "★ "; color: var(--accent); }
+  .chip.svc { border-color: var(--warn); color: var(--warn); }
+  .chip.agg { border-color: var(--accent-dim); color: var(--accent); }
+  .agg-group { display: inline-flex; align-items: center; gap: 4px; margin-right: 8px; }
+  .agg-group .gl { font-size: 10px; color: var(--dim); }
+  .relay-missing { border-color: var(--warn); color: var(--warn); }
+  .relay-sidelined { border-color: var(--bad); color: var(--bad); text-decoration: line-through; opacity: .6; }
+  /* relay the demo fault knob is poisoning */
+  .chip.target { border-color: var(--bad); box-shadow: 0 0 8px rgba(224,71,107,0.4); }
+  .chip.target::after { content: " ⚡"; }
+
+  .rail .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px 14px; margin-bottom: 16px; }
+  .faults { display: flex; flex-direction: column; gap: 8px; max-height: 300px; overflow: auto; }
+  .fault { border-left: 3px solid var(--bad); padding: 4px 0 4px 8px; }
+  .fault.unattributed { border-color: var(--warn); }
+  .fault .meta { color: var(--dim); font-size: 10px; }
+  .fault .act { color: var(--accent); font-size: 11px; }
+  /* fault kind, color-coded so corrupt/integrity reads apart from liveness */
+  .fk-Liveness { color: var(--warn); }
+  .fk-Integrity, .fk-Decryption { color: var(--bad); }
+  .fk-Censorship { color: var(--violet); }
+  .fault.new { animation: flashin .8s ease-out; }
+  @keyframes flashin { from { background: rgba(224,71,107,0.25); } to { background: transparent; } }
+  .empty { color: var(--dim); font-style: italic; }
+  #cfg-history { max-height: 300px; overflow-y: auto; }
+  .cfg-row { display: flex; justify-content: space-between; gap: 10px; padding: 3px 0; border-bottom: 1px dashed var(--line); }
+  .cfg-row .ver { color: var(--accent); } .cfg-row .diff { color: var(--dim); font-size: 11px; text-align: right; }
+
+  footer { margin-top: 26px; color: var(--dim); font-size: 11px; }
+  .mock-banner { display: none; margin-left: 8px; color: var(--warn);
+    border: 1px dashed var(--warn); padding: 2px 8px; border-radius: 4px; }
+  body.mock .mock-banner { display: inline-block; }
+</style>
+</head>
+<body>
+  <header>
+    <div class="brand">anymone<span class="cursor">_</span></div>
+    <div class="scope">network view</div>
+    <div class="vantage"><span class="k">observer</span> <span class="v"><span class="dot"></span><span id="vantage">—</span></span></div>
+  </header>
+
+  <div class="metrics">
+    <div class="metric"><div class="n accent" id="m-goodput">0</div><div class="l">msgs / sec</div></div>
+    <div class="metric"><div class="n" id="m-participants">0</div><div class="l">participants</div></div>
+    <div class="metric"><div class="n" id="m-subnets">0</div><div class="l">subnets</div></div>
+    <div class="metric"><div class="n" id="m-anon">0</div><div class="l">anon set</div></div>
+    <div class="metric"><div class="n" id="m-config">0</div><div class="l">config version</div></div>
+    <div class="metric"><div class="n" id="m-decoded">0</div><div class="l">msgs decoded</div></div>
+  </div>
+
+  <div class="section-title" id="controls-title" style="display:none">controls</div>
+  <div class="controls" id="controls" style="display:none"></div>
+
+  <div class="section-title">participants</div>
+  <div class="panel"><div class="participants" id="participants"><span class="empty">none</span></div></div>
+
+  <div class="layout">
+    <div class="main">
+      <div class="section-title">subnetworks</div>
+      <div class="grid" id="subnets"></div>
+    </div>
+    <div class="rail">
+      <div class="section-title">chat</div>
+      <div class="panel"><div class="chat-feed" id="chat"><div class="empty">—</div></div></div>
+      <div class="section-title">faults</div>
+      <div class="panel"><div class="faults" id="faults"><div class="empty">no faults observed</div></div></div>
+      <div class="section-title">config history</div>
+      <div class="panel" id="cfg-history"><div class="empty">—</div></div>
+      <div class="section-title">candidate pool</div>
+      <div class="panel"><div class="chips" id="pool"><span class="empty">empty</span></div></div>
+    </div>
+  </div>
+
+  <footer>polling <code>/state</code> · <span id="ts">—</span><span class="mock-banner">no backend — MOCK data</span></footer>
+
+<script>
+/* =============================================================================
+ *  /state API CONTRACT  (global network view, served by the observer node)
+ *  ---------------------------------------------------------------------------
+ *  The dashboard consumes ONLY the shape below. The mock source and the real
+ *  observer endpoint produce the SAME shape, so swapping mock → real is just a
+ *  matter of /state responding. All public keys are "ed25519:<hex>" strings
+ *  (matches anymone's Pubkey human-readable serde). All rates are derived
+ *  client-side from cumulative counters — the backend reports totals, not rates.
+ *
+ *  NetworkState {
+ *    observer: {
+ *      vantage:        string,    // e.g. "scraping 7 nodes"
+ *      config_version: number,
+ *      threshold:      number,    // committee multisig threshold
+ *      participants:   number,    // total distinct nodes known
+ *    },
+ *    participants: Array<{ pk: string, role: Role, live: boolean }>,
+ *                                       // anonymous clients appear as pk "client:<subnet>:<i>"
+ *    committee: Committee | null,
+ *    subnets:   Array<Subnet>,
+ *    faults:    Array<Fault>,           // chronological, oldest first
+ *    candidate_pool: Array<string>,     // registered-but-unplaced relay pks
+ *    config: { version: number, history: Array<{ version: number, diff: string }> },
+ *    fault_target?: string | null,     // relay pk the demo `fault` knob poisons
+ *    chat_endpoint?: string | null,    // chat participant web app the feed reads from
+ *    control?: { [name: string]: { label: string, value: number, min: number,
+ *                                  options?: Array<string> } },
+ *                                       // live demo knobs (demo mode only; absent
+ *                                       // on a real network). POST {count} to
+ *                                       // /admin/knob/{name} to set one. `options`
+ *                                       // ⇒ discrete: value is an index into them.
+ *  }
+ *
+ *  Role = "committee" | "relay" | "service" | "client"
+ *
+ *  Committee {                           // the committee's internal Panetiere
+ *    round: number, round_duration_ms: number,
+ *    members: Array<string>, leader: string,
+ *    deliberating: boolean,              // true while renegotiating a config
+ *    decoded: number,                    // cumulative committee-round outputs
+ *  }
+ *
+ *  Subnet {
+ *    id: number,
+ *    protocol: "Panetiere" | "Adcnet" | "Noop",
+ *    round: number,                      // current/highest round seen
+ *    round_duration_ms: number,
+ *    anon_set: number,                   // LIVE anonymity set: observed submitters this round (dynamic)
+ *    capacity: number,                   // subnet config capacity (client_set_max from the enacted config)
+ *    aggregators: Array<Array<string>> | null,  // aggregator groups (null = direct flow); each group's replica committee
+ *    msgs_round: number,                 // messages decoded in the latest round
+ *    wire_overhead: number | null,       // observed bytes per useful decoded byte (broadcast+shares; null until decoded)
+ *    recent_rounds: Array<{ round: number, anon_set: number, msgs: number }>,  // newest first, ≤3
+ *    decoded: number,                    // CUMULATIVE decoded payloads (rate derived)
+ *    leader: string,                     // ADCNet canonical-set leader = sorted_relays[id % n]
+ *    relays: Array<string>,
+ *    relay_states: { [pk: string]: "live" | "missing" | "sidelined" },  // absent ⇒ "live"
+ *    services: Array<{ tag: string, pubkey: string }>,
+ *    status: "healthy" | "lagging" | "stalled" | "renegotiating",
+ *    share_frontier:  number,            // highest round any relay published a share for
+ *    output_frontier: number,            // highest round that produced decoded output
+ *    escalated_at: number | null,        // round the protocol escalated (e.g. ADCNet→Panetiere)
+ *  }
+ *
+ *  Fault {
+ *    round: number,
+ *    subnet: number,
+ *    kind: "Liveness" | "Decryption" | "Integrity" | "Censorship",
+ *    attribution: string | null,         // faulted pk, or null = unattributable
+ *    action: string,                      // observed committee response: the diff of the config
+ *                                         // that followed ("renegotiating…" while still pending)
+ *  }
+ * ===========================================================================*/
+
+const ROLE_COLOR = { committee: "#b9a6ff", relay: "#1fe0c8", service: "#e0a11f", client: "#5b6878" };
+const RING_R = 24, RING_C = 2 * Math.PI * RING_R;
+const shortPk = s => {
+  const h = (s || "").replace(/^ed25519:/, "");
+  return h.length > 10 ? h.slice(0, 6) + "…" + h.slice(-4) : h;
+};
+
+/* ---- Source seam: real endpoint, mock fallback. Same contract. ---------- */
+const RealSource = {
+  async get() {
+    const r = await fetch("/state", { cache: "no-store" });
+    if (!r.ok) throw new Error("status " + r.status);
+    return r.json();
+  },
+};
+
+async function getState() {
+  try { return { state: await RealSource.get(), mock: false }; }
+  catch { return { state: MockSource.get(), mock: true }; }
+}
+
+/* ---- derived-rate bookkeeping (per subnet & committee, by id) ------------ */
+const roundClock = new Map();   // id -> { round, at }  (phase-ring animation)
+const rateRing = new Map();      // id -> [{ t, decoded }]
+const escSeenAt = new Map();     // id -> performance.now() when escalation first observed
+const lastEsc = new Map();       // id -> last escalated_at round seen (to detect a new escalation)
+const seenFaults = new Set();
+
+function goodput(id, decoded) {
+  const now = performance.now();
+  let ring = rateRing.get(id); if (!ring) { ring = []; rateRing.set(id, ring); }
+  ring.push({ t: now, decoded });
+  while (ring.length > 120 || (ring.length > 2 && now - ring[0].t > 60000)) ring.shift();
+  if (ring.length < 2) return { rps: 0, series: [] };
+  const dt = (ring[ring.length-1].t - ring[0].t) / 1000;
+  // Goodput is reported monotonic, but clamp at 0 so a counter reset (e.g. a
+  // watcher respawn on protocol flip) can never render a negative rate.
+  const rps = dt > 0 ? Math.max(0, (ring[ring.length-1].decoded - ring[0].decoded) / dt) : 0;
+  const series = [];
+  for (let i = 1; i < ring.length; i++) {
+    const d = (ring[i].t - ring[i-1].t) / 1000;
+    series.push(d > 0 ? Math.max(0, (ring[i].decoded - ring[i-1].decoded) / d) : 0);
+  }
+  return { rps, series };
+}
+
+/* ---- render ------------------------------------------------------------- */
+function render(state, isMock) {
+  document.body.classList.toggle("mock", !!isMock);
+  document.querySelector(".vantage").classList.toggle("stale", !!isMock);
+  document.getElementById("vantage").textContent = isMock ? "mock data" : (state.observer?.vantage || "—");
+
+  renderControls(state.control);
+  faultTarget = state.fault_target || null;
+  renderParticipants(state.participants || []);
+  renderChat(state.chat_endpoint);
+
+  const cards = [];
+  if (state.committee) cards.push(committeeAsCard(state.committee));
+  for (const s of (state.subnets || [])) cards.push(s);
+
+  const grid = document.getElementById("subnets");
+  grid.innerHTML = "";
+  let totalGoodput = 0;
+  for (const s of cards) {
+    const prev = roundClock.get(s.id);
+    if (!prev || prev.round !== s.round) roundClock.set(s.id, { round: s.round, at: performance.now() });
+    const { rps, series } = goodput(s.id, s.decoded || 0);
+    if (!s._committee) totalGoodput += rps;
+    grid.appendChild(card(s, rps, series));
+  }
+
+  const subnets = state.subnets || [];
+  document.getElementById("m-goodput").textContent = totalGoodput.toFixed(1);
+  document.getElementById("m-participants").textContent = state.observer?.participants ?? (state.participants?.length || 0);
+  document.getElementById("m-subnets").textContent = subnets.length;
+  document.getElementById("m-anon").textContent = subnets.reduce((a, s) => Math.max(a, s.anon_set || 0), 0);
+  document.getElementById("m-config").textContent = state.config?.version ?? state.observer?.config_version ?? 0;
+  document.getElementById("m-decoded").textContent = subnets.reduce((a, s) => a + (s.decoded || 0), 0);
+
+  renderFaults(state.faults || []);
+  renderCfgHistory(state.config?.history || []);
+  renderPool(state.candidate_pool || []);
+  document.getElementById("ts").textContent = new Date().toLocaleTimeString();
+}
+
+/* ---- live demo controls (knobs) ----------------------------------------- */
+const knobEls = new Map();   // name -> { input, min } | { seg: true, box }
+let faultTarget = null;      // pk of the relay the `fault` knob is poisoning
+
+function renderControls(control) {
+  const wrap = document.getElementById("controls");
+  const title = document.getElementById("controls-title");
+  const names = control ? Object.keys(control) : [];
+  const show = names.length > 0;
+  wrap.style.display = show ? "flex" : "none";
+  title.style.display = show ? "block" : "none";
+  if (!show) return;
+  for (const name of names) {
+    const k = control[name];
+    let el = knobEls.get(name);
+    if (!el) {
+      const box = document.createElement("div");
+      box.className = "knob";
+      box.innerHTML = '<div class="knob-label"></div>';
+      box.querySelector(".knob-label").textContent = k.label || name;
+      if (k.options) {
+        // Discrete knob: one button per option, value = selected index.
+        const seg = document.createElement("div");
+        seg.className = "seg";
+        k.options.forEach((opt, i) => {
+          const b = document.createElement("button");
+          b.className = "seg-btn";
+          b.textContent = opt;
+          b.dataset.i = i;
+          b.onclick = () => setKnob(name, i);
+          seg.appendChild(b);
+        });
+        box.appendChild(seg);
+        wrap.appendChild(box);
+        el = { seg: true, box };
+      } else {
+        const row = document.createElement("div");
+        row.className = "knob-row";
+        row.innerHTML =
+          '<button class="knob-btn" data-d="-1">−</button>' +
+          '<input class="knob-val" type="number" inputmode="numeric" />' +
+          '<button class="knob-btn" data-d="1">+</button>';
+        box.appendChild(row);
+        const input = row.querySelector(".knob-val");
+        const step = d => setKnob(name, (parseInt(input.value, 10) || 0) + d);
+        row.querySelector('[data-d="-1"]').onclick = () => step(-1);
+        row.querySelector('[data-d="1"]').onclick = () => step(1);
+        input.onchange = () => setKnob(name, parseInt(input.value, 10) || 0);
+        wrap.appendChild(box);
+        el = { input, min: k.min ?? 0 };
+      }
+      knobEls.set(name, el);
+    }
+    if (el.seg) {
+      el.box.querySelectorAll(".seg-btn").forEach(b =>
+        b.classList.toggle("active", parseInt(b.dataset.i, 10) === k.value));
+    } else {
+      el.min = k.min ?? 0;
+      el.input.min = el.min;
+      // Don't clobber what the user is typing.
+      if (document.activeElement !== el.input) el.input.value = k.value;
+    }
+  }
+}
+
+async function setKnob(name, v) {
+  const el = knobEls.get(name);
+  let count = Math.floor(v);
+  if (el && !el.seg) count = Math.max(el.min || 0, count);
+  if (el && el.input) el.input.value = count;   // optimistic; next poll confirms
+  try {
+    await fetch("/admin/knob/" + encodeURIComponent(name), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ count }),
+    });
+  } catch (e) { /* observer not reachable; next poll re-syncs */ }
+}
+
+function committeeAsCard(c) {
+  return { ...c, id: "committee", _committee: true, protocol: "Panetiere",
+    relays: c.members, status: c.deliberating ? "renegotiating" : "healthy",
+    anon_set: c.anon_set || 0, relay_states: {}, services: [] };
+}
+
+function sparkSvg(series, escFrac) {
+  if (series.length < 2) return "";
+  const w = 100, h = 34, max = Math.max(1, ...series);
+  const pts = series.map((v, i) => [ (i/(series.length-1))*w, h - (v/max)*(h-4) - 2 ]);
+  const line = pts.map((p, i) => (i?"L":"M") + p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" ");
+  const area = "M0," + h + " " + pts.map(p => "L"+p[0].toFixed(1)+","+p[1].toFixed(1)).join(" ") + " L"+w+","+h+" Z";
+  const esc = escFrac != null ? `<line class="esc" x1="${(escFrac*w).toFixed(1)}" y1="0" x2="${(escFrac*w).toFixed(1)}" y2="${h}"/>` : "";
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><path class="area" d="${area}"/><path d="${line}"/>${esc}</svg>`;
+}
+
+function card(s, rps, series) {
+  const el = document.createElement("div");
+  const status = s.status || "healthy";
+  el.className = "card status-" + status + (s.protocol==="Panetiere"?" flash":"") + (s._committee?" committee":"");
+  el.dataset.sid = s.id;
+
+  const rs = s.relay_states || {};
+  const relays = (s.relays || []).map(pk => {
+    let cls = "chip";
+    if (pk === s.leader) cls += " leader";
+    if (rs[pk] === "missing") cls += " relay-missing";
+    if (rs[pk] === "sidelined") cls += " relay-sidelined";
+    if (pk === faultTarget) cls += " target";
+    return `<span class="${cls}">${shortPk(pk)}</span>`;
+  }).join("");
+  const services = (s.services || []).map(svc => `<span class="chip svc">${svc.tag}</span>`).join("");
+  const aggGroups = s.aggregators || [];
+  const aggHtml = aggGroups.map((g, i) =>
+    `<span class="agg-group"><span class="gl">g${i}</span>${g.map(pk => `<span class="chip agg">${shortPk(pk)}</span>`).join("")}</span>`
+  ).join("");
+
+  const gap = (s.share_frontier != null && s.output_frontier != null) ? s.share_frontier - s.output_frontier : null;
+  const gapCls = gap == null ? "" : gap <= 1 ? "gap-ok" : gap <= 4 ? "gap-warn" : "gap-bad";
+  const frontiers = gap == null ? "" : `
+    <div class="stats">
+      <div><div class="sv">${s.share_frontier}</div><div class="sl">share frontier</div></div>
+      <div><div class="sv">${s.output_frontier}</div><div class="sl">output frontier</div></div>
+      <div><div class="sv ${gapCls}">${gap>=0?"+":""}${gap}</div><div class="sl">lag</div></div>
+    </div>`;
+  const anon = s.anon_set != null ? s.anon_set : 0;
+  const wo = s.wire_overhead != null ? s.wire_overhead + "×" : "—";
+  const specs = `
+    <div class="stats">
+      <div><div class="sv">${s.round_duration_ms != null ? s.round_duration_ms + "ms" : "—"}</div><div class="sl">round</div></div>
+      <div><div class="sv">${anon}</div><div class="sl">anon set (live)</div></div>
+      <div><div class="sv">${s.capacity != null ? s.capacity : "—"}</div><div class="sl">capacity</div></div>
+      <div><div class="sv">${s.msgs_round != null ? s.msgs_round : 0}</div><div class="sl">msgs/round</div></div>
+      <div><div class="sv">${wo}</div><div class="sl">wire overhead</div></div>
+    </div>`;
+
+  // Per-round breakdown of the last few rounds (newest first).
+  const recent = s.recent_rounds || [];
+  const recentRows = recent.length ? `
+    <div class="roster-title">last ${recent.length} rounds</div>
+    <table class="rounds">
+      <tr><th>round</th><th>anon</th><th>msgs</th></tr>
+      ${recent.map(r => `<tr><td>r${r.round}</td><td>${r.anon_set}</td><td>${r.msgs}</td></tr>`).join("")}
+    </table>` : "";
+
+  // Position the escalation marker by the *time* it was observed, mapped onto
+  // the sparkline's time window — not by mixing round deltas with sample counts.
+  // It scrolls off the left edge once it ages past the ~60s window.
+  let escFrac = null;
+  if (s.escalated_at != null) {
+    if (lastEsc.get(s.id) !== s.escalated_at) {
+      escSeenAt.set(s.id, performance.now());
+      lastEsc.set(s.id, s.escalated_at);
+    }
+    const ring = rateRing.get(s.id);
+    if (ring && ring.length >= 2) {
+      const t0 = ring[0].t, t1 = ring[ring.length - 1].t, te = escSeenAt.get(s.id);
+      if (te >= t0 && t1 > t0) escFrac = (te - t0) / (t1 - t0);
+    }
+  }
+  const escTag = s.escalated_at != null ? `<span class="escalated">↑ escalated @r${s.escalated_at}</span>` : "";
+
+  el.innerHTML = `
+    <div class="card-head">
+      <span class="sid">${s._committee ? "committee" : "subnet " + s.id}</span>
+      <span class="proto proto-${s.protocol}">${s.protocol}</span>${escTag}
+      <span class="status">${status}</span>
+    </div>
+    <div class="round-row">
+      <svg class="ring" viewBox="0 0 56 56">
+        <circle class="track" cx="28" cy="28" r="${RING_R}"></circle>
+        <circle class="fill" cx="28" cy="28" r="${RING_R}" stroke-dasharray="${RING_C}" stroke-dashoffset="${RING_C}"></circle>
+      </svg>
+      <div class="round-num"><small>round</small><span>${s.round}</span></div>
+      <div class="tput"><div class="big">${rps.toFixed(1)}</div><div class="l">msgs/sec</div></div>
+    </div>
+    ${sparkSvg(series, escFrac)}
+    ${frontiers}${specs}${recentRows}
+    <div class="roster-title">${s._committee ? "members" : "relays"} · ${(s.relays||[]).length}</div>
+    <div class="chips">${relays || '<span class="chip">none</span>'}</div>
+    ${aggGroups.length ? `<div class="roster-title">aggregators · ${aggGroups.length} group${aggGroups.length>1?"s":""}</div><div class="chips">${aggHtml}</div>` : ""}
+    ${services ? `<div class="roster-title">services</div><div class="chips">${services}</div>` : ""}
+  `;
+  return el;
+}
+
+function renderFaults(faults) {
+  const box = document.getElementById("faults");
+  if (!faults.length) { box.innerHTML = '<div class="empty">no faults observed</div>'; return; }
+  box.innerHTML = "";
+  for (const f of faults.slice().reverse()) {
+    const key = `${f.round}:${f.subnet}:${f.kind}`;
+    const isNew = !seenFaults.has(key); seenFaults.add(key);
+    const el = document.createElement("div");
+    el.className = "fault " + (f.attribution ? "attributed" : "unattributed") + (isNew ? " new" : "");
+    el.innerHTML = `<div class="meta">r${f.round} · subnet ${f.subnet} · <b class="fk fk-${f.kind}">${f.kind}</b> · ${f.attribution ? shortPk(f.attribution) : "unattributable"}</div>
+      <div class="act">→ ${f.action}</div>`;
+    box.appendChild(el);
+  }
+}
+function renderCfgHistory(hist) {
+  const box = document.getElementById("cfg-history");
+  if (!hist.length) { box.innerHTML = '<div class="empty">—</div>'; return; }
+  box.innerHTML = "";
+  for (const c of hist.slice().reverse()) {
+    const row = document.createElement("div"); row.className = "cfg-row";
+    row.innerHTML = `<span class="ver">v${c.version}</span><span class="diff">${c.diff || "—"}</span>`;
+    box.appendChild(row);
+  }
+}
+function renderPool(pool) {
+  const box = document.getElementById("pool");
+  box.innerHTML = pool.length ? pool.map(pk => `<span class="chip">${shortPk(pk)}</span>`).join("") : '<span class="empty">empty</span>';
+}
+
+/* ---- participants list ---------------------------------------------------- */
+const ROLE_ORDER = { committee: 0, relay: 1, service: 2, client: 3 };
+
+function renderParticipants(list) {
+  const box = document.getElementById("participants");
+  if (!list.length) { box.innerHTML = '<span class="empty">none</span>'; return; }
+  const named = list.filter(p => !String(p.pk).startsWith("client:"));
+  const anon = list.length - named.length;
+  named.sort((a, b) => (ROLE_ORDER[a.role] ?? 9) - (ROLE_ORDER[b.role] ?? 9));
+  let html = named.map(p => {
+    const color = p.live === false ? "#e0476b" : (ROLE_COLOR[p.role] || "#5b6878");
+    return `<span class="pchip ${p.live === false ? "dead" : ""}" title="${p.pk}">
+      <i style="background:${color}"></i>${p.role} · ${shortPk(p.pk)}</span>`;
+  }).join("");
+  if (anon > 0) html += `<span class="pcount">+ ${anon} anonymous client${anon === 1 ? "" : "s"}</span>`;
+  box.innerHTML = html;
+}
+
+/* ---- chat feed: read from a chat participant's web app -------------------- */
+let chatLastSeq = -1;
+async function renderChat(endpoint) {
+  const box = document.getElementById("chat");
+  if (!endpoint) { box.innerHTML = '<div class="empty">no chat participant</div>'; return; }
+  try {
+    const r = await fetch(endpoint.replace(/\/$/, "") + "/chat/feed", { cache: "no-store" });
+    const msgs = await r.json();
+    if (!msgs.length) { box.innerHTML = '<div class="empty">no messages yet</div>'; return; }
+    const top = msgs[msgs.length - 1].seq;
+    if (top === chatLastSeq) return;
+    chatLastSeq = top;
+    const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+    box.innerHTML = msgs.slice(-40).map(m =>
+      `<div class="chat-msg"><span class="from">${esc(m.from)}</span>${esc(m.text)}</div>`
+    ).join("");
+    box.scrollTop = box.scrollHeight;
+  } catch (e) { /* backend not reachable from the browser; leave as-is */ }
+}
+
+function animate() {
+  const now = performance.now();
+  for (const el of document.querySelectorAll(".card")) {
+    const sid = el.dataset.sid === "committee" ? "committee" : Number(el.dataset.sid);
+    const clk = roundClock.get(sid), fill = el.querySelector(".ring .fill");
+    if (!clk || !fill) continue;
+    const dur = parseFloat((el.querySelector(".stats .sv")||{}).textContent) || 1000;
+    const frac = Math.min(1, (now - clk.at) / (dur > 30 ? dur : 1000));
+    fill.setAttribute("stroke-dashoffset", String(RING_C * (1 - frac)));
+  }
+  requestAnimationFrame(animate);
+}
+requestAnimationFrame(animate);
+
+/* ---- MockSource: scripts the full fault→renegotiate→escalate→dip story --- */
+const MockSource = (() => {
+  let st = null, started = 0;
+  function init() {
+    started = performance.now();
+    const R = ["ed25519:3f2a91c4de","ed25519:8b17ef0042","ed25519:c4d9aa7711","ed25519:1029ffba63","ed25519:77ab10de55"];
+    const svc = "ed25519:5e1f00aa12", cli = "ed25519:90abcd3401";
+    st = {
+      observer: { vantage: "scraping 7 nodes", config_version: 1, threshold: 2, participants: 7 },
+      participants: [
+        { pk: R[0], role: "committee", live: true }, { pk: R[1], role: "committee", live: true },
+        { pk: R[2], role: "relay", live: true }, { pk: R[3], role: "relay", live: true },
+        { pk: R[4], role: "relay", live: true }, { pk: svc, role: "service", live: true },
+        { pk: cli, role: "client", live: true },
+      ],
+      committee: { round: 40, round_duration_ms: 400, members: [R[0],R[1]], leader: R[0], deliberating: false, decoded: 5 },
+      candidate_pool: [R[4]],
+      faults: [],
+      config: { version: 1, history: [{ version: 1, diff: "genesis · subnet0 Adcnet, subnet1 Panetiere" }] },
+      subnets: [
+        { id: 0, protocol: "Adcnet", round: 120, round_duration_ms: 250, anon_set: 14, decoded: 60,
+          leader: R[2], relays: [R[2],R[3]], relay_states: {}, services: [{ tag: "anymone.chat", pubkey: svc }],
+          status: "healthy", share_frontier: 120, output_frontier: 120, escalated_at: null },
+        { id: 1, protocol: "Panetiere", round: 70, round_duration_ms: 400, anon_set: 9, decoded: 28,
+          leader: R[3], relays: [R[3],R[4]], relay_states: {}, services: [{ tag: "anymone.chat", pubkey: svc }],
+          status: "healthy", share_frontier: 70, output_frontier: 70, escalated_at: null },
+      ],
+      _R: R,
+    };
+    setInterval(step, 60);
+  }
+  function step() {
+    const t = performance.now() - started;
+    const s0 = st.subnets[0], s1 = st.subnets[1], R = st._R;
+    if (Math.random() < 0.55) { s0.round++; s0.share_frontier = s0.round; }
+    if (Math.random() < 0.30) { s1.round++; s1.share_frontier = s1.round; }
+    if (Math.random() < 0.20) st.committee.round++;
+
+    if (t < 6000) {                                   // healthy
+      if (Math.random() < 0.5) { s0.decoded++; s0.output_frontier = s0.round; }
+      if (Math.random() < 0.22) { s1.decoded++; s1.output_frontier = s1.round; }
+    } else if (t < 10000) {                           // relay c4d9aa goes missing → stall
+      s0.relay_states[R[2]] = "missing";
+      const node = st.participants.find(n => n.pk === R[2]); if (node) node.live = false;
+      s0.status = (s0.share_frontier - s0.output_frontier) > 4 ? "stalled" : "lagging";
+      if (Math.random() < 0.22) { s1.decoded++; s1.output_frontier = s1.round; }
+    } else if (t < 12500) {                           // committee deliberates, fault recorded
+      st.committee.deliberating = true; s0.status = "renegotiating";
+      if (!st.faults.some(f => f.subnet === 0)) {
+        st.faults.push({ round: s0.output_frontier, subnet: 0, kind: "Liveness",
+          attribution: R[2], action: "sideline c4d9aa + escalate Adcnet→Panetiere" });
+      }
+    } else {                                          // new config: escalate, swap relay, dip throughput
+      if (st.config.version === 1) {
+        st.config.version = 2; st.observer.config_version = 2;
+        st.config.history.push({ version: 2, diff: "−c4d9aa · subnet0 Adcnet→Panetiere · +77ab10 from pool" });
+        s0.protocol = "Panetiere"; s0.escalated_at = s0.round; s0.round_duration_ms = 400;
+        s0.relay_states = { [R[2]]: "sidelined" }; s0.relays = [R[3], R[4]];
+        st.candidate_pool = [];
+        const gone = st.participants.find(n => n.pk === R[2]); if (gone) gone.role = "relay";
+        st.committee.deliberating = false; s0.status = "healthy";
+      }
+      s0.output_frontier = s0.round;
+      if (Math.random() < 0.24) s0.decoded++;          // lower goodput post-escalation
+      if (Math.random() < 0.22) { s1.decoded++; s1.output_frontier = s1.round; }
+    }
+  }
+  return { get() { if (!st) init(); return st; } };
+})();
+
+/* ---- poll loop ---------------------------------------------------------- */
+async function tick() { const { state, mock } = await getState(); render(state, mock); }
+tick();
+setInterval(tick, 500);
+</script>
+</body>
+</html>

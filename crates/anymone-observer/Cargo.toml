@@ -1,0 +1,22 @@
+[package]
+name = "anymone-observer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anymone-core = { path = "../anymone-core" }
+anymone-chat = { path = "../anymone-chat" }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+libp2p.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+hex.workspace = true
+rand.workspace = true

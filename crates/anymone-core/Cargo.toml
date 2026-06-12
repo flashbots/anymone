@@ -1,0 +1,40 @@
+[package]
+name = "anymone-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libp2p-identity.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+bincode.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+rand_chacha = "0.3"
+hex.workspace = true
+zeroize.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+panetiere = { git = "ssh://git@github.com/flashbots/panetiere", branch = "main" }
+chipmunk_code = { git = "https://github.com/Ruteri/Chipmunk", branch = "main", default-features = false, features = ["fast-ntt"] }
+adcnet = { git = "ssh://git@github.com/flashbots/adcnet-rs", branch = "main" }
+num-bigint = { version = "0.4", features = ["serde"] }
+libp2p.workspace = true
+
+[features]
+default = []
+# Spawning full Anymone instances on loopback libp2p for tests. Lands in M3.
+test-util = []
+
+[dev-dependencies]
+serial_test = "3"
+tempfile = "3"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "test-util"] }
+rand_chacha = "0.3"
+portpicker = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
