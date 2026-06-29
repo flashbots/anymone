@@ -19,7 +19,7 @@ use panetiere::protocol::client::run_client_round;
 use panetiere::protocol::server::{run_server_round, ServerInbox};
 use panetiere::protocol::verify::{aggregate_and_decrypt, decrypt_aggregate, VerifyError};
 use panetiere::protocol::{ClientId, ProtocolParams, ServerId};
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
 
@@ -328,7 +328,10 @@ pub struct PanetiereClientSession {
     server_xpubs: HashMap<ServerId, ExchangePublicKey>,
     pending: Option<Vec<KahePoly>>,
     rng_seed: [u8; 32],
-    cover: bool,
+    cover_rate: f32,
+    /// Separate stream for the cover draw: the per-round protocol RNG is
+    /// deterministic, so reusing it would make cover predictable.
+    cover_rng: ChaCha20Rng,
 }
 
 impl PanetiereClientSession {
@@ -339,6 +342,9 @@ impl PanetiereClientSession {
         server_xpubs: HashMap<ServerId, ExchangePublicKey>,
         rng_seed: [u8; 32],
     ) -> Self {
+        // Domain-separate the cover stream from the per-round protocol seed.
+        let mut cover_seed = rng_seed;
+        cover_seed[0] ^= 0xA5;
         PanetiereClientSession {
             pp,
             client_id,
@@ -346,7 +352,8 @@ impl PanetiereClientSession {
             server_xpubs,
             pending: None,
             rng_seed,
-            cover: true,
+            cover_rate: 1.0,
+            cover_rng: ChaCha20Rng::from_seed(cover_seed),
         }
     }
 
@@ -361,7 +368,7 @@ impl Session for PanetiereClientSession {
     fn begin_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
         let msg = match self.pending.take() {
             Some(m) => m,
-            None if self.cover => zero_message(),
+            None if self.cover_rng.gen::<f32>() < self.cover_rate => zero_message(),
             None => return Vec::new(),
         };
         // The RNG is rebuilt from the seed each round; folding the round into
@@ -418,8 +425,8 @@ impl Session for PanetiereClientSession {
         self.stage_message(polys);
     }
 
-    fn set_cover(&mut self, cover: bool) {
-        self.cover = cover;
+    fn set_cover_rate(&mut self, rate: f32) {
+        self.cover_rate = rate;
     }
 }
 

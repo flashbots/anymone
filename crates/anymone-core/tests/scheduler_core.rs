@@ -313,6 +313,28 @@ fn non_lead_core_never_stages() {
     assert!(staged_body(&core.tick(0, 0)).is_none());
 }
 
+#[test]
+fn cover_rate_stamped_and_reproposed() {
+    let committee: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
+    let mut core = lead_core(&committee, 2);
+    let relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
+    let service = Identity::generate();
+    register_relays_and_service(&mut core, &relays, &service);
+
+    // Default rate stamped onto every subnet.
+    let first = staged_proposal(&core.tick(0, 0)).expect("first proposal staged");
+    assert!(first.body.subnets.iter().all(|s| s.cover_rate == 1.0));
+    enact(&mut core, &committee, first);
+
+    // Unchanged content → no re-propose.
+    assert!(staged_body(&core.tick(1, 0)).is_none());
+
+    // A cover change re-proposes with the new rate.
+    core.set_cover_rate(0.25);
+    let reproposed = staged_proposal(&core.tick(2, 0)).expect("cover change re-proposes");
+    assert!(reproposed.body.subnets.iter().all(|s| s.cover_rate == 0.25));
+}
+
 /// A live ADCNet subnet (clients + relays, relay 0 the leader) over a
 /// synchronous bus, returning every wire message so it can be fed to the
 /// committee core via `on_subnet_message`, exactly as the runtime would.

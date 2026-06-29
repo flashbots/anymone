@@ -29,7 +29,7 @@ pub fn now_unix_ms() -> u64 {
 
 /// Body that the multisig signs. Kept separate from `signatures` so the
 /// canonical bytes are easy to derive.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AnymoneRoundConfigurationBody {
     pub round: Round,
     /// Wall-clock (unix ms) at which `round` begins; subnet drivers derive the
@@ -38,7 +38,7 @@ pub struct AnymoneRoundConfigurationBody {
     pub subnets: Vec<Subnet>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AnymoneRoundConfiguration {
     pub body: AnymoneRoundConfigurationBody,
     pub signatures: Vec<Signature>,
@@ -51,12 +51,32 @@ pub struct Signature {
     pub bytes: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Subnet {
     pub id: SubnetId,
     pub services: Vec<ServiceEntry>,
     pub relays: Vec<Pubkey>,
     pub protocol: ProtocolConfig,
+    /// Probability an idle client sends a cover (zero) message each round.
+    pub cover_rate: f32,
+}
+
+impl Subnet {
+    /// Subnet with the default cover rate (1.0).
+    pub fn new(
+        id: SubnetId,
+        services: Vec<ServiceEntry>,
+        relays: Vec<Pubkey>,
+        protocol: ProtocolConfig,
+    ) -> Self {
+        Subnet {
+            id,
+            services,
+            relays,
+            protocol,
+            cover_rate: 1.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -380,12 +400,7 @@ impl AnymoneRoundConfiguration {
         let body = AnymoneRoundConfigurationBody {
             round,
             epoch_unix_ms: now_unix_ms(),
-            subnets: vec![Subnet {
-                id: 0,
-                services,
-                relays,
-                protocol,
-            }],
+            subnets: vec![Subnet::new(0, services, relays, protocol)],
         };
         AnymoneRoundConfiguration::new(body)
     }
@@ -407,15 +422,15 @@ mod tests {
         AnymoneRoundConfigurationBody {
             round: 42,
             epoch_unix_ms: 0,
-            subnets: vec![Subnet {
-                id: 0,
-                services: vec![ServiceEntry {
+            subnets: vec![Subnet::new(
+                0,
+                vec![ServiceEntry {
                     tag: ServiceTag::from_label("anymone.echo"),
                     pubkey: Identity::generate().pubkey(),
                 }],
-                relays: (0..3).map(|_| Identity::generate().pubkey()).collect(),
-                protocol: ProtocolConfig::Noop(NoopConfig::default()),
-            }],
+                (0..3).map(|_| Identity::generate().pubkey()).collect(),
+                ProtocolConfig::Noop(NoopConfig::default()),
+            )],
         }
     }
 

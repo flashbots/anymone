@@ -295,19 +295,21 @@ fn adcnet_config_body(n_subnets: usize) -> AnymoneRoundConfigurationBody {
     relay_xk.sort_by_key(|(p, _)| *p);
     let svc = Identity::generate();
     let subnets = (0..n_subnets)
-        .map(|id| Subnet {
-            id: id as u32,
-            services: vec![ServiceEntry { tag: ServiceTag::from_label("anymone.chat"), pubkey: svc.pubkey() }],
-            relays: relay_pks.clone(),
-            protocol: ProtocolConfig::Adcnet(AdcnetConfig {
-                round_duration_ms: 3000,
-                max_payload_bytes: 256,
-                estimated_messages: 32,
-                client_set_min: 0,
-                client_set_max: 32,
-                relay_exchange_keys: relay_xk.clone(),
-                aggregation: None,
-            }),
+        .map(|id| {
+            Subnet::new(
+                id as u32,
+                vec![ServiceEntry { tag: ServiceTag::from_label("anymone.chat"), pubkey: svc.pubkey() }],
+                relay_pks.clone(),
+                ProtocolConfig::Adcnet(AdcnetConfig {
+                    round_duration_ms: 3000,
+                    max_payload_bytes: 256,
+                    estimated_messages: 32,
+                    client_set_min: 0,
+                    client_set_max: 32,
+                    relay_exchange_keys: relay_xk.clone(),
+                    aggregation: None,
+                }),
+            )
         })
         .collect();
     AnymoneRoundConfigurationBody { round: 1, epoch_unix_ms: now_unix_ms(), subnets }

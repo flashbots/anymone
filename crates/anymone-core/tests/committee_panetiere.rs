@@ -240,6 +240,7 @@ async fn committee_scales_to_second_subnet_under_load() {
         escalation_grace: 5,
         subnet_grow_at: 31,
         message_size: 64,
+        ..PanetiereCommitteeConfig::default()
     };
     let mut committee_tasks = Vec::new();
     for id in &committee_ids {

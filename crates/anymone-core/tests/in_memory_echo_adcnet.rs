@@ -272,13 +272,13 @@ async fn adcnet_second_subnet_with_distinct_leader_roundtrips() {
         round: 0,
         epoch_unix_ms: anymone_core::config::now_unix_ms(),
         subnets: vec![
-            Subnet { id: 0, services: vec![], relays: relay_pks.clone(), protocol: proto() },
-            Subnet {
-                id: 1,
-                services: vec![ServiceEntry { tag: echo_tag(), pubkey: service.pubkey() }],
-                relays: relay_pks.clone(),
-                protocol: proto(),
-            },
+            Subnet::new(0, vec![], relay_pks.clone(), proto()),
+            Subnet::new(
+                1,
+                vec![ServiceEntry { tag: echo_tag(), pubkey: service.pubkey() }],
+                relay_pks.clone(),
+                proto(),
+            ),
         ],
     };
     let cfg = AnymoneRoundConfiguration::new(body).sign_with(&[&committee]);
@@ -367,12 +367,7 @@ async fn live_reconfiguration_moves_service_to_a_new_subnet() {
     let v0 = AnymoneRoundConfiguration::new(AnymoneRoundConfigurationBody {
         round: 0,
         epoch_unix_ms: now_unix_ms(),
-        subnets: vec![Subnet {
-            id: 0,
-            services: vec![svc_entry()],
-            relays: relay_pks.clone(),
-            protocol: proto(),
-        }],
+        subnets: vec![Subnet::new(0, vec![svc_entry()], relay_pks.clone(), proto())],
     })
     .sign_with(&[&committee]);
 
@@ -425,8 +420,8 @@ async fn live_reconfiguration_moves_service_to_a_new_subnet() {
         round: 1,
         epoch_unix_ms: now_unix_ms(),
         subnets: vec![
-            Subnet { id: 0, services: vec![], relays: relay_pks.clone(), protocol: proto() },
-            Subnet { id: 1, services: vec![svc_entry()], relays: relay_pks.clone(), protocol: proto() },
+            Subnet::new(0, vec![], relay_pks.clone(), proto()),
+            Subnet::new(1, vec![svc_entry()], relay_pks.clone(), proto()),
         ],
     })
     .sign_with(&[&committee]);
@@ -499,7 +494,7 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
     let v0 = AnymoneRoundConfiguration::new(AnymoneRoundConfigurationBody {
         round: 0,
         epoch_unix_ms: now_unix_ms(),
-        subnets: vec![Subnet { id: 0, services: vec![svc()], relays: relay_pks.clone(), protocol: proto() }],
+        subnets: vec![Subnet::new(0, vec![svc()], relay_pks.clone(), proto())],
     })
     .sign_with(&[&committee]);
     // v1 carries the service on BOTH subnets, so ~half the clients re-home to
@@ -508,8 +503,8 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
         round: 1,
         epoch_unix_ms: now_unix_ms(),
         subnets: vec![
-            Subnet { id: 0, services: vec![svc()], relays: relay_pks.clone(), protocol: proto() },
-            Subnet { id: 1, services: vec![svc()], relays: relay_pks.clone(), protocol: proto() },
+            Subnet::new(0, vec![svc()], relay_pks.clone(), proto()),
+            Subnet::new(1, vec![svc()], relay_pks.clone(), proto()),
         ],
     })
     .sign_with(&[&committee]);

@@ -76,6 +76,7 @@ async fn scheduler_publishes_config_after_quorum() {
     assert_eq!(subnet.relays.len(), 2);
     assert_eq!(subnet.services.len(), 1);
     assert_eq!(subnet.services[0].tag, echo_tag);
+    assert_eq!(subnet.cover_rate, 1.0);
 
     scheduler_handle.abort();
 }

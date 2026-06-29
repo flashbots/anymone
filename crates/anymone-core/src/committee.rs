@@ -7,6 +7,7 @@
 //! the committee-anonymisation Panetiere. All scheduling *decisions* live in the
 //! sans-IO [`SchedulerCore`](crate::scheduler_core::SchedulerCore)
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -79,6 +80,8 @@ pub struct PanetiereCommitteeConfig {
     pub subnet_grow_at: u32,
     /// Per-message payload bound the scheduled subnets carry.
     pub message_size: usize,
+    /// Cover rate (f32 bits) shared so a caller can retune it live.
+    pub cover_rate: Arc<AtomicU32>,
 }
 
 impl Default for PanetiereCommitteeConfig {
@@ -92,6 +95,7 @@ impl Default for PanetiereCommitteeConfig {
             escalation_grace: crate::scheduler_core::ESCALATION_GRACE,
             subnet_grow_at: crate::scheduler_core::SUBNET_GROW_AT,
             message_size: 256,
+            cover_rate: Arc::new(AtomicU32::new(1.0f32.to_bits())),
         }
     }
 }
@@ -280,6 +284,7 @@ pub async fn spawn_panetiere_committee_scheduler(
                     anymone_round = crate::runtime::round_at(0, 0, dur_ms, now_ms).max(anymone_round + 1);
                     deadline = crate::runtime::deadline_for(anymone_round, 0, 0, dur_ms, now_ms);
 
+                    core.set_cover_rate(f32::from_bits(config.cover_rate.load(Ordering::Relaxed)));
                     for action in core.tick(anymone_round, now_ms) {
                         execute!(action);
                     }

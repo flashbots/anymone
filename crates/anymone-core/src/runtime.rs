@@ -4,7 +4,7 @@
 //! in its own task; sessions live inside the task and never see async.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Instant;
 
@@ -110,19 +110,12 @@ pub(crate) struct AnymoneInner {
     /// Fan-out of subnet/round events ([`Event`]). Workers publish; callers
     /// subscribe via [`Anymone::events`].
     pub(crate) events: broadcast::Sender<Event>,
-    /// Probability an idle client session contributes a cover (zero) message in
-    /// a round, as `f32` bits. 1.0 = always cover (the default).
-    cover_rate: AtomicU32,
     /// Byzantine misbehavior this node's relay sessions adopt (demo/testing):
     /// 0 = honest, 1 = withhold shares, 2 = corrupt shares.
     misbehavior: AtomicU8,
 }
 
 impl AnymoneInner {
-    fn cover_rate(&self) -> f64 {
-        f32::from_bits(self.cover_rate.load(Ordering::Relaxed)) as f64
-    }
-
     fn misbehavior(&self) -> Option<Misbehavior> {
         match self.misbehavior.load(Ordering::Relaxed) {
             1 => Some(Misbehavior::Withhold),
@@ -153,6 +146,9 @@ pub(crate) enum StageMsg {
     /// Drop the client session. Sent to a client's *old* subnet on re-home so it
     /// leaves that anonymity set — otherwise the population is double-counted.
     Retire { client_tag: ServiceTag },
+    /// Adopt a new cover rate from a config change, without rebuilding the worker
+    /// (which would drop idle pipes from the anonymity set).
+    SetCoverRate(f32),
 }
 
 impl Anymone {
@@ -210,7 +206,6 @@ impl Anymone {
             pipes: Mutex::new(HashMap::new()),
             subnets: Mutex::new(HashMap::new()),
             events: broadcast::channel(EVENTS_CAPACITY).0,
-            cover_rate: AtomicU32::new(1.0f32.to_bits()),
             misbehavior: AtomicU8::new(0),
         });
         let tasks = Arc::new(SubnetTasks {
@@ -340,15 +335,6 @@ impl Anymone {
     /// consumer lags and drops the oldest events rather than blocking the runtime.
     pub fn events(&self) -> broadcast::Receiver<Event> {
         self.inner.events.subscribe()
-    }
-
-    /// Set the probability (clamped to `0.0..=1.0`) that an idle client session
-    /// on this node sends a cover message each round. 1.0 (the default) means
-    /// every open pipe always fills its slot; lowering it thins cover so the
-    /// per-round anonymity set tracks roughly `senders + rate × idle pipes`.
-    pub fn set_cover_rate(&self, rate: f64) {
-        let bits = (rate.clamp(0.0, 1.0) as f32).to_bits();
-        self.inner.cover_rate.store(bits, Ordering::Relaxed);
     }
 
     /// Make this node's relay sessions misbehave (`None` = honest). For demos
@@ -534,6 +520,16 @@ async fn apply_config(
     }
     drop(workers);
     drop(stage_map);
+    // Deliver each subnet's cover rate to its (surviving) worker; a cover-only
+    // change isn't in `subnet_sig`, so the worker isn't rebuilt for it.
+    {
+        let stage_map = inner.subnets.lock().unwrap();
+        for subnet in &config.body.subnets {
+            if let Some(tx) = stage_map.get(&subnet.id) {
+                let _ = tx.send(StageMsg::SetCoverRate(subnet.cover_rate));
+            }
+        }
+    }
     let _ = inner.events.send(Event::ConfigUpdated {
         round: config.body.round,
     });
@@ -593,6 +589,7 @@ async fn run_subnet(
 
     let mut sessions: HashMap<SessionKey, Box<dyn Session>> = HashMap::new();
     let mut client_homes: HashSet<ServiceTag> = HashSet::new();
+    let mut cover_rate = subnet.cover_rate;
     if subnet.relays.contains(&identity_pk) {
         sessions.insert(
             SessionKey::Server,
@@ -699,13 +696,10 @@ async fn run_subnet(
     if let Some(m) = fault_monitor.as_mut() {
         m.begin_round(round, Instant::now());
     }
-    let cover_rate = inner.cover_rate();
     let misbehavior = inner.misbehavior();
     for (key, s) in sessions.iter_mut() {
-        match key {
-            SessionKey::Client => s.set_cover(rand::random::<f64>() < cover_rate),
-            SessionKey::Server => s.set_misbehavior(misbehavior),
-            SessionKey::Watch | SessionKey::Aggregator => {}
+        if let SessionKey::Server = key {
+            s.set_misbehavior(misbehavior);
         }
         for out in s.begin_round(round, Instant::now()) {
             if let Some(m) = fault_monitor.as_mut() {
@@ -786,13 +780,10 @@ async fn run_subnet(
                 if let Some(m) = fault_monitor.as_mut() {
                     m.begin_round(round, Instant::now());
                 }
-                let cover_rate = inner.cover_rate();
                 let misbehavior = inner.misbehavior();
                 for (key, s) in sessions.iter_mut() {
-                    match key {
-                        SessionKey::Client => s.set_cover(rand::random::<f64>() < cover_rate),
-                        SessionKey::Server => s.set_misbehavior(misbehavior),
-                        SessionKey::Watch | SessionKey::Aggregator => {}
+                    if let SessionKey::Server = key {
+                        s.set_misbehavior(misbehavior);
                     }
                     for out in s.begin_round(round, Instant::now()) {
                         if let Some(m) = fault_monitor.as_mut() {
@@ -830,19 +821,27 @@ async fn run_subnet(
                         client_homes.insert(client_tag);
                         sessions
                             .entry(SessionKey::Client)
-                            .or_insert_with(|| build_client_session(&subnet, &shared, &inner.identity));
+                            .or_insert_with(|| build_client_session(&subnet, &shared, &inner.identity))
+                            .set_cover_rate(cover_rate);
                     }
                     StageMsg::Stage { client_tag, payload } => {
                         client_homes.insert(client_tag);
                         let sess = sessions
                             .entry(SessionKey::Client)
                             .or_insert_with(|| build_client_session(&subnet, &shared, &inner.identity));
+                        sess.set_cover_rate(cover_rate);
                         sess.stage(payload);
                     }
                     StageMsg::Retire { client_tag } => {
                         client_homes.remove(&client_tag);
                         if client_homes.is_empty() {
                             sessions.remove(&SessionKey::Client);
+                        }
+                    }
+                    StageMsg::SetCoverRate(rate) => {
+                        cover_rate = rate;
+                        if let Some(c) = sessions.get_mut(&SessionKey::Client) {
+                            c.set_cover_rate(rate);
                         }
                     }
                 }

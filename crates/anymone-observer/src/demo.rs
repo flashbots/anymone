@@ -10,6 +10,7 @@
 //! Everything else — real Panetiere/ADCNet rounds, committee deliberation,
 //! goodput, config history — is the genuine protocol running live.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -92,12 +93,14 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
     let committee_pks: Vec<_> = committee_ids.iter().map(|i| i.pubkey()).collect();
     let gov = GovernanceBootstrap { committee: committee_pks.clone(), threshold: COMMITTEE_THRESHOLD };
 
+    let cover_target = Arc::new(AtomicU32::new((args.cover_rate.clamp(0.0, 1.0) as f32).to_bits()));
     let ccfg = PanetiereCommitteeConfig {
         committee_round_duration: Duration::from_millis(args.committee_round_ms),
         public_round_duration: Duration::from_millis(args.public_round_ms),
         min_relays: args.relays,
         min_services: 1,
         fault_grace: 2,
+        cover_rate: cover_target.clone(),
         ..PanetiereCommitteeConfig::default()
     };
     // Schedulers subscribe to the registration topic before returning, so it's
@@ -245,6 +248,19 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
             }
         });
     }
+    // Push the "cover" knob into the shared committee target each round.
+    {
+        let controls = controls.clone();
+        let cover_target = cover_target.clone();
+        tokio::spawn(async move {
+            loop {
+                let pct = controls.knob("cover").map(|k| k.get()).unwrap_or(100);
+                cover_target.store((pct as f32 / 100.0).to_bits(), Ordering::Relaxed);
+                tokio::time::sleep(round).await;
+            }
+        });
+    }
+
     tracing::info!(
         clients = n_clients,
         client_rate = send_prob,
@@ -276,7 +292,6 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
                         send_prob,
                         round,
                         next_index,
-                        controls.clone(),
                     )));
                     next_index += 1;
                 }
@@ -327,7 +342,6 @@ async fn client_loop(
     send_prob: f64,
     round: Duration,
     index: usize,
-    controls: Arc<crate::DemoControls>,
 ) {
     let client = match Anymone::start(id, transport, gov).await {
         Ok(c) => c,
@@ -352,8 +366,6 @@ async fn client_loop(
         let _ = pipe.send(say("hello from the anonymity set")).await;
     }
     loop {
-        let cover = controls.knob("cover").map(|k| k.get()).unwrap_or(100);
-        client.set_cover_rate(cover as f64 / 100.0);
         tokio::time::sleep(round).await;
         if rand::random::<f64>() < send_prob {
             let line = LINES[rand::random::<usize>() % LINES.len()];

@@ -195,6 +195,9 @@ pub struct SchedulerCore {
     /// resized to fit the observed client population, keeping per-round CPU
     /// proportional to actual usage rather than a fixed worst case.
     capacity: u32,
+    /// Cover rate stamped onto every scheduled subnet; folded into the content
+    /// key so a change re-proposes.
+    cover_rate: f32,
 
     // Lead-proposer state: bump `public_round` only when the round-independent
     // content (protocol + roster + services) changes, then re-stage every round
@@ -241,6 +244,7 @@ impl SchedulerCore {
             subnet_count: 1,
             shrink_streak: 0,
             capacity: INITIAL_CAPACITY,
+            cover_rate: 1.0,
             last_content: None,
             public_round: 0,
             published_round: None,
@@ -251,6 +255,10 @@ impl SchedulerCore {
 
     pub fn is_lead(&self) -> bool {
         self.is_lead
+    }
+
+    pub fn set_cover_rate(&mut self, rate: f32) {
+        self.cover_rate = rate.clamp(0.0, 1.0);
     }
 
     /// Ingest a registration. (Re-)registration of a relay heals a sideline,
@@ -420,6 +428,7 @@ impl SchedulerCore {
                 &self.services,
                 count,
                 self.capacity,
+                self.cover_rate,
             );
             if self.last_content.as_ref() != Some(&content) {
                 self.public_round = self.public_round.wrapping_add(1);
@@ -695,6 +704,7 @@ impl SchedulerCore {
                     client_set_min: 0,
                     client_set_max: 256,
                 }),
+                cover_rate: self.cover_rate,
             }],
             SchedulerProtocol::Adcnet => {
                 // Each subnet sizes its IBLT to the observed load; clients
@@ -715,6 +725,7 @@ impl SchedulerCore {
                             relay_exchange_keys: relay_xk.clone(),
                             aggregation: aggregation.clone(),
                         }),
+                        cover_rate: self.cover_rate,
                     })
                     .collect()
             }
@@ -735,6 +746,7 @@ impl SchedulerCore {
                         relay_exchange_keys: relay_xk,
                         aggregation,
                     }),
+                    cover_rate: self.cover_rate,
                 }]
             }
         };
@@ -756,6 +768,7 @@ fn content_key(
     services: &HashMap<ServiceTag, Pubkey>,
     subnet_count: u32,
     capacity: u32,
+    cover_rate: f32,
 ) -> Vec<u8> {
     let mut key = Vec::new();
     key.push(match proto {
@@ -765,6 +778,8 @@ fn content_key(
     });
     key.extend_from_slice(&subnet_count.to_le_bytes());
     key.extend_from_slice(&capacity.to_le_bytes());
+    // Quantize so a change in the committee's cover target re-proposes a config.
+    key.push((cover_rate.clamp(0.0, 1.0) * 100.0).round() as u8);
     let mut relay_vec: Vec<Pubkey> = relays.iter().copied().collect();
     relay_vec.sort();
     for pk in &relay_vec {

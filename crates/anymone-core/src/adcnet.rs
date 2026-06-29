@@ -21,7 +21,7 @@ use adcnet::protocol::{
     AdcNetConfig as UpstreamAdcNetConfig, AggregationMode, ClientRoundMessage,
     Round as UpstreamRound, RoundBroadcast, RoundContext, ServerPartialDecryptionMessage,
 };
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -290,7 +290,8 @@ pub struct AdcnetClientSession {
     signed_key: Option<Signed<KeyExchange>>,
     pending: Option<Vec<u8>>,
     rng: ChaCha20Rng,
-    cover: bool,
+    /// Idle-round cover probability, drawn against the private `rng`.
+    cover_rate: f32,
 }
 
 impl AdcnetClientSession {
@@ -309,7 +310,7 @@ impl AdcnetClientSession {
             signed_key: None,
             pending: None,
             rng: ChaCha20Rng::from_seed(rng_seed),
-            cover: true,
+            cover_rate: 1.0,
         }
     }
 
@@ -336,7 +337,7 @@ impl Session for AdcnetClientSession {
 
         let round_u32 = round as u32;
         let payload = self.pending.take();
-        if payload.is_none() && !self.cover {
+        if payload.is_none() && self.rng.gen::<f32>() >= self.cover_rate {
             return Vec::new();
         }
         let contribution = match client_contribute(
@@ -375,8 +376,8 @@ impl Session for AdcnetClientSession {
         self.stage_message(payload);
     }
 
-    fn set_cover(&mut self, cover: bool) {
-        self.cover = cover;
+    fn set_cover_rate(&mut self, rate: f32) {
+        self.cover_rate = rate;
     }
 }
 

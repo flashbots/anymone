@@ -87,6 +87,28 @@ fn adcnet_session_happy_path() {
     }
 
     assert!(decoded_all.contains(&payload), "payload never decoded; got {decoded_all:?}");
+
+    // Idle client: covers at rate 1.0, silent at 0.0; a staged payload always sends.
+    let mk = |rate: f32| {
+        let mut shared: HashMap<ServerId, SharedKey> = HashMap::new();
+        for (i, sid) in server_ids.iter().enumerate() {
+            shared.insert(*sid, client_id.exchange().ecdh(&servers_id[i].exchange_pubkey()));
+        }
+        let mut c = AdcnetClientSession::new(
+            cfg.clone(),
+            client_id.to_adcnet_signing_key(),
+            shared,
+            client_id.exchange_pubkey(),
+            [7u8; 32],
+        );
+        c.set_cover_rate(rate);
+        c
+    };
+    assert!(mk(0.0).begin_round(0, now).is_empty(), "rate 0 idle stays silent");
+    assert!(!mk(1.0).begin_round(0, now).is_empty(), "rate 1 idle covers");
+    let mut staged = mk(0.0);
+    staged.stage_message(b"x".to_vec());
+    assert!(!staged.begin_round(0, now).is_empty(), "staged payload always sends");
 }
 
 /// A live 1-round ADCNet subnet (one client + N relays, relay 0 the leader)

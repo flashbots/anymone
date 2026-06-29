@@ -49,11 +49,9 @@ pub trait Session: Send {
     /// Default impl: no-op (server / watch sessions ignore this).
     fn stage(&mut self, _payload: Vec<u8>) {}
 
-    /// Runtime cover-traffic policy for the upcoming round. When `false`, an
-    /// idle client session sits the round out instead of contributing its zero
-    /// message; a real staged payload is always sent regardless. Sessions that
-    /// don't originate cover ignore this. Default: cover.
-    fn set_cover(&mut self, _cover: bool) {}
+    /// Adopt a new cover rate from a config change. Client sessions that
+    /// originate cover honor it; others ignore it.
+    fn set_cover_rate(&mut self, _rate: f32) {}
 
     /// Byzantine misbehavior policy (demo/testing). `None` is honest. A server
     /// session honors it; clients/watchers ignore it. Default: honest.
