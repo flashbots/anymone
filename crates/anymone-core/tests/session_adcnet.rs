@@ -54,6 +54,7 @@ fn adcnet_session_happy_path() {
                 servers_id[i].to_adcnet_signing_key(),
                 servers_id[i].exchange().clone(),
                 n_servers,
+                0,
                 i == 0,
                 leader_pk,
                 None,
@@ -154,13 +155,14 @@ impl Subnet {
                     relay_ids[i].to_adcnet_signing_key(),
                     relay_ids[i].exchange().clone(),
                     n_servers,
+                    0,
                     i == 0,
                     leader_pk,
                     None,
                 )
             })
             .collect();
-        let observer = AdcnetObserverSession::new(relay_pks.clone(), fault_threshold);
+        let observer = AdcnetObserverSession::new(relay_pks.clone(), leader_pk, fault_threshold);
 
         Subnet {
             client,

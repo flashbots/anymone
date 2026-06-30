@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use anymone_core::identity::ExchangeIdentity;
 use anymone_core::panetiere::{
-    PanetiereAggregatorSession, PanetiereClientSession, PanetiereServerSession,
+    PanetiereAggregatorSession, PanetiereClientSession, PanetiereServerSession, SetMode,
 };
 use anymone_core::session::{LeaderAggregation, Session};
 use anymone_core::{Identity, Pubkey};
@@ -85,7 +85,8 @@ fn run_aggregated(
                 *sid,
                 64,
                 exchanges[sid.0 as usize].clone(),
-                sid.0 == 0,
+                if sid.0 == 0 { SetMode::Leader } else { SetMode::SelfDerived },
+                0,
                 server_pubkeys(&server_pks),
                 Some(leader_agg()),
             )

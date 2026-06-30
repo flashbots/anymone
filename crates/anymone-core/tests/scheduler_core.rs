@@ -18,7 +18,7 @@ use anymone_core::scheduler_core::{
 };
 use anymone_core::faults::{Attribution, Fault, FaultKind};
 use anymone_core::identity::ExchangeIdentity;
-use anymone_core::panetiere::{PanetiereClientSession, PanetiereServerSession};
+use anymone_core::panetiere::{PanetiereClientSession, PanetiereServerSession, SetMode};
 use anymone_core::session::{Misbehavior, Session};
 use anymone_core::{FaultReport, Identity, Pubkey, Registration, ServiceTag, TOPIC_CONFIG};
 
@@ -399,6 +399,7 @@ impl Subnet {
                     sorted[i].to_adcnet_signing_key(),
                     sorted[i].exchange().clone(),
                     sorted.len(),
+                    0,
                     i == 0,
                     leader_pk,
                     None,
@@ -773,7 +774,8 @@ impl PanetiereSubnet {
                     *sid,
                     8,
                     exchanges[sid.0 as usize].clone(),
-                    sid.0 == 0,
+                    if sid.0 == 0 { SetMode::Leader } else { SetMode::SelfDerived },
+                    0,
                     server_pubkeys.clone(),
                     None,
                 )

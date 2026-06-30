@@ -107,13 +107,14 @@ async fn adcnet_echo_roundtrip_in_memory() {
     });
 
     // Observer reconstructs the anon set from the leader's ClientSet broadcasts.
+    let leader = anymone_core::runtime::subnet_leader_pk(&cfg.body.subnets[0]);
     let anon = Arc::new(std::sync::atomic::AtomicU64::new(0));
     {
         let mut sub =
             net.handle(Identity::generate().pubkey()).subscribe(&subnet_broadcast_topic(0)).await;
         let anon = anon.clone();
         tokio::spawn(async move {
-            let mut o = AdcnetObserverSession::new(roster, 2);
+            let mut o = AdcnetObserverSession::new(roster, leader, 2);
             while let Some(m) = sub.recv().await {
                 o.on_inbound(m.from, m.payload);
                 anon.fetch_max(o.anonymity_set().unwrap_or(0) as u64, Ordering::Relaxed);
@@ -516,8 +517,9 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
         let mut sub0 = net.handle(Identity::generate().pubkey()).subscribe(&subnet_broadcast_topic(0)).await;
         let anon0 = anon0.clone();
         let roster = relay_pks.clone();
+        let leader = { let mut r = relay_pks.clone(); r.sort(); r[0] };
         tokio::spawn(async move {
-            let mut o = AdcnetObserverSession::new(roster, 2);
+            let mut o = AdcnetObserverSession::new(roster, leader, 2);
             while let Some(m) = sub0.recv().await {
                 o.on_inbound(m.from, m.payload);
                 anon0.store(o.anonymity_set().unwrap_or(0) as u64, Ordering::Relaxed);

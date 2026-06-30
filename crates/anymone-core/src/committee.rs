@@ -18,7 +18,8 @@ use tracing::debug;
 use crate::governance::{FaultReport, TOPIC_FAULTS, TOPIC_REGISTRATION};
 use crate::identity::{Identity, Pubkey};
 use crate::panetiere::{
-    channel_mse_params, setup_pp, PanetiereClientSession, PanetiereServerSession, COMMITTEE_MSG_BYTES,
+    channel_mse_params, setup_pp, PanetiereClientSession, PanetiereServerSession, SetMode,
+    COMMITTEE_MSG_BYTES,
 };
 use crate::scheduler_core::{SchedulerAction, SchedulerCore, SchedulerParams};
 use crate::scheduling::Registration;
@@ -243,7 +244,10 @@ pub async fn spawn_panetiere_committee_scheduler(
             my_server_id,
             committee.len() as u32,
             identity.exchange().clone(),
-            false, // every member decodes locally; no Decoded on the committee topic
+            // Leaderless, all-to-all: every member derives its own set and decodes
+            // locally; no announcer, no Decoded on the committee topic.
+            SetMode::SelfDerived,
+            0,
             committee_server_pubkeys,
             None, // committee runs the direct flow, never aggregated
         ));

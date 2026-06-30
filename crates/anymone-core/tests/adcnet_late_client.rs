@@ -114,7 +114,8 @@ async fn late_clients_join_and_grow_anon_set() {
     {
         let obs_id = Identity::generate();
         let mut sub = h(obs_id.pubkey()).subscribe("anymone/subnet/0").await;
-        let mut session = AdcnetObserverSession::new(roster, 2);
+        let leader = anymone_core::runtime::subnet_leader_pk(&configuration.body.subnets[0]);
+        let mut session = AdcnetObserverSession::new(roster, leader, 2);
         let max_anon = max_anon.clone();
         tokio::spawn(async move {
             while let Some(m) = sub.recv().await {

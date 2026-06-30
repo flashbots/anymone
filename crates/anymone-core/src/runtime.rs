@@ -643,9 +643,15 @@ pub(crate) fn deadline_for(
 pub fn subnet_leader_pk(subnet: &Subnet) -> Pubkey {
     let mut sorted = subnet.relays.to_vec();
     sorted.sort();
-    let n = sorted.len();
+    leader_of(&sorted, subnet.id)
+}
+
+/// The leader index into an already-sorted roster, shared by `subnet_leader_pk`
+/// and the committee's per-subnet observers so the two never disagree.
+pub fn leader_of(sorted_roster: &[Pubkey], subnet_id: SubnetId) -> Pubkey {
+    let n = sorted_roster.len();
     assert!(n > 0, "subnet has at least one relay");
-    sorted[(subnet.id as usize) % n]
+    sorted_roster[(subnet_id as usize) % n]
 }
 
 /// Topics this node subscribes to for `subnet`. The combining relays read

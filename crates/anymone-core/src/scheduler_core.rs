@@ -605,7 +605,8 @@ impl SchedulerCore {
             self.observers = sig
                 .iter()
                 .filter_map(|(id, roster, proto)| {
-                    build_observer(*proto, roster.clone(), self.params.fault_threshold)
+                    let leader = crate::runtime::leader_of(roster, *id);
+                    build_observer(*proto, roster.clone(), leader, self.params.fault_threshold)
                         .map(|o| (*id, o))
                 })
                 .collect();
@@ -937,14 +938,15 @@ impl PublicObserver {
 fn build_observer(
     proto: Option<SchedulerProtocol>,
     roster: Vec<Pubkey>,
+    leader: Pubkey,
     fault_threshold: u64,
 ) -> Option<PublicObserver> {
     match proto {
         Some(SchedulerProtocol::Adcnet) => Some(PublicObserver::Adcnet(
-            AdcnetObserverSession::new(roster, fault_threshold),
+            AdcnetObserverSession::new(roster, leader, fault_threshold),
         )),
         Some(SchedulerProtocol::Panetiere) => Some(PublicObserver::Panetiere(
-            PanetiereObserverSession::new(roster, fault_threshold),
+            PanetiereObserverSession::new(roster, Some(leader), fault_threshold),
         )),
         _ => None,
     }

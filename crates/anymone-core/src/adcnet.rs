@@ -108,6 +108,7 @@ fn server_session(
         identity.to_adcnet_signing_key(),
         identity.exchange().clone(),
         subnet.relays.len(),
+        cfg.client_set_min as usize,
         is_leader,
         leader_pk,
         aggregation,
@@ -162,7 +163,7 @@ pub(crate) async fn run_subnet(
     let mut fault_monitor: Option<Box<dyn Session>> = if leader_pk == identity_pk {
         let mut roster = subnet.relays.clone();
         roster.sort();
-        Some(Box::new(AdcnetObserverSession::new(roster, FAULT_THRESHOLD)))
+        Some(Box::new(AdcnetObserverSession::new(roster, leader_pk, FAULT_THRESHOLD)))
     } else {
         None
     };
@@ -502,15 +503,18 @@ pub struct AdcnetObserverSession {
     tracker: crate::faults::OutputFaultTracker,
     /// Canonical client set size per round — the per-round anonymity set.
     anon_set_by_round: std::collections::BTreeMap<u64, usize>,
+    /// Only this peer's `ClientSet`/`Decoded` are trusted (forgery guard).
+    leader: PeerId,
 }
 
 const ANON_SET_HISTORY: usize = 16;
 
 impl AdcnetObserverSession {
-    pub fn new(roster: Vec<PeerId>, fault_threshold: u64) -> Self {
+    pub fn new(roster: Vec<PeerId>, leader: PeerId, fault_threshold: u64) -> Self {
         AdcnetObserverSession {
             tracker: crate::faults::OutputFaultTracker::new(roster, fault_threshold),
             anon_set_by_round: std::collections::BTreeMap::new(),
+            leader,
         }
     }
 
@@ -550,22 +554,22 @@ impl Session for AdcnetObserverSession {
         Vec::new()
     }
 
-    fn on_inbound(&mut self, _from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
+    fn on_inbound(&mut self, from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
         match observe_adcnet(&payload) {
             AdcnetObserved::Share { round, idx } => {
                 self.tracker.observe_share(round, idx);
             }
-            AdcnetObserved::Output { round } => {
+            AdcnetObserved::Output { round } if from == self.leader => {
                 self.tracker.observe_output(round);
             }
-            AdcnetObserved::ClientSet { size, round } => {
+            AdcnetObserved::ClientSet { size, round } if from == self.leader => {
                 self.anon_set_by_round.insert(round, size);
                 while self.anon_set_by_round.len() > ANON_SET_HISTORY {
                     let oldest = *self.anon_set_by_round.keys().next().unwrap();
                     self.anon_set_by_round.remove(&oldest);
                 }
             }
-            AdcnetObserved::Other => {}
+            _ => {}
         }
         Vec::new()
     }
@@ -576,6 +580,36 @@ impl Session for AdcnetObserverSession {
             decoded: Vec::new(),
             faults: self.tracker.evaluate(),
         }
+    }
+}
+
+#[cfg(test)]
+mod observer_tests {
+    use super::*;
+    use crate::identity::Identity;
+
+    #[test]
+    fn anon_set_and_output_only_from_leader() {
+        let leader = Identity::generate();
+        let other = Identity::generate();
+        let leader_pk = leader.pubkey();
+        let mut obs = AdcnetObserverSession::new(vec![leader_pk, other.pubkey()], leader_pk, 2);
+        let signed = Signed::new(
+            &leader.to_adcnet_signing_key(),
+            KeyExchange { xpub: leader.exchange_pubkey().to_sec1_bytes() },
+        )
+        .unwrap();
+        let cs = bincode::serialize(&AdcnetWire::ClientSet { round: 1, clients: vec![signed] }).unwrap();
+        obs.on_inbound(other.pubkey(), cs.clone());
+        assert_eq!(obs.anonymity_set(), None, "non-leader ClientSet must be ignored");
+        obs.on_inbound(leader_pk, cs);
+        assert_eq!(obs.anonymity_set(), Some(1));
+
+        let dec = bincode::serialize(&AdcnetWire::Decoded { round: 5, payloads: vec![] }).unwrap();
+        obs.on_inbound(other.pubkey(), dec.clone());
+        assert_eq!(obs.output_frontier(), None, "forged Decoded must not advance output");
+        obs.on_inbound(leader_pk, dec);
+        assert_eq!(obs.output_frontier(), Some(5));
     }
 }
 
@@ -785,6 +819,8 @@ pub struct AdcnetServerSession {
     /// Leader only: signed `KeyExchange` per seen client, to put in `ClientSet`.
     client_keys: HashMap<PublicKey, Signed<KeyExchange>>,
     expected_servers: usize,
+    /// Anonymity floor: the leader won't decode a canonical set smaller than this.
+    min_clients: usize,
     /// This server leads canonical-set announcement (sorted-first relay).
     is_leader: bool,
     /// The leader's anymone pubkey — `ClientSet` announcements are only
@@ -826,6 +862,7 @@ impl AdcnetServerSession {
         signing_key: PrivateKey,
         exchange: ExchangeIdentity,
         expected_servers: usize,
+        min_clients: usize,
         is_leader: bool,
         leader_pk: PeerId,
         aggregation: Option<LeaderAggregation>,
@@ -838,6 +875,7 @@ impl AdcnetServerSession {
             shared_secrets: HashMap::new(),
             client_keys: HashMap::new(),
             expected_servers,
+            min_clients,
             is_leader,
             leader_pk,
             clients_by_round: HashMap::new(),
@@ -925,6 +963,9 @@ impl AdcnetServerSession {
             return None;
         }
         let set = self.client_set_by_round.get(&target)?;
+        if set.len() < self.min_clients {
+            return None;
+        }
         let shares = self.shares_by_round.get(&target)?;
         if shares.len() < self.expected_servers {
             return None;
