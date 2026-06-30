@@ -39,7 +39,7 @@ use crate::runtime::{
 };
 use crate::session::{LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
 use crate::transport::{Inbound, Subscription};
-use crate::wire::ServiceTag;
+use crate::wire::RouteTag;
 
 /// Per-subnet ADCNet parameters (IBLT sizing), built once at subnet start.
 fn one_round_config(cfg: &AdcnetConfig) -> OneRoundConfig {
@@ -134,7 +134,7 @@ pub(crate) async fn run_subnet(
     let client_agg_topic = client_aggregator_topic(&subnet, identity_pk);
 
     let mut sessions: HashMap<SessionKey, Box<dyn Session>> = HashMap::new();
-    let mut client_homes: HashSet<ServiceTag> = HashSet::new();
+    let mut client_homes: HashSet<RouteTag> = HashSet::new();
     let mut cover_rate = subnet.cover_rate;
 
     if subnet.relays.contains(&identity_pk) {

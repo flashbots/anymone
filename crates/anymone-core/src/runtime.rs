@@ -24,7 +24,7 @@ use crate::pipe::{Pipe, PipeIncoming, PipeMessage};
 use crate::faults::Fault;
 use crate::session::{Misbehavior, Session};
 use crate::transport::{Inbound, Subscription, Transport};
-use crate::wire::{Frame, ServiceTag, SERVICE_TAG_LEN};
+use crate::wire::{Frame, RouteTag, ServiceTag, SERVICE_TAG_LEN};
 
 /// Consecutive output-less rounds before a subnet's leader-side monitor reports
 /// a `Liveness` fault — the established "fault on the second round" threshold
@@ -96,7 +96,7 @@ pub(crate) struct AnymoneInner {
     /// send-time resolution sees the latest subnet set and re-homes clients automatically.
     pub(crate) config: RwLock<AnymoneRoundConfiguration>,
     /// `service_tag` → inbox for the matching `Pipe` (service tags and return tags).
-    pub(crate) pipes: Mutex<HashMap<ServiceTag, mpsc::UnboundedSender<PipeIncoming>>>,
+    pub(crate) pipes: Mutex<HashMap<RouteTag, mpsc::UnboundedSender<PipeIncoming>>>,
     pub(crate) subnets: Mutex<HashMap<SubnetId, mpsc::UnboundedSender<StageMsg>>>,
     /// Fan-out of subnet/round events ([`Event`]). Workers publish; callers
     /// subscribe via [`Anymone::events`].
@@ -128,15 +128,15 @@ fn misbehavior_code(mode: Option<Misbehavior>) -> u8 {
 pub(crate) enum StageMsg {
     /// Build the client session for an open `Pipe` so it ticks (and so emits
     /// cover) every round, even with no `send`.
-    Join { client_tag: ServiceTag },
+    Join { client_tag: RouteTag },
     /// Stage a payload on the client session (building it if needed).
     Stage {
-        client_tag: ServiceTag,
+        client_tag: RouteTag,
         payload: Vec<u8>,
     },
     /// Drop the client session. Sent to a client's *old* subnet on re-home so it
     /// leaves that anonymity set — otherwise the population is double-counted.
-    Retire { client_tag: ServiceTag },
+    Retire { client_tag: RouteTag },
     /// Adopt a new cover rate from a config change, without rebuilding the worker
     /// (which would drop idle pipes from the anonymity set).
     SetCoverRate(f32),
@@ -157,7 +157,6 @@ impl Anymone {
             transport,
             bootstrap,
             config_sub,
-            registration: None,
         }
     }
 
@@ -240,13 +239,13 @@ impl Anymone {
 
         let mut return_bytes = [0u8; SERVICE_TAG_LEN];
         rand::thread_rng().fill_bytes(&mut return_bytes);
-        let return_tag = ServiceTag(return_bytes);
+        let return_tag = RouteTag(return_bytes);
 
         let (in_tx, in_rx) = mpsc::unbounded_channel();
         self.inner.pipes.lock().unwrap().insert(return_tag, in_tx);
 
         // Join the home subnet so the pipe contributes cover before any send.
-        if let Some(subnet) = resolve_send_subnet(&self.inner, Some(tag), return_tag, tag) {
+        if let Some(subnet) = resolve_send_subnet(&self.inner, Some(tag), return_tag, tag.into()) {
             let tx = self.inner.subnets.lock().unwrap().get(&subnet).cloned();
             if let Some(tx) = tx {
                 let _ = tx.send(StageMsg::Join {
@@ -284,9 +283,9 @@ impl Anymone {
         }
 
         let (in_tx, in_rx) = mpsc::unbounded_channel();
-        self.inner.pipes.lock().unwrap().insert(tag, in_tx);
+        self.inner.pipes.lock().unwrap().insert(tag.into(), in_tx);
 
-        Ok(Pipe::new(Arc::downgrade(&self.inner), None, tag, in_rx))
+        Ok(Pipe::new(Arc::downgrade(&self.inner), None, tag.into(), in_rx))
     }
 
     /// Join a broadcast room on `tag`: receive every message addressed to `tag`
@@ -308,20 +307,20 @@ impl Anymone {
         }
 
         let (in_tx, in_rx) = mpsc::unbounded_channel();
-        self.inner.pipes.lock().unwrap().insert(tag, in_tx);
+        self.inner.pipes.lock().unwrap().insert(tag.into(), in_tx);
 
         // Join one carrier for cover; receiving is route-by-tag on every subnet.
-        if let Some(subnet) = resolve_send_subnet(&self.inner, Some(tag), tag, tag) {
+        if let Some(subnet) = resolve_send_subnet(&self.inner, Some(tag), tag.into(), tag.into()) {
             let tx = self.inner.subnets.lock().unwrap().get(&subnet).cloned();
             if let Some(tx) = tx {
-                let _ = tx.send(StageMsg::Join { client_tag: tag });
+                let _ = tx.send(StageMsg::Join { client_tag: tag.into() });
             }
         }
 
         Ok(Pipe::new(
             Arc::downgrade(&self.inner),
             Some(tag),
-            tag,
+            tag.into(),
             in_rx,
         ))
     }
@@ -364,61 +363,20 @@ pub enum OpenError {
 }
 
 /// Prepared (not yet running) instance with its governance subscription set up.
-/// Advance with [`AnymonePrep::start`]; relays/services call [`AnymonePrep::announce`]
-/// first so `start` also republishes their registration until placed and beyond.
+/// Advance with [`AnymonePrep::start`]. Relays/services publish their registration
+/// separately via [`crate::scheduling::announce_relay_registration`] /
+/// [`announce_service_registration`](crate::scheduling::announce_service_registration).
 pub struct AnymonePrep {
     identity: Identity,
     transport: Arc<dyn Transport>,
     bootstrap: GovernanceBootstrap,
     config_sub: Subscription,
-    registration: Option<(Vec<u8>, std::time::Duration)>,
 }
 
 impl AnymonePrep {
-    /// Register this node (relay/service) so [`start`](Self::start) republishes
-    /// `registration` on the registration topic every `interval` — until placed,
-    /// then for the node's lifetime so a sidelined node re-registers and heals
-    /// back in. Clients and the committee don't register and skip this.
-    pub fn announce(mut self, registration: Vec<u8>, interval: std::time::Duration) -> Self {
-        self.registration = Some((registration, interval));
-        self
-    }
-
     /// Await the first valid signed config, bring up its subnets, and hand the
-    /// subscription to the reconfig watcher for later versions. If a
-    /// [`registration`](Self::announce) was set, republish it while awaiting the
-    /// config and then for the node's lifetime.
+    /// subscription to the reconfig watcher for later versions.
     pub async fn start(mut self) -> Result<Anymone, GovernanceError> {
-        let Some((registration, interval)) = self.registration.take() else {
-            return self.run().await;
-        };
-        let transport = self.transport.clone();
-        let started = self.run();
-        tokio::pin!(started);
-        let anymone = loop {
-            transport
-                .publish(crate::governance::TOPIC_REGISTRATION, registration.clone())
-                .await;
-            tokio::select! {
-                res = &mut started => break res?,
-                _ = tokio::time::sleep(interval) => {}
-            }
-        };
-        // Keep re-announcing for the node's lifetime (weak handle, so the task
-        // ends when the node is dropped).
-        let weak = std::sync::Arc::downgrade(&transport);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(interval).await;
-                let Some(t) = weak.upgrade() else { break };
-                t.publish(crate::governance::TOPIC_REGISTRATION, registration.clone())
-                    .await;
-            }
-        });
-        Ok(anymone)
-    }
-
-    async fn run(mut self) -> Result<Anymone, GovernanceError> {
         let committee = self.bootstrap.committee.clone();
         let threshold = self.bootstrap.threshold;
         let verify =
@@ -820,7 +778,7 @@ pub(crate) fn route_to_pipe(inner: &AnymoneInner, bytes: &[u8]) {
             return;
         }
     };
-    let outer_tag = frame.service_tag();
+    let outer_tag = frame.dst();
     let data = match frame {
         Frame::Raw { data, .. } => data,
         Frame::Fragment { .. } => return, // reassembly is M6
@@ -844,11 +802,11 @@ pub(crate) fn route_to_pipe(inner: &AnymoneInner, bytes: &[u8]) {
 pub(crate) fn resolve_send_subnet(
     inner: &AnymoneInner,
     peer_tag: Option<ServiceTag>,
-    return_tag: ServiceTag,
-    dst: ServiceTag,
+    return_tag: RouteTag,
+    dst: RouteTag,
 ) -> Option<SubnetId> {
     let cfg = inner.config.read().unwrap();
-    let (candidates, key): (Vec<SubnetId>, ServiceTag) = match peer_tag {
+    let (candidates, key): (Vec<SubnetId>, RouteTag) = match peer_tag {
         Some(service) => (
             cfg.body
                 .subnets
@@ -873,7 +831,7 @@ pub(crate) fn resolve_send_subnet(
 pub(crate) fn stage_outbound(
     inner: &Weak<AnymoneInner>,
     subnet: SubnetId,
-    client_tag: ServiceTag,
+    client_tag: RouteTag,
     payload: Vec<u8>,
 ) -> Result<(), crate::pipe::SendError> {
     let inner = inner.upgrade().ok_or(crate::pipe::SendError::Closed)?;
@@ -897,7 +855,7 @@ pub(crate) fn stage_outbound(
 pub(crate) fn retire_outbound(
     inner: &Weak<AnymoneInner>,
     subnet: SubnetId,
-    client_tag: ServiceTag,
+    client_tag: RouteTag,
 ) {
     let Some(inner) = inner.upgrade() else { return };
     let tx = inner.subnets.lock().unwrap().get(&subnet).cloned();

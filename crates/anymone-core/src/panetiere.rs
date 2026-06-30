@@ -35,7 +35,7 @@ use crate::runtime::{
 use crate::scheduler_core::expected_active;
 use crate::session::{LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
 use crate::transport::{Inbound, Subscription};
-use crate::wire::ServiceTag;
+use crate::wire::RouteTag;
 
 /// Per-subnet Panetiere parameters (CS/KAHE keygen), built once at subnet start.
 fn setup_pp(cfg: &PanetiereConfig, subnet: &Subnet) -> Arc<ProtocolParams> {
@@ -132,7 +132,7 @@ pub(crate) async fn run_subnet(
     let client_agg_topic = client_aggregator_topic(&subnet, identity_pk);
 
     let mut sessions: HashMap<SessionKey, Box<dyn Session>> = HashMap::new();
-    let mut client_homes: HashSet<ServiceTag> = HashSet::new();
+    let mut client_homes: HashSet<RouteTag> = HashSet::new();
     let mut cover_rate = subnet.cover_rate;
 
     if subnet.relays.contains(&identity_pk) {

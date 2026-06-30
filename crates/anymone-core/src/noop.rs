@@ -126,7 +126,7 @@ pub(crate) async fn run_subnet(
         SessionKey, StageMsg,
     };
     use crate::transport::Inbound;
-    use crate::wire::ServiceTag;
+    use crate::wire::RouteTag;
     use std::collections::{HashMap, HashSet};
 
     let cfg = match &subnet.protocol {
@@ -137,7 +137,7 @@ pub(crate) async fn run_subnet(
     let topic = subnet_broadcast_topic(subnet.id);
 
     let mut sessions: HashMap<SessionKey, Box<dyn Session>> = HashMap::new();
-    let mut client_homes: HashSet<ServiceTag> = HashSet::new();
+    let mut client_homes: HashSet<RouteTag> = HashSet::new();
     let mut cover_rate = subnet.cover_rate;
     let key = if subnet.relays.contains(&identity_pk) {
         SessionKey::Server

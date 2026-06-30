@@ -6,12 +6,13 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anymone_core::config::ExchangePublicKeyWire;
 use anymone_core::p2p::{Libp2pConfig, Libp2pNetwork};
 use anymone_core::transport::Transport;
-use anymone_core::{Anymone, BootstrapConfig, GovernanceBootstrap, Identity, Registration};
+use anymone_core::{
+    announce_service_registration, Anymone, BootstrapConfig, GovernanceBootstrap, Identity,
+};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
@@ -79,15 +80,11 @@ async fn main() -> Result<()> {
         // (placement is by tag, so a duplicate registration is harmless;
         // re-announced until placed).
         None => {
-            let reg = Registration::service(
-                &identity,
-                anymone_chat::chat_tag(),
-                ExchangePublicKeyWire::from_key(&identity.exchange_pubkey()),
-            )
-            .encode();
+            let xk = ExchangePublicKeyWire::from_key(&identity.exchange_pubkey());
+            let _reannounce =
+                announce_service_registration(transport.clone(), &identity, anymone_chat::chat_tag(), xk).await;
             let anymone = Anymone::prepare(identity, transport, gov)
                 .await
-                .announce(reg, Duration::from_secs(10))
                 .start()
                 .await
                 .map_err(|e| anyhow!("anymone start: {e}"))?;

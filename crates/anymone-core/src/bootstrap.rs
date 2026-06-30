@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::committee::CommitteeParams;
 use crate::governance::GovernanceConfig;
 use crate::identity::Pubkey;
 
@@ -17,6 +18,10 @@ pub struct BootstrapConfig {
     pub identity_path: PathBuf,
     pub network: NetworkConfig,
     pub governance: GovernanceConfig,
+    /// Committee scheduler tunables (shared across all nodes). Optional — an
+    /// absent `[committee]` section uses [`CommitteeParams`] defaults.
+    #[serde(default)]
+    pub committee: CommitteeParams,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,13 +118,21 @@ bootstrap_peers = ["/dns4/seed/tcp/7100/p2p/12D3KooW..."]
 
 [governance]
 threshold = 2
-{members}"#
+{members}
+[committee]
+public_round_ms = 2000"#
         );
         let cfg = BootstrapConfig::from_toml_str(&toml).unwrap();
         assert_eq!(cfg.governance.committee.len(), 3);
         assert_eq!(cfg.governance.threshold, 2);
         assert_eq!(cfg.network.bootstrap_peers.len(), 1);
         assert!(cfg.governance.committee[0].exchange_pubkey.to_key().is_ok());
+        // Present field parses; omitted committee fields fall back to defaults.
+        assert_eq!(cfg.committee.public_round_ms, 2000);
+        assert_eq!(cfg.committee.committee_round_ms, 10_000);
+        // A config with no `[committee]` section at all uses all defaults.
+        let no_committee = BootstrapConfig::from_toml_str(&toml.replace("[committee]\npublic_round_ms = 2000", "")).unwrap();
+        assert_eq!(no_committee.committee.public_round_ms, 4000);
     }
 
     #[test]

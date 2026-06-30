@@ -5,6 +5,7 @@
 //! (capacity-driven grow/shrink).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anymone_core::adcnet::{AdcnetClientSession, AdcnetServerSession};
@@ -16,11 +17,16 @@ use anymone_core::scheduler_core::{
     CommitteeSig, SchedulerAction, SchedulerCore, SchedulerParams, SignedProposal,
 };
 use anymone_core::faults::{Attribution, Fault, FaultKind};
-use anymone_core::session::Session;
+use anymone_core::identity::ExchangeIdentity;
+use anymone_core::panetiere::{PanetiereClientSession, PanetiereServerSession};
+use anymone_core::session::{Misbehavior, Session};
 use anymone_core::{Identity, Pubkey, Registration, ServiceTag, TOPIC_CONFIG};
 
-use adcnet::crypto::{ServerId, SharedKey};
+use adcnet::crypto::{ExchangePublicKey, ServerId, SharedKey};
 use adcnet::protocol::session::one_round::{IbltMsgParamsOwned, OneRoundConfig};
+use panetiere::protocol::{ClientId, ProtocolParams, ServerId as PanServerId};
+use rand::SeedableRng;
+use rand_chacha::ChaCha20Rng;
 
 fn xkw(id: &Identity) -> ExchangePublicKeyWire {
     ExchangePublicKeyWire::from_key(&id.exchange_pubkey())
@@ -708,4 +714,194 @@ fn registration_signature_binds_to_registrant() {
         signature[0] ^= 0xff;
     }
     assert!(!reg.verify(), "a tampered signature must not verify");
+}
+
+/// A live Panetiere subnet (one client + 3 relays, relay 0 the decoding leader,
+/// relay 2 corrupting its shares) over a synchronous bus, returning every wire
+/// message so it can be fed to the committee core via `on_subnet_message` — the
+/// same path the daemon uses. Built from the same relay identities the core
+/// registered, so each `server_id` (the sorted-roster index) lines up with the
+/// config roster the core's observer learned.
+struct PanetiereSubnet {
+    client: PanetiereClientSession,
+    client_pk: Pubkey,
+    servers: Vec<PanetiereServerSession>,
+    server_pks: Vec<Pubkey>,
+    share_bus: Vec<(Pubkey, Vec<u8>)>,
+    now: Instant,
+    seq: u64,
+}
+
+impl PanetiereSubnet {
+    fn new(relay_ids: &[Identity]) -> Self {
+        let n = relay_ids.len();
+        let mut setup_rng = ChaCha20Rng::from_seed([7u8; 32]);
+        let pp = Arc::new(ProtocolParams::setup(&mut setup_rng, n));
+        let server_ids: Vec<PanServerId> = (0..n as u32).map(PanServerId).collect();
+
+        let mut sorted = relay_ids.to_vec();
+        sorted.sort_by_key(|i| i.pubkey());
+        let server_pks: Vec<Pubkey> = sorted.iter().map(|i| i.pubkey()).collect();
+        let server_pubkeys: HashMap<PanServerId, Pubkey> = server_pks
+            .iter()
+            .enumerate()
+            .map(|(i, pk)| (PanServerId(i as u32), *pk))
+            .collect();
+
+        let exchanges: Vec<ExchangeIdentity> =
+            (0..n).map(|_| ExchangeIdentity::generate()).collect();
+        let xpubs: HashMap<PanServerId, ExchangePublicKey> = exchanges
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (PanServerId(i as u32), e.public()))
+            .collect();
+
+        let client_id = Identity::generate();
+        let client =
+            PanetiereClientSession::new(pp.clone(), ClientId(0), server_ids.clone(), xpubs, [42u8; 32]);
+        let mut servers: Vec<PanetiereServerSession> = server_ids
+            .iter()
+            .map(|sid| {
+                PanetiereServerSession::new(
+                    pp.clone(),
+                    *sid,
+                    8,
+                    exchanges[sid.0 as usize].clone(),
+                    sid.0 == 0,
+                    server_pubkeys.clone(),
+                    None,
+                )
+            })
+            .collect();
+        servers[2].set_misbehavior(Some(Misbehavior::CorruptShare));
+
+        PanetiereSubnet {
+            client,
+            client_pk: client_id.pubkey(),
+            servers,
+            server_pks,
+            share_bus: Vec::new(),
+            now: Instant::now(),
+            seq: 0,
+        }
+    }
+
+    /// Run one round. Returns (every wire message produced, the leader's faults,
+    /// the number of payloads the leader decoded this round). Server shares reach
+    /// peers with a one-round delay, exactly as gossip delivers them.
+    fn round(&mut self, r: u64) -> (Vec<(Pubkey, Vec<u8>)>, Vec<Fault>, usize) {
+        let mut produced = Vec::new();
+        for (from, m) in std::mem::take(&mut self.share_bus) {
+            for s in self.servers.iter_mut() {
+                s.on_inbound(from, m.clone());
+            }
+        }
+        // A distinct real payload every round so the leader emits a `Decoded`.
+        self.client.stage(format!("payload-{:02}", self.seq).into_bytes());
+        self.seq += 1;
+        let client_out = self.client.begin_round(r, self.now);
+        for s in self.servers.iter_mut() {
+            for m in &client_out {
+                s.on_inbound(self.client_pk, m.clone());
+            }
+        }
+        for m in &client_out {
+            produced.push((self.client_pk, m.clone()));
+        }
+
+        let mut faults = Vec::new();
+        let mut decoded = 0usize;
+        for i in 0..self.servers.len() {
+            let out = self.servers[i].end_round(r, self.now);
+            let pk = self.server_pks[i];
+            if i == 0 {
+                decoded = out.decoded.len();
+                faults = out.faults;
+            }
+            for m in out.outbound {
+                self.share_bus.push((pk, m.clone()));
+                produced.push((pk, m));
+            }
+        }
+        (produced, faults, decoded)
+    }
+}
+
+/// RED repro — fails until the integrity-fault path is fixed. A relay that
+/// corrupts its Panetiere shares is tolerated by t-of-n decode, so the subnet
+/// keeps producing output (liveness met) and the leader attributes an
+/// `Integrity` fault every round. But the committee's only fault source is its
+/// liveness observer, which never sees integrity faults — so after
+/// `escalation_grace` "clean" ticks it silently de-escalates back to optimistic
+/// ADCNet with the corrupt relay still in the roster. Correct behaviour: stay
+/// escalated and sideline the offender. (This is not a stall: the subnet decodes
+/// fine; the ignored signal is the integrity fault, not missing output.)
+#[test]
+fn corrupt_panetiere_keeps_escalation() {
+    let committee: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
+    let mut core = lead_core(&committee, 2);
+    let relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
+    let service = Identity::generate();
+    register_relays_and_service(&mut core, &relays, &service);
+
+    // Optimistic ADCNet baseline.
+    let first = staged_proposal(&core.tick(0, 0)).expect("first proposal");
+    assert_eq!(proto_name(&first.body), "adcnet");
+    enact(&mut core, &committee, first);
+
+    // An ADCNet corrupt share fails decode without attribution → unattributable
+    // fault → escalate to Panetiere keeping all 3 relays (the corrupt one rides in).
+    core.apply_observed_faults(0, vec![Fault {
+        kind: FaultKind::Liveness,
+        attribution: Attribution::None,
+        evidence: Vec::new(),
+    }], 0);
+    let esc = staged_proposal(&core.tick(1, 0)).expect("escalation proposal");
+    assert_eq!(proto_name(&esc.body), "panetiere");
+    assert_eq!(esc.body.subnets[0].relays.len(), 3);
+    let corrupt_pk = {
+        let mut sorted: Vec<Pubkey> = relays.iter().map(|i| i.pubkey()).collect();
+        sorted.sort();
+        sorted[2]
+    };
+    assert!(esc.body.subnets[0].relays.contains(&corrupt_pk));
+    enact(&mut core, &committee, esc);
+
+    // Run the corrupt Panetiere subnet into the committee observer well past the
+    // escalation grace, ticking the core each round as the daemon would.
+    let mut net = PanetiereSubnet::new(&relays);
+    let mut saw_integrity = false;
+    let mut total_output = 0usize;
+    let mut deescalated = false;
+    for r in 0..9u64 {
+        let (wire, faults, decoded) = net.round(r);
+        for (from, bytes) in wire {
+            core.on_subnet_message(0, from, bytes);
+        }
+        total_output += decoded;
+        if faults.iter().any(|f| {
+            f.kind == FaultKind::Integrity
+                && f.attribution == Attribution::Peers(vec![corrupt_pk])
+        }) {
+            saw_integrity = true;
+        }
+        if let Some(b) = staged_body(&core.tick(2 + r, 0)) {
+            if proto_name(&b) == "adcnet" {
+                deescalated = true;
+            }
+        }
+    }
+
+    // Preconditions — not a stall: the subnet kept producing output AND the
+    // leader raised the integrity fault.
+    assert!(total_output > 0, "subnet must keep producing output (liveness met)");
+    assert!(saw_integrity, "leader must attribute an integrity fault to the corrupt relay");
+
+    // Desired behaviour (fails today): the ongoing integrity fault keeps the
+    // subnet escalated; it must NOT fall back to ADCNet with the offender re-included.
+    assert!(
+        !deescalated,
+        "subnet de-escalated to ADCNet despite an ongoing integrity fault \
+         from {corrupt_pk:?}; the offender is back in the optimistic roster"
+    );
 }

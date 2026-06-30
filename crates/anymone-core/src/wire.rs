@@ -85,12 +85,36 @@ impl<'de> serde::Deserialize<'de> for ServiceTag {
     }
 }
 
+/// A 20-byte delivery address the transport routes to. A destination is either a
+/// service (reachable at its [`ServiceTag`]) or a client's per-pipe return path;
+/// on the wire both are just delivery addresses, distinct from service *identity*.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct RouteTag(pub [u8; SERVICE_TAG_LEN]);
+
+impl RouteTag {
+    pub const fn from_bytes(bytes: [u8; SERVICE_TAG_LEN]) -> Self {
+        RouteTag(bytes)
+    }
+}
+
+impl From<ServiceTag> for RouteTag {
+    fn from(t: ServiceTag) -> Self {
+        RouteTag(t.0)
+    }
+}
+
+impl fmt::Debug for RouteTag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RouteTag({})", hex::encode(self.0))
+    }
+}
+
 /// A parsed message off the broadcast channel, borrowed from the underlying buffer.
 #[derive(Debug, Clone)]
 pub enum Frame<'a> {
-    Raw { service_tag: ServiceTag, data: &'a [u8] },
+    Raw { dst: RouteTag, data: &'a [u8] },
     Fragment {
-        service_tag: ServiceTag,
+        dst: RouteTag,
         n_chunks: u8,
         chunk_index: u8,
         signature: [u8; SIGNATURE_LEN],
@@ -99,10 +123,10 @@ pub enum Frame<'a> {
 }
 
 impl<'a> Frame<'a> {
-    pub fn service_tag(&self) -> ServiceTag {
+    pub fn dst(&self) -> RouteTag {
         match self {
-            Frame::Raw { service_tag, .. } => *service_tag,
-            Frame::Fragment { service_tag, .. } => *service_tag,
+            Frame::Raw { dst, .. } => *dst,
+            Frame::Fragment { dst, .. } => *dst,
         }
     }
 
@@ -116,7 +140,7 @@ impl<'a> Frame<'a> {
                 let (tag, data) = rest.split_at(SERVICE_TAG_LEN);
                 let mut tag_bytes = [0u8; SERVICE_TAG_LEN];
                 tag_bytes.copy_from_slice(tag);
-                Ok(Frame::Raw { service_tag: ServiceTag(tag_bytes), data })
+                Ok(Frame::Raw { dst: RouteTag(tag_bytes), data })
             }
             VERSION_MULTI_FRAGMENT => {
                 let min_len = SERVICE_TAG_LEN + 1 + 1 + SIGNATURE_LEN;
@@ -138,7 +162,7 @@ impl<'a> Frame<'a> {
                 let mut sig_bytes = [0u8; SIGNATURE_LEN];
                 sig_bytes.copy_from_slice(sig);
                 Ok(Frame::Fragment {
-                    service_tag: ServiceTag(tag_bytes),
+                    dst: RouteTag(tag_bytes),
                     n_chunks,
                     chunk_index,
                     signature: sig_bytes,
@@ -151,14 +175,14 @@ impl<'a> Frame<'a> {
 
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
-            Frame::Raw { service_tag, data } => {
+            Frame::Raw { dst, data } => {
                 out.push(VERSION_RAW);
-                out.extend_from_slice(&service_tag.0);
+                out.extend_from_slice(&dst.0);
                 out.extend_from_slice(data);
             }
-            Frame::Fragment { service_tag, n_chunks, chunk_index, signature, data } => {
+            Frame::Fragment { dst, n_chunks, chunk_index, signature, data } => {
                 out.push(VERSION_MULTI_FRAGMENT);
-                out.extend_from_slice(&service_tag.0);
+                out.extend_from_slice(&dst.0);
                 out.push(*n_chunks);
                 out.push(*chunk_index);
                 out.extend_from_slice(signature);
@@ -174,17 +198,17 @@ impl<'a> Frame<'a> {
     }
 }
 
-/// Bytes the v1 signature is computed over: version || service_tag || n_chunks
+/// Bytes the v1 signature is computed over: version || dst || n_chunks
 /// || chunk_index || data. Useful for both signing and verification.
 pub fn fragment_signing_bytes(
-    service_tag: &ServiceTag,
+    dst: &RouteTag,
     n_chunks: u8,
     chunk_index: u8,
     data: &[u8],
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(1 + SERVICE_TAG_LEN + 1 + 1 + data.len());
     buf.push(VERSION_MULTI_FRAGMENT);
-    buf.extend_from_slice(&service_tag.0);
+    buf.extend_from_slice(&dst.0);
     buf.push(n_chunks);
     buf.push(chunk_index);
     buf.extend_from_slice(data);
@@ -207,18 +231,18 @@ pub enum WireError {
 mod tests {
     use super::*;
 
-    fn tag() -> ServiceTag {
-        ServiceTag::from_label("anymone.echo")
+    fn tag() -> RouteTag {
+        ServiceTag::from_label("anymone.echo").into()
     }
 
     #[test]
     fn raw_roundtrip() {
-        let f = Frame::Raw { service_tag: tag(), data: b"hello" };
+        let f = Frame::Raw { dst: tag(), data: b"hello" };
         let bytes = f.to_bytes();
         let parsed = Frame::decode(&bytes).unwrap();
         match parsed {
-            Frame::Raw { service_tag, data } => {
-                assert_eq!(service_tag, tag());
+            Frame::Raw { dst, data } => {
+                assert_eq!(dst, tag());
                 assert_eq!(data, b"hello");
             }
             other => panic!("expected Raw, got {other:?}"),
@@ -228,7 +252,7 @@ mod tests {
     #[test]
     fn fragment_roundtrip() {
         let f = Frame::Fragment {
-            service_tag: tag(),
+            dst: tag(),
             n_chunks: 3,
             chunk_index: 1,
             signature: [7u8; SIGNATURE_LEN],
@@ -237,8 +261,8 @@ mod tests {
         let bytes = f.to_bytes();
         let parsed = Frame::decode(&bytes).unwrap();
         match parsed {
-            Frame::Fragment { service_tag, n_chunks, chunk_index, signature, data } => {
-                assert_eq!(service_tag, tag());
+            Frame::Fragment { dst, n_chunks, chunk_index, signature, data } => {
+                assert_eq!(dst, tag());
                 assert_eq!(n_chunks, 3);
                 assert_eq!(chunk_index, 1);
                 assert_eq!(signature, [7u8; SIGNATURE_LEN]);
@@ -269,7 +293,7 @@ mod tests {
     #[test]
     fn rejects_zero_chunks() {
         let f = Frame::Fragment {
-            service_tag: tag(),
+            dst: tag(),
             n_chunks: 0,
             chunk_index: 0,
             signature: [0u8; SIGNATURE_LEN],
@@ -283,7 +307,7 @@ mod tests {
     #[test]
     fn rejects_chunk_index_past_count() {
         let f = Frame::Fragment {
-            service_tag: tag(),
+            dst: tag(),
             n_chunks: 2,
             chunk_index: 5,
             signature: [0u8; SIGNATURE_LEN],

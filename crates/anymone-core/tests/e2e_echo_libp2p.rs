@@ -17,7 +17,7 @@ use anymone_core::scheduling::{announce_relay_registration, announce_service_reg
 use anymone_core::transport::Transport;
 use anymone_core::{
     committee_roster, spawn_panetiere_committee_scheduler, Anymone, AnymoneRoundConfiguration,
-    GovernanceBootstrap, Identity, PanetiereCommitteeConfig, Registration, ServiceTag, TOPIC_CONFIG,
+    GovernanceBootstrap, Identity, PanetiereCommitteeConfig, ServiceTag, TOPIC_CONFIG,
     TOPIC_REGISTRATION,
 };
 use libp2p::Multiaddr;
@@ -275,31 +275,30 @@ async fn deployment_echo_full_nodes_via_bootnode() {
         ..PanetiereCommitteeConfig::default()
     };
     let mut keep: Vec<Arc<Libp2pNetwork>> = vec![boot.net.clone()];
-    let announce = Duration::from_secs(1);
-
-    // Relays + service start announcing while there's no committee to hear them.
+    // Relays + service start announcing while there's no committee to hear them;
+    // the lifetime re-announcer keeps re-publishing until the committee comes up.
     let mut starts = Vec::new();
     for _ in 0..2 {
         let id = Identity::generate();
         let node = start_node(id.clone(), pick(), dial.clone()).await;
         keep.push(node.net.clone());
-        let reg = Registration::relay(&id, xk(&id)).encode();
-        let gov = gov.clone();
         let net: Arc<dyn Transport> = node.net.clone();
+        announce_relay_registration(net.clone(), &id, xk(&id)).await;
+        let gov = gov.clone();
         starts.push(tokio::spawn(async move {
-            Anymone::prepare(id, net, gov).await.announce(reg, announce).start().await
+            Anymone::prepare(id, net, gov).await.start().await
         }));
     }
 
     let svc_id = Identity::generate();
     let svc_node = start_node(svc_id.clone(), pick(), dial.clone()).await;
     keep.push(svc_node.net.clone());
-    let svc_reg = Registration::service(&svc_id, ECHO_TAG, xk(&svc_id)).encode();
     let svc_handle = {
         let gov = gov.clone();
         let net: Arc<dyn Transport> = svc_node.net.clone();
+        announce_service_registration(net.clone(), &svc_id, ECHO_TAG, xk(&svc_id)).await;
         tokio::spawn(async move {
-            Anymone::prepare(svc_id, net, gov).await.announce(svc_reg, announce).start().await
+            Anymone::prepare(svc_id, net, gov).await.start().await
         })
     };
 

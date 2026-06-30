@@ -6,8 +6,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
-use crate::config::{AnymoneRoundConfiguration, ExchangePublicKeyWire};
-use crate::governance::{TOPIC_CONFIG, TOPIC_REGISTRATION};
+use crate::config::ExchangePublicKeyWire;
+use crate::governance::TOPIC_REGISTRATION;
 use crate::identity::{Identity, Pubkey};
 use crate::transport::Transport;
 use crate::wire::ServiceTag;
@@ -104,61 +104,35 @@ impl Registration {
 
 const REGISTRATION_REANNOUNCE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Re-broadcast a relay registration until this relay appears in a config (placement
-/// is the accept signal), then stop. Closes the gossipsub no-replay race that a single
-/// publish loses. Returns the background task's handle.
+/// Re-broadcast a relay registration on `TOPIC_REGISTRATION` every
+/// [`REGISTRATION_REANNOUNCE_INTERVAL`] for the node's lifetime. The single
+/// announce mechanism: re-announcing is idempotent (the committee dedups relays),
+/// and continuing past placement lets a sidelined relay re-register and heal.
+/// The task ends when the transport — held by the running node — is dropped.
 pub async fn announce_relay_registration(
     transport: Arc<dyn Transport>,
     identity: &Identity,
     exchange_pubkey: ExchangePublicKeyWire,
 ) -> JoinHandle<()> {
-    let pubkey = identity.pubkey();
-    let reg = Registration::relay(identity, exchange_pubkey).encode();
-    let config_sub = transport.subscribe(TOPIC_CONFIG).await;
-    spawn_reannounce(transport, reg, config_sub, move |cfg| {
-        cfg.body.subnets.iter().any(|s| s.relays.contains(&pubkey))
-    })
+    spawn_reannounce(transport, Registration::relay(identity, exchange_pubkey).encode())
 }
 
-/// Re-broadcast a service registration until it appears in a config, then stop.
+/// Re-broadcast a service registration for the node's lifetime (see
+/// [`announce_relay_registration`]).
 pub async fn announce_service_registration(
     transport: Arc<dyn Transport>,
     identity: &Identity,
     tag: ServiceTag,
     exchange_pubkey: ExchangePublicKeyWire,
 ) -> JoinHandle<()> {
-    let pubkey = identity.pubkey();
-    let reg = Registration::service(identity, tag, exchange_pubkey).encode();
-    let config_sub = transport.subscribe(TOPIC_CONFIG).await;
-    spawn_reannounce(transport, reg, config_sub, move |cfg| {
-        cfg.body.subnets.iter().any(|s| {
-            s.services
-                .iter()
-                .any(|e| e.tag == tag && e.pubkey == pubkey)
-        })
-    })
+    spawn_reannounce(transport, Registration::service(identity, tag, exchange_pubkey).encode())
 }
 
-fn spawn_reannounce(
-    transport: Arc<dyn Transport>,
-    reg: Vec<u8>,
-    mut config_sub: crate::transport::Subscription,
-    placed: impl Fn(&AnymoneRoundConfiguration) -> bool + Send + 'static,
-) -> JoinHandle<()> {
+fn spawn_reannounce(transport: Arc<dyn Transport>, reg: Vec<u8>) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             transport.publish(TOPIC_REGISTRATION, reg.clone()).await;
-            tokio::select! {
-                _ = tokio::time::sleep(REGISTRATION_REANNOUNCE_INTERVAL) => {}
-                msg = config_sub.recv() => {
-                    let Some(msg) = msg else { return };
-                    if bincode::deserialize::<AnymoneRoundConfiguration>(&msg.payload)
-                        .is_ok_and(|cfg| placed(&cfg))
-                    {
-                        return;
-                    }
-                }
-            }
+            tokio::time::sleep(REGISTRATION_REANNOUNCE_INTERVAL).await;
         }
     })
 }

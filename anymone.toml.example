@@ -27,3 +27,15 @@ exchange_pubkey = "00"
 [[governance.committee]]
 pubkey = "ed25519:0000000000000000000000000000000000000000000000000000000000000002"
 exchange_pubkey = "00"
+
+# Committee scheduler tunables. Must be identical on every node (they shape the
+# published config all nodes decode against). Optional — omit for these defaults.
+[committee]
+committee_round_ms = 10000  # internal committee-Panetiere round
+public_round_ms = 4000      # public-subnet round (lands in every ProtocolConfig)
+min_relays = 1              # relays observed before the first config is staged
+min_services = 1
+fault_grace = 2             # output-less public rounds before renegotiating
+escalation_grace = 5        # fault-free rounds before de-escalating
+subnet_grow_at = 63         # per-subnet load that triggers another subnet
+message_size = 256          # per-message payload bound

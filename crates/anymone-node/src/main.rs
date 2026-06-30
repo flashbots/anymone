@@ -7,22 +7,19 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anymone_core::config::ExchangePublicKeyWire;
 use anymone_core::p2p::{Libp2pConfig, Libp2pNetwork};
 use anymone_core::transport::Transport;
 use anymone_core::{
-    spawn_panetiere_committee_scheduler, Anymone, BootstrapConfig, PanetiereCommitteeConfig,
-    GovernanceBootstrap, Identity, Registration, ServiceTag,
+    announce_relay_registration, announce_service_registration,
+    spawn_panetiere_committee_scheduler, Anymone, BootstrapConfig, GovernanceBootstrap, Identity,
+    ServiceTag,
 };
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use libp2p::{Multiaddr, PeerId};
 use tracing_subscriber::EnvFilter;
-
-/// How often a relay/service re-announces its registration until it's placed.
-const REGISTER_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Parser, Debug)]
 #[command(name = "anymone-node", version, about = "Run an anymone node.")]
@@ -58,27 +55,6 @@ struct RunArgs {
     /// If set, serve `GET /state/peers` on this port for the observer's mesh view.
     #[arg(long)]
     peers_port: Option<u16>,
-
-    // --- committee tuning (role == committee only) ---
-    /// Committee internal-Panetiere round duration, in milliseconds.
-    #[arg(long, default_value = "10000")]
-    committee_round_ms: u64,
-    /// Public-subnet round duration, in milliseconds.
-    #[arg(long, default_value = "4000")]
-    public_round_ms: u64,
-    /// Minimum relays observed before the committee stages its first config.
-    #[arg(long, default_value = "1")]
-    min_relays: usize,
-    /// Minimum services observed before the committee stages its first config.
-    #[arg(long, default_value = "1")]
-    min_services: usize,
-    /// Consecutive output-less public rounds before the committee renegotiates.
-    #[arg(long, default_value = "2")]
-    fault_grace: u64,
-    /// Fault-free rounds before a general escalation de-escalates; keep above
-    /// `fault_grace`.
-    #[arg(long, default_value = "5")]
-    escalation_grace: u32,
 }
 
 #[derive(Parser, Debug)]
@@ -239,35 +215,19 @@ async fn run(args: RunArgs) -> Result<()> {
     match args.role {
         Role::Committee => {
             let roster = bootstrap.governance.roster();
-            let ccfg = PanetiereCommitteeConfig {
-                committee_round_duration: Duration::from_millis(args.committee_round_ms),
-                public_round_duration: Duration::from_millis(args.public_round_ms),
-                min_relays: args.min_relays,
-                min_services: args.min_services,
-                fault_grace: args.fault_grace,
-                escalation_grace: args.escalation_grace,
-                ..PanetiereCommitteeConfig::default()
-            };
-            let _scheduler = spawn_panetiere_committee_scheduler(
-                transport,
-                identity,
-                roster,
-                bootstrap.governance.threshold,
-                ccfg,
-            )
-            .await;
+            let threshold = bootstrap.governance.threshold;
+            let ccfg = bootstrap.committee.clone().into_config();
+            let _scheduler =
+                spawn_panetiere_committee_scheduler(transport, identity, roster, threshold, ccfg)
+                    .await;
             tracing::info!("committee online; waiting for ctrl-c");
             tokio::signal::ctrl_c().await.ok();
         }
         Role::Relay => {
-            let reg = Registration::relay(
-                &identity,
-                ExchangePublicKeyWire::from_key(&identity.exchange_pubkey()),
-            )
-            .encode();
+            let xk = ExchangePublicKeyWire::from_key(&identity.exchange_pubkey());
+            let _reannounce = announce_relay_registration(transport.clone(), &identity, xk).await;
             let _anymone = Anymone::prepare(identity, transport, gov)
                 .await
-                .announce(reg, REGISTER_INTERVAL)
                 .start()
                 .await
                 .map_err(|e| anyhow!("anymone start: {e}"))?;
@@ -279,15 +239,11 @@ async fn run(args: RunArgs) -> Result<()> {
                 .service_tag
                 .ok_or_else(|| anyhow!("--service-tag is required for role=service"))?;
             let tag = ServiceTag::from_label(&label);
-            let reg = Registration::service(
-                &identity,
-                tag,
-                ExchangePublicKeyWire::from_key(&identity.exchange_pubkey()),
-            )
-            .encode();
+            let xk = ExchangePublicKeyWire::from_key(&identity.exchange_pubkey());
+            let _reannounce =
+                announce_service_registration(transport.clone(), &identity, tag, xk).await;
             let anymone = Anymone::prepare(identity, transport, gov)
                 .await
-                .announce(reg, REGISTER_INTERVAL)
                 .start()
                 .await
                 .map_err(|e| anyhow!("anymone start: {e}"))?;

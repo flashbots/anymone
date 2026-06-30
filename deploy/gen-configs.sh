@@ -62,6 +62,9 @@ bootstrap_peers = [$3]
 [governance]
 threshold = $THRESHOLD
 $COMMITTEE_BLOCK
+[committee]
+committee_round_ms = 10000
+public_round_ms = 4000
 EOF
 }
 

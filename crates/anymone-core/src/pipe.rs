@@ -9,24 +9,24 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::runtime::{resolve_send_subnet, retire_outbound, stage_outbound, AnymoneInner};
-use crate::wire::{Frame, ServiceTag};
+use crate::wire::{Frame, RouteTag, ServiceTag};
 use crate::SubnetId;
 
 /// What gets put on the wire between Pipes: the inner `PipeMessage` is
-/// bincode-encoded, then wrapped in a v0 raw `Frame` whose `service_tag` is
-/// the destination tag (the peer's return tag, or the service's bound tag).
+/// bincode-encoded, then wrapped in a v0 raw `Frame` whose `dst` is the
+/// destination delivery address (the peer's return path, or the service's tag).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PipeMessage {
-    pub return_tag: ServiceTag,
+    pub return_tag: RouteTag,
     #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
 }
 
-/// What a `Pipe` yields on `recv`: the originator's return tag plus their
+/// What a `Pipe` yields on `recv`: the originator's return path plus their
 /// bytes. The tag is what the recipient should pass to `send_to` for replies.
 #[derive(Debug, Clone)]
 pub struct PipeIncoming {
-    pub return_tag: ServiceTag,
+    pub return_tag: RouteTag,
     pub payload: Vec<u8>,
 }
 
@@ -35,9 +35,9 @@ pub struct Pipe {
     /// For client-opened pipes: the bound service tag (so `send` knows where).
     /// For service-bound pipes: `None` (caller must use `send_to`).
     peer_tag: Option<ServiceTag>,
-    /// Our local routing tag — for client pipes this is the random per-pipe
-    /// return tag, for service pipes this is the service's bound tag.
-    return_tag: ServiceTag,
+    /// Our own delivery address — for client pipes a random per-pipe return
+    /// path, for service pipes the service tag as a delivery address.
+    return_tag: RouteTag,
     /// Subnet this pipe last staged on. When a send resolves a different subnet
     /// (the committee re-homed us across a reconfig), we retire the client
     /// session on the old one so we stop contributing there.
@@ -49,14 +49,14 @@ impl Pipe {
     pub(crate) fn new(
         anymone: Weak<AnymoneInner>,
         peer_tag: Option<ServiceTag>,
-        return_tag: ServiceTag,
+        return_tag: RouteTag,
         inbound: mpsc::UnboundedReceiver<PipeIncoming>,
     ) -> Self {
         Pipe { anymone, peer_tag, return_tag, last_subnet: Mutex::new(None), inbound }
     }
 
-    /// Our local routing tag.
-    pub fn return_tag(&self) -> ServiceTag {
+    /// Our own delivery address.
+    pub fn return_tag(&self) -> RouteTag {
         self.return_tag
     }
 
@@ -66,9 +66,10 @@ impl Pipe {
         self.send_to(dst, payload).await
     }
 
-    /// Send `payload` addressed to `dst`. Service-side replies use this with
-    /// the request's `return_tag`.
-    pub async fn send_to(&self, dst: ServiceTag, payload: Vec<u8>) -> Result<(), SendError> {
+    /// Send `payload` addressed to `dst` (a service tag, or a peer's return
+    /// path). Service-side replies pass the request's `return_tag`.
+    pub async fn send_to(&self, dst: impl Into<RouteTag>, payload: Vec<u8>) -> Result<(), SendError> {
+        let dst = dst.into();
         // Resolve the subnet from the current config every send, so the pipe
         // re-homes as the committee adds/removes subnets.
         let anymone = self.anymone.upgrade().ok_or(SendError::Closed)?;
@@ -92,7 +93,7 @@ impl Pipe {
         let msg = PipeMessage { return_tag: self.return_tag, payload };
         let data = bincode::serialize(&msg).map_err(|e| SendError::Encode(e.to_string()))?;
         let mut bytes = Vec::with_capacity(1 + 20 + data.len());
-        Frame::Raw { service_tag: dst, data: &data }.encode(&mut bytes);
+        Frame::Raw { dst, data: &data }.encode(&mut bytes);
         stage_outbound(&self.anymone, subnet, self.return_tag, bytes)
     }
 

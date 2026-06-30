@@ -100,6 +100,54 @@ impl Default for PanetiereCommitteeConfig {
     }
 }
 
+/// Committee scheduler tunables as they live in the shared bootstrap TOML
+/// (`[committee]`), so every committee node agrees — it's critical they match.
+/// `cover_rate` is intentionally absent: it's a runtime knob, not a file setting.
+/// An absent `[committee]` section yields these deployment defaults.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct CommitteeParams {
+    pub committee_round_ms: u64,
+    pub public_round_ms: u64,
+    pub min_relays: usize,
+    pub min_services: usize,
+    pub fault_grace: u64,
+    pub escalation_grace: u32,
+    pub subnet_grow_at: u32,
+    pub message_size: usize,
+}
+
+impl Default for CommitteeParams {
+    fn default() -> Self {
+        CommitteeParams {
+            committee_round_ms: 10_000,
+            public_round_ms: 4_000,
+            min_relays: 1,
+            min_services: 1,
+            fault_grace: 2,
+            escalation_grace: crate::scheduler_core::ESCALATION_GRACE,
+            subnet_grow_at: crate::scheduler_core::SUBNET_GROW_AT,
+            message_size: 256,
+        }
+    }
+}
+
+impl CommitteeParams {
+    pub fn into_config(self) -> PanetiereCommitteeConfig {
+        PanetiereCommitteeConfig {
+            committee_round_duration: Duration::from_millis(self.committee_round_ms),
+            public_round_duration: Duration::from_millis(self.public_round_ms),
+            min_relays: self.min_relays,
+            min_services: self.min_services,
+            fault_grace: self.fault_grace,
+            escalation_grace: self.escalation_grace,
+            subnet_grow_at: self.subnet_grow_at,
+            message_size: self.message_size,
+            cover_rate: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+        }
+    }
+}
+
 /// Spawn the committee scheduler. `committee` carries each member's exchange
 /// pubkey alongside its identity (from the committee's shared configuration) so
 /// the internal Panetiere's openings are sealed member-to-member. Returns the
