@@ -11,20 +11,21 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rand::{RngCore, SeedableRng};
-use rand_chacha::ChaCha20Rng;
+use rand::RngCore;
 use tokio::task::JoinHandle;
 use tracing::debug;
 
-use crate::governance::TOPIC_REGISTRATION;
+use crate::governance::{FaultReport, TOPIC_FAULTS, TOPIC_REGISTRATION};
 use crate::identity::{Identity, Pubkey};
-use crate::panetiere::{PanetiereClientSession, PanetiereServerSession};
+use crate::panetiere::{
+    channel_mse_params, setup_pp, PanetiereClientSession, PanetiereServerSession, COMMITTEE_MSG_BYTES,
+};
 use crate::scheduler_core::{SchedulerAction, SchedulerCore, SchedulerParams};
 use crate::scheduling::Registration;
 use crate::session::Session;
 use crate::transport::Transport;
 
-use panetiere::protocol::{ClientId, ProtocolParams, ServerId};
+use panetiere::protocol::{ClientId, ServerId};
 
 pub const TOPIC_COMMITTEE_PANETIERE: &str = "anymone/committee/0";
 pub const TOPIC_COMMITTEE_SIGS: &str = "anymone/committee/sigs";
@@ -162,6 +163,7 @@ pub async fn spawn_panetiere_committee_scheduler(
 ) -> JoinHandle<()> {
     // Subscribe-before-spawn for every consumed topic.
     let mut reg_sub = transport.subscribe(TOPIC_REGISTRATION).await;
+    let mut faults_sub = transport.subscribe(TOPIC_FAULTS).await;
     let mut panetiere_sub = transport.subscribe(TOPIC_COMMITTEE_PANETIERE).await;
     let mut sigs_sub = transport.subscribe(TOPIC_COMMITTEE_SIGS).await;
     let committee_xpubs: std::collections::HashMap<Pubkey, crate::config::ExchangePublicKeyWire> =
@@ -191,9 +193,10 @@ pub async fn spawn_panetiere_committee_scheduler(
     }
 
     // Committee-anonymisation Panetiere parameters, derived deterministically.
+    // ρ=3: a malicious member can't overwrite the lead's config in the IBLT.
     let setup_seed = derive_committee_seed(&committee);
-    let mut rng = ChaCha20Rng::from_seed(setup_seed);
-    let pp = Arc::new(ProtocolParams::setup(&mut rng, committee.len()));
+    let committee_mse = channel_mse_params(3, COMMITTEE_MSG_BYTES, setup_seed);
+    let pp = setup_pp(&committee_mse, committee.len(), setup_seed);
     let mut sorted_committee = committee.clone();
     sorted_committee.sort();
     let our_pk = identity.pubkey();
@@ -236,6 +239,7 @@ pub async fn spawn_panetiere_committee_scheduler(
             .collect();
         let mut server_session: Box<dyn Session> = Box::new(PanetiereServerSession::new(
             pp.clone(),
+            committee_mse.clone(),
             my_server_id,
             committee.len() as u32,
             identity.exchange().clone(),
@@ -266,6 +270,7 @@ pub async fn spawn_panetiere_committee_scheduler(
                             rand::rngs::OsRng.fill_bytes(&mut seed);
                             Box::new(PanetiereClientSession::new(
                                 pp.clone(),
+                                committee_mse.clone(),
                                 ClientId(my_server_id.0),
                                 server_ids.clone(),
                                 server_xpubs.clone(),
@@ -344,6 +349,12 @@ pub async fn spawn_panetiere_committee_scheduler(
                         if reg.verify() {
                             core.on_registration(reg);
                         }
+                    }
+                }
+
+                Some(msg) = faults_sub.recv() => {
+                    if let Some(report) = FaultReport::decode(&msg.payload) {
+                        core.on_fault_report(msg.from, report, crate::config::now_unix_ms());
                     }
                 }
 

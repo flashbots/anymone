@@ -45,6 +45,7 @@ fn panetiere_config(committee: &Identity, relays: &[Identity], service_pk: Pubke
         ProtocolConfig::Panetiere(PanetiereConfig {
             round_duration_ms: 250,
             message_size: 1024,
+            estimated_messages: 4,
             client_set_min: 0,
             client_set_max: 8,
             threshold: 2,

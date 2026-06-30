@@ -175,6 +175,7 @@ impl Default for NoopConfig {
 pub struct PanetiereConfig {
     pub round_duration_ms: u64,
     pub message_size: usize,
+    pub estimated_messages: u32,
     pub client_set_min: u32,
     pub client_set_max: u32,
     pub threshold: u32,

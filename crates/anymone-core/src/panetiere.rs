@@ -14,11 +14,12 @@ use chipmunk_code::KahePoly;
 use panetiere::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
 use panetiere::cs::{Cs, HidingMerkleCommitment, Opening, PackedOpening};
 use panetiere::kahe::{Kahe, KaheScheme};
+use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::protocol::aggregator::run_aggregator_round;
 use panetiere::protocol::client::run_client_round;
 use panetiere::protocol::server::{run_server_round, ServerInbox};
 use panetiere::protocol::verify::{aggregate_and_decrypt, decrypt_aggregate, VerifyError};
-use panetiere::protocol::{ClientId, ProtocolParams, ServerId};
+use panetiere::protocol::{message_polys, ClientId, ProtocolParams, ServerId};
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
@@ -37,10 +38,52 @@ use crate::session::{LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Sessi
 use crate::transport::{Inbound, Subscription};
 use crate::wire::RouteTag;
 
-/// Per-subnet Panetiere parameters (CS/KAHE keygen), built once at subnet start.
-fn setup_pp(cfg: &PanetiereConfig, subnet: &Subnet) -> Arc<ProtocolParams> {
-    let mut rng = ChaCha20Rng::from_seed(cfg.setup_seed);
-    Arc::new(ProtocolParams::setup(&mut rng, subnet.relays.len()))
+/// Two bytes per MSE symbol — safely below `t = 2^18`, so no value wraps and the
+/// byte↔symbol map is a plain little-endian `u16`.
+const BYTES_PER_SYMBOL: usize = 2;
+
+/// MSE parameters for a Panetiere channel carrying up to `rho` real messages of
+/// `message_bytes` each: γ=4, δ ≈ 3 buckets per insert (peeling margin), ξ symbols
+/// to hold the bytes. `prf_key` is domain-separated from the shared `setup_seed`
+/// so all participants agree.
+pub(crate) fn channel_mse_params(rho: u32, message_bytes: usize, setup_seed: [u8; 32]) -> MseParams {
+    const GAMMA: usize = 4;
+    let delta = (3 * rho.max(1) as usize).div_ceil(GAMMA);
+    let xi = message_bytes.div_ceil(BYTES_PER_SYMBOL).max(1);
+    let mut prf_key = setup_seed;
+    prf_key[0] ^= 0x5C;
+    MseParams::new(GAMMA, delta, xi, prf_key)
+}
+
+/// Message-byte bound for the committee's config-anonymising channel (a
+/// serialized `SignedProposal` fits well within this).
+pub(crate) const COMMITTEE_MSG_BYTES: usize = 4096;
+
+/// Per-subnet Panetiere parameters, with the KAHE message width sized to exactly
+/// hold one MSE pack (`mu_kahe = n_polys`, `l = 1`).
+pub(crate) fn setup_pp(params: &MseParams, n_servers: usize, setup_seed: [u8; 32]) -> Arc<ProtocolParams> {
+    let mut rng = ChaCha20Rng::from_seed(setup_seed);
+    let mu_kahe = MseEncoding::n_polys(params);
+    Arc::new(ProtocolParams::setup_with_kahe_dims(&mut rng, n_servers, mu_kahe, 1))
+}
+
+/// Pack message bytes into `xi` little-endian `u16` MSE symbols (zero-padded).
+fn bytes_to_symbols(payload: &[u8], xi: usize) -> Vec<i32> {
+    let mut buf = payload.to_vec();
+    buf.resize(xi * BYTES_PER_SYMBOL, 0);
+    (0..xi)
+        .map(|i| u16::from_le_bytes([buf[2 * i], buf[2 * i + 1]]) as i32)
+        .collect()
+}
+
+/// Inverse of [`bytes_to_symbols`]; trailing zero padding is left for
+/// `Frame::decode` to ignore (the frame is self-delimiting).
+fn symbols_to_bytes(symbols: &[i32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(symbols.len() * BYTES_PER_SYMBOL);
+    for &s in symbols {
+        out.extend_from_slice(&(s as u16).to_le_bytes());
+    }
+    out
 }
 
 /// `pk`'s position in the sorted relay list — the Panetiere `ServerId`.
@@ -64,7 +107,7 @@ fn server_xpubs(cfg: &PanetiereConfig, subnet: &Subnet) -> HashMap<ServerId, Exc
         .collect()
 }
 
-fn client_session(pp: &Arc<ProtocolParams>, cfg: &PanetiereConfig, subnet: &Subnet, identity: &Identity) -> Box<dyn Session> {
+fn client_session(pp: &Arc<ProtocolParams>, mse: &MseParams, cfg: &PanetiereConfig, subnet: &Subnet, identity: &Identity) -> Box<dyn Session> {
     let mut sorted = subnet.relays.clone();
     sorted.sort();
     let server_ids: Vec<ServerId> = (0..sorted.len() as u32).map(ServerId).collect();
@@ -74,6 +117,7 @@ fn client_session(pp: &Arc<ProtocolParams>, cfg: &PanetiereConfig, subnet: &Subn
     rand::rngs::OsRng.fill_bytes(&mut seed);
     Box::new(PanetiereClientSession::new(
         pp.clone(),
+        mse.clone(),
         client_id_from_pubkey(identity.pubkey()),
         server_ids,
         server_xpubs(cfg, subnet),
@@ -83,6 +127,7 @@ fn client_session(pp: &Arc<ProtocolParams>, cfg: &PanetiereConfig, subnet: &Subn
 
 fn server_session(
     pp: &Arc<ProtocolParams>,
+    mse: &MseParams,
     cfg: &PanetiereConfig,
     subnet: &Subnet,
     identity: &Identity,
@@ -103,6 +148,7 @@ fn server_session(
     let aggregation = cfg.aggregation.as_ref().map(LeaderAggregation::from_config);
     Box::new(PanetiereServerSession::new(
         pp.clone(),
+        mse.clone(),
         server_id,
         expected_active(cfg.client_set_max),
         identity.exchange().clone(),
@@ -127,7 +173,8 @@ pub(crate) async fn run_subnet(
         _ => unreachable!("panetiere::run_subnet on a non-Panetiere subnet"),
     };
     let identity_pk = inner.identity.pubkey();
-    let pp = setup_pp(&cfg, &subnet);
+    let mse = channel_mse_params(cfg.estimated_messages, cfg.message_size, cfg.setup_seed);
+    let pp = setup_pp(&mse, subnet.relays.len(), cfg.setup_seed);
     let leader_pk = subnet_leader_pk(&subnet);
     let client_agg_topic = client_aggregator_topic(&subnet, identity_pk);
 
@@ -138,7 +185,7 @@ pub(crate) async fn run_subnet(
     if subnet.relays.contains(&identity_pk) {
         sessions.insert(
             SessionKey::Server,
-            server_session(&pp, &cfg, &subnet, &inner.identity, leader_pk),
+            server_session(&pp, &mse, &cfg, &subnet, &inner.identity, leader_pk),
         );
     } else {
         sessions.insert(SessionKey::Watch, Box::new(PanetiereWatchSession::new(leader_pk)));
@@ -292,14 +339,14 @@ pub(crate) async fn run_subnet(
                         client_homes.insert(client_tag);
                         sessions
                             .entry(SessionKey::Client)
-                            .or_insert_with(|| client_session(&pp, &cfg, &subnet, &inner.identity))
+                            .or_insert_with(|| client_session(&pp, &mse, &cfg, &subnet, &inner.identity))
                             .set_cover_rate(cover_rate);
                     }
                     StageMsg::Stage { client_tag, payload } => {
                         client_homes.insert(client_tag);
                         let sess = sessions
                             .entry(SessionKey::Client)
-                            .or_insert_with(|| client_session(&pp, &cfg, &subnet, &inner.identity));
+                            .or_insert_with(|| client_session(&pp, &mse, &cfg, &subnet, &inner.identity));
                         sess.set_cover_rate(cover_rate);
                         sess.stage(payload);
                     }
@@ -481,11 +528,41 @@ pub(crate) fn is_client_public(bytes: &[u8]) -> bool {
 /// Non-participating liveness/anonymity observer for a Panetiere subnet. Feeds
 /// an [`OutputFaultTracker`] from real wire messages: `ServerPublic`s are the
 /// per-relay share signal, the leader's `Decoded` is the output signal.
+/// The self-contained `ShareOpeningMismatch` check (no canonical set, no
+/// decryption); `true` when the wire can't be reconstructed, so malformed bytes
+/// never frame a relay.
+fn server_public_consistent(agg_open: &PackedOpeningWire, agg_share: &[u8]) -> bool {
+    let n_shares = agg_open.mu_cs as usize;
+    let Ok(open) = Opening::from_packed(&PackedOpening::from(agg_open.clone())) else {
+        return true;
+    };
+    match panetiere::cs::unpack_cs_shares(agg_share, n_shares) {
+        Some(share) => share.as_slice() == open.s(),
+        None => true,
+    }
+}
+
+/// Culprit `ServerId` iff `evidence` is a `ServerPublic` with a mismatched share
+/// — lets the committee re-verify a leader's report instead of trusting it.
+pub(crate) fn integrity_culprit_from_evidence(evidence: &[u8]) -> Option<ServerId> {
+    match bincode::deserialize::<PanetiereWire>(evidence).ok()? {
+        PanetiereWire::ServerPublic { server_id, agg_open, agg_share, .. } => {
+            (!server_public_consistent(&agg_open, &agg_share)).then_some(ServerId(server_id))
+        }
+        _ => None,
+    }
+}
+
 pub struct PanetiereObserverSession {
     tracker: OutputFaultTracker,
+    /// Sorted roster; index = wire `server_id`.
+    roster: Vec<PeerId>,
     max_round: Option<u64>,
     /// Canonical client set size per round — the per-round anonymity set.
     anon_set_by_round: std::collections::BTreeMap<u64, usize>,
+    /// Integrity culprits caught from inconsistent shares, deduped, emitted at `end_round`.
+    integrity_pending: Vec<Fault>,
+    integrity_seen: HashSet<(u64, u32)>,
 }
 
 const ANON_SET_HISTORY: usize = 16;
@@ -493,9 +570,12 @@ const ANON_SET_HISTORY: usize = 16;
 impl PanetiereObserverSession {
     pub fn new(roster: Vec<PeerId>, fault_threshold: u64) -> Self {
         PanetiereObserverSession {
-            tracker: OutputFaultTracker::new(roster, fault_threshold),
+            tracker: OutputFaultTracker::new(roster.clone(), fault_threshold),
+            roster,
             max_round: None,
             anon_set_by_round: std::collections::BTreeMap::new(),
+            integrity_pending: Vec::new(),
+            integrity_seen: HashSet::new(),
         }
     }
 
@@ -556,7 +636,8 @@ impl Session for PanetiereObserverSession {
                     round,
                     server_id,
                     clients,
-                    ..
+                    agg_open,
+                    agg_share,
                 } => {
                     // Panetiere server ids are the 0-based sorted-roster index.
                     self.tracker.observe_share(*round, *server_id as usize);
@@ -564,6 +645,20 @@ impl Session for PanetiereObserverSession {
                     while self.anon_set_by_round.len() > ANON_SET_HISTORY {
                         let oldest = *self.anon_set_by_round.keys().next().unwrap();
                         self.anon_set_by_round.remove(&oldest);
+                    }
+                    // A corrupt share is an attributable integrity fault even though
+                    // t-of-n decode tolerates it, so liveness alone would miss it.
+                    self.integrity_seen.retain(|(r, _)| *r + ANON_SET_HISTORY as u64 >= *round);
+                    if !server_public_consistent(agg_open, agg_share)
+                        && self.integrity_seen.insert((*round, *server_id))
+                    {
+                        if let Some(pk) = self.roster.get(*server_id as usize).copied() {
+                            self.integrity_pending.push(Fault {
+                                kind: FaultKind::Integrity,
+                                attribution: Attribution::Peers(vec![pk]),
+                                evidence: payload.clone(),
+                            });
+                        }
                     }
                 }
                 PanetiereWire::Decoded { round, .. } => {
@@ -576,11 +671,9 @@ impl Session for PanetiereObserverSession {
     }
 
     fn end_round(&mut self, _round: Round, _now: Instant) -> RoundOutcome {
-        RoundOutcome {
-            outbound: Vec::new(),
-            decoded: Vec::new(),
-            faults: self.tracker.evaluate(),
-        }
+        let mut faults = std::mem::take(&mut self.integrity_pending);
+        faults.extend(self.tracker.evaluate());
+        RoundOutcome { outbound: Vec::new(), decoded: Vec::new(), faults }
     }
 }
 
@@ -589,6 +682,7 @@ impl Session for PanetiereObserverSession {
 /// messages. Ignores inbound.
 pub struct PanetiereClientSession {
     pp: Arc<ProtocolParams>,
+    mse: MseParams,
     client_id: ClientId,
     server_ids: Vec<ServerId>,
     server_xpubs: HashMap<ServerId, ExchangePublicKey>,
@@ -598,21 +692,28 @@ pub struct PanetiereClientSession {
     /// Separate stream for the cover draw: the per-round protocol RNG is
     /// deterministic, so reusing it would make cover predictable.
     cover_rng: ChaCha20Rng,
+    /// Unpredictable stream for per-insert MSE randomness `r` (a predictable `r`
+    /// would let an adversary craft a colliding insert).
+    r_rng: ChaCha20Rng,
 }
 
 impl PanetiereClientSession {
     pub fn new(
         pp: Arc<ProtocolParams>,
+        mse: MseParams,
         client_id: ClientId,
         server_ids: Vec<ServerId>,
         server_xpubs: HashMap<ServerId, ExchangePublicKey>,
         rng_seed: [u8; 32],
     ) -> Self {
-        // Domain-separate the cover stream from the per-round protocol seed.
+        // Domain-separate the cover and MSE-r streams from the protocol seed.
         let mut cover_seed = rng_seed;
         cover_seed[0] ^= 0xA5;
+        let mut r_seed = rng_seed;
+        r_seed[0] ^= 0x3C;
         PanetiereClientSession {
             pp,
+            mse,
             client_id,
             server_ids,
             server_xpubs,
@@ -620,13 +721,8 @@ impl PanetiereClientSession {
             rng_seed,
             cover_rate: 1.0,
             cover_rng: ChaCha20Rng::from_seed(cover_seed),
+            r_rng: ChaCha20Rng::from_seed(r_seed),
         }
-    }
-
-    /// Stage a typed Panetiere message (vector of `KahePoly`). Caller is
-    /// expected to have run `panetiere::codec::encode_raw(bytes)` to get here.
-    pub fn stage_message(&mut self, msg: Vec<KahePoly>) {
-        self.pending = Some(msg);
     }
 }
 
@@ -635,7 +731,9 @@ impl Session for PanetiereClientSession {
         let msg = match self.pending.take() {
             Some(m) => m,
             None if self.cover_rng.gen::<f32>() < self.cover_rate => {
-                panetiere::protocol::zero_message(&self.pp)
+                let mut cover = MseEncoding::cover(&self.mse);
+                cover.resize(message_polys(&self.pp), KahePoly::default());
+                cover
             }
             None => return Vec::new(),
         };
@@ -686,13 +784,15 @@ impl Session for PanetiereClientSession {
     }
 
     fn stage(&mut self, payload: Vec<u8>) {
-        // Encode to polys, then resize to the fixed KAHE message length so every
-        // client (real or cover) contributes the same poly count; the server
-        // trims with `codec::decode_raw`. Oversized payloads truncate (needs
-        // fragmentation, review #5).
-        let mut polys = panetiere::codec::encode_raw(&payload);
-        polys.resize(panetiere::protocol::message_polys(&self.pp), KahePoly::default());
-        self.stage_message(polys);
+        // One MSE insert per message: the leader peels every active client's
+        // element out of the summed plaintext, so concurrent senders don't
+        // collide. Oversized payloads truncate (needs fragmentation, review #5).
+        let symbols = bytes_to_symbols(&payload, self.mse.payload_symbols);
+        let mut enc = MseEncoding::new(self.mse.clone());
+        enc.insert(&mut self.r_rng, &symbols);
+        let mut polys = enc.pack();
+        polys.resize(message_polys(&self.pp), KahePoly::default());
+        self.pending = Some(polys);
     }
 
     fn set_cover_rate(&mut self, rate: f32) {
@@ -734,6 +834,7 @@ struct GroupAgg {
 ///    so decode naturally lags one anymone round.
 pub struct PanetiereServerSession {
     pp: Arc<ProtocolParams>,
+    mse: MseParams,
     server_id: ServerId,
     max_clients: u32,
     exchange: ExchangeIdentity,
@@ -758,6 +859,7 @@ const PANETIERE_ROUND_RETENTION: Round = 4;
 impl PanetiereServerSession {
     pub fn new(
         pp: Arc<ProtocolParams>,
+        mse: MseParams,
         server_id: ServerId,
         max_clients: u32,
         exchange: ExchangeIdentity,
@@ -767,6 +869,7 @@ impl PanetiereServerSession {
     ) -> Self {
         PanetiereServerSession {
             pp,
+            mse,
             server_id,
             max_clients,
             exchange,
@@ -1119,18 +1222,26 @@ impl Session for PanetiereServerSession {
                 }
             }
             if let Some(plain) = decoded_round {
-                // Re-encode to raw bytes via the codec so the runtime sees an
-                // opaque payload. An all-zero sum is a cover-only round.
-                let bytes = panetiere::codec::decode_raw(&plain).unwrap_or_default();
-                if bytes.iter().any(|b| *b != 0) {
+                // Peel every client's MSE element out of the summed plaintext —
+                // each is one message, so concurrent senders don't collide. A
+                // cover-only round peels to nothing; a peel stall yields nothing.
+                let n = MseEncoding::n_polys(&self.mse).min(plain.len());
+                let msgs: Vec<Vec<u8>> = MseEncoding::unpack(&self.mse, &plain[..n])
+                    .decode()
+                    .map(|elements| {
+                        elements
+                            .into_iter()
+                            .map(|symbols| symbols_to_bytes(&symbols))
+                            .filter(|b| b.iter().any(|x| *x != 0))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !msgs.is_empty() {
                     if self.emit_decoded {
-                        let wire = PanetiereWire::Decoded {
-                            round: *r,
-                            payloads: vec![bytes.clone()],
-                        };
+                        let wire = PanetiereWire::Decoded { round: *r, payloads: msgs.clone() };
                         outbound.push(bincode::serialize(&wire).expect("serialise decoded"));
                     }
-                    decoded.push(bytes);
+                    decoded.extend(msgs);
                 }
                 state.decoded = true;
                 // Free the heavy crypto state; keep the (now-empty) bucket

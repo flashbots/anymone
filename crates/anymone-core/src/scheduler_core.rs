@@ -31,7 +31,7 @@ use crate::config::{
     AnymoneRoundConfigurationBody, ExchangePublicKeyWire, PanetiereConfig,
     ProtocolConfig, Round, ServiceEntry, Signature, Subnet, SubnetId,
 };
-use crate::governance::TOPIC_CONFIG;
+use crate::governance::{FaultReport, TOPIC_CONFIG};
 use crate::identity::{Identity, Pubkey};
 use crate::panetiere::PanetiereObserverSession;
 use crate::scheduling::{Registration, SchedulerProtocol};
@@ -331,6 +331,38 @@ impl SchedulerCore {
                 }
             }
         }
+    }
+
+    /// Ingest an integrity `FaultReport` gossiped on `TOPIC_FAULTS`. Accepted only
+    /// from the subnet's leader and only when we can re-verify the evidence
+    /// ourselves and it attributes the named relay — so a lying leader can't frame
+    /// an honest one. Liveness stays the observer's job.
+    pub fn on_fault_report(&mut self, from: Pubkey, report: FaultReport, now_unix_ms: u64) {
+        if report.fault.kind != FaultKind::Integrity {
+            return;
+        }
+        let roster = match self
+            .current_subnets_sig
+            .iter()
+            .find(|(id, _, _)| *id == report.subnet)
+        {
+            Some((_, roster, _)) if !roster.is_empty() => roster.clone(),
+            _ => return,
+        };
+        if from != roster[(report.subnet as usize) % roster.len()] {
+            return;
+        }
+        let Some(sid) = crate::panetiere::integrity_culprit_from_evidence(&report.fault.evidence)
+        else {
+            return;
+        };
+        let Some(culprit) = roster.get(sid.0 as usize).copied() else {
+            return;
+        };
+        if report.fault.attribution != Attribution::Peers(vec![culprit]) {
+            return;
+        }
+        self.apply_observed_faults(report.subnet, vec![report.fault], now_unix_ms);
     }
 
     /// Advance one committee round: tick the observer, apply any faults, and —
@@ -739,6 +771,7 @@ impl SchedulerCore {
                     SchedulerProtocol::Panetiere => ProtocolConfig::Panetiere(PanetiereConfig {
                         round_duration_ms: dur_ms,
                         message_size: self.params.message_size,
+                        estimated_messages: expected_active(self.capacity),
                         client_set_min: 0,
                         client_set_max: self.capacity,
                         threshold: (n / 2 + 1).max(n.saturating_sub(2)),

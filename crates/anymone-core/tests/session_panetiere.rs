@@ -17,7 +17,7 @@ use anymone_core::session::{Misbehavior, Session};
 use anymone_core::{Identity, Pubkey, ServiceEntry, ServiceTag};
 
 use adcnet::crypto::ExchangePublicKey;
-use panetiere::codec;
+use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::protocol::ProtocolParams;
 use panetiere::protocol::{ClientId, ServerId};
 use rand::SeedableRng;
@@ -39,28 +39,44 @@ fn server_pubkeys(server_pks: &[Pubkey]) -> HashMap<ServerId, Pubkey> {
     server_pks.iter().enumerate().map(|(i, pk)| (ServerId(i as u32), *pk)).collect()
 }
 
+/// MSE channel params (γ=4, δ≈3 buckets/insert, ξ for `msg_bytes`) plus a KAHE
+/// `pp` whose message width holds exactly one MSE pack — what the wrapper builds.
+fn channel(
+    rng: &mut ChaCha20Rng,
+    n_servers: usize,
+    rho: usize,
+    msg_bytes: usize,
+) -> (MseParams, Arc<ProtocolParams>) {
+    let delta = (3 * rho.max(1)).div_ceil(4);
+    let xi = msg_bytes.div_ceil(2).max(1);
+    let mse = MseParams::new(4, delta, xi, [0xAA; 32]);
+    let n_polys = MseEncoding::n_polys(&mse);
+    let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(rng, n_servers, n_polys, 1));
+    (mse, pp)
+}
+
 #[test]
 fn panetiere_session_happy_path() {
     let mut setup_rng = ChaCha20Rng::from_seed([7u8; 32]);
     let n_servers = 3;
-    let pp = Arc::new(ProtocolParams::setup(&mut setup_rng, n_servers));
+    let (mse, pp) = channel(&mut setup_rng, n_servers, 1, 64);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_id = ClientId(0);
     let client_pk = Identity::generate().pubkey();
     let server_pks: Vec<_> = (0..n_servers).map(|_| Identity::generate().pubkey()).collect();
 
     let (exchanges, xpubs) = exchange_env(n_servers);
-    let mut client =
-        PanetiereClientSession::new(pp.clone(), client_id, server_ids.clone(), xpubs, [42u8; 32]);
+    let mut client = PanetiereClientSession::new(
+        pp.clone(), mse.clone(), client_id, server_ids.clone(), xpubs, [42u8; 32]);
     let mut servers: Vec<PanetiereServerSession> = server_ids
         .iter()
         .map(|sid| {
-            PanetiereServerSession::new(pp.clone(), *sid, 8, exchanges[sid.0 as usize].clone(), false, server_pubkeys(&server_pks), None)
+            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, 8, exchanges[sid.0 as usize].clone(), false, server_pubkeys(&server_pks), None)
         })
         .collect();
 
     let payload: Vec<u8> = b"hello panetiere over the session trait".to_vec();
-    client.stage_message(codec::encode_raw(&payload));
+    client.stage(payload.clone());
 
     let now = Instant::now();
     let client_out = client.begin_round(0, now);
@@ -93,7 +109,6 @@ fn panetiere_session_happy_path() {
         .iter()
         .find(|o| !o.decoded.is_empty())
         .expect("at least one server should decode");
-    // Decoded buffer is the payload plus codec zero-padding.
     let decoded_bytes = &any_decoded.decoded[0];
     assert!(decoded_bytes.len() >= payload.len());
     assert_eq!(&decoded_bytes[..payload.len()], payload.as_slice());
@@ -101,22 +116,23 @@ fn panetiere_session_happy_path() {
 
 /// Round-trip a payload through a committee-sized (3-server) Panetiere exactly
 /// as the committee does to anonymise its config proposal. Returns the decoded
-/// bytes (with codec zero padding).
+/// bytes (with trailing zero padding).
 fn committee_panetiere_roundtrip(payload: &[u8]) -> Vec<u8> {
     let mut setup_rng = ChaCha20Rng::from_seed([7u8; 32]);
     let n_servers = 3;
-    let pp = Arc::new(ProtocolParams::setup(&mut setup_rng, n_servers));
+    // ρ=3, message bound matching the committee's COMMITTEE_MSG_BYTES.
+    let (mse, pp) = channel(&mut setup_rng, n_servers, 3, 4096);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_pk = Identity::generate().pubkey();
     let server_pks: Vec<_> = (0..n_servers).map(|_| Identity::generate().pubkey()).collect();
 
     let (exchanges, xpubs) = exchange_env(n_servers);
-    let mut client =
-        PanetiereClientSession::new(pp.clone(), ClientId(0), server_ids.clone(), xpubs, [42u8; 32]);
+    let mut client = PanetiereClientSession::new(
+        pp.clone(), mse.clone(), ClientId(0), server_ids.clone(), xpubs, [42u8; 32]);
     let mut servers: Vec<PanetiereServerSession> = server_ids
         .iter()
         .map(|sid| {
-            PanetiereServerSession::new(pp.clone(), *sid, 8, exchanges[sid.0 as usize].clone(), false, server_pubkeys(&server_pks), None)
+            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, 8, exchanges[sid.0 as usize].clone(), false, server_pubkeys(&server_pks), None)
         })
         .collect();
 
@@ -156,18 +172,18 @@ fn panetiere_back_to_back_rounds_lose_nothing() {
     const N_ROUNDS: u64 = 12;
     let mut setup_rng = ChaCha20Rng::from_seed([7u8; 32]);
     let n_servers = 3usize;
-    let pp = Arc::new(ProtocolParams::setup(&mut setup_rng, n_servers));
+    let (mse, pp) = channel(&mut setup_rng, n_servers, 1, 64);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_pk = Identity::generate().pubkey();
     let server_pks: Vec<_> = (0..n_servers).map(|_| Identity::generate().pubkey()).collect();
 
     let (exchanges, xpubs) = exchange_env(n_servers);
-    let mut client =
-        PanetiereClientSession::new(pp.clone(), ClientId(0), server_ids.clone(), xpubs, [42u8; 32]);
+    let mut client = PanetiereClientSession::new(
+        pp.clone(), mse.clone(), ClientId(0), server_ids.clone(), xpubs, [42u8; 32]);
     let mut servers: Vec<PanetiereServerSession> = server_ids
         .iter()
         .map(|sid| {
-            PanetiereServerSession::new(pp.clone(), *sid, 8, exchanges[sid.0 as usize].clone(), false, server_pubkeys(&server_pks), None)
+            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, 8, exchanges[sid.0 as usize].clone(), false, server_pubkeys(&server_pks), None)
         })
         .collect();
 
@@ -225,20 +241,21 @@ fn panetiere_back_to_back_rounds_lose_nothing() {
 fn panetiere_corrupt_share_attributes_integrity() {
     let mut setup_rng = ChaCha20Rng::from_seed([7u8; 32]);
     let n_servers = 3;
-    let pp = Arc::new(ProtocolParams::setup(&mut setup_rng, n_servers));
+    let (mse, pp) = channel(&mut setup_rng, n_servers, 1, 64);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_pk = Identity::generate().pubkey();
     let server_pks: Vec<_> = (0..n_servers).map(|_| Identity::generate().pubkey()).collect();
     let (exchanges, xpubs) = exchange_env(n_servers);
 
-    let mut client =
-        PanetiereClientSession::new(pp.clone(), ClientId(0), server_ids.clone(), xpubs, [42u8; 32]);
+    let mut client = PanetiereClientSession::new(
+        pp.clone(), mse.clone(), ClientId(0), server_ids.clone(), xpubs, [42u8; 32]);
     // Server 0 is the decoding leader; server 2 corrupts its share.
     let mut servers: Vec<PanetiereServerSession> = server_ids
         .iter()
         .map(|sid| {
             PanetiereServerSession::new(
                 pp.clone(),
+                mse.clone(),
                 *sid,
                 8,
                 exchanges[sid.0 as usize].clone(),
@@ -251,7 +268,7 @@ fn panetiere_corrupt_share_attributes_integrity() {
     servers[2].set_misbehavior(Some(Misbehavior::CorruptShare));
 
     let payload = b"integrity-checked payload".to_vec();
-    client.stage_message(codec::encode_raw(&payload));
+    client.stage(payload.clone());
     let now = Instant::now();
     let client_out = client.begin_round(0, now);
     for s in servers.iter_mut() {
@@ -283,6 +300,83 @@ fn panetiere_corrupt_share_attributes_integrity() {
     assert_eq!(fault.kind, FaultKind::Integrity);
     assert_eq!(fault.attribution, Attribution::Peers(vec![server_pks[2]]));
     assert!(!fault.evidence.is_empty(), "evidence is the offending ServerPublic bytes");
+}
+
+/// Several clients sending DISTINCT real messages in the SAME round, plus cover
+/// clients, must all decode — the MSE peels each insert out of the summed
+/// plaintext (a single summed buffer would lose all but one). Cover adds nothing.
+#[test]
+fn panetiere_concurrent_clients_all_decode() {
+    let mut setup_rng = ChaCha20Rng::from_seed([7u8; 32]);
+    let n_servers = 3;
+    let active = 4usize;
+    let cover = 2usize;
+    let total = active + cover;
+    let (mse, pp) = channel(&mut setup_rng, n_servers, active, 64);
+    let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
+    let client_pks: Vec<Pubkey> = (0..total).map(|_| Identity::generate().pubkey()).collect();
+    let server_pks: Vec<_> = (0..n_servers).map(|_| Identity::generate().pubkey()).collect();
+    let (exchanges, xpubs) = exchange_env(n_servers);
+
+    let mut clients: Vec<PanetiereClientSession> = (0..total)
+        .map(|i| {
+            PanetiereClientSession::new(
+                pp.clone(),
+                mse.clone(),
+                ClientId(i as u32),
+                server_ids.clone(),
+                xpubs.clone(),
+                [40 + i as u8; 32],
+            )
+        })
+        .collect();
+    let mut servers: Vec<PanetiereServerSession> = server_ids
+        .iter()
+        .map(|sid| {
+            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, 8, exchanges[sid.0 as usize].clone(), sid.0 == 0, server_pubkeys(&server_pks), None)
+        })
+        .collect();
+
+    // First `active` clients send real messages; the rest stay idle → cover.
+    let payloads: Vec<Vec<u8>> =
+        (0..active).map(|i| format!("client-{i}-says-hi").into_bytes()).collect();
+    for (i, p) in payloads.iter().enumerate() {
+        clients[i].stage(p.clone());
+    }
+
+    let now = Instant::now();
+    for (i, c) in clients.iter_mut().enumerate() {
+        for m in c.begin_round(0, now) {
+            for s in servers.iter_mut() {
+                s.on_inbound(client_pks[i], m.clone());
+            }
+        }
+    }
+    let mid: Vec<_> = servers.iter_mut().map(|s| s.end_round(0, now)).collect();
+    for i in 0..servers.len() {
+        for (j, o) in mid.iter().enumerate() {
+            if i == j { continue; }
+            for m in &o.outbound {
+                servers[i].on_inbound(server_pks[j], m.clone());
+            }
+        }
+    }
+    let finals: Vec<_> = servers.iter_mut().map(|s| s.end_round(1, now)).collect();
+    let decoded: Vec<Vec<u8>> = finals.iter().flat_map(|o| o.decoded.clone()).collect();
+    for p in &payloads {
+        assert!(
+            decoded.iter().any(|d| d.windows(p.len()).any(|w| w == p.as_slice())),
+            "message {:?} not recovered; all concurrent messages must decode, got {} buffers",
+            String::from_utf8_lossy(p),
+            decoded.len(),
+        );
+    }
+    // Cover contributes nothing: exactly `active` distinct messages come out.
+    let distinct: HashSet<Vec<u8>> = decoded
+        .iter()
+        .map(|d| d.iter().take_while(|b| **b != 0).copied().collect())
+        .collect();
+    assert_eq!(distinct.len(), active, "cover must not add messages; got {}", distinct.len());
 }
 
 fn adcnet_config_body(n_subnets: usize) -> AnymoneRoundConfigurationBody {
@@ -340,18 +434,18 @@ fn panetiere_fixed_seed_multiround_no_stall() {
     const N_MSGS: usize = 10;
     let mut setup_rng = ChaCha20Rng::from_seed([7u8; 32]);
     let n_servers = 3usize;
-    let pp = Arc::new(ProtocolParams::setup(&mut setup_rng, n_servers));
+    let (mse, pp) = channel(&mut setup_rng, n_servers, 1, 64);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_pk = Identity::generate().pubkey();
     let server_pks: Vec<_> = (0..n_servers).map(|_| Identity::generate().pubkey()).collect();
 
     let (exchanges, xpubs) = exchange_env(n_servers);
-    let mut client =
-        PanetiereClientSession::new(pp.clone(), ClientId(0), server_ids.clone(), xpubs, [42u8; 32]);
+    let mut client = PanetiereClientSession::new(
+        pp.clone(), mse.clone(), ClientId(0), server_ids.clone(), xpubs, [42u8; 32]);
     let mut servers: Vec<PanetiereServerSession> = server_ids
         .iter()
         .map(|sid| {
-            PanetiereServerSession::new(pp.clone(), *sid, 8, exchanges[sid.0 as usize].clone(), false, server_pubkeys(&server_pks), None)
+            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, 8, exchanges[sid.0 as usize].clone(), false, server_pubkeys(&server_pks), None)
         })
         .collect();
 

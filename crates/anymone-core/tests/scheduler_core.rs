@@ -20,10 +20,11 @@ use anymone_core::faults::{Attribution, Fault, FaultKind};
 use anymone_core::identity::ExchangeIdentity;
 use anymone_core::panetiere::{PanetiereClientSession, PanetiereServerSession};
 use anymone_core::session::{Misbehavior, Session};
-use anymone_core::{Identity, Pubkey, Registration, ServiceTag, TOPIC_CONFIG};
+use anymone_core::{FaultReport, Identity, Pubkey, Registration, ServiceTag, TOPIC_CONFIG};
 
 use adcnet::crypto::{ExchangePublicKey, ServerId, SharedKey};
 use adcnet::protocol::session::one_round::{IbltMsgParamsOwned, OneRoundConfig};
+use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::protocol::{ClientId, ProtocolParams, ServerId as PanServerId};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -736,7 +737,11 @@ impl PanetiereSubnet {
     fn new(relay_ids: &[Identity]) -> Self {
         let n = relay_ids.len();
         let mut setup_rng = ChaCha20Rng::from_seed([7u8; 32]);
-        let pp = Arc::new(ProtocolParams::setup(&mut setup_rng, n));
+        // One real sender per round (the rest of the demo's clients re-home
+        // elsewhere); MSE sized to that.
+        let mse = MseParams::new(4, 1, 32, [0xAA; 32]);
+        let n_polys = MseEncoding::n_polys(&mse);
+        let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(&mut setup_rng, n, n_polys, 1));
         let server_ids: Vec<PanServerId> = (0..n as u32).map(PanServerId).collect();
 
         let mut sorted = relay_ids.to_vec();
@@ -757,13 +762,14 @@ impl PanetiereSubnet {
             .collect();
 
         let client_id = Identity::generate();
-        let client =
-            PanetiereClientSession::new(pp.clone(), ClientId(0), server_ids.clone(), xpubs, [42u8; 32]);
+        let client = PanetiereClientSession::new(
+            pp.clone(), mse.clone(), ClientId(0), server_ids.clone(), xpubs, [42u8; 32]);
         let mut servers: Vec<PanetiereServerSession> = server_ids
             .iter()
             .map(|sid| {
                 PanetiereServerSession::new(
                     pp.clone(),
+                    mse.clone(),
                     *sid,
                     8,
                     exchanges[sid.0 as usize].clone(),
@@ -904,4 +910,106 @@ fn corrupt_panetiere_keeps_escalation() {
         "subnet de-escalated to ADCNet despite an ongoing integrity fault \
          from {corrupt_pk:?}; the offender is back in the optimistic roster"
     );
+}
+
+/// A core escalated to a 3-relay Panetiere subnet 0 (via an unattributable fault,
+/// so no relay is dropped), ready to receive integrity fault reports.
+fn escalated_panetiere_core(
+    committee: &[Identity],
+    relays: &[Identity],
+    service: &Identity,
+) -> SchedulerCore {
+    let mut core = lead_core(committee, 2);
+    register_relays_and_service(&mut core, relays, service);
+    let first = staged_proposal(&core.tick(0, 0)).expect("first proposal");
+    enact(&mut core, committee, first);
+    core.apply_observed_faults(0, vec![Fault {
+        kind: FaultKind::Liveness,
+        attribution: Attribution::None,
+        evidence: Vec::new(),
+    }], 0);
+    let esc = staged_proposal(&core.tick(1, 0)).expect("escalation");
+    assert_eq!(proto_name(&esc.body), "panetiere");
+    enact(&mut core, committee, esc);
+    core
+}
+
+/// Approach B: the committee acts on a leader's integrity `FaultReport` only when
+/// it comes from the subnet leader AND the committee re-verifies the evidence
+/// itself — so a corrupt-share relay is sidelined, but a lying leader can't frame
+/// an honest one.
+#[test]
+fn committee_acts_on_verified_leader_integrity_report() {
+    let committee: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
+    let relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
+    let service = Identity::generate();
+
+    let mut sorted = relays.clone();
+    sorted.sort_by_key(|i| i.pubkey());
+    let leader_pk = sorted[0].pubkey();
+    let honest_pk = sorted[1].pubkey();
+    let corrupt_pk = sorted[2].pubkey();
+
+    // Run the corrupt subnet to capture the leader's integrity fault (evidence =
+    // the offending ServerPublic) and an honest relay's consistent ServerPublic.
+    let mut net = PanetiereSubnet::new(&relays);
+    let mut integrity: Option<Fault> = None;
+    let mut honest_sp: Option<Vec<u8>> = None;
+    for r in 0..4u64 {
+        let (wire, faults, _) = net.round(r);
+        if honest_sp.is_none() {
+            honest_sp = wire.iter().find(|(from, _)| *from == honest_pk).map(|(_, b)| b.clone());
+        }
+        if integrity.is_none() {
+            integrity = faults.into_iter().find(|f| f.kind == FaultKind::Integrity);
+        }
+        if integrity.is_some() && honest_sp.is_some() {
+            break;
+        }
+    }
+    let fault = integrity.expect("leader emits an integrity fault");
+    assert_eq!(fault.attribution, Attribution::Peers(vec![corrupt_pk]));
+    let honest_sp = honest_sp.expect("captured an honest ServerPublic");
+
+    // Verified report from the leader sidelines the offender; subnet stays Panetiere.
+    let mut core = escalated_panetiere_core(&committee, &relays, &service);
+    core.on_fault_report(
+        leader_pk,
+        FaultReport { round: 5, subnet: 0, reporter: leader_pk, fault: fault.clone() },
+        0,
+    );
+    let body = staged_body(&core.tick(2, 0)).expect("re-propose after integrity report");
+    assert_eq!(proto_name(&body), "panetiere");
+    assert!(!body.subnets[0].relays.contains(&corrupt_pk));
+
+    // A report from a non-leader is ignored (forced re-propose keeps all 3 relays).
+    let mut core = escalated_panetiere_core(&committee, &relays, &service);
+    core.on_fault_report(
+        honest_pk,
+        FaultReport { round: 5, subnet: 0, reporter: honest_pk, fault: fault.clone() },
+        0,
+    );
+    core.set_cover_rate(0.5);
+    let body = staged_body(&core.tick(2, 0)).expect("cover change re-proposes");
+    assert!(body.subnets[0].relays.contains(&corrupt_pk));
+
+    // Evidence that re-verifies as consistent can't frame an honest relay.
+    let mut core = escalated_panetiere_core(&committee, &relays, &service);
+    core.on_fault_report(
+        leader_pk,
+        FaultReport {
+            round: 5,
+            subnet: 0,
+            reporter: leader_pk,
+            fault: Fault {
+                kind: FaultKind::Integrity,
+                attribution: Attribution::Peers(vec![honest_pk]),
+                evidence: honest_sp,
+            },
+        },
+        0,
+    );
+    core.set_cover_rate(0.7);
+    let body = staged_body(&core.tick(2, 0)).expect("cover change re-proposes");
+    assert!(body.subnets[0].relays.contains(&honest_pk));
 }

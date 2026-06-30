@@ -15,7 +15,7 @@ use anymone_core::session::{LeaderAggregation, Session};
 use anymone_core::{Identity, Pubkey};
 
 use adcnet::crypto::ExchangePublicKey;
-use panetiere::codec;
+use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::protocol::{ClientId, ProtocolParams, ServerId};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -46,7 +46,10 @@ fn run_aggregated(
     payload: &[u8],
 ) -> Vec<Vec<u8>> {
     let mut setup_rng = ChaCha20Rng::from_seed([7u8; 32]);
-    let pp = Arc::new(ProtocolParams::setup(&mut setup_rng, n_servers));
+    // Only client 0 is active; the IBLT is sized to the active count.
+    let mse = MseParams::new(4, 1, 32, [0xAA; 32]);
+    let n_polys = MseEncoding::n_polys(&mse);
+    let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(&mut setup_rng, n_servers, n_polys, 1));
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let server_pks: Vec<Pubkey> = (0..n_servers).map(|_| Identity::generate().pubkey()).collect();
     let (exchanges, xpubs) = exchange_env(n_servers);
@@ -67,10 +70,10 @@ fn run_aggregated(
         .map(|i| {
             let mut seed = [0u8; 32];
             seed[..4].copy_from_slice(&i.to_le_bytes());
-            PanetiereClientSession::new(pp.clone(), ClientId(i), server_ids.clone(), xpubs.clone(), seed)
+            PanetiereClientSession::new(pp.clone(), mse.clone(), ClientId(i), server_ids.clone(), xpubs.clone(), seed)
         })
         .collect();
-    clients[0].stage_message(codec::encode_raw(payload));
+    clients[0].stage(payload.to_vec());
 
     // Every relay runs in aggregated mode; only the leader (server 0) emits.
     let mut servers: Vec<PanetiereServerSession> = server_ids
@@ -78,6 +81,7 @@ fn run_aggregated(
         .map(|sid| {
             PanetiereServerSession::new(
                 pp.clone(),
+                mse.clone(),
                 *sid,
                 64,
                 exchanges[sid.0 as usize].clone(),

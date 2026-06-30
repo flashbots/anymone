@@ -55,6 +55,7 @@ async fn fault_for(mode: Misbehavior, panetiere: bool) -> Reported {
         ProtocolConfig::Panetiere(PanetiereConfig {
             round_duration_ms: 200,
             message_size: 256,
+            estimated_messages: 4,
             client_set_min: 0,
             client_set_max: 8,
             threshold: 2,
