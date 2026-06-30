@@ -12,7 +12,8 @@ use anymone_core::config::{
 };
 use anymone_core::panetiere::{PanetiereClientSession, PanetiereServerSession};
 use anymone_core::identity::ExchangeIdentity;
-use anymone_core::session::{Attribution, FaultKind, Misbehavior, Session};
+use anymone_core::faults::{Attribution, FaultKind};
+use anymone_core::session::{Misbehavior, Session};
 use anymone_core::{Identity, Pubkey, ServiceEntry, ServiceTag};
 
 use adcnet::crypto::ExchangePublicKey;

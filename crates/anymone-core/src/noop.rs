@@ -8,7 +8,8 @@
 use std::time::Instant;
 
 use crate::config::{NoopConfig, Round};
-use crate::session::{Attribution, Fault, FaultKind, PeerId, RoundOutcome, Session};
+use crate::faults::{Attribution, Fault, FaultKind};
+use crate::session::{PeerId, RoundOutcome, Session};
 
 /// Client session: emits a staged payload at `begin_round`, ignores inbound,
 /// produces nothing at `end_round`.
@@ -106,6 +107,136 @@ pub fn client_session(cfg: &NoopConfig) -> Box<dyn Session> {
 
 pub fn server_session(cfg: &NoopConfig) -> Box<dyn Session> {
     Box::new(NoopServerSession::new(cfg.clone()))
+}
+
+/// Self-contained Noop subnet driver. No crypto, no ingress/shares split, no
+/// aggregator or leader monitor: clients and servers all share the broadcast
+/// topic. The runtime dispatches here for Noop subnets.
+pub(crate) async fn run_subnet(
+    subnet: crate::config::Subnet,
+    inner: std::sync::Arc<crate::runtime::AnymoneInner>,
+    mut stage_rx: tokio::sync::mpsc::UnboundedReceiver<crate::runtime::StageMsg>,
+    mut subscriptions: Vec<crate::transport::Subscription>,
+    base_round: crate::config::Round,
+    epoch_unix_ms: u64,
+) {
+    use crate::config::ProtocolConfig;
+    use crate::runtime::{
+        deadline_for, gossip_faults, recv_any, round_at, route_to_pipe, subnet_broadcast_topic,
+        SessionKey, StageMsg,
+    };
+    use crate::transport::Inbound;
+    use crate::wire::ServiceTag;
+    use std::collections::{HashMap, HashSet};
+
+    let cfg = match &subnet.protocol {
+        ProtocolConfig::Noop(c) => c.clone(),
+        _ => unreachable!("noop::run_subnet on a non-Noop subnet"),
+    };
+    let identity_pk = inner.identity.pubkey();
+    let topic = subnet_broadcast_topic(subnet.id);
+
+    let mut sessions: HashMap<SessionKey, Box<dyn Session>> = HashMap::new();
+    let mut client_homes: HashSet<ServiceTag> = HashSet::new();
+    let mut cover_rate = subnet.cover_rate;
+    let key = if subnet.relays.contains(&identity_pk) {
+        SessionKey::Server
+    } else {
+        SessionKey::Watch
+    };
+    sessions.insert(key, server_session(&cfg));
+
+    let dur_ms = (subnet.protocol.round_duration().as_millis() as u64).max(1);
+    let now_ms = crate::config::now_unix_ms();
+    let mut round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms);
+    let mut deadline = deadline_for(round, base_round, epoch_unix_ms, dur_ms, now_ms);
+
+    for s in sessions.values_mut() {
+        for out in s.begin_round(round, Instant::now()) {
+            inner.transport.publish(&topic, out).await;
+        }
+    }
+
+    loop {
+        tokio::select! {
+            biased;
+
+            _ = tokio::time::sleep_until(deadline) => {
+                let mut decoded_all: Vec<Vec<u8>> = Vec::new();
+                let mut faults = Vec::new();
+                for s in sessions.values_mut() {
+                    let outcome = s.end_round(round, Instant::now());
+                    for out in outcome.outbound {
+                        inner.transport.publish(&topic, out).await;
+                    }
+                    decoded_all.extend(outcome.decoded);
+                    faults.extend(outcome.faults);
+                }
+                let n_decoded = decoded_all.len();
+                for bytes in decoded_all {
+                    route_to_pipe(&inner, &bytes);
+                }
+                if n_decoded > 0 {
+                    let _ = inner.events.send(crate::runtime::Event::RoundDecoded {
+                        round,
+                        subnet: subnet.id,
+                        n_messages: n_decoded,
+                    });
+                }
+                gossip_faults(&inner, subnet.id, round, identity_pk, faults).await;
+
+                let now_ms = crate::config::now_unix_ms();
+                round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms).max(round + 1);
+                deadline = deadline_for(round, base_round, epoch_unix_ms, dur_ms, now_ms);
+                for s in sessions.values_mut() {
+                    for out in s.begin_round(round, Instant::now()) {
+                        inner.transport.publish(&topic, out).await;
+                    }
+                }
+            }
+
+            msg = recv_any(&mut subscriptions) => {
+                let Inbound { from, payload } = msg;
+                for s in sessions.values_mut() {
+                    for out in s.on_inbound(from, payload.clone()) {
+                        inner.transport.publish(&topic, out).await;
+                    }
+                }
+            }
+
+            Some(stage) = stage_rx.recv() => {
+                match stage {
+                    StageMsg::Join { client_tag } => {
+                        client_homes.insert(client_tag);
+                        sessions
+                            .entry(SessionKey::Client)
+                            .or_insert_with(|| client_session(&cfg))
+                            .set_cover_rate(cover_rate);
+                    }
+                    StageMsg::Stage { client_tag, payload } => {
+                        client_homes.insert(client_tag);
+                        let sess = sessions
+                            .entry(SessionKey::Client)
+                            .or_insert_with(|| client_session(&cfg));
+                        sess.set_cover_rate(cover_rate);
+                        sess.stage(payload);
+                    }
+                    StageMsg::Retire { client_tag } => {
+                        client_homes.remove(&client_tag);
+                        if client_homes.is_empty() {
+                            sessions.remove(&SessionKey::Client);
+                        }
+                    }
+                    StageMsg::SetCoverRate(rate) => {
+                        cover_rate = rate;
+                        if let Some(c) = sessions.get_mut(&SessionKey::Client) {
+                            c.set_cover_rate(rate);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

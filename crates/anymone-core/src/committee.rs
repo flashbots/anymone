@@ -180,13 +180,6 @@ pub async fn spawn_panetiere_committee_scheduler(
         let topic = TOPIC_COMMITTEE_PANETIERE.to_string();
         let round_duration = config.committee_round_duration;
 
-        // Re-broadcast the current config periodically so nodes that come up
-        // after it was first published (late-joining clients) can still pick it
-        // up through the normal config-topic subscription
-        let rebroadcast_interval = config.public_round_duration;
-        let mut rebroadcast_deadline = tokio::time::Instant::now() + rebroadcast_interval;
-        let mut last_config: Option<Vec<u8>> = None;
-
         let mut core = SchedulerCore::new(identity.clone(), committee.clone(), threshold, params);
         let committee_server_pubkeys = sorted_committee
             .iter()
@@ -237,7 +230,8 @@ pub async fn spawn_panetiere_committee_scheduler(
                     SchedulerAction::Publish { topic, bytes } => {
                         if topic == crate::governance::TOPIC_CONFIG {
                             debug!("committee: publishing config");
-                            last_config = Some(bytes.clone());
+                            // Serve it so a joining node can pull rather than await a push.
+                            transport.serve_config(bytes.clone());
                         }
                         transport.publish(&topic, bytes).await;
                     }
@@ -245,26 +239,16 @@ pub async fn spawn_panetiere_committee_scheduler(
             }};
         }
 
-        for out in server_session.begin_round(anymone_round, Instant::now()) {
-            transport.publish(&topic, out).await;
-        }
+        let init = server_session.begin_round(anymone_round, Instant::now());
+        emit(&transport, &topic, our_pk, &mut server_session, &mut client_session, init).await;
 
         loop {
             tokio::select! {
                 biased;
 
-                _ = tokio::time::sleep_until(rebroadcast_deadline) => {
-                    rebroadcast_deadline += rebroadcast_interval;
-                    if let Some(bytes) = &last_config {
-                        transport.publish(crate::governance::TOPIC_CONFIG, bytes.clone()).await;
-                    }
-                }
-
                 _ = tokio::time::sleep_until(deadline) => {
                     let outcome = server_session.end_round(anymone_round, Instant::now());
-                    for out in outcome.outbound {
-                        transport.publish(&topic, out).await;
-                    }
+                    emit(&transport, &topic, our_pk, &mut server_session, &mut client_session, outcome.outbound).await;
                     for decoded in outcome.decoded {
                         if let Ok(proposal) =
                             bincode::deserialize::<crate::scheduler_core::SignedProposal>(&decoded)
@@ -289,26 +273,22 @@ pub async fn spawn_panetiere_committee_scheduler(
                         execute!(action);
                     }
 
-                    for out in server_session.begin_round(anymone_round, Instant::now()) {
-                        transport.publish(&topic, out).await;
-                    }
-                    if let Some(cs) = client_session.as_mut() {
-                        for out in cs.begin_round(anymone_round, Instant::now()) {
-                            transport.publish(&topic, out).await;
-                        }
-                    }
+                    let server_out = server_session.begin_round(anymone_round, Instant::now());
+                    emit(&transport, &topic, our_pk, &mut server_session, &mut client_session, server_out).await;
+                    let client_out = client_session
+                        .as_mut()
+                        .map(|cs| cs.begin_round(anymone_round, Instant::now()))
+                        .unwrap_or_default();
+                    emit(&transport, &topic, our_pk, &mut server_session, &mut client_session, client_out).await;
                 }
 
                 Some(msg) = panetiere_sub.recv() => {
                     let crate::transport::Inbound { from, payload } = msg;
-                    for out in server_session.on_inbound(from, payload.clone()) {
-                        transport.publish(&topic, out).await;
-                    }
+                    let mut outs = server_session.on_inbound(from, payload.clone());
                     if let Some(cs) = client_session.as_mut() {
-                        for out in cs.on_inbound(from, payload) {
-                            transport.publish(&topic, out).await;
-                        }
+                        outs.extend(cs.on_inbound(from, payload));
                     }
+                    emit(&transport, &topic, our_pk, &mut server_session, &mut client_session, outs).await;
                 }
 
                 Some(msg) = reg_sub.recv() => {
@@ -335,6 +315,28 @@ pub async fn spawn_panetiere_committee_scheduler(
             }
         }
     })
+}
+
+/// Send a member's own committee-Panetiere output to peers and feed it back into
+/// the member's own sessions. The transport doesn't loop a publish back to the
+/// publisher, so this in-process feed is the only way a member counts its own
+/// shares. Drains the cascade each `on_inbound` produces (finite per round).
+async fn emit(
+    transport: &Arc<dyn Transport>,
+    topic: &str,
+    our_pk: Pubkey,
+    server_session: &mut Box<dyn Session>,
+    client_session: &mut Option<Box<dyn Session>>,
+    init: Vec<Vec<u8>>,
+) {
+    let mut queue: std::collections::VecDeque<Vec<u8>> = init.into_iter().collect();
+    while let Some(out) = queue.pop_front() {
+        transport.publish(topic, out.clone()).await;
+        queue.extend(server_session.on_inbound(our_pk, out.clone()));
+        if let Some(cs) = client_session.as_mut() {
+            queue.extend(cs.on_inbound(our_pk, out));
+        }
+    }
 }
 
 /// Deterministic Panetiere setup seed for the committee's internal subnet,

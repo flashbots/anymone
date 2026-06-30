@@ -243,51 +243,7 @@ pub struct AdcnetConfig {
     pub aggregation: Option<Aggregation>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExchangePublicKeyWire(pub Vec<u8>);
-
-impl ExchangePublicKeyWire {
-    pub fn from_key(k: &adcnet::crypto::ExchangePublicKey) -> Self {
-        ExchangePublicKeyWire(k.to_sec1_bytes())
-    }
-    pub fn to_key(&self) -> Result<adcnet::crypto::ExchangePublicKey, String> {
-        adcnet::crypto::ExchangePublicKey::from_sec1_bytes(&self.0).map_err(|e| format!("{e:?}"))
-    }
-}
-
-impl Serialize for ExchangePublicKeyWire {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        if s.is_human_readable() {
-            s.serialize_str(&hex::encode(&self.0))
-        } else {
-            serde_bytes::Bytes::new(&self.0).serialize(s)
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for ExchangePublicKeyWire {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        if d.is_human_readable() {
-            let s = String::deserialize(d)?;
-            let v = hex::decode(&s).map_err(serde::de::Error::custom)?;
-            Ok(ExchangePublicKeyWire(v))
-        } else {
-            let v: serde_bytes::ByteBuf = serde_bytes::ByteBuf::deserialize(d)?;
-            Ok(ExchangePublicKeyWire(v.into_vec()))
-        }
-    }
-}
-
-impl PartialOrd for ExchangePublicKeyWire {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for ExchangePublicKeyWire {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.cmp(&other.0)
-    }
-}
+pub use crate::keys::ExchangePublicKeyWire;
 
 /// ADCNet 2-round (auction-then-broadcast) config. The auction round
 /// allocates `message_length`-byte slots; the message round carries the

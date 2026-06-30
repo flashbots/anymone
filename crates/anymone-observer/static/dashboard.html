@@ -555,7 +555,7 @@ function card(s, rps, series) {
         <circle class="track" cx="28" cy="28" r="${RING_R}"></circle>
         <circle class="fill" cx="28" cy="28" r="${RING_R}" stroke-dasharray="${RING_C}" stroke-dashoffset="${RING_C}"></circle>
       </svg>
-      <div class="round-num"><small>round</small><span>${s.round}</span></div>
+      <div class="round-num"><small>round</small><span>${s.round != null ? s.round : "—"}</span></div>
       <div class="tput"><div class="big">${rps.toFixed(1)}</div><div class="l">msgs/sec</div></div>
     </div>
     ${sparkSvg(series, escFrac)}

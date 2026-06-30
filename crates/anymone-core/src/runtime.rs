@@ -3,37 +3,33 @@
 //! The runtime owns the clock and the transport-side I/O. Each subnet runs
 //! in its own task; sessions live inside the task and never see async.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
-use std::time::Instant;
 
+use rand::RngCore;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
-use crate::adcnet::{
-    AdcnetClientSession, AdcnetObserverSession, AdcnetServerSession, AdcnetWatchSession,
-};
+use crate::adcnet::AdcnetWatchSession;
 use crate::config::{
-    AdcnetConfig, AnymoneRoundConfiguration, PanetiereConfig, ProtocolConfig, Round, Subnet,
-    SubnetId,
+    AnymoneRoundConfiguration, ProtocolConfig, Round, Subnet, SubnetId,
 };
 use crate::governance::{FaultReport, GovernanceBootstrap, GovernanceError, TOPIC_FAULTS};
 use crate::identity::{Identity, Pubkey};
 use crate::noop;
-use crate::panetiere::{
-    PanetiereClientSession, PanetiereObserverSession, PanetiereServerSession, PanetiereWatchSession,
-};
+use crate::panetiere::PanetiereWatchSession;
 use crate::pipe::{Pipe, PipeIncoming, PipeMessage};
-use crate::session::{Fault, Misbehavior, Session};
+use crate::faults::Fault;
+use crate::session::{Misbehavior, Session};
 use crate::transport::{Inbound, Subscription, Transport};
 use crate::wire::{Frame, ServiceTag, SERVICE_TAG_LEN};
 
 /// Consecutive output-less rounds before a subnet's leader-side monitor reports
 /// a `Liveness` fault — the established "fault on the second round" threshold
 /// (matches the committee + dashboard observers).
-const FAULT_THRESHOLD: u64 = 2;
+pub(crate) const FAULT_THRESHOLD: u64 = 2;
 
 /// Capacity of the [`Anymone::events`] broadcast. Slow consumers lag and lose
 /// the oldest events rather than blocking the subnet workers.
@@ -58,11 +54,6 @@ pub enum Event {
     /// A new `AnymoneRoundConfiguration` took effect.
     ConfigUpdated { round: Round },
 }
-
-use adcnet::protocol::session::one_round::{IbltMsgParamsOwned, OneRoundConfig};
-use panetiere::protocol::{ClientId, ProtocolParams, ServerId};
-use rand::{RngCore, SeedableRng};
-use rand_chacha::ChaCha20Rng;
 
 /// Runtime for one node, driving every subnet it participates in. Clones share
 /// the same node; the last clone dropped aborts every per-subnet task (the tasks
@@ -116,7 +107,7 @@ pub(crate) struct AnymoneInner {
 }
 
 impl AnymoneInner {
-    fn misbehavior(&self) -> Option<Misbehavior> {
+    pub(crate) fn misbehavior(&self) -> Option<Misbehavior> {
         match self.misbehavior.load(Ordering::Relaxed) {
             1 => Some(Misbehavior::Withhold),
             2 => Some(Misbehavior::CorruptShare),
@@ -166,6 +157,7 @@ impl Anymone {
             transport,
             bootstrap,
             config_sub,
+            registration: None,
         }
     }
 
@@ -212,7 +204,10 @@ impl Anymone {
             workers: Mutex::new(HashMap::new()),
             aux: Mutex::new(Vec::new()),
         });
+        let served = bincode::serialize(&config).unwrap_or_default();
         apply_config(&inner, &tasks, config).await;
+        // Answer config-pull requests from joining peers with what we adopted.
+        transport.serve_config(served);
 
         if let Some((sub, bootstrap)) = governance {
             let inner_w = Arc::downgrade(&inner);
@@ -337,6 +332,17 @@ impl Anymone {
         self.inner.events.subscribe()
     }
 
+    /// Round duration of the adopted config (all public subnets share it). Read
+    /// live so a caller's cadence tracks reconfiguration.
+    pub fn round_duration(&self) -> std::time::Duration {
+        let cfg = self.inner.config.read().unwrap();
+        cfg.body
+            .subnets
+            .first()
+            .map(|s| s.protocol.round_duration())
+            .unwrap_or(std::time::Duration::from_secs(1))
+    }
+
     /// Make this node's relay sessions misbehave (`None` = honest). For demos
     /// and fault-injection tests: a `Withhold`ing relay triggers an attributed
     /// `Liveness` fault; a `CorruptShare` relay is unattributable under ADCNet
@@ -358,54 +364,36 @@ pub enum OpenError {
 }
 
 /// Prepared (not yet running) instance with its governance subscription set up.
-/// Advance with [`AnymonePrep::start`].
+/// Advance with [`AnymonePrep::start`]; relays/services call [`AnymonePrep::announce`]
+/// first so `start` also republishes their registration until placed and beyond.
 pub struct AnymonePrep {
     identity: Identity,
     transport: Arc<dyn Transport>,
     bootstrap: GovernanceBootstrap,
     config_sub: Subscription,
+    registration: Option<(Vec<u8>, std::time::Duration)>,
 }
 
 impl AnymonePrep {
-    /// Await the first valid signed config, bring up its subnets, and hand the
-    /// subscription to the reconfig watcher for later versions.
-    pub async fn start(mut self) -> Result<Anymone, GovernanceError> {
-        let cfg = loop {
-            let msg = self
-                .config_sub
-                .recv()
-                .await
-                .ok_or(GovernanceError::TopicClosed)?;
-            let Ok(cfg) = bincode::deserialize::<AnymoneRoundConfiguration>(&msg.payload) else {
-                continue;
-            };
-            if cfg
-                .verify_multisig(&self.bootstrap.committee, self.bootstrap.threshold)
-                .is_ok()
-            {
-                break cfg;
-            }
-        };
-        Ok(Anymone::build_from_config(
-            self.identity,
-            self.transport,
-            cfg,
-            Some((self.config_sub, self.bootstrap)),
-        )
-        .await)
+    /// Register this node (relay/service) so [`start`](Self::start) republishes
+    /// `registration` on the registration topic every `interval` — until placed,
+    /// then for the node's lifetime so a sidelined node re-registers and heals
+    /// back in. Clients and the committee don't register and skip this.
+    pub fn announce(mut self, registration: Vec<u8>, interval: std::time::Duration) -> Self {
+        self.registration = Some((registration, interval));
+        self
     }
 
-    /// Like [`start`](Self::start) but re-publishes `registration` on the
-    /// registration topic every `interval` — first until the node is placed, then
-    /// for the node's lifetime so a relay/service later dropped from the roster
-    /// (sidelined) re-registers and is healed back in once its backoff lapses.
-    pub async fn start_announcing(
-        self,
-        registration: Vec<u8>,
-        interval: std::time::Duration,
-    ) -> Result<Anymone, GovernanceError> {
+    /// Await the first valid signed config, bring up its subnets, and hand the
+    /// subscription to the reconfig watcher for later versions. If a
+    /// [`registration`](Self::announce) was set, republish it while awaiting the
+    /// config and then for the node's lifetime.
+    pub async fn start(mut self) -> Result<Anymone, GovernanceError> {
+        let Some((registration, interval)) = self.registration.take() else {
+            return self.run().await;
+        };
         let transport = self.transport.clone();
-        let started = self.start();
+        let started = self.run();
         tokio::pin!(started);
         let anymone = loop {
             transport
@@ -416,8 +404,8 @@ impl AnymonePrep {
                 _ = tokio::time::sleep(interval) => {}
             }
         };
-        // Keep re-announcing for as long as the node is alive (weak handle, so the
-        // task ends when the node is dropped).
+        // Keep re-announcing for the node's lifetime (weak handle, so the task
+        // ends when the node is dropped).
         let weak = std::sync::Arc::downgrade(&transport);
         tokio::spawn(async move {
             loop {
@@ -429,10 +417,49 @@ impl AnymonePrep {
         });
         Ok(anymone)
     }
+
+    async fn run(mut self) -> Result<Anymone, GovernanceError> {
+        let committee = self.bootstrap.committee.clone();
+        let threshold = self.bootstrap.threshold;
+        let verify =
+            |c: &AnymoneRoundConfiguration| c.verify_multisig(&committee, threshold).is_ok();
+        let cfg = loop {
+            // Prefer pulling the current config from a connected peer.
+            if let Some(c) = self
+                .transport
+                .fetch_config()
+                .await
+                .and_then(|b| bincode::deserialize::<AnymoneRoundConfiguration>(&b).ok())
+                .filter(&verify)
+            {
+                break c;
+            }
+            // No peer answered yet — briefly await a pushed config, then retry the pull.
+            tokio::select! {
+                msg = self.config_sub.recv() => {
+                    let msg = msg.ok_or(GovernanceError::TopicClosed)?;
+                    if let Ok(c) = bincode::deserialize::<AnymoneRoundConfiguration>(&msg.payload) {
+                        if verify(&c) {
+                            break c;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+            }
+        };
+        Ok(Anymone::build_from_config(
+            self.identity,
+            self.transport,
+            cfg,
+            Some((self.config_sub, self.bootstrap)),
+        )
+        .await)
+    }
+
 }
 
 #[derive(PartialEq, Eq, Hash)]
-enum SessionKey {
+pub(crate) enum SessionKey {
     Server,
     Watch,
     Client,
@@ -487,17 +514,22 @@ async fn apply_config(
         }
         let (stage_tx, stage_rx) = mpsc::unbounded_channel();
         let inner_for_task = inner.clone();
-        let handle = tokio::spawn(async move {
-            run_subnet(
-                subnet,
-                inner_for_task,
-                stage_rx,
-                subscriptions,
-                base_round,
-                epoch_unix_ms,
-            )
-            .await;
-        });
+        // The one place that dispatches on protocol: each runs its own self-contained
+        // subnet driver. ScheduledAdcnet/Nym are not wired yet.
+        let handle = match &subnet.protocol {
+            ProtocolConfig::Adcnet(_) => tokio::spawn(crate::adcnet::run_subnet(
+                subnet, inner_for_task, stage_rx, subscriptions, base_round, epoch_unix_ms,
+            )),
+            ProtocolConfig::Panetiere(_) => tokio::spawn(crate::panetiere::run_subnet(
+                subnet, inner_for_task, stage_rx, subscriptions, base_round, epoch_unix_ms,
+            )),
+            ProtocolConfig::Noop(_) => tokio::spawn(crate::noop::run_subnet(
+                subnet, inner_for_task, stage_rx, subscriptions, base_round, epoch_unix_ms,
+            )),
+            ProtocolConfig::ScheduledAdcnet(_) | ProtocolConfig::Nym(_) => {
+                unimplemented!("ScheduledAdcnet / Nym runtime wiring is not yet implemented")
+            }
+        };
         built.push((id, sig, stage_tx, handle));
     }
 
@@ -556,8 +588,8 @@ async fn reconfig_watch(
         let (Some(inner), Some(tasks)) = (inner.upgrade(), tasks.upgrade()) else {
             return; // the node was dropped
         };
-        // Adopt strictly newer versions only; re-broadcasts of the same config
-        // (the committee resends every round for late joiners) are a no-op.
+        // Adopt strictly newer versions only; a re-publish of the same config is
+        // a no-op.
         {
             let cur = inner.config.read().unwrap();
             if cfg.body.round <= cur.body.round {
@@ -565,288 +597,67 @@ async fn reconfig_watch(
             }
         }
         *inner.config.write().unwrap() = cfg.clone();
+        // Serve the new version to peers that pull instead of waiting for a push.
+        inner.transport.serve_config(msg.payload.clone());
         apply_config(&inner, &tasks, cfg).await;
     }
 }
 
-async fn run_subnet(
-    subnet: Subnet,
-    inner: Arc<AnymoneInner>,
-    mut stage_rx: mpsc::UnboundedReceiver<StageMsg>,
-    mut subscriptions: Vec<Subscription>,
-    base_round: Round,
-    epoch_unix_ms: u64,
+/// Destination topic for one outbound message, given the role that produced it
+/// and the protocol's wire predicates. Shared by every protocol's subnet driver.
+pub(crate) fn egress_dest(
+    subnet_id: SubnetId,
+    uses_ingress: bool,
+    is_share: fn(&[u8]) -> bool,
+    is_client: fn(&[u8]) -> bool,
+    client_agg_topic: Option<&str>,
+    key: &SessionKey,
+    bytes: &[u8],
+) -> String {
+    if !uses_ingress {
+        return subnet_broadcast_topic(subnet_id);
+    }
+    match key {
+        SessionKey::Server => {
+            if is_share(bytes) {
+                subnet_shares_topic(subnet_id)
+            } else {
+                subnet_broadcast_topic(subnet_id)
+            }
+        }
+        // In an aggregated subnet a client's contribution goes to its aggregator
+        // group's topic instead of ingress (Panetiere openings still go to ingress).
+        SessionKey::Client => match client_agg_topic {
+            Some(t) if is_client(bytes) => t.to_string(),
+            _ => subnet_ingress_topic(subnet_id),
+        },
+        // Aggregators publish their signed group aggregate on the shares topic,
+        // where the leader already listens.
+        SessionKey::Aggregator => subnet_shares_topic(subnet_id),
+        SessionKey::Watch => subnet_broadcast_topic(subnet_id),
+    }
+}
+
+/// Gossip every observed fault for the committee/auditors and surface it locally
+/// on the events stream. Shared by every protocol's subnet driver.
+pub(crate) async fn gossip_faults(
+    inner: &AnymoneInner,
+    subnet_id: SubnetId,
+    round: Round,
+    reporter: Pubkey,
+    faults: Vec<Fault>,
 ) {
-    let identity_pk = inner.identity.pubkey();
-    let broadcast_topic = subnet_broadcast_topic(subnet.id);
-    let ingress_topic = subnet_ingress_topic(subnet.id);
-    let shares_topic = subnet_shares_topic(subnet.id);
-    let uses_ingress = subnet_uses_ingress(&subnet);
-
-    let round_duration = subnet.protocol.round_duration();
-
-    let shared = SubnetShared::from_subnet(&subnet);
-
-    let mut sessions: HashMap<SessionKey, Box<dyn Session>> = HashMap::new();
-    let mut client_homes: HashSet<ServiceTag> = HashSet::new();
-    let mut cover_rate = subnet.cover_rate;
-    if subnet.relays.contains(&identity_pk) {
-        sessions.insert(
-            SessionKey::Server,
-            build_server_session(&subnet, &shared, &inner.identity),
-        );
-    } else {
-        sessions.insert(SessionKey::Watch, watch_session_for(&subnet));
-    }
-    // Aggregator role: a node in some aggregator group sums that group's client
-    // contributions. Coexists with any relay role.
-    if let Some(a) = subnet_aggregation(&subnet) {
-        if let Some(group) = aggregator_group_of(a, identity_pk) {
-            let n_groups = a.groups.len() as u32;
-            let session: Box<dyn Session> = match &subnet.protocol {
-                ProtocolConfig::Panetiere(_) => {
-                    Box::new(crate::panetiere::PanetiereAggregatorSession::new(
-                        group,
-                        n_groups,
-                        inner.identity.clone(),
-                    ))
-                }
-                ProtocolConfig::Adcnet(_) => Box::new(crate::adcnet::AdcnetAggregatorSession::new(
-                    group,
-                    n_groups,
-                    inner.identity.clone(),
-                )),
-                _ => unreachable!("aggregation only on Panetiere/Adcnet"),
-            };
-            sessions.insert(SessionKey::Aggregator, session);
-        }
-    }
-
-    // Leader-side liveness monitor: it sees every relay's share (shares topic)
-    // and its own decoded output, so feeding it all inbound + local outbound
-    // reconstructs the wire view the observer needs. One reporter per subnet.
-    let mut fault_monitor: Option<Box<dyn Session>> = if subnet_leader_pk(&subnet) == identity_pk {
-        let mut roster = subnet.relays.clone();
-        roster.sort();
-        match &subnet.protocol {
-            ProtocolConfig::Panetiere(_) => Some(Box::new(PanetiereObserverSession::new(
-                roster,
-                FAULT_THRESHOLD,
-            ))),
-            ProtocolConfig::Adcnet(_) => Some(Box::new(AdcnetObserverSession::new(
-                roster,
-                FAULT_THRESHOLD,
-            ))),
-            _ => None,
-        }
-    } else {
-        None
-    };
-
-    // Round labels are derived from the signed wall-clock epoch (passed in from
-    // the config that scheduled this subnet), not counted locally, so every node
-    // agrees on the current round regardless of when it joined or how long it
-    // was blocked. `deadline` aligns to absolute round boundaries; a node that
-    // falls behind re-derives and skips ahead.
-    let dur_ms = (round_duration.as_millis() as u64).max(1);
-
-    let now_ms = crate::config::now_unix_ms();
-    let mut round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms);
-    let mut deadline = deadline_for(round, base_round, epoch_unix_ms, dur_ms, now_ms);
-    // Fire `mid_round` halfway through each round (aggregators emit their batch).
-    let mut mid_deadline = deadline - std::time::Duration::from_millis(dur_ms / 2);
-    let mut mid_done = false;
-
-    let is_share: fn(&[u8]) -> bool = match &subnet.protocol {
-        ProtocolConfig::Adcnet(_) => crate::adcnet::is_server_share,
-        ProtocolConfig::Panetiere(_) => crate::panetiere::is_server_share,
-        _ => |_| false,
-    };
-    // In an aggregated subnet a client's contribution goes to its aggregator
-    // group's topic instead of ingress (Panetiere openings still go to ingress).
-    let client_agg_topic: Option<String> = client_aggregator_topic(&subnet, identity_pk);
-    let is_agg_client: fn(&[u8]) -> bool = match &subnet.protocol {
-        ProtocolConfig::Adcnet(_) => crate::adcnet::is_client_message,
-        ProtocolConfig::Panetiere(_) => crate::panetiere::is_client_public,
-        _ => |_| false,
-    };
-    let egress = |key: &SessionKey, bytes: &[u8]| -> &str {
-        if !uses_ingress {
-            return &broadcast_topic;
-        }
-        match key {
-            SessionKey::Server => {
-                if is_share(bytes) {
-                    &shares_topic
-                } else {
-                    &broadcast_topic
-                }
-            }
-            SessionKey::Client => match &client_agg_topic {
-                Some(t) if is_agg_client(bytes) => t,
-                _ => &ingress_topic,
-            },
-            // Aggregators publish their signed group aggregate on the shares
-            // topic, where the leader already listens.
-            SessionKey::Aggregator => &shares_topic,
-            SessionKey::Watch => &broadcast_topic,
-        }
-    };
-
-    if let Some(m) = fault_monitor.as_mut() {
-        m.begin_round(round, Instant::now());
-    }
-    let misbehavior = inner.misbehavior();
-    for (key, s) in sessions.iter_mut() {
-        if let SessionKey::Server = key {
-            s.set_misbehavior(misbehavior);
-        }
-        for out in s.begin_round(round, Instant::now()) {
-            if let Some(m) = fault_monitor.as_mut() {
-                m.on_inbound(identity_pk, out.clone());
-            }
-            let dest = egress(key, &out);
-            inner.transport.publish(dest, out).await;
-        }
-    }
-
-    loop {
-        tokio::select! {
-            biased;
-
-            _ = tokio::time::sleep_until(mid_deadline), if !mid_done => {
-                mid_done = true;
-                for (key, s) in sessions.iter_mut() {
-                    for out in s.mid_round(round, Instant::now()) {
-                        if let Some(m) = fault_monitor.as_mut() {
-                            m.on_inbound(identity_pk, out.clone());
-                        }
-                        let dest = egress(key, &out);
-                        inner.transport.publish(dest, out).await;
-                    }
-                }
-            }
-
-            _ = tokio::time::sleep_until(deadline) => {
-                let mut decoded_all: Vec<Vec<u8>> = Vec::new();
-                let mut faults: Vec<Fault> = Vec::new();
-                for (key, s) in sessions.iter_mut() {
-                    let outcome = s.end_round(round, Instant::now());
-                    for out in outcome.outbound {
-                        if let Some(m) = fault_monitor.as_mut() {
-                            m.on_inbound(identity_pk, out.clone());
-                        }
-                        let dest = egress(key, &out);
-                        inner.transport.publish(dest, out).await;
-                    }
-                    decoded_all.extend(outcome.decoded);
-                    faults.extend(outcome.faults);
-                }
-                if let Some(m) = fault_monitor.as_mut() {
-                    faults.extend(m.end_round(round, Instant::now()).faults);
-                }
-                let n_decoded = decoded_all.len();
-                for bytes in decoded_all {
-                    route_to_pipe(&inner, &bytes);
-                }
-                if n_decoded > 0 {
-                    let _ = inner.events.send(Event::RoundDecoded {
-                        round,
-                        subnet: subnet.id,
-                        n_messages: n_decoded,
-                    });
-                }
-                // Gossip every observed fault for the committee/auditors and
-                // surface it locally on the events stream.
-                for fault in faults {
-                    let report = FaultReport {
-                        round,
-                        subnet: subnet.id,
-                        reporter: identity_pk,
-                        fault: fault.clone(),
-                    };
-                    inner.transport.publish(TOPIC_FAULTS, report.encode()).await;
-                    let _ = inner.events.send(Event::Fault { round, subnet: subnet.id, fault });
-                }
-                // Re-derive the round from the clock (self-correcting), but
-                // always advance at least one round so a sub-millisecond skew
-                // between the tokio timer and the wall clock can't replay the
-                // round we just ended.
-                let now_ms = crate::config::now_unix_ms();
-                round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms).max(round + 1);
-                deadline = deadline_for(round, base_round, epoch_unix_ms, dur_ms, now_ms);
-                mid_deadline = deadline - std::time::Duration::from_millis(dur_ms / 2);
-                mid_done = false;
-                if let Some(m) = fault_monitor.as_mut() {
-                    m.begin_round(round, Instant::now());
-                }
-                let misbehavior = inner.misbehavior();
-                for (key, s) in sessions.iter_mut() {
-                    if let SessionKey::Server = key {
-                        s.set_misbehavior(misbehavior);
-                    }
-                    for out in s.begin_round(round, Instant::now()) {
-                        if let Some(m) = fault_monitor.as_mut() {
-                            m.on_inbound(identity_pk, out.clone());
-                        }
-                        let dest = egress(key, &out);
-                        inner.transport.publish(dest, out).await;
-                    }
-                }
-            }
-
-            msg = recv_any(&mut subscriptions) => {
-                let Inbound { from, payload } = msg;
-                // Sessions self-include their own output; don't ingest the loopback.
-                if from == identity_pk {
-                    continue;
-                }
-                if let Some(m) = fault_monitor.as_mut() {
-                    m.on_inbound(from, payload.clone());
-                }
-                for (key, s) in sessions.iter_mut() {
-                    for out in s.on_inbound(from, payload.clone()) {
-                        if let Some(m) = fault_monitor.as_mut() {
-                            m.on_inbound(identity_pk, out.clone());
-                        }
-                        let dest = egress(key, &out);
-                        inner.transport.publish(dest, out).await;
-                    }
-                }
-            }
-
-            Some(stage) = stage_rx.recv() => {
-                match stage {
-                    StageMsg::Join { client_tag } => {
-                        client_homes.insert(client_tag);
-                        sessions
-                            .entry(SessionKey::Client)
-                            .or_insert_with(|| build_client_session(&subnet, &shared, &inner.identity))
-                            .set_cover_rate(cover_rate);
-                    }
-                    StageMsg::Stage { client_tag, payload } => {
-                        client_homes.insert(client_tag);
-                        let sess = sessions
-                            .entry(SessionKey::Client)
-                            .or_insert_with(|| build_client_session(&subnet, &shared, &inner.identity));
-                        sess.set_cover_rate(cover_rate);
-                        sess.stage(payload);
-                    }
-                    StageMsg::Retire { client_tag } => {
-                        client_homes.remove(&client_tag);
-                        if client_homes.is_empty() {
-                            sessions.remove(&SessionKey::Client);
-                        }
-                    }
-                    StageMsg::SetCoverRate(rate) => {
-                        cover_rate = rate;
-                        if let Some(c) = sessions.get_mut(&SessionKey::Client) {
-                            c.set_cover_rate(rate);
-                        }
-                    }
-                }
-            }
-        }
+    for fault in faults {
+        let report = FaultReport {
+            round,
+            subnet: subnet_id,
+            reporter,
+            fault: fault.clone(),
+        };
+        inner.transport.publish(TOPIC_FAULTS, report.encode()).await;
+        let _ = inner
+            .events
+            .send(Event::Fault { round, subnet: subnet_id, fault });
     }
 }
 
@@ -867,42 +678,6 @@ pub(crate) fn deadline_for(
     let boundary_ms = epoch_unix_ms + (round - base_round + 1) * dur_ms;
     let wait = boundary_ms.saturating_sub(now_ms);
     tokio::time::Instant::now() + std::time::Duration::from_millis(wait)
-}
-
-/// Per-subnet state shared across sessions, built once so `ProtocolParams::setup`
-/// (CS / KAHE keygen) isn't re-run for every client stage.
-enum SubnetShared {
-    Trivial,
-    Panetiere { pp: Arc<ProtocolParams> },
-    Adcnet { one_round: OneRoundConfig },
-}
-
-impl SubnetShared {
-    fn from_subnet(subnet: &Subnet) -> Self {
-        match &subnet.protocol {
-            ProtocolConfig::Panetiere(cfg) => {
-                let mut rng = ChaCha20Rng::from_seed(cfg.setup_seed);
-                let pp = Arc::new(ProtocolParams::setup(&mut rng, subnet.relays.len()));
-                SubnetShared::Panetiere { pp }
-            }
-            ProtocolConfig::Adcnet(cfg) => {
-                let one_round = OneRoundConfig {
-                    iblt: IbltMsgParamsOwned {
-                        estimated_messages: cfg.estimated_messages,
-                        max_payload_bytes: cfg.max_payload_bytes,
-                    },
-                };
-                SubnetShared::Adcnet { one_round }
-            }
-            _ => SubnetShared::Trivial,
-        }
-    }
-}
-
-fn adcnet_relay_index(subnet: &Subnet, pk: Pubkey) -> Option<u32> {
-    let mut sorted = subnet.relays.to_vec();
-    sorted.sort();
-    sorted.iter().position(|p| *p == pk).map(|i| i as u32)
 }
 
 /// Subnet leader (ADCNet canonical-set announcer / Panetiere `Decoded`
@@ -947,7 +722,7 @@ fn subnet_subscription_topics(subnet: &Subnet, me: Pubkey) -> Vec<String> {
 }
 
 /// Aggregation config for a subnet, if either protocol enabled it.
-fn subnet_aggregation(subnet: &Subnet) -> Option<&crate::config::Aggregation> {
+pub(crate) fn subnet_aggregation(subnet: &Subnet) -> Option<&crate::config::Aggregation> {
     match &subnet.protocol {
         ProtocolConfig::Panetiere(c) => c.aggregation.as_ref(),
         ProtocolConfig::Adcnet(c) => c.aggregation.as_ref(),
@@ -956,7 +731,7 @@ fn subnet_aggregation(subnet: &Subnet) -> Option<&crate::config::Aggregation> {
 }
 
 /// Group index whose aggregator committee includes `me`, if any.
-fn aggregator_group_of(a: &crate::config::Aggregation, me: Pubkey) -> Option<u32> {
+pub(crate) fn aggregator_group_of(a: &crate::config::Aggregation, me: Pubkey) -> Option<u32> {
     a.groups
         .iter()
         .position(|g| g.aggregators.contains(&me))
@@ -964,7 +739,7 @@ fn aggregator_group_of(a: &crate::config::Aggregation, me: Pubkey) -> Option<u32
 }
 
 /// The group topic a client routes its contribution to in an aggregated subnet.
-fn client_aggregator_topic(subnet: &Subnet, me: Pubkey) -> Option<String> {
+pub(crate) fn client_aggregator_topic(subnet: &Subnet, me: Pubkey) -> Option<String> {
     let a = subnet_aggregation(subnet)?;
     let group = u32::from_be_bytes([me.0[0], me.0[1], me.0[2], me.0[3]]) % a.groups.len() as u32;
     Some(subnet_aggregator_topic(subnet.id, group))
@@ -972,11 +747,15 @@ fn client_aggregator_topic(subnet: &Subnet, me: Pubkey) -> Option<String> {
 
 /// Await the next message on any of `subs`, dropping closed ones. Parks forever
 /// once all are closed, so it never fires spuriously in a `tokio::select!`.
-async fn recv_any(subs: &mut Vec<Subscription>) -> Inbound {
+pub(crate) async fn recv_any(subs: &mut Vec<Subscription>) -> Inbound {
     loop {
         if subs.is_empty() {
             std::future::pending::<()>().await;
         }
+        // Rotate first: `select_all` returns the lowest-index ready future, so a
+        // fixed order lets the high-volume ingress topic starve the low-volume
+        // shares topic (relays would never see each other's decryption shares).
+        subs.rotate_left(1);
         let futures: Vec<_> = subs.iter_mut().map(|s| Box::pin(s.recv())).collect();
         let (res, idx, _) = futures_util::future::select_all(futures).await;
         match res {
@@ -1018,194 +797,6 @@ pub fn subnet_aggregator_topic(id: SubnetId, group: u32) -> String {
     format!("anymone/subnet/{id}/agg/{group}")
 }
 
-/// ADCNet client shared secrets: ECDH the node's exchange privkey against each
-/// relay's exchange pubkey from the subnet config.
-fn adcnet_client_shared_secrets(
-    cfg: &AdcnetConfig,
-    identity: &Identity,
-    subnet: &Subnet,
-) -> std::collections::HashMap<adcnet::crypto::ServerId, adcnet::crypto::SharedKey> {
-    use std::collections::HashMap as Map;
-    let mut sorted = subnet.relays.to_vec();
-    sorted.sort();
-    let mut out = Map::new();
-    let xkey_by_pk: Map<Pubkey, &crate::config::ExchangePublicKeyWire> = cfg
-        .relay_exchange_keys
-        .iter()
-        .map(|(p, x)| (*p, x))
-        .collect();
-    for (i, pk) in sorted.iter().enumerate() {
-        if let Some(xkw) = xkey_by_pk.get(pk) {
-            if let Ok(xk) = xkw.to_key() {
-                let sid = adcnet::crypto::ServerId((i + 1) as u32);
-                out.insert(sid, identity.exchange().ecdh(&xk));
-            }
-        }
-    }
-    out
-}
-
-/// Panetiere `ServerId` → relay exchange pubkey, for sealing client openings.
-fn panetiere_server_xpubs(
-    cfg: &PanetiereConfig,
-    subnet: &Subnet,
-) -> HashMap<ServerId, adcnet::crypto::ExchangePublicKey> {
-    let mut sorted = subnet.relays.to_vec();
-    sorted.sort();
-    let xkey_by_pk: HashMap<Pubkey, &crate::config::ExchangePublicKeyWire> = cfg
-        .relay_exchange_keys
-        .iter()
-        .map(|(p, x)| (*p, x))
-        .collect();
-    sorted
-        .iter()
-        .enumerate()
-        .filter_map(|(i, pk)| {
-            let xk = xkey_by_pk.get(pk)?.to_key().ok()?;
-            Some((ServerId(i as u32), xk))
-        })
-        .collect()
-}
-
-/// Position of `pk` in the sorted relay list — the Panetiere `ServerId`.
-fn server_index(relays: &[Pubkey], pk: Pubkey) -> Option<u32> {
-    let mut sorted = relays.to_vec();
-    sorted.sort();
-    sorted.iter().position(|p| *p == pk).map(|i| i as u32)
-}
-
-/// Deterministic `ClientId` from the pipe's return tag — first 4 bytes as
-/// big-endian u32. Same node + same pipe yields the same id, which is what
-/// the Panetiere decoder uses to merge round publics with openings.
-fn client_id_from_pubkey(pk: Pubkey) -> ClientId {
-    ClientId(u32::from_be_bytes([pk.0[0], pk.0[1], pk.0[2], pk.0[3]]))
-}
-
-fn leader_aggregation_from_config(
-    a: &crate::config::Aggregation,
-) -> crate::session::LeaderAggregation {
-    let roster = a
-        .groups
-        .iter()
-        .enumerate()
-        .map(|(i, g)| (i as u32, g.aggregators.clone()))
-        .collect();
-    crate::session::LeaderAggregation { roster }
-}
-
-fn build_server_session(
-    subnet: &Subnet,
-    shared: &SubnetShared,
-    identity: &Identity,
-) -> Box<dyn Session> {
-    let identity_pk = identity.pubkey();
-    match (&subnet.protocol, shared) {
-        (ProtocolConfig::Noop(c), _) => noop::server_session(c),
-        (ProtocolConfig::Panetiere(cfg), SubnetShared::Panetiere { pp }) => {
-            let server_id = ServerId(
-                server_index(&subnet.relays, identity_pk)
-                    .expect("build_server_session called on non-relay"),
-            );
-            let mut sorted = subnet.relays.clone();
-            sorted.sort();
-            let server_pubkeys = sorted
-                .into_iter()
-                .enumerate()
-                .map(|(i, pk)| (ServerId(i as u32), pk))
-                .collect();
-            // Every relay needs the aggregator roster (canonical mode + verifying
-            // group-aggregate signatures); only the leader emits the decode.
-            let aggregation = cfg.aggregation.as_ref().map(leader_aggregation_from_config);
-            Box::new(PanetiereServerSession::new(
-                pp.clone(),
-                server_id,
-                crate::scheduler_core::expected_active(cfg.client_set_max),
-                identity.exchange().clone(),
-                subnet_leader_pk(subnet) == identity_pk,
-                server_pubkeys,
-                aggregation,
-            ))
-        }
-        (ProtocolConfig::Adcnet(cfg), SubnetShared::Adcnet { one_round }) => {
-            let idx = adcnet_relay_index(subnet, identity_pk)
-                .expect("build_server_session called on non-relay");
-            let server_id = adcnet::crypto::ServerId(idx + 1);
-            let leader_pk = subnet_leader_pk(subnet);
-            let leader_idx = (subnet.id as usize) % subnet.relays.len();
-            let is_leader = idx as usize == leader_idx;
-            // Only the leader combines, so only it needs the aggregator roster.
-            let aggregation = if is_leader {
-                cfg.aggregation.as_ref().map(leader_aggregation_from_config)
-            } else {
-                None
-            };
-            Box::new(AdcnetServerSession::new(
-                one_round.clone(),
-                server_id,
-                identity.to_adcnet_signing_key(),
-                identity.exchange().clone(),
-                subnet.relays.len(),
-                is_leader, // sorted_relays[id % n] leads this subnet
-                leader_pk,
-                aggregation,
-            ))
-        }
-        (ProtocolConfig::ScheduledAdcnet(_), _) | (ProtocolConfig::Nym(_), _) => {
-            unimplemented!("ScheduledAdcnet / Nym runtime wiring is not yet implemented")
-        }
-        (ProtocolConfig::Panetiere(_), _) => {
-            unreachable!("Panetiere requires SubnetShared::Panetiere")
-        }
-        (ProtocolConfig::Adcnet(_), _) => unreachable!("Adcnet requires SubnetShared::Adcnet"),
-    }
-}
-
-fn build_client_session(
-    subnet: &Subnet,
-    shared: &SubnetShared,
-    identity: &Identity,
-) -> Box<dyn Session> {
-    match (&subnet.protocol, shared) {
-        (ProtocolConfig::Noop(c), _) => noop::client_session(c),
-        (ProtocolConfig::Panetiere(cfg), SubnetShared::Panetiere { pp }) => {
-            let client_id = client_id_from_pubkey(identity.pubkey());
-            let mut sorted = subnet.relays.clone();
-            sorted.sort();
-            let server_ids: Vec<ServerId> = (0..sorted.len() as u32).map(ServerId).collect();
-            // Secret entropy: a seed derived from the return tag (public, rides
-            // in routing headers) would let anyone replay the client's round.
-            let mut seed = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut seed);
-            Box::new(PanetiereClientSession::new(
-                pp.clone(),
-                client_id,
-                server_ids,
-                panetiere_server_xpubs(cfg, subnet),
-                seed,
-            ))
-        }
-        (ProtocolConfig::Adcnet(cfg), SubnetShared::Adcnet { one_round }) => {
-            let shared_secrets = adcnet_client_shared_secrets(cfg, identity, subnet);
-            let mut seed = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut seed);
-            Box::new(AdcnetClientSession::new(
-                one_round.clone(),
-                identity.to_adcnet_signing_key(),
-                shared_secrets,
-                identity.exchange_pubkey(),
-                seed,
-            ))
-        }
-        (ProtocolConfig::ScheduledAdcnet(_), _) | (ProtocolConfig::Nym(_), _) => {
-            unimplemented!("ScheduledAdcnet / Nym runtime wiring is not yet implemented")
-        }
-        (ProtocolConfig::Panetiere(_), _) => {
-            unreachable!("Panetiere requires SubnetShared::Panetiere")
-        }
-        (ProtocolConfig::Adcnet(_), _) => unreachable!("Adcnet requires SubnetShared::Adcnet"),
-    }
-}
-
 /// Build a non-participating watch session for `subnet`: reads the leader's
 /// `Decoded` broadcasts (Noop: a plain server session), no crypto state.
 pub fn watch_session_for(subnet: &Subnet) -> Box<dyn Session> {
@@ -1221,7 +812,7 @@ pub fn watch_session_for(subnet: &Subnet) -> Box<dyn Session> {
     }
 }
 
-fn route_to_pipe(inner: &AnymoneInner, bytes: &[u8]) {
+pub(crate) fn route_to_pipe(inner: &AnymoneInner, bytes: &[u8]) {
     let frame = match Frame::decode(bytes) {
         Ok(f) => f,
         Err(e) => {

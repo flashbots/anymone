@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anymone_core::config::{AnymoneRoundConfiguration, ProtocolConfig, Subnet, SubnetId};
-use anymone_core::session::{Attribution, Fault};
+use anymone_core::faults::{Attribution, Fault};
 use anymone_core::{Pubkey, ServiceTag};
 use serde_json::{json, Value};
 
@@ -21,10 +21,12 @@ const FEED_CAP: usize = 64;
 
 #[derive(Default, Clone)]
 pub struct SubnetLive {
-    pub round: u64,
+    /// Highest round observed on the wire; `None` until real traffic is seen
+    /// (never a synthesized/local value).
+    pub round: Option<u64>,
     pub decoded: u64,
-    pub share_frontier: u64,
-    pub output_frontier: u64,
+    pub share_frontier: Option<u64>,
+    pub output_frontier: Option<u64>,
     pub status: String,
     /// Live anonymity set: size of the latest observed canonical client set
     /// (actual submitters this round), not the `client_set_max` config cap.
@@ -164,7 +166,11 @@ impl Observatory {
                 let was = prev.body.subnets.iter().find(|p| p.id == s.id).map(|p| proto_name(&p.protocol));
                 if let Some(w) = was {
                     if w != proto_name(&s.protocol) {
-                        self.escalated_at.insert(s.id, self.live.get(&s.id).map(|l| l.round).unwrap_or(version));
+                        // Record the real wire round of the escalation if one's been
+                        // observed; never a synthesized stand-in.
+                        if let Some(r) = self.live.get(&s.id).and_then(|l| l.round) {
+                            self.escalated_at.insert(s.id, r);
+                        }
                     }
                 }
             }
@@ -246,20 +252,22 @@ impl Observatory {
         self.decoded_raw.insert(id, raw);
         live.decoded = self.decoded_offset.get(&id).copied().unwrap_or(0) + raw;
 
-        // msgs this round = delta of the monotonic decoded counter.
+        // msgs this round = delta of the monotonic decoded counter. Only record a
+        // per-round stat once a real wire round is known — never a fabricated one.
         let prev_decoded = self.live.get(&id).map(|l| l.decoded).unwrap_or(0);
         let msgs = live.decoded.saturating_sub(prev_decoded);
-        let ring = self.recent.entry(id).or_default();
-        match ring.back_mut() {
-            // Same round updated again: refresh in place.
-            Some(last) if last.round == live.round => {
-                last.anon_set = live.anon_set;
-                last.msgs = msgs;
-            }
-            _ => {
-                ring.push_back(RoundStat { round: live.round, anon_set: live.anon_set, msgs });
-                while ring.len() > 5 {
-                    ring.pop_front();
+        if let Some(r) = live.round {
+            let ring = self.recent.entry(id).or_default();
+            match ring.back_mut() {
+                Some(last) if last.round == r => {
+                    last.anon_set = live.anon_set;
+                    last.msgs = msgs;
+                }
+                _ => {
+                    ring.push_back(RoundStat { round: r, anon_set: live.anon_set, msgs });
+                    while ring.len() > 5 {
+                        ring.pop_front();
+                    }
                 }
             }
         }
@@ -578,7 +586,7 @@ fn short(pk: &Pubkey) -> String {
 mod tests {
     use super::*;
     use anymone_core::config::AnymoneRoundConfigurationBody;
-    use anymone_core::session::FaultKind;
+    use anymone_core::faults::FaultKind;
 
     fn obs() -> Observatory {
         Observatory::new(vec![], 1, "test".into(), 1000)
@@ -597,12 +605,12 @@ mod tests {
         let mut o = obs();
         let mut reported = Vec::new();
         for d in [5u64, 10, 15] {
-            o.update_live(0, SubnetLive { decoded: d, round: d, ..Default::default() });
+            o.update_live(0, SubnetLive { decoded: d, round: Some(d), ..Default::default() });
             reported.push(o.live.get(&0).unwrap().decoded);
         }
         // A watcher restart (e.g. protocol flip) resets the raw counter to 0.
         for d in [3u64, 6, 9] {
-            o.update_live(0, SubnetLive { decoded: d, round: 100 + d, ..Default::default() });
+            o.update_live(0, SubnetLive { decoded: d, round: Some(100 + d), ..Default::default() });
             reported.push(o.live.get(&0).unwrap().decoded);
         }
         for w in reported.windows(2) {

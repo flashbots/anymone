@@ -10,13 +10,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anymone_core::config::ExchangePublicKeyWire;
+use anymone_core::config::{ExchangePublicKeyWire, NoopConfig, ProtocolConfig, ServiceEntry};
 use anymone_core::governance::TOPIC_FAULTS;
 use anymone_core::p2p::{Libp2pConfig, Libp2pNetwork};
-use anymone_core::scheduling::{
-    announce_relay_registration, announce_service_registration, spawn_committee_scheduler,
-    SchedulerConfig,
-};
+use anymone_core::scheduling::{announce_relay_registration, announce_service_registration};
 use anymone_core::transport::Transport;
 use anymone_core::{
     committee_roster, spawn_panetiere_committee_scheduler, Anymone, AnymoneRoundConfiguration,
@@ -86,94 +83,29 @@ async fn e2e_echo_via_libp2p() {
     let service = start_node(svc_id.clone(), port_s, dial.clone()).await;
     let client = start_node(cli_id.clone(), port_x, dial).await;
 
-    let bootstrap = GovernanceBootstrap {
-        committee: vec![committee.identity.pubkey()],
-        threshold: 1,
-    };
+    // Static Noop subnet every node adopts directly (no scheduler). The
+    // committee node has no special role here — it's just the mesh hub the
+    // others dial. Registration → committee → config is covered by the
+    // committee-scheduler tests below.
+    let relay_pks = vec![r1_id.pubkey(), r2_id.pubkey(), r3_id.pubkey()];
+    let services = vec![ServiceEntry { tag: ECHO_TAG, pubkey: svc_id.pubkey() }];
+    let protocol = ProtocolConfig::Noop(NoopConfig {
+        round_duration_ms: 30,
+        message_size: 1024,
+        client_set_min: 0,
+        client_set_max: 256,
+    });
+    let config = AnymoneRoundConfiguration::singleton_subnet(0, protocol, relay_pks, services);
 
-    // Phase 1 — every subscriber subscribes (sync) before any publisher fires.
-    let scheduler_task = spawn_committee_scheduler(
-        committee.net.clone() as Arc<dyn Transport>,
-        committee.identity.clone(),
-        SchedulerConfig {
-            min_relays: 3,
-            min_services: 1,
-            subnet_round_duration: Duration::from_millis(30),
-            protocol: anymone_core::SchedulerProtocol::Noop,
-        },
-    )
-    .await;
-
-    let committee_prep = Anymone::prepare(
-        committee.identity.clone(),
-        committee.net.clone(),
-        bootstrap.clone(),
-    )
-    .await;
-    let r1_prep = Anymone::prepare(r1.identity.clone(), r1.net.clone(), bootstrap.clone()).await;
-    let r2_prep = Anymone::prepare(r2.identity.clone(), r2.net.clone(), bootstrap.clone()).await;
-    let r3_prep = Anymone::prepare(r3.identity.clone(), r3.net.clone(), bootstrap.clone()).await;
-    let svc_prep =
-        Anymone::prepare(svc_id.clone(), service.net.clone(), bootstrap.clone()).await;
-    let cli_prep =
-        Anymone::prepare(cli_id.clone(), client.net.clone(), bootstrap.clone()).await;
-
-    // Phase 2 — relays/service publish their registrations. The libp2p
-    // transport buffers each publish until the gossipsub mesh has remote
-    // subscribers, so a single publish suffices.
-    let r1_net = r1.net.clone();
-    let r2_net = r2.net.clone();
-    let r3_net = r3.net.clone();
-    let svc_net = service.net.clone();
-    let r1_xk = anymone_core::config::ExchangePublicKeyWire::from_key(&r1_id.exchange_pubkey());
-    let r2_xk = anymone_core::config::ExchangePublicKeyWire::from_key(&r2_id.exchange_pubkey());
-    let r3_xk = anymone_core::config::ExchangePublicKeyWire::from_key(&r3_id.exchange_pubkey());
-    let svc_xk = anymone_core::config::ExchangePublicKeyWire::from_key(&svc_id.exchange_pubkey());
-    let r1_reg = Registration::relay(&r1_id, r1_xk).encode();
-    let r2_reg = Registration::relay(&r2_id, r2_xk).encode();
-    let r3_reg = Registration::relay(&r3_id, r3_xk).encode();
-    let svc_reg = Registration::service(&svc_id, ECHO_TAG, svc_xk).encode();
-    tokio::join!(
-        async move {
-            r1_net
-                .publish(TOPIC_REGISTRATION, r1_reg)
-                .await
-        },
-        async move {
-            r2_net
-                .publish(TOPIC_REGISTRATION, r2_reg)
-                .await
-        },
-        async move {
-            r3_net
-                .publish(TOPIC_REGISTRATION, r3_reg)
-                .await
-        },
-        async move {
-            svc_net
-                .publish(TOPIC_REGISTRATION, svc_reg)
-                .await
-        },
-    );
-
-    // Phase 3 — every node awaits its config + starts the subnet runtime.
-    let c_h = tokio::spawn(async move { committee_prep.start().await.unwrap() });
-    let r1_h = tokio::spawn(async move { r1_prep.start().await.unwrap() });
-    let r2_h = tokio::spawn(async move { r2_prep.start().await.unwrap() });
-    let r3_h = tokio::spawn(async move { r3_prep.start().await.unwrap() });
-    let s_h = tokio::spawn(async move { svc_prep.start().await.unwrap() });
-    let cl_h = tokio::spawn(async move { cli_prep.start().await.unwrap() });
-
-    let bounded = Duration::from_secs(30);
     let _committee_anymone =
-        tokio::time::timeout(bounded, c_h).await.expect("committee start timed out").unwrap();
-    let _r1 = tokio::time::timeout(bounded, r1_h).await.expect("r1 start timed out").unwrap();
-    let _r2 = tokio::time::timeout(bounded, r2_h).await.expect("r2 start timed out").unwrap();
-    let _r3 = tokio::time::timeout(bounded, r3_h).await.expect("r3 start timed out").unwrap();
+        Anymone::start_with_config(committee_id.clone(), committee.net.clone(), config.clone()).await;
+    let _r1 = Anymone::start_with_config(r1_id.clone(), r1.net.clone(), config.clone()).await;
+    let _r2 = Anymone::start_with_config(r2_id.clone(), r2.net.clone(), config.clone()).await;
+    let _r3 = Anymone::start_with_config(r3_id.clone(), r3.net.clone(), config.clone()).await;
     let service_anymone =
-        tokio::time::timeout(bounded, s_h).await.expect("svc start timed out").unwrap();
+        Anymone::start_with_config(svc_id.clone(), service.net.clone(), config.clone()).await;
     let client_anymone =
-        tokio::time::timeout(bounded, cl_h).await.expect("cli start timed out").unwrap();
+        Anymone::start_with_config(cli_id.clone(), client.net.clone(), config.clone()).await;
 
     let mut svc_pipe = service_anymone.bind(ECHO_TAG).await.unwrap();
     tokio::spawn(async move {
@@ -189,8 +121,6 @@ async fn e2e_echo_via_libp2p() {
         .expect("recv timed out")
         .expect("pipe closed");
     assert_eq!(reply.payload, b"hello");
-
-    drop(scheduler_task);
 }
 
 /// Reproduces the standalone deployment topology: a discovery **bootnode**, a
@@ -357,7 +287,7 @@ async fn deployment_echo_full_nodes_via_bootnode() {
         let gov = gov.clone();
         let net: Arc<dyn Transport> = node.net.clone();
         starts.push(tokio::spawn(async move {
-            Anymone::prepare(id, net, gov).await.start_announcing(reg, announce).await
+            Anymone::prepare(id, net, gov).await.announce(reg, announce).start().await
         }));
     }
 
@@ -369,7 +299,7 @@ async fn deployment_echo_full_nodes_via_bootnode() {
         let gov = gov.clone();
         let net: Arc<dyn Transport> = svc_node.net.clone();
         tokio::spawn(async move {
-            Anymone::prepare(svc_id, net, gov).await.start_announcing(svc_reg, announce).await
+            Anymone::prepare(svc_id, net, gov).await.announce(svc_reg, announce).start().await
         })
     };
 

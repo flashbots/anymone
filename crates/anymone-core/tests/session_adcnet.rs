@@ -10,7 +10,8 @@ use std::time::Instant;
 use anymone_core::adcnet::{
     AdcnetClientSession, AdcnetObserverSession, AdcnetServerSession, AdcnetWatchSession,
 };
-use anymone_core::session::{Attribution, FaultKind, Session};
+use anymone_core::faults::{Attribution, FaultKind};
+use anymone_core::session::Session;
 use anymone_core::{Identity, Pubkey};
 
 use adcnet::crypto::{ServerId, SharedKey};
@@ -29,7 +30,7 @@ fn adcnet_session_happy_path() {
 
     let client_id = Identity::generate();
     let servers_id: Vec<Identity> = (0..n_servers).map(|_| Identity::generate()).collect();
-    let server_ids: Vec<ServerId> = (1..=n_servers as u32).map(ServerId).collect();
+    let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let leader_pk = servers_id[0].pubkey();
 
     let mut client_shared: HashMap<ServerId, SharedKey> = HashMap::new();
@@ -135,7 +136,7 @@ impl Subnet {
 
         let mut client_shared: HashMap<ServerId, SharedKey> = HashMap::new();
         for (i, rid) in relay_ids.iter().enumerate() {
-            client_shared.insert(ServerId((i + 1) as u32), client_id.exchange().ecdh(&rid.exchange_pubkey()));
+            client_shared.insert(ServerId(i as u32), client_id.exchange().ecdh(&rid.exchange_pubkey()));
         }
 
         let client = AdcnetClientSession::new(
@@ -149,7 +150,7 @@ impl Subnet {
             .map(|i| {
                 AdcnetServerSession::new(
                     cfg.clone(),
-                    ServerId((i + 1) as u32),
+                    ServerId(i as u32),
                     relay_ids[i].to_adcnet_signing_key(),
                     relay_ids[i].exchange().clone(),
                     n_servers,

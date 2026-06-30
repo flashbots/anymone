@@ -4,8 +4,11 @@
 //! ([`ScheduledAdcnetClientSession`] / [`ScheduledAdcnetServerSession`], which
 //! wrap the upstream stateful services). See IMPLEMENTATION.md §ADCNet sessions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
+
+use tokio::sync::mpsc;
 
 use crate::identity::{ExchangeIdentity, Identity};
 use adcnet::crypto::{
@@ -13,21 +16,317 @@ use adcnet::crypto::{
 };
 use adcnet::protocol::messages::Signed;
 use adcnet::protocol::session::one_round::{
-    client_contribute, combine_round, server_contribute, ClientContribution, OneRoundConfig,
-    ServerShare,
+    client_contribute, combine_round, server_contribute, ClientContribution, IbltMsgParamsOwned,
+    OneRoundConfig, ServerShare,
 };
 use adcnet::protocol::session::two_round::{ClientService, ServerService};
 use adcnet::protocol::{
     AdcNetConfig as UpstreamAdcNetConfig, AggregationMode, ClientRoundMessage,
     Round as UpstreamRound, RoundBroadcast, RoundContext, ServerPartialDecryptionMessage,
 };
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use crate::config::Round;
+use crate::config::{AdcnetConfig, ProtocolConfig, Round, Subnet};
+use crate::faults::Fault;
+use crate::identity::Pubkey;
+use crate::runtime::{
+    aggregator_group_of, client_aggregator_topic, deadline_for, egress_dest, gossip_faults,
+    recv_any, round_at, route_to_pipe, subnet_aggregation, subnet_leader_pk, AnymoneInner,
+    SessionKey, StageMsg, FAULT_THRESHOLD,
+};
 use crate::session::{LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
+use crate::transport::{Inbound, Subscription};
+use crate::wire::ServiceTag;
+
+/// Per-subnet ADCNet parameters (IBLT sizing), built once at subnet start.
+fn one_round_config(cfg: &AdcnetConfig) -> OneRoundConfig {
+    OneRoundConfig {
+        iblt: IbltMsgParamsOwned {
+            estimated_messages: cfg.estimated_messages,
+            max_payload_bytes: cfg.max_payload_bytes,
+        },
+    }
+}
+
+/// `pk`'s 0-based position in the sorted relay list — the ADCNet `ServerId`.
+/// 0-based to match Panetiere (whose base is fixed by its Shamir/Merkle index);
+/// ADCNet treats the id as an opaque label, so either base works.
+fn relay_index(subnet: &Subnet, pk: Pubkey) -> Option<u32> {
+    let mut sorted = subnet.relays.to_vec();
+    sorted.sort();
+    sorted.iter().position(|p| *p == pk).map(|i| i as u32)
+}
+
+/// ECDH the node's exchange privkey against each relay's exchange pubkey,
+/// keyed by 0-based `ServerId`.
+fn client_shared_secrets(
+    cfg: &AdcnetConfig,
+    identity: &Identity,
+    subnet: &Subnet,
+) -> HashMap<ServerId, SharedKey> {
+    crate::keys::roster_exchange_pubkeys(&subnet.relays, &cfg.relay_exchange_keys)
+        .into_iter()
+        .map(|(i, xk)| (ServerId(i as u32), identity.exchange().ecdh(&xk)))
+        .collect()
+}
+
+fn client_session(one_round: &OneRoundConfig, cfg: &AdcnetConfig, subnet: &Subnet, identity: &Identity) -> Box<dyn Session> {
+    let shared_secrets = client_shared_secrets(cfg, identity, subnet);
+    let mut seed = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut seed);
+    Box::new(AdcnetClientSession::new(
+        one_round.clone(),
+        identity.to_adcnet_signing_key(),
+        shared_secrets,
+        identity.exchange_pubkey(),
+        seed,
+    ))
+}
+
+fn server_session(
+    one_round: &OneRoundConfig,
+    cfg: &AdcnetConfig,
+    subnet: &Subnet,
+    identity: &Identity,
+    leader_pk: Pubkey,
+) -> Box<dyn Session> {
+    let identity_pk = identity.pubkey();
+    let idx = relay_index(subnet, identity_pk).expect("server_session called on non-relay");
+    let is_leader = identity_pk == leader_pk;
+    // Only the leader combines, so only it needs the aggregator roster.
+    let aggregation = if is_leader {
+        cfg.aggregation.as_ref().map(LeaderAggregation::from_config)
+    } else {
+        None
+    };
+    Box::new(AdcnetServerSession::new(
+        one_round.clone(),
+        ServerId(idx),
+        identity.to_adcnet_signing_key(),
+        identity.exchange().clone(),
+        subnet.relays.len(),
+        is_leader,
+        leader_pk,
+        aggregation,
+    ))
+}
+
+/// Self-contained ADCNet subnet driver: builds this node's sessions, then owns
+/// the round loop. The runtime dispatches here for ADCNet subnets.
+pub(crate) async fn run_subnet(
+    subnet: Subnet,
+    inner: Arc<AnymoneInner>,
+    mut stage_rx: mpsc::UnboundedReceiver<StageMsg>,
+    mut subscriptions: Vec<Subscription>,
+    base_round: Round,
+    epoch_unix_ms: u64,
+) {
+    let cfg = match &subnet.protocol {
+        ProtocolConfig::Adcnet(c) => c.clone(),
+        _ => unreachable!("adcnet::run_subnet on a non-ADCNet subnet"),
+    };
+    let identity_pk = inner.identity.pubkey();
+    let one_round = one_round_config(&cfg);
+    let leader_pk = subnet_leader_pk(&subnet);
+    let client_agg_topic = client_aggregator_topic(&subnet, identity_pk);
+
+    let mut sessions: HashMap<SessionKey, Box<dyn Session>> = HashMap::new();
+    let mut client_homes: HashSet<ServiceTag> = HashSet::new();
+    let mut cover_rate = subnet.cover_rate;
+
+    if subnet.relays.contains(&identity_pk) {
+        sessions.insert(
+            SessionKey::Server,
+            server_session(&one_round, &cfg, &subnet, &inner.identity, leader_pk),
+        );
+    } else {
+        sessions.insert(SessionKey::Watch, Box::new(AdcnetWatchSession::new(leader_pk)));
+    }
+    if let Some(a) = subnet_aggregation(&subnet) {
+        if let Some(group) = aggregator_group_of(a, identity_pk) {
+            sessions.insert(
+                SessionKey::Aggregator,
+                Box::new(AdcnetAggregatorSession::new(
+                    group,
+                    a.groups.len() as u32,
+                    inner.identity.clone(),
+                )),
+            );
+        }
+    }
+    // Leader-side liveness monitor: sees every relay's share and the local output,
+    // reconstructing the observer's wire view. One reporter per subnet.
+    let mut fault_monitor: Option<Box<dyn Session>> = if leader_pk == identity_pk {
+        let mut roster = subnet.relays.clone();
+        roster.sort();
+        Some(Box::new(AdcnetObserverSession::new(roster, FAULT_THRESHOLD)))
+    } else {
+        None
+    };
+
+    let egress = |key: &SessionKey, bytes: &[u8]| {
+        egress_dest(
+            subnet.id,
+            true,
+            is_server_share,
+            is_client_message,
+            client_agg_topic.as_deref(),
+            key,
+            bytes,
+        )
+    };
+
+    // Round labels derive from the signed wall-clock epoch, not a local counter,
+    // so every node agrees regardless of when it joined; `deadline` aligns to
+    // absolute boundaries and a node that falls behind re-derives and skips ahead.
+    let dur_ms = (subnet.protocol.round_duration().as_millis() as u64).max(1);
+    let now_ms = crate::config::now_unix_ms();
+    let mut round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms);
+    let mut deadline = deadline_for(round, base_round, epoch_unix_ms, dur_ms, now_ms);
+    let mut mid_deadline = deadline - std::time::Duration::from_millis(dur_ms / 2);
+    let mut mid_done = false;
+
+    if let Some(m) = fault_monitor.as_mut() {
+        m.begin_round(round, Instant::now());
+    }
+    let misbehavior = inner.misbehavior();
+    for (key, s) in sessions.iter_mut() {
+        if let SessionKey::Server = key {
+            s.set_misbehavior(misbehavior);
+        }
+        for out in s.begin_round(round, Instant::now()) {
+            if let Some(m) = fault_monitor.as_mut() {
+                m.on_inbound(identity_pk, out.clone());
+            }
+            let dest = egress(key, &out);
+            inner.transport.publish(&dest, out).await;
+        }
+    }
+
+    loop {
+        tokio::select! {
+            biased;
+
+            _ = tokio::time::sleep_until(mid_deadline), if !mid_done => {
+                mid_done = true;
+                for (key, s) in sessions.iter_mut() {
+                    for out in s.mid_round(round, Instant::now()) {
+                        if let Some(m) = fault_monitor.as_mut() {
+                            m.on_inbound(identity_pk, out.clone());
+                        }
+                        let dest = egress(key, &out);
+                        inner.transport.publish(&dest, out).await;
+                    }
+                }
+            }
+
+            _ = tokio::time::sleep_until(deadline) => {
+                let mut decoded_all: Vec<Vec<u8>> = Vec::new();
+                let mut faults: Vec<Fault> = Vec::new();
+                for (key, s) in sessions.iter_mut() {
+                    let outcome = s.end_round(round, Instant::now());
+                    for out in outcome.outbound {
+                        if let Some(m) = fault_monitor.as_mut() {
+                            m.on_inbound(identity_pk, out.clone());
+                        }
+                        let dest = egress(key, &out);
+                        inner.transport.publish(&dest, out).await;
+                    }
+                    decoded_all.extend(outcome.decoded);
+                    faults.extend(outcome.faults);
+                }
+                if let Some(m) = fault_monitor.as_mut() {
+                    faults.extend(m.end_round(round, Instant::now()).faults);
+                }
+                let n_decoded = decoded_all.len();
+                for bytes in decoded_all {
+                    route_to_pipe(&inner, &bytes);
+                }
+                if n_decoded > 0 {
+                    let _ = inner.events.send(crate::runtime::Event::RoundDecoded {
+                        round,
+                        subnet: subnet.id,
+                        n_messages: n_decoded,
+                    });
+                }
+                gossip_faults(&inner, subnet.id, round, identity_pk, faults).await;
+
+                let now_ms = crate::config::now_unix_ms();
+                round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms).max(round + 1);
+                deadline = deadline_for(round, base_round, epoch_unix_ms, dur_ms, now_ms);
+                mid_deadline = deadline - std::time::Duration::from_millis(dur_ms / 2);
+                mid_done = false;
+                if let Some(m) = fault_monitor.as_mut() {
+                    m.begin_round(round, Instant::now());
+                }
+                let misbehavior = inner.misbehavior();
+                for (key, s) in sessions.iter_mut() {
+                    if let SessionKey::Server = key {
+                        s.set_misbehavior(misbehavior);
+                    }
+                    for out in s.begin_round(round, Instant::now()) {
+                        if let Some(m) = fault_monitor.as_mut() {
+                            m.on_inbound(identity_pk, out.clone());
+                        }
+                        let dest = egress(key, &out);
+                        inner.transport.publish(&dest, out).await;
+                    }
+                }
+            }
+
+            msg = recv_any(&mut subscriptions) => {
+                let Inbound { from, payload } = msg;
+                if let Some(m) = fault_monitor.as_mut() {
+                    m.on_inbound(from, payload.clone());
+                }
+                for (key, s) in sessions.iter_mut() {
+                    for out in s.on_inbound(from, payload.clone()) {
+                        if let Some(m) = fault_monitor.as_mut() {
+                            m.on_inbound(identity_pk, out.clone());
+                        }
+                        let dest = egress(key, &out);
+                        inner.transport.publish(&dest, out).await;
+                    }
+                }
+            }
+
+            Some(stage) = stage_rx.recv() => {
+                match stage {
+                    StageMsg::Join { client_tag } => {
+                        client_homes.insert(client_tag);
+                        sessions
+                            .entry(SessionKey::Client)
+                            .or_insert_with(|| client_session(&one_round, &cfg, &subnet, &inner.identity))
+                            .set_cover_rate(cover_rate);
+                    }
+                    StageMsg::Stage { client_tag, payload } => {
+                        client_homes.insert(client_tag);
+                        let sess = sessions
+                            .entry(SessionKey::Client)
+                            .or_insert_with(|| client_session(&one_round, &cfg, &subnet, &inner.identity));
+                        sess.set_cover_rate(cover_rate);
+                        sess.stage(payload);
+                    }
+                    StageMsg::Retire { client_tag } => {
+                        client_homes.remove(&client_tag);
+                        if client_homes.is_empty() {
+                            sessions.remove(&SessionKey::Client);
+                        }
+                    }
+                    StageMsg::SetCoverRate(rate) => {
+                        cover_rate = rate;
+                        if let Some(c) = sessions.get_mut(&SessionKey::Client) {
+                            c.set_cover_rate(rate);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum AdcnetWire {
@@ -181,7 +480,7 @@ fn observe_adcnet(bytes: &[u8]) -> AdcnetObserved {
         Ok(AdcnetWire::Server(signed)) => match signed.recover() {
             Ok((s, _)) => AdcnetObserved::Share {
                 round: s.round as u64,
-                idx: (s.server_id.0 as usize).saturating_sub(1),
+                idx: s.server_id.0 as usize,
             },
             Err(_) => AdcnetObserved::Other,
         },
@@ -200,7 +499,7 @@ fn observe_adcnet(bytes: &[u8]) -> AdcnetObserved {
 /// without participating. Recognises ADCNet share/output messages and feeds a
 /// protocol-agnostic [`OutputFaultTracker`].
 pub struct AdcnetObserverSession {
-    tracker: crate::session::OutputFaultTracker,
+    tracker: crate::faults::OutputFaultTracker,
     /// Canonical client set size per round — the per-round anonymity set.
     anon_set_by_round: std::collections::BTreeMap<u64, usize>,
 }
@@ -210,7 +509,7 @@ const ANON_SET_HISTORY: usize = 16;
 impl AdcnetObserverSession {
     pub fn new(roster: Vec<PeerId>, fault_threshold: u64) -> Self {
         AdcnetObserverSession {
-            tracker: crate::session::OutputFaultTracker::new(roster, fault_threshold),
+            tracker: crate::faults::OutputFaultTracker::new(roster, fault_threshold),
             anon_set_by_round: std::collections::BTreeMap::new(),
         }
     }

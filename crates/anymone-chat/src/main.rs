@@ -34,13 +34,10 @@ struct Args {
     #[arg(long)]
     bot: Option<String>,
 
-    /// (bot) Probability [0,1] of sending a real message each round.
+    /// (bot) Probability [0,1] of sending a real message each round. The round
+    /// duration that paces sends is taken from the adopted config.
     #[arg(long, default_value = "0.5")]
     send_rate: f64,
-
-    /// (bot) Round duration in ms that paces sends.
-    #[arg(long, default_value = "4000")]
-    round_ms: u64,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -76,7 +73,7 @@ async fn main() -> Result<()> {
             let anymone = Anymone::start(identity, transport, gov)
                 .await
                 .map_err(|e| anyhow!("anymone start: {e}"))?;
-            anymone_chat::run_bot(anymone, handle, args.send_rate, Duration::from_millis(args.round_ms)).await
+            anymone_chat::run_bot(anymone, handle, args.send_rate).await
         }
         // Serving the web app: register the chat room so the committee places it
         // (placement is by tag, so a duplicate registration is harmless;
@@ -90,7 +87,8 @@ async fn main() -> Result<()> {
             .encode();
             let anymone = Anymone::prepare(identity, transport, gov)
                 .await
-                .start_announcing(reg, Duration::from_secs(10))
+                .announce(reg, Duration::from_secs(10))
+                .start()
                 .await
                 .map_err(|e| anyhow!("anymone start: {e}"))?;
             anymone_chat::serve(anymone, args.port).await

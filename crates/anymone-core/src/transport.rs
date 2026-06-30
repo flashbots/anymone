@@ -1,9 +1,5 @@
 //! Transport abstraction: subscribe/publish over named topics with
 //! peer-authenticated delivery.
-//!
-//! The real libp2p impl lands in M3. For now there's an in-memory impl that
-//! lets tests run multiple `Anymone` instances inside one process over a
-//! shared `InMemoryNetwork`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -22,22 +18,21 @@ pub struct Inbound {
 
 /// Receiver of inbound messages on a single topic subscription.
 ///
-/// Unlike libp2p gossipsub, this subscription **does** deliver
-/// publisher-to-self messages. The committee scheduler publishes configs
-/// on `anymone/config` and the same node's Anymone has to react — under
-/// gossipsub semantics the committee would never see its own publish.
-/// libp2p deployments will need a side-channel from the scheduler to the
-/// local Anymone; the in-memory transport sidesteps that with looser
-/// delivery here.
+/// A transport never delivers a message back to its publisher (matching libp2p
+/// gossipsub). The in-memory backend shares one broadcast channel among all
+/// subscribers, so it carries the publisher's own messages too — `owner` filters
+/// those out in `recv`. Components that must consume their own output feed it to
+/// their local state in-process at emit time (see `committee.rs`, `run_subnet`).
 pub struct Subscription {
     rx: broadcast::Receiver<Inbound>,
+    owner: Option<Pubkey>,
 }
 
 impl Subscription {
-    /// Construct a `Subscription` from an existing broadcast receiver.
-    /// Used by transport backends other than the in-memory impl.
+    /// Construct a `Subscription` from an existing broadcast receiver. Used by
+    /// the libp2p backend, where gossipsub already excludes the publisher.
     pub fn from_broadcast_receiver(rx: broadcast::Receiver<Inbound>) -> Self {
-        Subscription { rx }
+        Subscription { rx, owner: None }
     }
 }
 
@@ -45,6 +40,7 @@ impl Subscription {
     pub async fn recv(&mut self) -> Option<Inbound> {
         loop {
             match self.rx.recv().await {
+                Ok(msg) if Some(msg.from) == self.owner => continue,
                 Ok(msg) => return Some(msg),
                 Err(broadcast::error::RecvError::Closed) => return None,
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -61,21 +57,35 @@ pub trait Transport: Send + Sync + 'static {
 
     /// Publish `bytes` on `topic` to all current subscribers.
     async fn publish(&self, topic: &str, bytes: Vec<u8>);
+
+    /// Store the signed config this node serves to config-pull requests.
+    fn serve_config(&self, bytes: Vec<u8>);
+
+    /// Pull the latest signed config from a peer; `None` if none answers yet.
+    async fn fetch_config(&self) -> Option<Vec<u8>>;
 }
 
 /// In-memory broadcast network shared by multiple `Anymone` instances in a
 /// single process. Tests construct one and hand each node a `handle`.
 pub struct InMemoryNetwork {
     topics: Mutex<HashMap<String, broadcast::Sender<Inbound>>>,
+    /// Signed config each node serves, keyed by node pubkey — backs `fetch_config`.
+    configs: Mutex<HashMap<Pubkey, Vec<u8>>>,
 }
 
 impl InMemoryNetwork {
     pub fn new() -> Arc<Self> {
-        Arc::new(InMemoryNetwork { topics: Mutex::new(HashMap::new()) })
+        Arc::new(InMemoryNetwork {
+            topics: Mutex::new(HashMap::new()),
+            configs: Mutex::new(HashMap::new()),
+        })
     }
 
     pub fn handle(self: &Arc<Self>, identity: Pubkey) -> InMemoryHandle {
-        InMemoryHandle { net: self.clone(), identity }
+        InMemoryHandle {
+            net: self.clone(),
+            identity,
+        }
     }
 
     fn topic_sender(&self, topic: &str) -> broadcast::Sender<Inbound> {
@@ -89,7 +99,10 @@ impl InMemoryNetwork {
 
 impl Default for InMemoryNetwork {
     fn default() -> Self {
-        InMemoryNetwork { topics: Mutex::new(HashMap::new()) }
+        InMemoryNetwork {
+            topics: Mutex::new(HashMap::new()),
+            configs: Mutex::new(HashMap::new()),
+        }
     }
 }
 
@@ -103,13 +116,37 @@ pub struct InMemoryHandle {
 impl Transport for InMemoryHandle {
     async fn subscribe(&self, topic: &str) -> Subscription {
         let tx = self.net.topic_sender(topic);
-        Subscription { rx: tx.subscribe() }
+        Subscription {
+            rx: tx.subscribe(),
+            owner: Some(self.identity),
+        }
     }
 
     async fn publish(&self, topic: &str, bytes: Vec<u8>) {
         crate::wire_debug::trace(topic, &self.identity, &bytes);
         let tx = self.net.topic_sender(topic);
-        let _ = tx.send(Inbound { from: self.identity, payload: bytes });
+        let _ = tx.send(Inbound {
+            from: self.identity,
+            payload: bytes,
+        });
+    }
+
+    fn serve_config(&self, bytes: Vec<u8>) {
+        self.net
+            .configs
+            .lock()
+            .unwrap()
+            .insert(self.identity, bytes);
+    }
+
+    async fn fetch_config(&self) -> Option<Vec<u8>> {
+        // Any peer that's served a config; prefer another node's over our own.
+        let configs = self.net.configs.lock().unwrap();
+        configs
+            .iter()
+            .find(|(pk, _)| **pk != self.identity)
+            .or_else(|| configs.iter().next())
+            .map(|(_, bytes)| bytes.clone())
     }
 }
 
@@ -119,7 +156,7 @@ mod tests {
     use crate::identity::Identity;
 
     #[tokio::test]
-    async fn publish_reaches_all_subscribers_including_publisher() {
+    async fn publish_reaches_peers_but_not_publisher() {
         let net = InMemoryNetwork::new();
         let a = Identity::generate();
         let b = Identity::generate();
@@ -131,13 +168,19 @@ mod tests {
 
         handle_a.publish("t", b"hi".to_vec()).await;
 
-        for sub in [&mut sub_a, &mut sub_b] {
-            let msg = tokio::time::timeout(std::time::Duration::from_millis(100), sub.recv())
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(100), sub_b.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg.from, a.pubkey());
+        assert_eq!(msg.payload, b"hi");
+
+        // The publisher does not receive its own publish.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), sub_a.recv())
                 .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(msg.from, a.pubkey());
-            assert_eq!(msg.payload, b"hi");
-        }
+                .is_err(),
+            "publisher must not receive its own message"
+        );
     }
 }

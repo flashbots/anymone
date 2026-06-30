@@ -480,7 +480,8 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
     relay_xk.sort_by_key(|(p, _)| *p);
     let proto = || {
         ProtocolConfig::Adcnet(AdcnetConfig {
-            round_duration_ms: 200,
+            // Long round: many in-process nodes jitter under one runtime; slack keeps each contribution in the round the leader is collecting.
+            round_duration_ms: 1000,
             max_payload_bytes: 256,
             estimated_messages: 64,
             client_set_min: 0,

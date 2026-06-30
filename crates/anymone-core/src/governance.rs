@@ -10,10 +10,37 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::time::sleep;
 
-use crate::config::{AnymoneRoundConfiguration, Round, SubnetId};
+use crate::config::{AnymoneRoundConfiguration, ExchangePublicKeyWire, Round, SubnetId};
 use crate::identity::Pubkey;
-use crate::session::Fault;
+use crate::faults::Fault;
 use crate::transport::Transport;
+
+/// The committee + threshold a deployment configures (the `[governance]` section
+/// of the bootstrap TOML).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovernanceConfig {
+    pub committee: Vec<CommitteeMember>,
+    pub threshold: u32,
+}
+
+/// A committee member as configured: its identity pubkey plus the exchange
+/// pubkey the internal committee Panetiere needs to seal openings to it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitteeMember {
+    pub pubkey: Pubkey,
+    pub exchange_pubkey: ExchangePublicKeyWire,
+}
+
+impl GovernanceConfig {
+    /// The committee roster (pubkey + exchange pubkey) the committee scheduler
+    /// takes — so callers don't re-assemble it field-by-field.
+    pub fn roster(&self) -> Vec<(Pubkey, ExchangePublicKeyWire)> {
+        self.committee
+            .iter()
+            .map(|m| (m.pubkey, m.exchange_pubkey.clone()))
+            .collect()
+    }
+}
 
 pub const TOPIC_CONFIG: &str = "anymone/config";
 pub const TOPIC_REGISTRATION: &str = "anymone/registration";
@@ -48,7 +75,7 @@ pub struct GovernanceBootstrap {
 }
 
 impl GovernanceBootstrap {
-    pub fn from_bootstrap_config(cfg: &crate::identity::BootstrapConfig) -> Self {
+    pub fn from_bootstrap_config(cfg: &crate::bootstrap::BootstrapConfig) -> Self {
         GovernanceBootstrap {
             committee: cfg.governance.committee.iter().map(|m| m.pubkey).collect(),
             threshold: cfg.governance.threshold,

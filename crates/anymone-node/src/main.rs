@@ -238,12 +238,7 @@ async fn run(args: RunArgs) -> Result<()> {
 
     match args.role {
         Role::Committee => {
-            let roster: Vec<_> = bootstrap
-                .governance
-                .committee
-                .iter()
-                .map(|m| (m.pubkey, m.exchange_pubkey.clone()))
-                .collect();
+            let roster = bootstrap.governance.roster();
             let ccfg = PanetiereCommitteeConfig {
                 committee_round_duration: Duration::from_millis(args.committee_round_ms),
                 public_round_duration: Duration::from_millis(args.public_round_ms),
@@ -272,7 +267,8 @@ async fn run(args: RunArgs) -> Result<()> {
             .encode();
             let _anymone = Anymone::prepare(identity, transport, gov)
                 .await
-                .start_announcing(reg, REGISTER_INTERVAL)
+                .announce(reg, REGISTER_INTERVAL)
+                .start()
                 .await
                 .map_err(|e| anyhow!("anymone start: {e}"))?;
             tracing::info!("relay online; waiting for ctrl-c");
@@ -291,7 +287,8 @@ async fn run(args: RunArgs) -> Result<()> {
             .encode();
             let anymone = Anymone::prepare(identity, transport, gov)
                 .await
-                .start_announcing(reg, REGISTER_INTERVAL)
+                .announce(reg, REGISTER_INTERVAL)
+                .start()
                 .await
                 .map_err(|e| anyhow!("anymone start: {e}"))?;
             let mut pipe = anymone

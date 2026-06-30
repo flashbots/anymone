@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use adcnet::crypto::ExchangePublicKey;
-use chipmunk_code::{KahePoly, CS_MODULUS, ZETA};
+use chipmunk_code::KahePoly;
 use panetiere::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
 use panetiere::cs::{Cs, HidingMerkleCommitment, Opening, PackedOpening};
 use panetiere::kahe::{Kahe, KaheScheme};
@@ -19,16 +19,307 @@ use panetiere::protocol::client::run_client_round;
 use panetiere::protocol::server::{run_server_round, ServerInbox};
 use panetiere::protocol::verify::{aggregate_and_decrypt, decrypt_aggregate, VerifyError};
 use panetiere::protocol::{ClientId, ProtocolParams, ServerId};
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
-use crate::config::Round;
+use crate::config::{PanetiereConfig, ProtocolConfig, Round, Subnet};
 use crate::identity::{ExchangeIdentity, Identity, Pubkey};
-use crate::session::{
-    Attribution, Fault, FaultKind, LeaderAggregation, Misbehavior, OutputFaultTracker, PeerId,
-    RoundOutcome, Session,
+use crate::faults::{Attribution, Fault, FaultKind, OutputFaultTracker};
+use crate::runtime::{
+    aggregator_group_of, client_aggregator_topic, deadline_for, egress_dest, gossip_faults,
+    recv_any, round_at, route_to_pipe, subnet_aggregation, subnet_leader_pk, AnymoneInner,
+    SessionKey, StageMsg, FAULT_THRESHOLD,
 };
+use crate::scheduler_core::expected_active;
+use crate::session::{LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
+use crate::transport::{Inbound, Subscription};
+use crate::wire::ServiceTag;
+
+/// Per-subnet Panetiere parameters (CS/KAHE keygen), built once at subnet start.
+fn setup_pp(cfg: &PanetiereConfig, subnet: &Subnet) -> Arc<ProtocolParams> {
+    let mut rng = ChaCha20Rng::from_seed(cfg.setup_seed);
+    Arc::new(ProtocolParams::setup(&mut rng, subnet.relays.len()))
+}
+
+/// `pk`'s position in the sorted relay list — the Panetiere `ServerId`.
+fn server_index(relays: &[Pubkey], pk: Pubkey) -> Option<u32> {
+    let mut sorted = relays.to_vec();
+    sorted.sort();
+    sorted.iter().position(|p| *p == pk).map(|i| i as u32)
+}
+
+/// Deterministic `ClientId` from a pubkey's first 4 bytes; stable per node+pipe
+/// so the decoder merges a round's publics with its openings.
+fn client_id_from_pubkey(pk: Pubkey) -> ClientId {
+    ClientId(u32::from_be_bytes([pk.0[0], pk.0[1], pk.0[2], pk.0[3]]))
+}
+
+/// Panetiere `ServerId` → relay exchange pubkey, for sealing client openings.
+fn server_xpubs(cfg: &PanetiereConfig, subnet: &Subnet) -> HashMap<ServerId, ExchangePublicKey> {
+    crate::keys::roster_exchange_pubkeys(&subnet.relays, &cfg.relay_exchange_keys)
+        .into_iter()
+        .map(|(i, xk)| (ServerId(i as u32), xk))
+        .collect()
+}
+
+fn client_session(pp: &Arc<ProtocolParams>, cfg: &PanetiereConfig, subnet: &Subnet, identity: &Identity) -> Box<dyn Session> {
+    let mut sorted = subnet.relays.clone();
+    sorted.sort();
+    let server_ids: Vec<ServerId> = (0..sorted.len() as u32).map(ServerId).collect();
+    // Secret entropy: a seed from the (public) return tag would let anyone
+    // replay the client's round.
+    let mut seed = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut seed);
+    Box::new(PanetiereClientSession::new(
+        pp.clone(),
+        client_id_from_pubkey(identity.pubkey()),
+        server_ids,
+        server_xpubs(cfg, subnet),
+        seed,
+    ))
+}
+
+fn server_session(
+    pp: &Arc<ProtocolParams>,
+    cfg: &PanetiereConfig,
+    subnet: &Subnet,
+    identity: &Identity,
+    leader_pk: Pubkey,
+) -> Box<dyn Session> {
+    let identity_pk = identity.pubkey();
+    let server_id = ServerId(
+        server_index(&subnet.relays, identity_pk).expect("server_session called on non-relay"),
+    );
+    let mut sorted = subnet.relays.clone();
+    sorted.sort();
+    let server_pubkeys = sorted
+        .into_iter()
+        .enumerate()
+        .map(|(i, pk)| (ServerId(i as u32), pk))
+        .collect();
+    // Every relay needs the aggregator roster; only the leader emits the decode.
+    let aggregation = cfg.aggregation.as_ref().map(LeaderAggregation::from_config);
+    Box::new(PanetiereServerSession::new(
+        pp.clone(),
+        server_id,
+        expected_active(cfg.client_set_max),
+        identity.exchange().clone(),
+        identity_pk == leader_pk,
+        server_pubkeys,
+        aggregation,
+    ))
+}
+
+/// Self-contained Panetiere subnet driver: builds this node's sessions, then owns
+/// the round loop. The runtime dispatches here for Panetiere subnets.
+pub(crate) async fn run_subnet(
+    subnet: Subnet,
+    inner: Arc<AnymoneInner>,
+    mut stage_rx: mpsc::UnboundedReceiver<StageMsg>,
+    mut subscriptions: Vec<Subscription>,
+    base_round: Round,
+    epoch_unix_ms: u64,
+) {
+    let cfg = match &subnet.protocol {
+        ProtocolConfig::Panetiere(c) => c.clone(),
+        _ => unreachable!("panetiere::run_subnet on a non-Panetiere subnet"),
+    };
+    let identity_pk = inner.identity.pubkey();
+    let pp = setup_pp(&cfg, &subnet);
+    let leader_pk = subnet_leader_pk(&subnet);
+    let client_agg_topic = client_aggregator_topic(&subnet, identity_pk);
+
+    let mut sessions: HashMap<SessionKey, Box<dyn Session>> = HashMap::new();
+    let mut client_homes: HashSet<ServiceTag> = HashSet::new();
+    let mut cover_rate = subnet.cover_rate;
+
+    if subnet.relays.contains(&identity_pk) {
+        sessions.insert(
+            SessionKey::Server,
+            server_session(&pp, &cfg, &subnet, &inner.identity, leader_pk),
+        );
+    } else {
+        sessions.insert(SessionKey::Watch, Box::new(PanetiereWatchSession::new(leader_pk)));
+    }
+    if let Some(a) = subnet_aggregation(&subnet) {
+        if let Some(group) = aggregator_group_of(a, identity_pk) {
+            sessions.insert(
+                SessionKey::Aggregator,
+                Box::new(PanetiereAggregatorSession::new(
+                    group,
+                    a.groups.len() as u32,
+                    inner.identity.clone(),
+                )),
+            );
+        }
+    }
+    let mut fault_monitor: Option<Box<dyn Session>> = if leader_pk == identity_pk {
+        let mut roster = subnet.relays.clone();
+        roster.sort();
+        Some(Box::new(PanetiereObserverSession::new(roster, FAULT_THRESHOLD)))
+    } else {
+        None
+    };
+
+    let egress = |key: &SessionKey, bytes: &[u8]| {
+        egress_dest(
+            subnet.id,
+            true,
+            is_server_share,
+            is_client_public,
+            client_agg_topic.as_deref(),
+            key,
+            bytes,
+        )
+    };
+
+    let dur_ms = (subnet.protocol.round_duration().as_millis() as u64).max(1);
+    let now_ms = crate::config::now_unix_ms();
+    let mut round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms);
+    let mut deadline = deadline_for(round, base_round, epoch_unix_ms, dur_ms, now_ms);
+    let mut mid_deadline = deadline - std::time::Duration::from_millis(dur_ms / 2);
+    let mut mid_done = false;
+
+    if let Some(m) = fault_monitor.as_mut() {
+        m.begin_round(round, Instant::now());
+    }
+    let misbehavior = inner.misbehavior();
+    for (key, s) in sessions.iter_mut() {
+        if let SessionKey::Server = key {
+            s.set_misbehavior(misbehavior);
+        }
+        for out in s.begin_round(round, Instant::now()) {
+            if let Some(m) = fault_monitor.as_mut() {
+                m.on_inbound(identity_pk, out.clone());
+            }
+            let dest = egress(key, &out);
+            inner.transport.publish(&dest, out).await;
+        }
+    }
+
+    loop {
+        tokio::select! {
+            biased;
+
+            _ = tokio::time::sleep_until(mid_deadline), if !mid_done => {
+                mid_done = true;
+                for (key, s) in sessions.iter_mut() {
+                    for out in s.mid_round(round, Instant::now()) {
+                        if let Some(m) = fault_monitor.as_mut() {
+                            m.on_inbound(identity_pk, out.clone());
+                        }
+                        let dest = egress(key, &out);
+                        inner.transport.publish(&dest, out).await;
+                    }
+                }
+            }
+
+            _ = tokio::time::sleep_until(deadline) => {
+                let mut decoded_all: Vec<Vec<u8>> = Vec::new();
+                let mut faults: Vec<Fault> = Vec::new();
+                for (key, s) in sessions.iter_mut() {
+                    let outcome = s.end_round(round, Instant::now());
+                    for out in outcome.outbound {
+                        if let Some(m) = fault_monitor.as_mut() {
+                            m.on_inbound(identity_pk, out.clone());
+                        }
+                        let dest = egress(key, &out);
+                        inner.transport.publish(&dest, out).await;
+                    }
+                    decoded_all.extend(outcome.decoded);
+                    faults.extend(outcome.faults);
+                }
+                if let Some(m) = fault_monitor.as_mut() {
+                    faults.extend(m.end_round(round, Instant::now()).faults);
+                }
+                let n_decoded = decoded_all.len();
+                for bytes in decoded_all {
+                    route_to_pipe(&inner, &bytes);
+                }
+                if n_decoded > 0 {
+                    let _ = inner.events.send(crate::runtime::Event::RoundDecoded {
+                        round,
+                        subnet: subnet.id,
+                        n_messages: n_decoded,
+                    });
+                }
+                gossip_faults(&inner, subnet.id, round, identity_pk, faults).await;
+
+                let now_ms = crate::config::now_unix_ms();
+                round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms).max(round + 1);
+                deadline = deadline_for(round, base_round, epoch_unix_ms, dur_ms, now_ms);
+                mid_deadline = deadline - std::time::Duration::from_millis(dur_ms / 2);
+                mid_done = false;
+                if let Some(m) = fault_monitor.as_mut() {
+                    m.begin_round(round, Instant::now());
+                }
+                let misbehavior = inner.misbehavior();
+                for (key, s) in sessions.iter_mut() {
+                    if let SessionKey::Server = key {
+                        s.set_misbehavior(misbehavior);
+                    }
+                    for out in s.begin_round(round, Instant::now()) {
+                        if let Some(m) = fault_monitor.as_mut() {
+                            m.on_inbound(identity_pk, out.clone());
+                        }
+                        let dest = egress(key, &out);
+                        inner.transport.publish(&dest, out).await;
+                    }
+                }
+            }
+
+            msg = recv_any(&mut subscriptions) => {
+                let Inbound { from, payload } = msg;
+                if let Some(m) = fault_monitor.as_mut() {
+                    m.on_inbound(from, payload.clone());
+                }
+                for (key, s) in sessions.iter_mut() {
+                    for out in s.on_inbound(from, payload.clone()) {
+                        if let Some(m) = fault_monitor.as_mut() {
+                            m.on_inbound(identity_pk, out.clone());
+                        }
+                        let dest = egress(key, &out);
+                        inner.transport.publish(&dest, out).await;
+                    }
+                }
+            }
+
+            Some(stage) = stage_rx.recv() => {
+                match stage {
+                    StageMsg::Join { client_tag } => {
+                        client_homes.insert(client_tag);
+                        sessions
+                            .entry(SessionKey::Client)
+                            .or_insert_with(|| client_session(&pp, &cfg, &subnet, &inner.identity))
+                            .set_cover_rate(cover_rate);
+                    }
+                    StageMsg::Stage { client_tag, payload } => {
+                        client_homes.insert(client_tag);
+                        let sess = sessions
+                            .entry(SessionKey::Client)
+                            .or_insert_with(|| client_session(&pp, &cfg, &subnet, &inner.identity));
+                        sess.set_cover_rate(cover_rate);
+                        sess.stage(payload);
+                    }
+                    StageMsg::Retire { client_tag } => {
+                        client_homes.remove(&client_tag);
+                        if client_homes.is_empty() {
+                            sessions.remove(&SessionKey::Client);
+                        }
+                    }
+                    StageMsg::SetCoverRate(rate) => {
+                        cover_rate = rate;
+                        if let Some(c) = sessions.get_mut(&SessionKey::Client) {
+                            c.set_cover_rate(rate);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Tagged wire form for every Panetiere message published on a subnet topic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,31 +584,6 @@ impl Session for PanetiereObserverSession {
     }
 }
 
-/// A cover contribution: one zero polynomial. It joins the canonical set but
-/// adds nothing to the aggregated sum.
-fn zero_message() -> Vec<KahePoly> {
-    panetiere::codec::encode_raw(&[0u8, 0u8])
-}
-
-/// Pack bounds for a **fresh** opening (one per client → server): `r` is
-/// uniform in `[-β_cs, β_cs]` and decomposed tree nodes are bounded by `ZETA`
-/// (both genuine ∞-norm limits the verifier enforces). The share component `s`
-/// is an *arbitrary* element of `R_{q_cs}` whose representative isn't always
-/// centered into `[-q_cs/2, q_cs/2]`, so we pack it against the full modulus —
-/// `from_packed` restores the exact value, and ring arithmetic reduces mod
-/// `q_cs` regardless of representative.
-fn fresh_bounds(beta_cs: u32) -> (u32, u32, u32) {
-    (beta_cs, CS_MODULUS as u32, ZETA)
-}
-
-/// Pack bounds for an **aggregated** opening (a server's sum over ρ canonical
-/// openings). Summing ρ openings scales the `r` and tree-node bounds by ρ; `s`
-/// stays packed against the full modulus (see [`fresh_bounds`]). `rho` is an
-/// upper bound on the canonical set size, kept tight to minimise bit widths.
-fn aggregated_bounds(beta_cs: u32, rho: u32) -> (u32, u32, u32) {
-    (rho * beta_cs, CS_MODULUS as u32, rho * ZETA)
-}
-
 /// Client-side session: stages a payload, encrypts + Shamir-shares it at
 /// `begin_round`, and emits one `ClientPublic` plus per-server `Opening`
 /// messages. Ignores inbound.
@@ -368,7 +634,9 @@ impl Session for PanetiereClientSession {
     fn begin_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
         let msg = match self.pending.take() {
             Some(m) => m,
-            None if self.cover_rng.gen::<f32>() < self.cover_rate => zero_message(),
+            None if self.cover_rng.gen::<f32>() < self.cover_rate => {
+                panetiere::protocol::zero_message(&self.pp)
+            }
             None => return Vec::new(),
         };
         // The RNG is rebuilt from the seed each round; folding the round into
@@ -378,7 +646,7 @@ impl Session for PanetiereClientSession {
         let mut rng = ChaCha20Rng::from_seed(seed);
         let round_out = run_client_round(&mut rng, &self.pp, self.client_id, msg, &self.server_ids);
 
-        let (r_b, s_b, t_b) = fresh_bounds(self.pp.cs.beta_cs);
+        let (r_b, s_b, t_b) = panetiere::cs::fresh_opening_pack_bounds(&self.pp.cs);
 
         let mut out: Vec<Vec<u8>> = Vec::with_capacity(1 + self.server_ids.len());
 
@@ -418,10 +686,12 @@ impl Session for PanetiereClientSession {
     }
 
     fn stage(&mut self, payload: Vec<u8>) {
-        // Convert the runtime's raw payload bytes into Panetiere's plaintext
-        // polynomial form. `codec::encode_raw` zero-pads to the codec's slot
-        // size; the server side decodes back with `codec::decode_raw`.
-        let polys = panetiere::codec::encode_raw(&payload);
+        // Encode to polys, then resize to the fixed KAHE message length so every
+        // client (real or cover) contributes the same poly count; the server
+        // trims with `codec::decode_raw`. Oversized payloads truncate (needs
+        // fragmentation, review #5).
+        let mut polys = panetiere::codec::encode_raw(&payload);
+        polys.resize(panetiere::protocol::message_polys(&self.pp), KahePoly::default());
         self.stage_message(polys);
     }
 
@@ -518,48 +788,52 @@ fn try_decode_round(
     pp: &ProtocolParams,
     state: &PanetiereRoundState,
 ) -> (Option<Vec<KahePoly>>, Vec<ServerId>) {
-    let mut culprits = Vec::new();
     if state.peer_server_publics.len() < pp.shamir.t {
-        return (None, culprits);
+        return (None, Vec::new());
     }
-    // Each server_public.clients is the canonical set at that server, so the
-    // first peer's view suffices.
-    let Some(canonical) = state
-        .peer_server_publics
-        .values()
-        .next()
-        .map(|sp| sp.clients.clone())
-    else {
-        return (None, culprits);
-    };
-    let publics: Vec<(ClientId, ClientBulletinEntry)> = canonical
-        .iter()
-        .filter_map(|cid| {
-            state
-                .publics
-                .get(cid)
-                .map(|p: &ClientBulletinEntry| (*cid, p.clone()))
-        })
-        .collect();
-    if publics.len() != canonical.len() {
-        return (None, culprits);
+    // Relays each compute their ServerPublic over their own view of the round's
+    // canonical client set; under timing skew those views can differ, and shares
+    // over different sets don't combine. So anchor on a set that ≥t relays agree
+    // on (and we hold every client public for), trying the largest such set
+    // first so real (non-cover) clients aren't dropped.
+    let mut groups: std::collections::BTreeMap<Vec<ClientId>, Vec<ServerBulletinEntry>> =
+        std::collections::BTreeMap::new();
+    for sp in state.peer_server_publics.values() {
+        let mut key = sp.clients.clone();
+        key.sort();
+        groups.entry(key).or_default().push(sp.clone());
     }
-    let mut outputs: Vec<ServerBulletinEntry> =
-        state.peer_server_publics.values().cloned().collect();
-    loop {
+    let mut candidates: Vec<(Vec<ClientId>, Vec<ServerBulletinEntry>)> = groups.into_iter().collect();
+    candidates.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+    for (canonical, mut outputs) in candidates {
         if outputs.len() < pp.shamir.t {
-            return (None, culprits);
+            continue;
         }
-        match aggregate_and_decrypt(pp, &canonical, &publics, &outputs) {
-            Ok(plain) => return (Some(plain), culprits),
-            Err(VerifyError::InvalidServerOpening(i))
-            | Err(VerifyError::ShareOpeningMismatch(i)) => {
-                culprits.push(outputs[i].server_id);
-                outputs.remove(i);
+        let publics: Vec<(ClientId, ClientBulletinEntry)> = canonical
+            .iter()
+            .filter_map(|cid| state.publics.get(cid).map(|p| (*cid, p.clone())))
+            .collect();
+        if publics.len() != canonical.len() {
+            continue;
+        }
+        let mut culprits = Vec::new();
+        loop {
+            if outputs.len() < pp.shamir.t {
+                break;
             }
-            Err(_) => return (None, culprits),
+            match aggregate_and_decrypt(pp, &canonical, &publics, &outputs) {
+                Ok(plain) => return (Some(plain), culprits),
+                Err(VerifyError::InvalidServerOpening(i))
+                | Err(VerifyError::ShareOpeningMismatch(i)) => {
+                    culprits.push(outputs[i].server_id);
+                    outputs.remove(i);
+                }
+                Err(_) => break,
+            }
         }
     }
+    (None, Vec::new())
 }
 
 /// Aggregated-flow decode (leader): re-sum the per-group aggregates instead of
@@ -748,37 +1022,49 @@ impl Session for PanetiereServerSession {
         let mut outbound: Vec<Vec<u8>> = Vec::new();
         let mut decoded: Vec<Vec<u8>> = Vec::new();
 
-        // Phase 1: emit our ServerPublic for this round's collected openings.
+        // Phase 1: emit our ServerPublic for every settled round (`r <= round`)
+        // we've collected openings for and haven't emitted yet — not just the
+        // just-ended round. A relay whose round timer fires before that round's
+        // openings arrive (boundary skew) would otherwise strand them: Phase 1
+        // never revisits the bucket, so the round falls below `t` ServerPublics
+        // and never decodes — losing a client message that's sent only once.
         // Withhold drops us from the threshold set entirely; the others still
         // decode under t-of-n. CorruptShare instead emits a share that no longer
         // matches its (valid) opening, so the decoding leader attributes it.
         let withholding = self.misbehavior == Some(Misbehavior::Withhold);
         let corrupt_share = self.misbehavior == Some(Misbehavior::CorruptShare);
         let aggregated = self.aggregation.is_some();
-        let state = self.rounds.entry(round).or_default();
-        if !withholding && !state.emitted_my_public && !state.inbox_items.is_empty() {
-            // Canonical set, in deterministic client-id order. Direct flow: every
-            // client we hold BOTH a public and an opening for. Aggregated flow:
-            // the publics went to aggregators, so canonical is the openings we hold.
-            let mut canonical: Vec<ClientId> = if aggregated {
-                state.inbox_items.iter().map(|(cid, _)| *cid).collect()
-            } else {
-                state
-                    .inbox_items
-                    .iter()
-                    .filter_map(|(cid, _)| state.publics.get(cid).map(|_| *cid))
-                    .collect()
-            };
-            canonical.sort();
-            canonical.dedup();
-
-            if !canonical.is_empty() {
+        let cs = &self.pp.cs;
+        let sid = self.server_id;
+        if !withholding {
+            for (&r, state) in self.rounds.iter_mut() {
+                if r > round || state.emitted_my_public || state.inbox_items.is_empty() {
+                    continue;
+                }
+                // Canonical set, in deterministic client-id order. Direct flow: every
+                // client we hold BOTH a public and an opening for. Aggregated flow:
+                // the publics went to aggregators, so canonical is the openings we hold.
+                let mut canonical: Vec<ClientId> = if aggregated {
+                    state.inbox_items.iter().map(|(cid, _)| *cid).collect()
+                } else {
+                    state
+                        .inbox_items
+                        .iter()
+                        .filter_map(|(cid, _)| state.publics.get(cid).map(|_| *cid))
+                        .collect()
+                };
+                canonical.sort();
+                canonical.dedup();
+                if canonical.is_empty() {
+                    continue;
+                }
                 let inbox = ServerInbox {
-                    server_id: self.server_id,
+                    server_id: sid,
                     items: std::mem::take(&mut state.inbox_items),
                 };
                 if let Ok(sp) = run_server_round(&inbox, &canonical) {
-                    let (r_b, s_b, t_b) = aggregated_bounds(self.pp.cs.beta_cs, self.max_clients);
+                    let (r_b, s_b, t_b) =
+                        panetiere::cs::aggregated_opening_pack_bounds(cs, sp.clients.len() as u32);
                     let packed = sp.agg_open.pack(r_b, s_b, t_b);
                     let mut agg_share = panetiere::cs::pack_cs_shares(&sp.agg_share);
                     if corrupt_share {
@@ -787,7 +1073,7 @@ impl Session for PanetiereServerSession {
                         }
                     }
                     let wire = PanetiereWire::ServerPublic {
-                        round,
+                        round: r,
                         server_id: sp.server_id.0,
                         clients: sp.clients.iter().map(|c| c.0).collect(),
                         agg_open: PackedOpeningWire::from(&packed),

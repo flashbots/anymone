@@ -28,14 +28,15 @@ use serde::{Deserialize, Serialize};
 use crate::adcnet::AdcnetObserverSession;
 use crate::config::{
     AdcnetConfig, Aggregation, AggregatorGroup, AnymoneRoundConfiguration,
-    AnymoneRoundConfigurationBody, ExchangePublicKeyWire, NoopConfig, PanetiereConfig,
+    AnymoneRoundConfigurationBody, ExchangePublicKeyWire, PanetiereConfig,
     ProtocolConfig, Round, ServiceEntry, Signature, Subnet, SubnetId,
 };
 use crate::governance::TOPIC_CONFIG;
 use crate::identity::{Identity, Pubkey};
 use crate::panetiere::PanetiereObserverSession;
 use crate::scheduling::{Registration, SchedulerProtocol};
-use crate::session::{Attribution, Fault, FaultKind, Session};
+use crate::faults::{Attribution, Fault, FaultKind};
+use crate::session::Session;
 use crate::wire::ServiceTag;
 
 /// The public subnet the committee schedules + observes (singleton, id 0).
@@ -149,6 +150,16 @@ pub struct SchedulerParams {
     pub message_size: usize,
 }
 
+/// One public subnet's escalation state: `general` (unattributable fault, heals
+/// on a clean streak) and `relays` attributed-faulted here (escalated while any
+/// is still sidelined; heals on re-registration).
+#[derive(Default)]
+struct SubnetEscalation {
+    general: bool,
+    clean_streak: u32,
+    relays: HashSet<Pubkey>,
+}
+
 pub struct SchedulerCore {
     identity: Identity,
     committee: Vec<Pubkey>,
@@ -169,11 +180,10 @@ pub struct SchedulerCore {
     /// the offense. Re-registration is refused until `INTEGRITY_BACKOFF_MS` has
     /// elapsed (longer than a liveness sideline, which heals immediately).
     integrity_offenders: HashMap<Pubkey, u64>,
-    /// Set by an unattributable (general) fault; cleared after `clean_streak`
-    /// reaches [`ESCALATION_GRACE`], not by re-registration.
-    general_fault: bool,
-    /// Consecutive fault-free ticks; gates clearing `general_fault`.
-    clean_streak: u32,
+    /// Per-subnet escalation state, keyed by subnet id. Replaces a single global
+    /// flag so a fault on one subnet escalates only that subnet (and a clean
+    /// streak on one doesn't de-escalate another).
+    escalation: std::collections::BTreeMap<SubnetId, SubnetEscalation>,
 
     services: HashMap<ServiceTag, Pubkey>,
     relay_xpubs: HashMap<Pubkey, ExchangePublicKeyWire>,
@@ -235,8 +245,7 @@ impl SchedulerCore {
             registered: HashSet::new(),
             sidelined: HashSet::new(),
             integrity_offenders: HashMap::new(),
-            general_fault: false,
-            clean_streak: 0,
+            escalation: std::collections::BTreeMap::new(),
             services: HashMap::new(),
             relay_xpubs: HashMap::new(),
             observers: std::collections::BTreeMap::new(),
@@ -296,28 +305,29 @@ impl SchedulerCore {
         }
     }
 
-    /// Apply faults the observer produced: sideline attributed relays, or flag
-    /// a general escalation for an unattributable fault. Public so tests can
-    /// inject faults directly without crafting wire bytes.
-    pub fn apply_observed_faults(&mut self, faults: Vec<Fault>, now_unix_ms: u64) {
-        if !faults.is_empty() {
-            self.clean_streak = 0;
+    /// Apply faults observed on `subnet`: sideline attributed relays (globally —
+    /// relays are shared across subnets) and escalate this subnet. Public so
+    /// tests can inject faults without crafting wire bytes.
+    pub fn apply_observed_faults(&mut self, subnet: SubnetId, faults: Vec<Fault>, now_unix_ms: u64) {
+        if faults.is_empty() {
+            return;
         }
+        self.escalation.entry(subnet).or_default().clean_streak = 0;
         for fault in faults {
             let integrity = fault.kind == FaultKind::Integrity;
             match fault.attribution {
                 Attribution::Peers(pks) => {
                     for pk in pks {
-                        if self.registered.remove(&pk) {
-                            self.sidelined.insert(pk);
-                        }
+                        self.registered.remove(&pk);
+                        self.sidelined.insert(pk);
                         if integrity {
                             self.integrity_offenders.insert(pk, now_unix_ms);
                         }
+                        self.escalation.entry(subnet).or_default().relays.insert(pk);
                     }
                 }
                 Attribution::None => {
-                    self.general_fault = true;
+                    self.escalation.entry(subnet).or_default().general = true;
                 }
             }
         }
@@ -326,19 +336,32 @@ impl SchedulerCore {
     /// Advance one committee round: tick the observer, apply any faults, and —
     /// if we're the lead and the proposal content changed — stage a new config.
     pub fn tick(&mut self, round: Round, now_unix_ms: u64) -> Vec<SchedulerAction> {
-        // Evaluate every subnet's own liveness observer — each subnet has its
-        // own anonymity set and its own faults.
-        let mut faults = Vec::new();
-        for obs in self.observers.values_mut() {
-            faults.extend(obs.end_round_faults(round));
+        // Evaluate each subnet's own liveness observer and route its faults to
+        // that subnet's escalation state — each subnet has its own anonymity set,
+        // faults, and escalation.
+        let ids: Vec<SubnetId> = self.observers.keys().copied().collect();
+        let mut faulted: HashSet<SubnetId> = HashSet::new();
+        for id in ids {
+            let faults = self
+                .observers
+                .get_mut(&id)
+                .map(|o| o.end_round_faults(round))
+                .unwrap_or_default();
+            if !faults.is_empty() {
+                faulted.insert(id);
+            }
+            self.apply_observed_faults(id, faults, now_unix_ms);
         }
-        let observed_fault = !faults.is_empty();
-        self.apply_observed_faults(faults, now_unix_ms);
-        if !observed_fault {
-            self.clean_streak = self.clean_streak.saturating_add(1);
-        }
-        if self.general_fault && self.clean_streak >= self.params.escalation_grace {
-            self.general_fault = false;
+        // A subnet with no fault this tick advances its clean streak; its
+        // `general` flag clears once the streak reaches the grace.
+        let grace = self.params.escalation_grace;
+        for (id, esc) in self.escalation.iter_mut() {
+            if !faulted.contains(id) {
+                esc.clean_streak = esc.clean_streak.saturating_add(1);
+            }
+            if esc.general && esc.clean_streak >= grace {
+                esc.general = false;
+            }
         }
         self.integrity_offenders
             .retain(|_, t| now_unix_ms.saturating_sub(*t) < INTEGRITY_BACKOFF_MS);
@@ -403,30 +426,24 @@ impl SchedulerCore {
         if desired.abs_diff(self.capacity) >= capacity_resize_margin(self.capacity) {
             self.capacity = desired;
         }
+        // Drop escalation for subnets that no longer exist, so a reused id starts clean.
+        let count = self.subnet_count;
+        self.escalation.retain(|id, _| (*id as usize) < count);
+
         let mut actions = Vec::new();
-        let faulted = !self.sidelined.is_empty() || self.general_fault;
+        let faulted = !self.sidelined.is_empty() || self.escalation.values().any(|e| e.general);
         // `min_relays` gates bootstrap, not fault response: sidelining a relay
         // drops it from `registered`, and holding the full floor would wedge
         // governance — it must still escalate with the relays that remain.
         let enough_relays = self.registered.len() >= self.params.min_relays
             || (faulted && !self.registered.is_empty());
         if self.is_lead && enough_relays && self.services.len() >= self.params.min_services {
-            let proto = if faulted {
-                SchedulerProtocol::Panetiere
-            } else {
-                SchedulerProtocol::Adcnet
-            };
-            // Both subnet count and capacity fingerprint the config — a change in
-            // either restages. Panetiere is always one subnet.
-            let count = match proto {
-                SchedulerProtocol::Adcnet => self.subnet_count as u32,
-                _ => 1,
-            };
+            // Per-subnet protocol, so a fault escalates only its own subnet.
+            let protos = self.subnet_protocols();
             let content = content_key(
-                proto,
+                &protos,
                 &self.registered,
                 &self.services,
-                count,
                 self.capacity,
                 self.cover_rate,
             );
@@ -435,7 +452,7 @@ impl SchedulerCore {
                 self.last_content = Some(content);
             }
             if self.published_round != Some(self.public_round) {
-                let body = self.build_body(proto, now_unix_ms);
+                let body = self.build_body(&protos, now_unix_ms);
                 let signature = self.identity.sign(&body.canonical_bytes());
                 let proposal = SignedProposal {
                     body,
@@ -671,9 +688,28 @@ impl SchedulerCore {
         })
     }
 
+    fn subnet_escalated(&self, id: SubnetId) -> bool {
+        self.escalation.get(&id).is_some_and(|e| {
+            e.general || e.relays.iter().any(|pk| self.sidelined.contains(pk))
+        })
+    }
+
+    /// Per-subnet protocol: escalated subnets run Panetiere, the rest ADCNet.
+    fn subnet_protocols(&self) -> Vec<SchedulerProtocol> {
+        (0..self.subnet_count.max(1))
+            .map(|i| {
+                if self.subnet_escalated(i as SubnetId) {
+                    SchedulerProtocol::Panetiere
+                } else {
+                    SchedulerProtocol::Adcnet
+                }
+            })
+            .collect()
+    }
+
     fn build_body(
         &self,
-        proto: SchedulerProtocol,
+        protos: &[SchedulerProtocol],
         epoch_unix_ms: u64,
     ) -> AnymoneRoundConfigurationBody {
         let mut relay_vec: Vec<Pubkey> = self.registered.iter().copied().collect();
@@ -693,63 +729,43 @@ impl SchedulerCore {
             .iter()
             .filter_map(|pk| self.relay_xpubs.get(pk).map(|xk| (*pk, xk.clone())))
             .collect();
-        let subnets = match proto {
-            SchedulerProtocol::Noop => vec![Subnet {
-                id: SUBNET_ID,
-                services: service_vec,
-                relays: relay_vec,
-                protocol: ProtocolConfig::Noop(NoopConfig {
-                    round_duration_ms: dur_ms,
-                    message_size: 1024,
-                    client_set_min: 0,
-                    client_set_max: 256,
-                }),
-                cover_rate: self.cover_rate,
-            }],
-            SchedulerProtocol::Adcnet => {
-                // Each subnet sizes its IBLT to the observed load; clients
-                // distribute across them and each has its own leader
-                // (sorted-relay[id % n]). Beyond the grow threshold we add a subnet.
-                let aggregation = build_subnet_aggregation(self.capacity, &relay_vec, &relay_xk);
-                (0..self.subnet_count.max(1))
-                    .map(|i| Subnet {
-                        id: i as SubnetId,
-                        services: service_vec.clone(),
-                        relays: relay_vec.clone(),
-                        protocol: ProtocolConfig::Adcnet(AdcnetConfig {
-                            round_duration_ms: dur_ms,
-                            max_payload_bytes: self.params.message_size,
-                            estimated_messages: expected_active(self.capacity),
-                            client_set_min: 0,
-                            client_set_max: self.capacity,
-                            relay_exchange_keys: relay_xk.clone(),
-                            aggregation: aggregation.clone(),
-                        }),
-                        cover_rate: self.cover_rate,
-                    })
-                    .collect()
-            }
-            SchedulerProtocol::Panetiere => {
-                let n = relay_vec.len() as u32;
-                let aggregation = build_subnet_aggregation(self.capacity, &relay_vec, &relay_xk);
-                vec![Subnet {
-                    id: SUBNET_ID,
-                    services: service_vec,
-                    relays: relay_vec.clone(),
-                    protocol: ProtocolConfig::Panetiere(PanetiereConfig {
+        let aggregation = build_subnet_aggregation(self.capacity, &relay_vec, &relay_xk);
+        let n = relay_vec.len() as u32;
+        let subnets = protos
+            .iter()
+            .enumerate()
+            .map(|(i, proto)| {
+                let protocol = match proto {
+                    SchedulerProtocol::Panetiere => ProtocolConfig::Panetiere(PanetiereConfig {
                         round_duration_ms: dur_ms,
                         message_size: self.params.message_size,
                         client_set_min: 0,
                         client_set_max: self.capacity,
                         threshold: (n / 2 + 1).max(n.saturating_sub(2)),
                         setup_seed: derive_setup_seed(&relay_vec),
-                        relay_exchange_keys: relay_xk,
-                        aggregation,
+                        relay_exchange_keys: relay_xk.clone(),
+                        aggregation: aggregation.clone(),
                     }),
+                    // ADCNet for `Adcnet` (and the never-scheduled `Noop`).
+                    _ => ProtocolConfig::Adcnet(AdcnetConfig {
+                        round_duration_ms: dur_ms,
+                        max_payload_bytes: self.params.message_size,
+                        estimated_messages: expected_active(self.capacity),
+                        client_set_min: 0,
+                        client_set_max: self.capacity,
+                        relay_exchange_keys: relay_xk.clone(),
+                        aggregation: aggregation.clone(),
+                    }),
+                };
+                Subnet {
+                    id: i as SubnetId,
+                    services: service_vec.clone(),
+                    relays: relay_vec.clone(),
+                    protocol,
                     cover_rate: self.cover_rate,
-                }]
-            }
-        };
+                }
+            })
+            .collect();
         AnymoneRoundConfigurationBody {
             round: self.public_round,
             epoch_unix_ms,
@@ -763,20 +779,21 @@ impl SchedulerCore {
 /// Clients aren't part of the fingerprint — they're permissionless and never
 /// appear in the config (they key-exchange directly with relays on the subnet).
 fn content_key(
-    proto: SchedulerProtocol,
+    protos: &[SchedulerProtocol],
     relays: &HashSet<Pubkey>,
     services: &HashMap<ServiceTag, Pubkey>,
-    subnet_count: u32,
     capacity: u32,
     cover_rate: f32,
 ) -> Vec<u8> {
     let mut key = Vec::new();
-    key.push(match proto {
-        SchedulerProtocol::Noop => 0u8,
-        SchedulerProtocol::Adcnet => 1,
-        SchedulerProtocol::Panetiere => 2,
-    });
-    key.extend_from_slice(&subnet_count.to_le_bytes());
+    // Subnet count + each subnet's protocol, so one subnet escalating re-proposes.
+    key.extend_from_slice(&(protos.len() as u32).to_le_bytes());
+    for p in protos {
+        key.push(match p {
+            SchedulerProtocol::Adcnet => 1,
+            SchedulerProtocol::Panetiere => 2,
+        });
+    }
     key.extend_from_slice(&capacity.to_le_bytes());
     // Quantize so a change in the committee's cover target re-proposes a config.
     key.push((cover_rate.clamp(0.0, 1.0) * 100.0).round() as u8);

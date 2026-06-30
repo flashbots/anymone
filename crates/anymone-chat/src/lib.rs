@@ -131,12 +131,7 @@ fn bot_payload(handle: &str, n: usize) -> Vec<u8> {
 /// being here puts the bot in the anonymity set. The bot only decides the real
 /// send — a random line with probability `send_rate` each round. One bot = one
 /// client.
-pub async fn run_bot(
-    anymone: Anymone,
-    handle: String,
-    send_rate: f64,
-    round: Duration,
-) -> Result<()> {
+pub async fn run_bot(anymone: Anymone, handle: String, send_rate: f64) -> Result<()> {
     let pipe = loop {
         match anymone.subscribe(chat_tag()).await {
             Ok(p) => break p,
@@ -145,7 +140,9 @@ pub async fn run_bot(
     };
     let send_p = send_rate.clamp(0.0, 1.0);
     loop {
-        tokio::time::sleep(round).await;
+        // Pace to the protocol round from the adopted config (re-read so it
+        // tracks reconfig); one real-message decision per round.
+        tokio::time::sleep(anymone.round_duration()).await;
         if rand::random::<f64>() < send_p {
             let _ = pipe.send(bot_payload(&handle, rand::random::<usize>())).await;
         }

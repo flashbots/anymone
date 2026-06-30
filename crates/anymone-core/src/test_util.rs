@@ -93,24 +93,13 @@ impl Node {
         self.prepare_inner(bootstrap, None).await
     }
 
-    /// Phase 1 — also subscribe to `anymone/registration` (via the scheduler)
-    /// so the committee won't miss any registrations published by relays/
-    /// services that prepare after this committee.
-    pub async fn prepare_as_committee(
-        &mut self,
-        bootstrap: GovernanceBootstrap,
-        scheduler_cfg: crate::scheduling::SchedulerConfig,
-    ) -> NodePrep {
-        let scheduler_transport = self.transport();
-        let committee_identity = self.identity().clone();
-        let task = crate::scheduling::spawn_committee_scheduler(
-            scheduler_transport,
-            committee_identity,
-            scheduler_cfg,
-        )
-        .await;
-        self.aux_tasks.push(task);
-        self.prepare_inner(bootstrap, None).await
+    /// Start directly from a static signed config — no governance watcher, no
+    /// registration round. For tests that pin the subnet set up front.
+    pub async fn start_with_config(mut self, config: AnymoneRoundConfiguration) -> Self {
+        let id = self.keypair.take().expect("identity already consumed");
+        let transport = self.transport();
+        self.anymone = Some(Anymone::start_with_config(id, transport, config).await);
+        self
     }
 
     /// Phase 1 — same as participant, but defers a relay registration to

@@ -345,7 +345,6 @@ fn spawn_config_loop(transport: Arc<dyn Transport>, obs: Shared, committee: Vec<
             if cfg.verify_multisig(&committee, threshold).is_err() {
                 continue;
             }
-            let version = cfg.body.round;
             let is_new = obs.lock().unwrap().on_config(cfg.clone());
             if !is_new {
                 continue;
@@ -370,7 +369,6 @@ fn spawn_config_loop(transport: Arc<dyn Transport>, obs: Shared, committee: Vec<
                     }
                     let h = tokio::spawn(watch_subnet(
                         subnet.clone(),
-                        version,
                         transport.clone(),
                         obs.clone(),
                     ));
@@ -385,7 +383,7 @@ fn spawn_config_loop(transport: Arc<dyn Transport>, obs: Shared, committee: Vec<
 /// + output frontier); on ADCNet an observer session also tracks the share
 /// frontier and liveness faults. Round is anchored from the config and ticked
 /// on the protocol's own cadence (the node's clock isn't observable).
-async fn watch_subnet(subnet: Subnet, start_round: u64, transport: Arc<dyn Transport>, obs: Shared) {
+async fn watch_subnet(subnet: Subnet, transport: Arc<dyn Transport>, obs: Shared) {
     let topic = anymone_core::runtime::subnet_broadcast_topic(subnet.id);
     let mut sub = transport.subscribe(&topic).await;
     // The observer derives round stats from real wire messages: anon set +
@@ -415,10 +413,8 @@ async fn watch_subnet(subnet: Subnet, start_round: u64, transport: Arc<dyn Trans
     };
 
     let dur = subnet.protocol.round_duration();
-    let mut round = start_round;
     let mut deadline = tokio::time::Instant::now() + dur;
     let mut decoded_total: u64 = 0;
-    let mut last_output = 0u64;
     // Wire-overhead accounting: bytes seen on the topics the observer watches
     // (broadcast announcements + relay shares) vs the useful decoded payload
     // bytes. The high-volume client→leader ingress isn't observable, so this is
@@ -426,10 +422,12 @@ async fn watch_subnet(subnet: Subnet, start_round: u64, transport: Arc<dyn Trans
     let mut raw_bytes: u64 = 0;
     let mut goodput_bytes: u64 = 0;
 
+    // The observer/watch sessions track rounds from wire `on_inbound`; their tick
+    // round arg is unused, so 0 is passed (and never displayed).
     let now = Instant::now();
-    watch.begin_round(round, now);
+    watch.begin_round(0, now);
     if let Some(o) = adcnet_obs.as_mut() {
-        o.begin_round(round, now);
+        o.begin_round(0, now);
     }
 
     loop {
@@ -437,58 +435,27 @@ async fn watch_subnet(subnet: Subnet, start_round: u64, transport: Arc<dyn Trans
             biased;
             _ = tokio::time::sleep_until(deadline) => {
                 let now = Instant::now();
-                let out = watch.end_round(round, now);
-                let n = out.decoded.len() as u64;
-                decoded_total += n;
+                let out = watch.end_round(0, now);
+                decoded_total += out.decoded.len() as u64;
                 goodput_bytes += out.decoded.iter().map(|d| d.len() as u64).sum::<u64>();
-                if n > 0 { last_output = round; }
 
-                let (share_frontier, output_frontier);
+                // Frontiers come only from real wire messages — `None` until seen,
+                // never a synthesized value.
                 let mut faults = Vec::new();
-                if let Some(o) = adcnet_obs.as_mut() {
-                    let oc = o.end_round(round, now);
-                    faults = oc.faults;
-                    share_frontier = o.share_frontier().unwrap_or(round);
-                    output_frontier = o.output_frontier().unwrap_or(last_output);
-                } else if let Some(o) = panetiere_obs.as_mut() {
-                    let oc = o.end_round(round, now);
-                    faults = oc.faults;
-                    share_frontier = o.share_frontier().unwrap_or_else(|| o.round().unwrap_or(round));
-                    output_frontier = o.output_frontier().unwrap_or(last_output);
-                } else {
-                    share_frontier = round;
-                    output_frontier = last_output;
-                }
+                let (share_frontier, output_frontier): (Option<u64>, Option<u64>) =
+                    if let Some(o) = adcnet_obs.as_mut() {
+                        faults = o.end_round(0, now).faults;
+                        (o.share_frontier(), o.output_frontier())
+                    } else if let Some(o) = panetiere_obs.as_mut() {
+                        faults = o.end_round(0, now).faults;
+                        (o.share_frontier().or_else(|| o.round()), o.output_frontier())
+                    } else {
+                        (None, None)
+                    };
 
-                // Output naturally trails shares by a round or two
-                // (share→decode→broadcast latency), so a small gap is healthy.
-                // Only a growing gap (output frozen while shares advance) is a
-                // stall — mirrors the committee tracker's `stall_margin`.
-                let gap = share_frontier.saturating_sub(output_frontier);
-                let status = if output_frontier == 0 && round > start_round + 3 {
-                    "stalled"
-                } else if gap <= 2 {
-                    "healthy"
-                } else if gap <= 5 {
-                    "lagging"
-                } else {
-                    "stalled"
-                };
-                // Relays observed sharing recently → live; the rest of the
-                // roster renders "missing". Indices map into the sorted roster.
-                // Both protocols expose this from their real share traffic.
-                let recent_idxs = adcnet_obs
-                    .as_ref()
-                    .map(|o| o.relays_shared_recent(SHARE_LIVENESS_WINDOW))
-                    .or_else(|| panetiere_obs.as_ref().map(|o| o.relays_shared_recent(SHARE_LIVENESS_WINDOW)));
-                let live_relays: Vec<Pubkey> = recent_idxs
-                    .map(|idxs| idxs.into_iter().filter_map(|i| roster.get(i).copied()).collect())
-                    .unwrap_or_default();
-                // Displayed round = highest round actually seen on the wire
-                // (share / output / client-set), not the observer's free-running
-                // local tick — which drifts from the real round. Fall back to the
-                // local tick only before any traffic has been observed.
-                let wire_round = adcnet_obs
+                // Highest round actually seen on the wire (share / output /
+                // client-set); `None` before any traffic — the dashboard shows `—`.
+                let wire_round: Option<u64> = adcnet_obs
                     .as_ref()
                     .and_then(|o| {
                         [o.share_frontier(), o.output_frontier(), o.anon_set_round()]
@@ -496,13 +463,40 @@ async fn watch_subnet(subnet: Subnet, start_round: u64, transport: Arc<dyn Trans
                             .flatten()
                             .max()
                     })
-                    .or_else(|| panetiere_obs.as_ref().and_then(|o| o.round()))
-                    .unwrap_or(round);
-                // Anonymity set for the displayed round, not the latest seen.
-                let anon_set = adcnet_obs
+                    .or_else(|| panetiere_obs.as_ref().and_then(|o| o.round()));
+
+                // Output trails shares by a round or two (latency); a growing gap
+                // is a stall. With no fault-tracking observer (Noop) the subnet is
+                // just relaying — healthy if it's up.
+                let has_observer = adcnet_obs.is_some() || panetiere_obs.is_some();
+                let status = match (has_observer, share_frontier, output_frontier) {
+                    (false, _, _) => "healthy",
+                    (true, None, _) => "starting",
+                    (true, Some(_), None) => "lagging",
+                    (true, Some(s), Some(o)) => match s.saturating_sub(o) {
+                        0..=2 => "healthy",
+                        3..=5 => "lagging",
+                        _ => "stalled",
+                    },
+                };
+                // Relays observed sharing recently → live; the rest of the
+                // roster renders "missing". Indices map into the sorted roster.
+                let recent_idxs = adcnet_obs
                     .as_ref()
-                    .and_then(|o| o.anonymity_set_for(wire_round))
-                    .or_else(|| panetiere_obs.as_ref().and_then(|o| o.anonymity_set_for(wire_round)))
+                    .map(|o| o.relays_shared_recent(SHARE_LIVENESS_WINDOW))
+                    .or_else(|| panetiere_obs.as_ref().map(|o| o.relays_shared_recent(SHARE_LIVENESS_WINDOW)));
+                let live_relays: Vec<Pubkey> = recent_idxs
+                    .map(|idxs| idxs.into_iter().filter_map(|i| roster.get(i).copied()).collect())
+                    .unwrap_or_default();
+                // Anon set for the output frontier (the round whose msgs we count),
+                // so per-round msgs never exceed it (anon = msgs + cover).
+                let anon_set = output_frontier
+                    .and_then(|r| {
+                        adcnet_obs
+                            .as_ref()
+                            .and_then(|o| o.anonymity_set_for(r))
+                            .or_else(|| panetiere_obs.as_ref().and_then(|o| o.anonymity_set_for(r)))
+                    })
                     .unwrap_or(0) as u64;
                 {
                     let mut g = obs.lock().unwrap();
@@ -517,15 +511,17 @@ async fn watch_subnet(subnet: Subnet, start_round: u64, transport: Arc<dyn Trans
                         raw_bytes,
                         goodput_bytes,
                     });
-                    for f in &faults {
-                        g.record_fault(wire_round, subnet.id, f);
+                    // Attribute a fault only to the round it was actually seen in.
+                    if let Some(r) = wire_round {
+                        for f in &faults {
+                            g.record_fault(r, subnet.id, f);
+                        }
                     }
                 }
 
-                round += 1;
                 deadline += dur;
-                watch.begin_round(round, now);
-                if let Some(o) = adcnet_obs.as_mut() { o.begin_round(round, now); }
+                watch.begin_round(0, now);
+                if let Some(o) = adcnet_obs.as_mut() { o.begin_round(0, now); }
             }
             Some(msg) = sub.recv() => {
                 let anymone_core::Inbound { from, payload } = msg;

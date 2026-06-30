@@ -1,16 +1,12 @@
 //! Committee scheduling routine + registration plumbing.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
-use crate::config::{
-    AdcnetConfig, AnymoneRoundConfiguration, ExchangePublicKeyWire, NoopConfig, PanetiereConfig,
-    ProtocolConfig, ServiceEntry,
-};
+use crate::config::{AnymoneRoundConfiguration, ExchangePublicKeyWire};
 use crate::governance::{TOPIC_CONFIG, TOPIC_REGISTRATION};
 use crate::identity::{Identity, Pubkey};
 use crate::transport::Transport;
@@ -167,195 +163,14 @@ fn spawn_reannounce(
     })
 }
 
-/// Which protocol the committee schedules in the public subnet.
+/// Which protocol a subnet runs. The committee's `SchedulerCore` picks this
+/// per subnet (ADCNet optimistic, Panetiere when escalated); it is not a global
+/// knob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SchedulerProtocol {
-    /// Noop vector-append. Trivial; for bring-up and CI.
-    Noop,
+pub(crate) enum SchedulerProtocol {
     /// ADCNet 1-round IBLT-message flow. Non-threshold; optimistic default.
     Adcnet,
     /// Real Panetiere threshold ABC. Strict mode on fault.
     Panetiere,
 }
 
-/// Configuration knobs for the single-committee scheduler.
-#[derive(Debug, Clone)]
-pub struct SchedulerConfig {
-    /// Minimum number of relays before the committee builds + publishes
-    /// the first configuration.
-    pub min_relays: usize,
-    /// Minimum number of services before the committee builds + publishes.
-    pub min_services: usize,
-    /// Round duration the committee uses for the subnets it produces.
-    pub subnet_round_duration: Duration,
-    /// Which protocol to schedule in the public subnet.
-    pub protocol: SchedulerProtocol,
-}
-
-impl Default for SchedulerConfig {
-    fn default() -> Self {
-        SchedulerConfig {
-            min_relays: 1,
-            min_services: 1,
-            subnet_round_duration: Duration::from_secs(1),
-            protocol: SchedulerProtocol::Noop,
-        }
-    }
-}
-
-/// Build a `ProtocolConfig` from the scheduler's choice and the subnet's
-/// duration. Panetiere's `setup_seed` is derived deterministically from the
-/// relay set so every relay (and every late-joining watcher) agrees on the
-/// shared parameters without a separate round of out-of-band negotiation.
-/// Bundle the rosters the committee observed for a subnet, threaded into
-/// `build_protocol_config`. `relays` is the source of truth for the public
-/// roster; `relay_exchange_keys` carries each relay's ADCNet exchange pubkey.
-pub(crate) struct RegistrationBundle<'a> {
-    pub relays: &'a [Pubkey],
-    pub relay_exchange_keys: &'a [(Pubkey, ExchangePublicKeyWire)],
-}
-
-pub(crate) fn build_protocol_config(
-    proto: SchedulerProtocol,
-    round_duration: Duration,
-    bundle: &RegistrationBundle<'_>,
-) -> ProtocolConfig {
-    let dur_ms = round_duration.as_millis() as u64;
-    match proto {
-        SchedulerProtocol::Noop => ProtocolConfig::Noop(NoopConfig {
-            round_duration_ms: dur_ms,
-            message_size: 1024,
-            client_set_min: 0,
-            client_set_max: 256,
-        }),
-        SchedulerProtocol::Adcnet => ProtocolConfig::Adcnet(AdcnetConfig {
-            round_duration_ms: dur_ms,
-            // Knapsack quantises to KNAPSACK_CHUNK_BYTES (1 KiB); use one
-            // chunk per slot for the demo.
-            max_payload_bytes: 1024,
-            // IBLT sized to the active half; cover (zero) vanishes from it.
-            estimated_messages: 16,
-            client_set_min: 0,
-            client_set_max: 32,
-            relay_exchange_keys: bundle.relay_exchange_keys.to_vec(),
-            aggregation: None,
-        }),
-        SchedulerProtocol::Panetiere => {
-            let setup_seed = derive_setup_seed(bundle.relays);
-            let n = bundle.relays.len() as u32;
-            ProtocolConfig::Panetiere(PanetiereConfig {
-                round_duration_ms: dur_ms,
-                message_size: 1024,
-                client_set_min: 0,
-                client_set_max: 32,
-                threshold: (n / 2 + 1).max(n.saturating_sub(2)),
-                setup_seed,
-                relay_exchange_keys: bundle.relay_exchange_keys.to_vec(),
-                aggregation: None,
-            })
-        }
-    }
-}
-
-/// Deterministic 32-byte seed derived from the sorted relay roster. Stable
-/// across every committee member and every late joiner: same relays in →
-/// same seed out, regardless of insertion order.
-fn derive_setup_seed(relays: &[Pubkey]) -> [u8; 32] {
-    use std::hash::Hasher;
-    let mut sorted = relays.to_vec();
-    sorted.sort();
-    // Lightweight non-cryptographic mix; the seed is public anyway.
-    let mut state = [0u8; 32];
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    for pk in &sorted {
-        h.write(&pk.0);
-    }
-    let lo = h.finish().to_le_bytes();
-    state[..8].copy_from_slice(&lo);
-    // Spread it: hash again with a salt for the next 8 bytes, etc.
-    for chunk in 1..4 {
-        let mut h2 = std::collections::hash_map::DefaultHasher::new();
-        h2.write(&state[..chunk * 8]);
-        h2.write_u8(chunk as u8);
-        state[chunk * 8..(chunk + 1) * 8].copy_from_slice(&h2.finish().to_le_bytes());
-    }
-    state
-}
-
-/// Subscribe to `anymone/registration` synchronously, then spawn the
-/// event-driven scheduling task. Returning the `JoinHandle` only after the
-/// subscription is in place ensures callers can publish registrations
-/// straight after this call without losing them to a sub/publish race.
-pub async fn spawn_committee_scheduler(
-    transport: Arc<dyn Transport>,
-    committee: Identity,
-    config: SchedulerConfig,
-) -> JoinHandle<()> {
-    let mut sub = transport.subscribe(TOPIC_REGISTRATION).await;
-    tokio::spawn(async move {
-        let mut relays: HashSet<Pubkey> = HashSet::new();
-        let mut services: Vec<ServiceEntry> = Vec::new();
-        let mut relay_xpubs: std::collections::HashMap<Pubkey, ExchangePublicKeyWire> =
-            std::collections::HashMap::new();
-        let mut published = false;
-
-        while let Some(msg) = sub.recv().await {
-            let Ok(reg) = bincode::deserialize::<Registration>(&msg.payload) else {
-                continue;
-            };
-            if !reg.verify() {
-                continue;
-            }
-            match reg {
-                Registration::Relay {
-                    pubkey,
-                    exchange_pubkey,
-                    ..
-                } => {
-                    relays.insert(pubkey);
-                    relay_xpubs.insert(pubkey, exchange_pubkey);
-                }
-                Registration::Service {
-                    tag,
-                    pubkey,
-                    exchange_pubkey: _,
-                    ..
-                } => {
-                    if !services.iter().any(|s| s.tag == tag) {
-                        services.push(ServiceEntry { tag, pubkey });
-                    }
-                }
-            }
-            if !published
-                && relays.len() >= config.min_relays
-                && services.len() >= config.min_services
-            {
-                let mut relays_vec: Vec<Pubkey> = relays.iter().copied().collect();
-                relays_vec.sort();
-                let mut services_sorted = services.clone();
-                services_sorted.sort_by_key(|s| s.tag.0);
-                let relay_xk: Vec<(Pubkey, ExchangePublicKeyWire)> = relays_vec
-                    .iter()
-                    .filter_map(|pk| relay_xpubs.get(pk).map(|xk| (*pk, xk.clone())))
-                    .collect();
-                let bundle = RegistrationBundle {
-                    relays: &relays_vec,
-                    relay_exchange_keys: &relay_xk,
-                };
-                let protocol =
-                    build_protocol_config(config.protocol, config.subnet_round_duration, &bundle);
-                let signed = AnymoneRoundConfiguration::singleton_subnet(
-                    0,
-                    protocol,
-                    relays_vec,
-                    services_sorted,
-                )
-                .sign_with(&[&committee]);
-
-                let bytes = bincode::serialize(&signed).expect("config encodes");
-                transport.publish(TOPIC_CONFIG, bytes).await;
-                published = true;
-            }
-        }
-    })
-}

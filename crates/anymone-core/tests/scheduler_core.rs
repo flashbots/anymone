@@ -15,7 +15,8 @@ use anymone_core::config::{
 use anymone_core::scheduler_core::{
     CommitteeSig, SchedulerAction, SchedulerCore, SchedulerParams, SignedProposal,
 };
-use anymone_core::session::{Attribution, Fault, FaultKind, Session};
+use anymone_core::faults::{Attribution, Fault, FaultKind};
+use anymone_core::session::Session;
 use anymone_core::{Identity, Pubkey, Registration, ServiceTag, TOPIC_CONFIG};
 
 use adcnet::crypto::{ServerId, SharedKey};
@@ -125,7 +126,7 @@ fn renegotiates_adcnet_panetiere_adcnet() {
 
     // Liveness fault attributed to relay #1 (partial shares seen, #1's missing).
     let victim = relays[1].pubkey();
-    core.apply_observed_faults(vec![Fault {
+    core.apply_observed_faults(0, vec![Fault {
         kind: FaultKind::Liveness,
         attribution: Attribution::Peers(vec![victim]),
         evidence: Vec::new(),
@@ -164,7 +165,7 @@ fn unattributable_fault_escalates_without_dropping() {
     assert_eq!(body.subnets[0].relays.len(), 3);
 
     // General subnetwork fault (no output, all/none shares) — unattributable.
-    core.apply_observed_faults(vec![Fault {
+    core.apply_observed_faults(0, vec![Fault {
         kind: FaultKind::Liveness,
         attribution: Attribution::None,
         evidence: Vec::new(),
@@ -203,7 +204,7 @@ fn integrity_offender_barred_until_backoff() {
     enact(&mut core, &committee, first);
 
     let victim = relays[1].pubkey();
-    core.apply_observed_faults(vec![Fault {
+    core.apply_observed_faults(0, vec![Fault {
         kind: FaultKind::Integrity,
         attribution: Attribution::Peers(vec![victim]),
         evidence: Vec::new(),
@@ -369,7 +370,7 @@ impl Subnet {
                 let mut client_shared: HashMap<ServerId, SharedKey> = HashMap::new();
                 for (i, pk) in relay_pks.iter().enumerate() {
                     let xk = xk_by_pk.get(pk).unwrap().to_key().unwrap();
-                    client_shared.insert(ServerId((i + 1) as u32), client_id.exchange().ecdh(&xk));
+                    client_shared.insert(ServerId(i as u32), client_id.exchange().ecdh(&xk));
                 }
                 let mut seed = [3u8; 32];
                 seed[..8].copy_from_slice(&(ci as u64).to_le_bytes());
@@ -387,7 +388,7 @@ impl Subnet {
             .map(|i| {
                 AdcnetServerSession::new(
                     one_round.clone(),
-                    ServerId((i + 1) as u32),
+                    ServerId(i as u32),
                     sorted[i].to_adcnet_signing_key(),
                     sorted[i].exchange().clone(),
                     sorted.len(),
@@ -492,6 +493,19 @@ fn committee_schedules_second_subnet_when_one_nears_capacity() {
     let body = grown.expect("committee must schedule a second subnet once a subnet nears capacity");
     assert_eq!(proto_name(&body), "adcnet", "scaling stays on ADCNet (not a fault escalation)");
     assert!(body.subnets.len() >= 2, "expected ≥2 subnets, got {}", body.subnets.len());
+
+    // Per-subnet escalation (#19/#21): an unattributable fault on subnet 1
+    // escalates only subnet 1 to Panetiere; subnet 0 stays optimistic ADCNet.
+    let count = body.subnets.len();
+    core.apply_observed_faults(1, vec![Fault {
+        kind: FaultKind::Liveness,
+        attribution: Attribution::None,
+        evidence: Vec::new(),
+    }], 0);
+    let mixed = staged_body(&core.tick(9, 0)).expect("re-propose after per-subnet fault");
+    assert_eq!(mixed.subnets.len(), count, "a fault must not change the subnet count");
+    assert!(matches!(mixed.subnets[0].protocol, ProtocolConfig::Adcnet(_)), "unfaulted subnet 0 stays ADCNet");
+    assert!(matches!(mixed.subnets[1].protocol, ProtocolConfig::Panetiere(_)), "faulted subnet 1 escalates to Panetiere");
 }
 
 /// Reproduces the demo's subnet *flapping*: after growing to two subnets and

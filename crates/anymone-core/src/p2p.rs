@@ -19,12 +19,21 @@ use async_trait::async_trait;
 use libp2p::futures::StreamExt;
 use libp2p::gossipsub::{self, IdentTopic, MessageAuthenticity};
 use libp2p::multiaddr::Protocol;
+use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport};
 use libp2p::swarm::SwarmEvent;
-use libp2p::{identify, kad, noise, tcp, yamux, Multiaddr, PeerId, Swarm};
+use libp2p::{identify, kad, noise, tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm};
 use libp2p_identity as libp2p_id;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
+
+/// Config-pull request/response (`/anymone/config/1`): a joining node asks a
+/// connected peer for the latest signed config instead of waiting for a push.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConfigRequest;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConfigResponse(Option<Vec<u8>>);
 
 use crate::identity::{Identity, Pubkey};
 use crate::transport::{Inbound, Subscription, Transport};
@@ -51,11 +60,17 @@ struct Behaviour {
     gossipsub: gossipsub::Behaviour,
     identify: identify::Behaviour,
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
+    config_rr: request_response::cbor::Behaviour<ConfigRequest, ConfigResponse>,
 }
 
 enum Cmd {
     Subscribe(String),
     Publish(String, Vec<u8>),
+    /// Pull the served config from `peer`; reply carries its answer (or `None`).
+    FetchConfig {
+        peer: PeerId,
+        reply: oneshot::Sender<Option<Vec<u8>>>,
+    },
     /// Debug observability: snapshot gossipsub's per-topic subscriber + mesh sets.
     GossipSnapshot(tokio::sync::oneshot::Sender<Vec<TopicGossip>>),
     Shutdown,
@@ -73,6 +88,8 @@ pub struct Libp2pNetwork {
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     topics: Arc<Mutex<HashMap<String, broadcast::Sender<Inbound>>>>,
     peers: Arc<Mutex<HashSet<PeerId>>>,
+    /// Signed config this node answers config-pull requests with.
+    served_config: Arc<Mutex<Option<Vec<u8>>>>,
     local_pubkey: Pubkey,
     local_peer_id: PeerId,
     _task: JoinHandle<()>,
@@ -122,13 +139,21 @@ impl Libp2pNetwork {
         let topics: Arc<Mutex<HashMap<String, broadcast::Sender<Inbound>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let peers: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
+        let served_config: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
 
-        let task = tokio::spawn(swarm_loop(swarm, cmd_rx, topics.clone(), peers.clone()));
+        let task = tokio::spawn(swarm_loop(
+            swarm,
+            cmd_rx,
+            topics.clone(),
+            peers.clone(),
+            served_config.clone(),
+        ));
 
         Ok(Arc::new(Libp2pNetwork {
             cmd_tx,
             topics,
             peers,
+            served_config,
             local_pubkey,
             local_peer_id,
             _task: task,
@@ -178,19 +203,21 @@ impl Transport for Libp2pNetwork {
 
     async fn publish(&self, topic: &str, bytes: Vec<u8>) {
         crate::wire_debug::trace(topic, &self.local_pubkey, &bytes);
-        // Self-delivery: gossipsub doesn't loop publishes back to the
-        // publisher, but anymone (and the committee scheduler in particular)
-        // needs its own publishes to reach its own subscribers.
-        {
-            let topics = self.topics.lock().unwrap();
-            if let Some(s) = topics.get(topic) {
-                let _ = s.send(Inbound {
-                    from: self.local_pubkey,
-                    payload: bytes.clone(),
-                });
-            }
-        }
         let _ = self.cmd_tx.send(Cmd::Publish(topic.to_string(), bytes));
+    }
+
+    fn serve_config(&self, bytes: Vec<u8>) {
+        *self.served_config.lock().unwrap() = Some(bytes);
+    }
+
+    async fn fetch_config(&self) -> Option<Vec<u8>> {
+        let peer = self.peers.lock().unwrap().iter().next().copied()?;
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx.send(Cmd::FetchConfig { peer, reply: tx }).ok()?;
+        match tokio::time::timeout(Duration::from_secs(3), rx).await {
+            Ok(Ok(resp)) => resp,
+            _ => None,
+        }
     }
 }
 
@@ -226,10 +253,16 @@ fn build_behaviour(
         kp.public(),
     ));
 
+    let config_rr = request_response::cbor::Behaviour::new(
+        [(StreamProtocol::new("/anymone/config/1"), ProtocolSupport::Full)],
+        request_response::Config::default(),
+    );
+
     Ok(Behaviour {
         gossipsub,
         identify,
         kademlia,
+        config_rr,
     })
 }
 
@@ -247,8 +280,11 @@ async fn swarm_loop(
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     topics: Arc<Mutex<HashMap<String, broadcast::Sender<Inbound>>>>,
     peers: Arc<Mutex<HashSet<PeerId>>>,
+    served_config: Arc<Mutex<Option<Vec<u8>>>>,
 ) {
     use std::collections::VecDeque;
+    let mut pending_fetch: HashMap<OutboundRequestId, oneshot::Sender<Option<Vec<u8>>>> =
+        HashMap::new();
     // Publishes that hit `InsufficientPeers` (the mesh hasn't grafted yet) are
     // buffered and retried — on a peer subscribing and on a short timer — until
     // they go out once. Drains to empty after delivery; no traffic when idle.
@@ -284,6 +320,10 @@ async fn swarm_loop(
                         }
                         Err(e) => tracing::debug!(topic = %name, len, error = %e, "publish err"),
                     }
+                }
+                Some(Cmd::FetchConfig { peer, reply }) => {
+                    let id = swarm.behaviour_mut().config_rr.send_request(&peer, ConfigRequest);
+                    pending_fetch.insert(id, reply);
                 }
                 Some(Cmd::GossipSnapshot(reply)) => {
                     let gs = &swarm.behaviour().gossipsub;
@@ -324,6 +364,29 @@ async fn swarm_loop(
                 SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
                     gossipsub::Event::Subscribed { .. }
                 )) => flush_pending(&mut swarm, &mut pending),
+                SwarmEvent::Behaviour(BehaviourEvent::ConfigRr(
+                    request_response::Event::Message { message, .. }
+                )) => match message {
+                    request_response::Message::Request { channel, .. } => {
+                        let served = served_config.lock().unwrap().clone();
+                        let _ = swarm
+                            .behaviour_mut()
+                            .config_rr
+                            .send_response(channel, ConfigResponse(served));
+                    }
+                    request_response::Message::Response { request_id, response } => {
+                        if let Some(tx) = pending_fetch.remove(&request_id) {
+                            let _ = tx.send(response.0);
+                        }
+                    }
+                },
+                SwarmEvent::Behaviour(BehaviourEvent::ConfigRr(
+                    request_response::Event::OutboundFailure { request_id, .. }
+                )) => {
+                    if let Some(tx) = pending_fetch.remove(&request_id) {
+                        let _ = tx.send(None);
+                    }
+                }
                 SwarmEvent::Behaviour(BehaviourEvent::Identify(
                     identify::Event::Received { peer_id, info, .. }
                 )) => {

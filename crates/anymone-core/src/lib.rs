@@ -5,10 +5,13 @@
 //! are thin shells over it.
 
 pub mod adcnet;
+pub mod bootstrap;
 pub mod committee;
 pub mod config;
+pub mod faults;
 pub mod governance;
 pub mod identity;
+pub mod keys;
 pub mod noop;
 pub mod p2p;
 pub mod panetiere;
@@ -34,13 +37,12 @@ pub use config::{
     NoopConfig, NymConfig, PanetiereConfig, ProtocolConfig, Round, ScheduledAdcnetConfig,
     ServiceEntry, Signature, Subnet, SubnetId,
 };
+pub use bootstrap::{BootstrapConfig, NetworkConfig};
 pub use governance::{
-    FaultReport, GovernanceBootstrap, GovernanceError, TOPIC_CONFIG, TOPIC_FAULTS,
-    TOPIC_REGISTRATION,
+    CommitteeMember, FaultReport, GovernanceBootstrap, GovernanceConfig, GovernanceError,
+    TOPIC_CONFIG, TOPIC_FAULTS, TOPIC_REGISTRATION,
 };
-pub use identity::{
-    BootstrapConfig, CommitteeMember, GovernanceConfig, Identity, NetworkConfig, Pubkey,
-};
+pub use identity::{Identity, Pubkey};
 pub use panetiere::{
     PanetiereClientSession, PanetiereObserverSession, PanetiereServerSession, PanetiereWatchSession,
 };
@@ -48,12 +50,10 @@ pub use pipe::{Pipe, PipeIncoming, SendError};
 pub use runtime::{Anymone, AnymonePrep, Event, OpenError};
 pub use scheduler_core::{SchedulerAction, SchedulerCore, SchedulerParams, SignedProposal};
 pub use scheduling::{
-    announce_relay_registration, announce_service_registration, spawn_committee_scheduler,
-    Registration, SchedulerConfig, SchedulerProtocol,
+    announce_relay_registration, announce_service_registration, Registration,
 };
-pub use session::{
-    Attribution, Fault, FaultKind, Misbehavior, OutputFaultTracker, PeerId, RoundOutcome, Session,
-};
+pub use faults::{Attribution, Fault, FaultKind, OutputFaultTracker};
+pub use session::{LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
 pub use tee::{NoopProver, TeeProver, TeeVerifier};
 pub use transport::{InMemoryHandle, InMemoryNetwork, Inbound, Subscription, Transport};
 pub use wire::{Frame, ServiceTag, WireError};
