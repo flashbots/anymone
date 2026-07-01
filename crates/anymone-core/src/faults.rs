@@ -46,7 +46,8 @@ pub struct OutputFaultTracker {
     share_at_last_output: Option<u64>,
     evaluated_through: Option<u64>,
     fail_run: Vec<std::collections::HashSet<usize>>,
-    emitted: bool,
+    /// Reported for the current `fail_run`; cleared with it on success.
+    reported: bool,
 }
 
 const DEFAULT_STALL_MARGIN: u64 = 4;
@@ -64,7 +65,7 @@ impl OutputFaultTracker {
             share_at_last_output: None,
             evaluated_through: None,
             fail_run: Vec::new(),
-            emitted: false,
+            reported: false,
         }
     }
 
@@ -99,9 +100,6 @@ impl OutputFaultTracker {
     /// the relays missing in every failed round if that's a proper subset.
     pub fn evaluate(&mut self) -> Vec<Fault> {
         let mut faults = Vec::new();
-        if self.emitted {
-            return faults;
-        }
         let Some(frontier) = self.max_share_round else {
             return faults;
         };
@@ -113,6 +111,7 @@ impl OutputFaultTracker {
             if self.outputs.contains(&r) {
                 self.evaluated_through = Some(r);
                 self.fail_run.clear();
+                self.reported = false;
                 continue;
             }
             // A round with no shares never ran (no traffic / round-label drift),
@@ -126,10 +125,13 @@ impl OutputFaultTracker {
             if !(skipped || self.output_frozen()) {
                 break;
             }
+            self.evaluated_through = Some(r);
+            if self.reported {
+                continue;
+            }
             let missing: std::collections::HashSet<usize> = (0..self.roster.len())
                 .filter(|i| !shared.contains(i))
                 .collect();
-            self.evaluated_through = Some(r);
             self.fail_run.push(missing);
             if self.fail_run.len() as u64 >= self.threshold {
                 let mut culprits = self.fail_run[0].clone();
@@ -148,8 +150,7 @@ impl OutputFaultTracker {
                     attribution,
                     evidence: Vec::new(),
                 });
-                self.emitted = true;
-                break;
+                self.reported = true;
             }
         }
         faults
@@ -211,6 +212,7 @@ mod tests {
     fn two_failed_rounds_attribute_to_missing_relay() {
         let r = roster(3);
         let victim = r[1];
+        let victim2 = r[0];
         let mut t = OutputFaultTracker::new(r, 2);
         for round in 0..2u64 {
             for idx in 0..3 {
@@ -227,6 +229,30 @@ mod tests {
         assert_eq!(faults.len(), 1);
         assert_eq!(faults[0].kind, FaultKind::Liveness);
         assert_eq!(faults[0].attribution, Attribution::Peers(vec![victim]));
+
+        // Relay #1 recovers.
+        for idx in 0..3 {
+            t.observe_share(12, idx);
+        }
+        t.observe_output(12);
+        assert!(
+            t.evaluate().is_empty(),
+            "a single healthy round after recovery must not itself fault"
+        );
+
+        // Relay #0 now goes silent instead.
+        for round in 13..23u64 {
+            t.observe_share(round, 1);
+            t.observe_share(round, 2);
+        }
+        let faults2 = t.evaluate();
+        assert_eq!(
+            faults2.len(),
+            1,
+            "recovery must clear the latch so a new distinct failure is reported"
+        );
+        assert_eq!(faults2[0].kind, FaultKind::Liveness);
+        assert_eq!(faults2[0].attribution, Attribution::Peers(vec![victim2]));
     }
 
     #[test]
