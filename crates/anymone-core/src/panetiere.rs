@@ -30,8 +30,8 @@ use crate::identity::{ExchangeIdentity, Identity, Pubkey};
 use crate::faults::{Attribution, Fault, FaultKind, OutputFaultTracker};
 use crate::runtime::{
     aggregator_group_of, client_aggregator_topic, deadline_for, egress_dest, gossip_faults,
-    recv_any, round_at, route_to_pipe, subnet_aggregation, subnet_leader_pk, AnymoneInner,
-    SessionKey, StageMsg, FAULT_THRESHOLD,
+    publish_and_loop_back, recv_any, round_at, route_to_pipe, subnet_aggregation, subnet_leader_pk,
+    AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
 };
 use crate::scheduler_core::expected_active;
 use crate::session::{LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
@@ -264,17 +264,19 @@ pub(crate) async fn run_subnet(
         m.begin_round(round, Instant::now());
     }
     let misbehavior = inner.misbehavior();
-    for (key, s) in sessions.iter_mut() {
-        if let SessionKey::Server = key {
-            s.set_misbehavior(misbehavior);
-        }
-        for out in s.begin_round(round, Instant::now()) {
-            if let Some(m) = fault_monitor.as_mut() {
-                m.on_inbound(identity_pk, out.clone());
+    let outs: Vec<(SessionKey, Vec<u8>)> = sessions
+        .iter_mut()
+        .flat_map(|(key, s)| {
+            if let SessionKey::Server = key {
+                s.set_misbehavior(misbehavior);
             }
-            let dest = egress(key, &out);
-            inner.transport.publish(&dest, out).await;
-        }
+            let key = *key;
+            s.begin_round(round, Instant::now()).into_iter().map(move |out| (key, out))
+        })
+        .collect();
+    for (key, out) in outs {
+        publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
+            .await;
     }
 
     loop {
@@ -283,31 +285,32 @@ pub(crate) async fn run_subnet(
 
             _ = tokio::time::sleep_until(mid_deadline), if !mid_done => {
                 mid_done = true;
-                for (key, s) in sessions.iter_mut() {
-                    for out in s.mid_round(round, Instant::now()) {
-                        if let Some(m) = fault_monitor.as_mut() {
-                            m.on_inbound(identity_pk, out.clone());
-                        }
-                        let dest = egress(key, &out);
-                        inner.transport.publish(&dest, out).await;
-                    }
+                let outs: Vec<(SessionKey, Vec<u8>)> = sessions
+                    .iter_mut()
+                    .flat_map(|(key, s)| {
+                        let key = *key;
+                        s.mid_round(round, Instant::now()).into_iter().map(move |out| (key, out))
+                    })
+                    .collect();
+                for (key, out) in outs {
+                    publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
+                        .await;
                 }
             }
 
             _ = tokio::time::sleep_until(deadline) => {
                 let mut decoded_all: Vec<Vec<u8>> = Vec::new();
                 let mut faults: Vec<Fault> = Vec::new();
+                let mut outs: Vec<(SessionKey, Vec<u8>)> = Vec::new();
                 for (key, s) in sessions.iter_mut() {
                     let outcome = s.end_round(round, Instant::now());
-                    for out in outcome.outbound {
-                        if let Some(m) = fault_monitor.as_mut() {
-                            m.on_inbound(identity_pk, out.clone());
-                        }
-                        let dest = egress(key, &out);
-                        inner.transport.publish(&dest, out).await;
-                    }
+                    outs.extend(outcome.outbound.into_iter().map(|out| (*key, out)));
                     decoded_all.extend(outcome.decoded);
                     faults.extend(outcome.faults);
+                }
+                for (key, out) in outs {
+                    publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
+                        .await;
                 }
                 if let Some(m) = fault_monitor.as_mut() {
                     faults.extend(m.end_round(round, Instant::now()).faults);
@@ -334,17 +337,19 @@ pub(crate) async fn run_subnet(
                     m.begin_round(round, Instant::now());
                 }
                 let misbehavior = inner.misbehavior();
-                for (key, s) in sessions.iter_mut() {
-                    if let SessionKey::Server = key {
-                        s.set_misbehavior(misbehavior);
-                    }
-                    for out in s.begin_round(round, Instant::now()) {
-                        if let Some(m) = fault_monitor.as_mut() {
-                            m.on_inbound(identity_pk, out.clone());
+                let outs: Vec<(SessionKey, Vec<u8>)> = sessions
+                    .iter_mut()
+                    .flat_map(|(key, s)| {
+                        if let SessionKey::Server = key {
+                            s.set_misbehavior(misbehavior);
                         }
-                        let dest = egress(key, &out);
-                        inner.transport.publish(&dest, out).await;
-                    }
+                        let key = *key;
+                        s.begin_round(round, Instant::now()).into_iter().map(move |out| (key, out))
+                    })
+                    .collect();
+                for (key, out) in outs {
+                    publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
+                        .await;
                 }
             }
 
@@ -353,14 +358,16 @@ pub(crate) async fn run_subnet(
                 if let Some(m) = fault_monitor.as_mut() {
                     m.on_inbound(from, payload.clone());
                 }
-                for (key, s) in sessions.iter_mut() {
-                    for out in s.on_inbound(from, payload.clone()) {
-                        if let Some(m) = fault_monitor.as_mut() {
-                            m.on_inbound(identity_pk, out.clone());
-                        }
-                        let dest = egress(key, &out);
-                        inner.transport.publish(&dest, out).await;
-                    }
+                let outs: Vec<(SessionKey, Vec<u8>)> = sessions
+                    .iter_mut()
+                    .flat_map(|(key, s)| {
+                        let key = *key;
+                        s.on_inbound(from, payload.clone()).into_iter().map(move |out| (key, out))
+                    })
+                    .collect();
+                for (key, out) in outs {
+                    publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
+                        .await;
                 }
             }
 
@@ -1265,11 +1272,20 @@ impl Session for PanetiereServerSession {
         if is_leader && !withholding {
             let mut announce: Vec<(Round, Vec<ClientId>)> = Vec::new();
             for (&r, state) in self.rounds.iter() {
-                if r > round || self.announced_rounds.contains(&r) || state.inbox_items.is_empty() {
+                let empty = if aggregated {
+                    state.group_aggregates.is_empty()
+                } else {
+                    state.inbox_items.is_empty()
+                };
+                if r > round || self.announced_rounds.contains(&r) || empty {
                     continue;
                 }
                 let mut canonical: Vec<ClientId> = if aggregated {
-                    state.inbox_items.iter().map(|(cid, _)| *cid).collect()
+                    state
+                        .group_aggregates
+                        .values()
+                        .flat_map(|g| g.clients.iter().copied())
+                        .collect()
                 } else {
                     state
                         .inbox_items
@@ -1306,7 +1322,11 @@ impl Session for PanetiereServerSession {
                 // or openings alone in the aggregated flow).
                 let canonical: Vec<ClientId> = if self_derived {
                     let mut c: Vec<ClientId> = if aggregated {
-                        state.inbox_items.iter().map(|(cid, _)| *cid).collect()
+                        state
+                            .group_aggregates
+                            .values()
+                            .flat_map(|g| g.clients.iter().copied())
+                            .collect()
                     } else {
                         state
                             .inbox_items

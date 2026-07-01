@@ -416,7 +416,7 @@ impl AnymonePrep {
 
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SessionKey {
     Server,
     Watch,
@@ -594,6 +594,34 @@ pub(crate) fn egress_dest(
         SessionKey::Aggregator => subnet_shares_topic(subnet_id),
         SessionKey::Watch => subnet_broadcast_topic(subnet_id),
     }
+}
+
+/// Publish `out` and also feed it to this node's other local sessions — the
+/// transport drops a node's own messages, so a node with two roles on the same
+/// subnet (e.g. leader + aggregator) would otherwise never see the other's output.
+pub(crate) async fn publish_and_loop_back(
+    sessions: &mut HashMap<SessionKey, Box<dyn Session>>,
+    fault_monitor: &mut Option<Box<dyn Session>>,
+    inner: &Arc<AnymoneInner>,
+    egress: &impl Fn(&SessionKey, &[u8]) -> String,
+    identity_pk: Pubkey,
+    producer: SessionKey,
+    out: Vec<u8>,
+) {
+    if let Some(m) = fault_monitor.as_mut() {
+        m.on_inbound(identity_pk, out.clone());
+    }
+    for (key, s) in sessions.iter_mut() {
+        if *key == producer {
+            continue;
+        }
+        for followup in s.on_inbound(identity_pk, out.clone()) {
+            let dest = egress(key, &followup);
+            inner.transport.publish(&dest, followup).await;
+        }
+    }
+    let dest = egress(&producer, &out);
+    inner.transport.publish(&dest, out).await;
 }
 
 /// Gossip every observed fault for the committee/auditors and surface it locally

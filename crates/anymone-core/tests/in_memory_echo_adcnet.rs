@@ -9,7 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anymone_core::config::{
-    now_unix_ms, AdcnetConfig, AnymoneRoundConfigurationBody, ExchangePublicKeyWire, Subnet,
+    now_unix_ms, AdcnetConfig, Aggregation, AggregatorGroup, AnymoneRoundConfigurationBody,
+    ExchangePublicKeyWire, Subnet,
 };
 use anymone_core::runtime::subnet_broadcast_topic;
 use anymone_core::session::Session;
@@ -147,6 +148,90 @@ async fn adcnet_echo_roundtrip_in_memory() {
     })
     .await;
     assert!(reached.is_ok(), "idle open pipe never appeared in the anon set (no cover)");
+
+    drop(anymones);
+}
+
+/// Aggregation's single group is assigned relay 0 (`build_subnet_aggregation`'s
+/// round-robin), and subnet 0's leader is also relay 0 (`leader_of`) — so for a
+/// subnet's first group, the leader IS its own sole aggregator. Its `GroupAggregate`
+/// publish must still reach its own Server session even though the transport
+/// filters out a node's own messages from its own subscriptions.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn adcnet_aggregated_echo_roundtrip_when_leader_is_aggregator() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .try_init();
+
+    let net = InMemoryNetwork::new();
+    let committee = Identity::generate();
+    let mut relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
+    relays.sort_by_key(|i| i.pubkey());
+    let service = Identity::generate();
+    let client = Identity::generate();
+
+    let mut relay_xk: Vec<_> = relays.iter().map(|i| (i.pubkey(), xkw(i))).collect();
+    relay_xk.sort_by_key(|(p, _)| *p);
+    let relay_pks: Vec<_> = relays.iter().map(|i| i.pubkey()).collect();
+
+    let cfg = AnymoneRoundConfiguration::singleton_subnet(
+        0,
+        ProtocolConfig::Adcnet(AdcnetConfig {
+            round_duration_ms: 200,
+            max_payload_bytes: 1024,
+            estimated_messages: 8,
+            client_set_min: 0,
+            client_set_max: 8,
+            relay_exchange_keys: relay_xk,
+            aggregation: Some(Aggregation {
+                replication: 1,
+                groups: vec![AggregatorGroup {
+                    aggregators: vec![relay_pks[0]],
+                    aggregator_exchange_keys: vec![(relay_pks[0], xkw(&relays[0]))],
+                }],
+            }),
+        }),
+        relay_pks.clone(),
+        vec![ServiceEntry { tag: echo_tag(), pubkey: service.pubkey() }],
+    )
+    .sign_with(&[&committee]);
+    assert_eq!(
+        anymone_core::runtime::subnet_leader_pk(&cfg.body.subnets[0]),
+        relay_pks[0],
+        "test assumes leader == the sole aggregator, matching production for a subnet's first group"
+    );
+
+    let mut anymones: Vec<Anymone> = Vec::new();
+    for id in relays.into_iter() {
+        let handle = net.handle(id.pubkey());
+        anymones.push(Anymone::start_with_config(id, Arc::new(handle), cfg.clone()).await);
+    }
+    let service_handle = net.handle(service.pubkey());
+    let service_anymone =
+        Anymone::start_with_config(service, Arc::new(service_handle), cfg.clone()).await;
+    let client_handle = net.handle(client.pubkey());
+    let client_anymone =
+        Anymone::start_with_config(client, Arc::new(client_handle), cfg.clone()).await;
+
+    let mut svc_pipe = service_anymone.bind(echo_tag()).await.unwrap();
+    tokio::spawn(async move {
+        while let Some(req) = svc_pipe.recv().await {
+            let _ = svc_pipe.send_to(req.return_tag, req.payload).await;
+        }
+    });
+
+    let mut pipe = client_anymone.open(echo_tag()).await.unwrap();
+    pipe.send(b"hello aggregated adcnet".to_vec()).await.unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(15), pipe.recv())
+        .await
+        .expect("recv timed out — the leader's own aggregator output never reached its Server session")
+        .expect("pipe closed");
+    let reply_str = &reply.payload[..reply.payload.len().min(24)];
+    assert_eq!(reply_str, b"hello aggregated adcnet");
 
     drop(anymones);
 }

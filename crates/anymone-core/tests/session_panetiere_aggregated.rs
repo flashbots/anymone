@@ -120,23 +120,27 @@ fn run_aggregated(
         }
     }
 
+    // Aggregators emit mid-round, delivered to every relay before end_round(0) —
+    // matching production, where mid_round fires at the round's midpoint.
     let group_aggs: Vec<Vec<u8>> =
         aggregators.iter_mut().flat_map(|a| a.mid_round(0, now)).collect();
+    for s in servers.iter_mut() {
+        for m in &group_aggs {
+            s.on_inbound(server_pks[0], m.clone());
+        }
+    }
     let server_publics: Vec<(usize, Vec<u8>)> = servers
         .iter_mut()
         .enumerate()
         .flat_map(|(i, s)| s.end_round(0, now).outbound.into_iter().map(move |m| (i, m)))
         .collect();
 
-    // Round 1: peer ServerPublics cross-delivered; GroupAggregates to all relays.
+    // Round 1: peer ServerPublics cross-delivered.
     for i in 0..servers.len() {
         for (j, m) in &server_publics {
             if i != *j {
                 servers[i].on_inbound(server_pks[*j], m.clone());
             }
-        }
-        for m in &group_aggs {
-            servers[i].on_inbound(server_pks[0], m.clone());
         }
     }
 

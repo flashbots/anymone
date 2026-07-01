@@ -108,10 +108,11 @@ fn run_adcnet_aggregated(
     for r in 0..14u64 {
         for (i, c) in clients.iter_mut().enumerate() {
             for m in c.begin_round(r, now) {
-                bus.push((client_pks[i], m));
+                for (_, a) in aggregators.iter_mut() {
+                    a.on_inbound(client_pks[i], m.clone());
+                }
             }
         }
-        deliver(&mut bus, &mut servers, &mut aggregators);
         for (pk, a) in aggregators.iter_mut() {
             for m in a.mid_round(r, now) {
                 bus.push((*pk, m));
