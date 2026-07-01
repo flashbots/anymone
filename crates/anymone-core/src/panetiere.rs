@@ -69,6 +69,10 @@ pub(crate) fn setup_pp(params: &MseParams, n_servers: usize, setup_seed: [u8; 32
 
 /// Pack message bytes into `xi` little-endian `u16` MSE symbols (zero-padded).
 fn bytes_to_symbols(payload: &[u8], xi: usize) -> Vec<i32> {
+    debug_assert!(
+        payload.len() <= xi * BYTES_PER_SYMBOL,
+        "payload exceeds channel capacity; the pipe send gate should have rejected it"
+    );
     let mut buf = payload.to_vec();
     buf.resize(xi * BYTES_PER_SYMBOL, 0);
     (0..xi)
@@ -84,6 +88,27 @@ fn symbols_to_bytes(symbols: &[i32]) -> Vec<u8> {
         out.extend_from_slice(&(s as u16).to_le_bytes());
     }
     out
+}
+
+/// Conservative upper bound on the largest per-round wire message a Panetiere subnet
+/// broadcasts, for the committee's p2p size-cap guard. Sizes the real bulletin entries
+/// (`ClientBulletinEntry::packed_len`, `CsParams::aggregated_server_crypto_len`).
+pub(crate) fn max_wire_estimate(
+    message_size: usize,
+    estimated_messages: u32,
+    client_set_max: u32,
+    n_relays: usize,
+) -> usize {
+    const FRAMING: usize = 512;
+    // n_polys is pure; the CS params depend only on n_servers, so build `pp` with a
+    // tiny KAHE width to skip sampling the (large, unused-for-sizing) KAHE CRS.
+    let n_polys = MseEncoding::n_polys(&channel_mse_params(estimated_messages, message_size, [0u8; 32]));
+    let pp = setup_pp(&channel_mse_params(1, 1, [0u8; 32]), n_relays.max(1), [0u8; 32]);
+    let client_public = ClientBulletinEntry::packed_len(n_polys) + FRAMING;
+    let server_public =
+        pp.cs.aggregated_server_crypto_len(client_set_max) + client_set_max as usize * 4 + FRAMING;
+    let decoded = estimated_messages as usize * message_size + FRAMING;
+    client_public.max(server_public).max(decoded)
 }
 
 /// `pk`'s position in the sorted relay list — the Panetiere `ServerId`.
@@ -817,8 +842,7 @@ impl Session for PanetiereClientSession {
 
     fn stage(&mut self, payload: Vec<u8>) {
         // One MSE insert per message: the leader peels every active client's
-        // element out of the summed plaintext, so concurrent senders don't
-        // collide. Oversized payloads truncate (needs fragmentation, review #5).
+        // element out of the summed plaintext, so concurrent senders don't collide.
         let symbols = bytes_to_symbols(&payload, self.mse.payload_symbols);
         let mut enc = MseEncoding::new(self.mse.clone());
         enc.insert(&mut self.r_rng, &symbols);
@@ -1562,6 +1586,30 @@ mod observer_tests {
         assert_eq!(obs.output_frontier(), None, "forged Decoded must not advance output");
         obs.on_inbound(leader, dec);
         assert_eq!(obs.output_frontier(), Some(7));
+    }
+
+    #[test]
+    fn wire_estimate_covers_real_messages() {
+        use std::collections::HashMap;
+        let (msg_size, est_msgs, cset, n_relays) = (256usize, 4u32, 40u32, 3usize);
+        let est = max_wire_estimate(msg_size, est_msgs, cset, n_relays);
+
+        let mse = channel_mse_params(est_msgs, msg_size, [1u8; 32]);
+        let pp = setup_pp(&mse, n_relays, [1u8; 32]);
+        let server_ids: Vec<ServerId> = (0..n_relays as u32).map(ServerId).collect();
+        let mut c =
+            PanetiereClientSession::new(pp.clone(), mse, ClientId(1), server_ids, HashMap::new(), [2u8; 32]);
+        let client_public = c
+            .begin_round(0, Instant::now())
+            .iter()
+            .map(|m| m.len())
+            .max()
+            .unwrap();
+        assert!(est >= client_public, "estimate {est} < real ClientPublic {client_public}");
+        assert!(
+            est >= pp.cs.aggregated_server_crypto_len(cset),
+            "estimate omits the ServerPublic crypto term"
+        );
     }
 }
 

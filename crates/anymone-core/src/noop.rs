@@ -11,6 +11,17 @@ use crate::config::{NoopConfig, Round};
 use crate::faults::{Attribution, Fault, FaultKind};
 use crate::session::{PeerId, RoundOutcome, Session};
 
+/// Upper bound on the largest per-round Noop wire message: the leader relays every
+/// client's message, so the round output is up to `client_set_max` × `message_size`.
+pub(crate) fn max_wire_estimate(
+    message_size: usize,
+    _estimated_messages: u32,
+    client_set_max: u32,
+    _n_relays: usize,
+) -> usize {
+    client_set_max as usize * message_size + 64
+}
+
 /// Client session: emits a staged payload at `begin_round`, ignores inbound,
 /// produces nothing at `end_round`.
 pub struct NoopClientSession {

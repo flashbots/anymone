@@ -38,6 +38,9 @@ struct ConfigResponse(Option<Vec<u8>>);
 use crate::identity::{Identity, Pubkey};
 use crate::transport::{Inbound, Subscription, Transport};
 
+/// gossipsub per-message ceiling; the committee sizes subnets under it (`scheduler_core::MAX_SUBNET_WIRE`).
+pub const MAX_TRANSMIT_SIZE: usize = 16 * 1024 * 1024;
+
 /// Bootstrap parameters for [`Libp2pNetwork::start`].
 #[derive(Debug, Clone)]
 pub struct Libp2pConfig {
@@ -233,8 +236,7 @@ fn build_behaviour(
     let cfg = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_millis(200))
         .validation_mode(gossipsub::ValidationMode::Strict)
-        // Anonymous broadcast ciphertexts dwarf the 64 KiB default;
-        .max_transmit_size(16 * 1024 * 1024)
+        .max_transmit_size(MAX_TRANSMIT_SIZE)
         .build()?;
     let gossipsub = gossipsub::Behaviour::new(MessageAuthenticity::Signed(kp.clone()), cfg)?;
 
@@ -318,7 +320,7 @@ async fn swarm_loop(
                             tracing::debug!(topic = %name, len, n_subs = subs.len(), "publish buffered (InsufficientPeers)");
                             pending.entry(name).or_default().push_back(bytes);
                         }
-                        Err(e) => tracing::debug!(topic = %name, len, error = %e, "publish err"),
+                        Err(e) => tracing::warn!(topic = %name, len, limit = MAX_TRANSMIT_SIZE, error = %e, "publish dropped"),
                     }
                 }
                 Some(Cmd::FetchConfig { peer, reply }) => {

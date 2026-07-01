@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::runtime::{resolve_send_subnet, retire_outbound, stage_outbound, AnymoneInner};
-use crate::wire::{Frame, RouteTag, ServiceTag};
+use crate::wire::{Frame, RouteTag, ServiceTag, SERVICE_TAG_LEN};
 use crate::SubnetId;
 
 /// What gets put on the wire between Pipes: the inner `PipeMessage` is
@@ -75,6 +75,25 @@ impl Pipe {
         let anymone = self.anymone.upgrade().ok_or(SendError::Closed)?;
         let subnet = resolve_send_subnet(&anymone, self.peer_tag, self.return_tag, dst)
             .ok_or(SendError::SubnetGone)?;
+        let msg = PipeMessage { return_tag: self.return_tag, payload };
+        let data = bincode::serialize(&msg).map_err(|e| SendError::Encode(e.to_string()))?;
+        // Reject payloads too big for one message rather than truncating/dropping them
+        // downstream; fragmentation across rounds is a later batch.
+        let framed = 1 + SERVICE_TAG_LEN + data.len();
+        let max_payload = anymone
+            .config
+            .read()
+            .unwrap()
+            .body
+            .subnets
+            .iter()
+            .find(|s| s.id == subnet)
+            .map(|s| s.protocol.message_size());
+        if let Some(max) = max_payload {
+            if framed > max {
+                return Err(SendError::PayloadTooLarge { size: framed, max });
+            }
+        }
         // On re-home (client pipes), retire the client session on the subnet we
         // left so we stop contributing there — otherwise the old subnet keeps
         // counting us and the population is double-counted across subnets.
@@ -90,9 +109,7 @@ impl Pipe {
                 }
             }
         }
-        let msg = PipeMessage { return_tag: self.return_tag, payload };
-        let data = bincode::serialize(&msg).map_err(|e| SendError::Encode(e.to_string()))?;
-        let mut bytes = Vec::with_capacity(1 + 20 + data.len());
+        let mut bytes = Vec::with_capacity(framed);
         Frame::Raw { dst, data: &data }.encode(&mut bytes);
         stage_outbound(&self.anymone, subnet, self.return_tag, bytes)
     }
@@ -113,4 +130,6 @@ pub enum SendError {
     SubnetGone,
     #[error("encode: {0}")]
     Encode(String),
+    #[error("payload too large: {size} bytes exceeds the subnet's {max}-byte message limit")]
+    PayloadTooLarge { size: usize, max: usize },
 }

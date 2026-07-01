@@ -111,6 +111,38 @@ async fn panetiere_echo_roundtrip() {
     assert_eq!(&reply[..15], b"hello panetiere");
 }
 
+/// A payload too big for one subnet message is rejected up front, not silently
+/// truncated/dropped downstream.
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_send_is_rejected() {
+    let committee = Identity::generate();
+    let relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
+    let service = Identity::generate();
+    let client = Identity::generate();
+    let cfg = AnymoneRoundConfiguration::singleton_subnet(
+        0,
+        ProtocolConfig::Noop(NoopConfig {
+            round_duration_ms: 30,
+            message_size: 64,
+            client_set_min: 0,
+            client_set_max: 256,
+        }),
+        relays.iter().map(|i| i.pubkey()).collect(),
+        vec![ServiceEntry { tag: echo_tag(), pubkey: service.pubkey() }],
+    )
+    .sign_with(&[&committee]);
+
+    let net = InMemoryNetwork::new();
+    let client_anymone =
+        Anymone::start_with_config(client.clone(), Arc::new(net.handle(client.pubkey())), cfg).await;
+    let pipe = client_anymone.open(echo_tag()).await.unwrap();
+    let err = pipe.send(vec![0u8; 500]).await.unwrap_err();
+    assert!(
+        matches!(err, anymone_core::SendError::PayloadTooLarge { .. }),
+        "expected PayloadTooLarge, got {err:?}"
+    );
+}
+
 /// `subscribe` registers a tag receiver without owning it: a message to the tag
 /// reaches every subscriber, not just one owner.
 #[tokio::test(flavor = "multi_thread")]

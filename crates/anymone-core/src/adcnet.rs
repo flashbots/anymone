@@ -51,6 +51,24 @@ fn one_round_config(cfg: &AdcnetConfig) -> OneRoundConfig {
     }
 }
 
+/// Conservative upper bound on the largest per-round wire message an ADCNet subnet
+/// broadcasts, for the committee's p2p size-cap guard. Uses the real IBLT sizing
+/// (`encoded_len`); the blinded/share `Vec<u64>` dominates.
+pub(crate) fn max_wire_estimate(
+    message_size: usize,
+    estimated_messages: u32,
+    client_set_max: u32,
+    _n_relays: usize,
+) -> usize {
+    const SIGNED_FRAMING: usize = 256;
+    const KEYSET_ENTRY: usize = 200;
+    let iblt = IbltMsgParamsOwned { estimated_messages, max_payload_bytes: message_size };
+    let share = iblt.as_params().encoded_len() * 8 + SIGNED_FRAMING;
+    let client_set = client_set_max as usize * KEYSET_ENTRY + SIGNED_FRAMING;
+    let decoded = estimated_messages as usize * message_size + SIGNED_FRAMING;
+    share.max(client_set).max(decoded)
+}
+
 /// `pk`'s 0-based position in the sorted relay list — the ADCNet `ServerId`.
 /// 0-based to match Panetiere (whose base is fixed by its Shamir/Merkle index);
 /// ADCNet treats the id as an opaque label, so either base works.
@@ -610,6 +628,36 @@ mod observer_tests {
         assert_eq!(obs.output_frontier(), None, "forged Decoded must not advance output");
         obs.on_inbound(leader_pk, dec);
         assert_eq!(obs.output_frontier(), Some(5));
+    }
+
+    #[test]
+    fn wire_estimate_covers_real_messages() {
+        let (msg_size, est_msgs, cset) = (256usize, 32u32, 40u32);
+        let est = max_wire_estimate(msg_size, est_msgs, cset, 3);
+
+        let iblt = IbltMsgParamsOwned { estimated_messages: est_msgs, max_payload_bytes: msg_size };
+        let n = iblt.as_params().encoded_len();
+        let id = Identity::generate();
+        let share = Signed::new(
+            &id.to_adcnet_signing_key(),
+            ServerShare { server_id: ServerId(0), round: 1, share: vec![0u64; n] },
+        )
+        .unwrap();
+        let share_wire = bincode::serialize(&AdcnetWire::Server(share)).unwrap();
+        assert!(est >= share_wire.len(), "estimate {est} < real share {}", share_wire.len());
+
+        let key = Signed::new(
+            &id.to_adcnet_signing_key(),
+            KeyExchange { xpub: id.exchange_pubkey().to_sec1_bytes() },
+        )
+        .unwrap();
+        let cs = bincode::serialize(&AdcnetWire::ClientSet {
+            round: 1,
+            clients: vec![key; cset as usize],
+        })
+        .unwrap();
+        assert!(est >= cs.len(), "estimate {est} < real client set {}", cs.len());
+        assert!(est <= 4 * share_wire.len().max(cs.len()), "estimate {est} wildly loose");
     }
 }
 

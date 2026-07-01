@@ -620,8 +620,16 @@ let chatLastSeq = -1;
 async function renderChat(endpoint) {
   const box = document.getElementById("chat");
   if (!endpoint) { box.innerHTML = '<div class="empty">no chat participant</div>'; return; }
+  // Chat backend shares this dashboard's host; keep only its port.
+  let feedUrl;
   try {
-    const r = await fetch(endpoint.replace(/\/$/, "") + "/chat/feed", { cache: "no-store" });
+    const u = new URL(endpoint, window.location.href);
+    u.protocol = window.location.protocol;
+    u.hostname = window.location.hostname;
+    feedUrl = u.origin + "/chat/feed";
+  } catch (e) { feedUrl = endpoint.replace(/\/$/, "") + "/chat/feed"; }
+  try {
+    const r = await fetch(feedUrl, { cache: "no-store" });
     const msgs = await r.json();
     if (!msgs.length) { box.innerHTML = '<div class="empty">no messages yet</div>'; return; }
     const top = msgs[msgs.length - 1].seq;

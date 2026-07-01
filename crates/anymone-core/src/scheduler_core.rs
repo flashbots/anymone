@@ -99,6 +99,65 @@ pub(crate) fn expected_active(set: u32) -> u32 {
     set.div_ceil(2).max(MIN_CAPACITY / 2)
 }
 
+/// Per-subnet wire budget: a subnet's largest per-round message must stay under this,
+/// with headroom below the gossipsub ceiling.
+const MAX_SUBNET_WIRE: usize = crate::p2p::MAX_TRANSMIT_SIZE * 3 / 4;
+
+/// Capacity ceiling. Subnets split well before this; at this many clients the biggest
+/// message (the ciphertext) is still a few hundred KB, far under [`MAX_SUBNET_WIRE`],
+/// so a fixed cap avoids sizing a subnet whose message would blow the p2p limit.
+const MAX_SUBNET_CLIENTS: u32 = 300;
+
+/// Largest per-round wire message the given subnet protocol broadcasts, via each
+/// protocol's own packing-accurate estimator. Never-proposed protocols report 0
+/// (validate_body rejects them by variant).
+fn subnet_max_wire(p: &ProtocolConfig, n_relays: usize) -> usize {
+    match p {
+        ProtocolConfig::Adcnet(c) => crate::adcnet::max_wire_estimate(
+            c.max_payload_bytes, c.estimated_messages, c.client_set_max, n_relays,
+        ),
+        ProtocolConfig::Panetiere(c) => crate::panetiere::max_wire_estimate(
+            c.message_size, c.estimated_messages, c.client_set_max, n_relays,
+        ),
+        ProtocolConfig::Noop(c) => {
+            crate::noop::max_wire_estimate(c.message_size, c.client_set_max, c.client_set_max, n_relays)
+        }
+        ProtocolConfig::ScheduledAdcnet(_) | ProtocolConfig::Nym(_) => 0,
+    }
+}
+
+#[cfg(test)]
+mod sizing_tests {
+    use super::*;
+
+    #[test]
+    fn reference_capacity_fits_budget() {
+        // At the capacity ceiling the biggest message stays well under the wire budget.
+        let (msg, n_relays) = (256usize, 5usize);
+        let est = expected_active(MAX_SUBNET_CLIENTS);
+        let worst = crate::adcnet::max_wire_estimate(msg, est, MAX_SUBNET_CLIENTS, n_relays)
+            .max(crate::panetiere::max_wire_estimate(msg, est, MAX_SUBNET_CLIENTS, n_relays));
+        assert!(worst <= MAX_SUBNET_WIRE, "reference message {worst} exceeds budget");
+    }
+
+    #[test]
+    fn pathological_client_set_exceeds_budget() {
+        let over = subnet_max_wire(
+            &ProtocolConfig::Adcnet(crate::config::AdcnetConfig {
+                round_duration_ms: 1000,
+                max_payload_bytes: 256,
+                estimated_messages: expected_active(50_000),
+                client_set_min: 0,
+                client_set_max: 50_000,
+                relay_exchange_keys: vec![],
+                aggregation: None,
+            }),
+            5,
+        );
+        assert!(over > MAX_SUBNET_WIRE, "validate_body must reject this");
+    }
+}
+
 /// Effects the core wants performed. The daemon executes them; a test inspects
 /// them. (Mirrors `Session::begin_round -> Vec<Vec<u8>>`: return the bytes,
 /// don't perform the I/O.)
@@ -458,6 +517,8 @@ impl SchedulerCore {
         if desired.abs_diff(self.capacity) >= capacity_resize_margin(self.capacity) {
             self.capacity = desired;
         }
+        // Cap clients per subnet so the biggest message stays under the p2p limit.
+        self.capacity = self.capacity.min(MAX_SUBNET_CLIENTS);
         // Drop escalation for subnets that no longer exist, so a reused id starts clean.
         let count = self.subnet_count;
         self.escalation.retain(|id, _| (*id as usize) < count);
@@ -661,6 +722,9 @@ impl SchedulerCore {
             return false;
         }
         for s in &body.subnets {
+            if subnet_max_wire(&s.protocol, s.relays.len()) > MAX_SUBNET_WIRE {
+                return false;
+            }
             if !s.relays.iter().all(|pk| self.registered.contains(pk)) {
                 return false;
             }
