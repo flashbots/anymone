@@ -195,7 +195,7 @@ pub async fn spawn_panetiere_committee_scheduler(
 
     // Committee-anonymisation Panetiere parameters, derived deterministically.
     // ρ=3: a malicious member can't overwrite the lead's config in the IBLT.
-    let setup_seed = derive_committee_seed(&committee);
+    let setup_seed = crate::keys::derive_seed(b"anymone/committee-seed", &committee);
     let committee_mse = channel_mse_params(3, COMMITTEE_MSG_BYTES, setup_seed);
     let pp = setup_pp(&committee_mse, committee.len(), setup_seed);
     let mut sorted_committee = committee.clone();
@@ -400,25 +400,4 @@ async fn emit(
             queue.extend(cs.on_inbound(our_pk, out));
         }
     }
-}
-
-/// Deterministic Panetiere setup seed for the committee's internal subnet,
-/// from the sorted committee roster.
-fn derive_committee_seed(committee: &[Pubkey]) -> [u8; 32] {
-    use std::hash::Hasher;
-    let mut sorted = committee.to_vec();
-    sorted.sort();
-    let mut state = [0u8; 32];
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    for pk in &sorted {
-        h.write(&pk.0);
-    }
-    state[..8].copy_from_slice(&h.finish().to_le_bytes());
-    for chunk in 1..4 {
-        let mut h2 = std::collections::hash_map::DefaultHasher::new();
-        h2.write(&state[..chunk * 8]);
-        h2.write_u8(chunk as u8);
-        state[chunk * 8..(chunk + 1) * 8].copy_from_slice(&h2.finish().to_le_bytes());
-    }
-    state
 }

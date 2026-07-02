@@ -33,12 +33,12 @@ use crate::config::{AdcnetConfig, ProtocolConfig, Round, Subnet};
 use crate::faults::Fault;
 use crate::identity::Pubkey;
 use crate::runtime::{
-    aggregator_group_of, client_aggregator_topic, deadline_for, egress_dest, gossip_faults,
-    publish_and_loop_back, recv_any, round_at, route_to_pipe, subnet_aggregation, subnet_leader_pk,
-    AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
+    aggregator_group_of, client_aggregator_topic, deadline_for, drain_inbound, egress_dest,
+    gossip_faults, handle_inbound, publish_and_loop_back, recv_any, round_at, route_to_pipe,
+    subnet_aggregation, subnet_leader_pk, AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
 };
 use crate::session::{LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
-use crate::transport::{Inbound, Subscription};
+use crate::transport::Subscription;
 use crate::wire::RouteTag;
 
 /// Per-subnet ADCNet parameters (IBLT sizing), built once at subnet start.
@@ -120,12 +120,15 @@ fn server_session(
     } else {
         None
     };
+    let mut roster = subnet.relays.clone();
+    roster.sort();
     Box::new(AdcnetServerSession::new(
         one_round.clone(),
         ServerId(idx),
         identity.to_adcnet_signing_key(),
         identity.exchange().clone(),
         subnet.relays.len(),
+        roster,
         cfg.client_set_min as usize,
         is_leader,
         leader_pk,
@@ -233,6 +236,7 @@ pub(crate) async fn run_subnet(
 
             _ = tokio::time::sleep_until(mid_deadline), if !mid_done => {
                 mid_done = true;
+                drain_inbound(&mut subscriptions, &mut sessions, &mut fault_monitor, &inner, &egress, identity_pk).await;
                 let outs: Vec<(SessionKey, Vec<u8>)> = sessions
                     .iter_mut()
                     .flat_map(|(key, s)| {
@@ -247,6 +251,7 @@ pub(crate) async fn run_subnet(
             }
 
             _ = tokio::time::sleep_until(deadline) => {
+                drain_inbound(&mut subscriptions, &mut sessions, &mut fault_monitor, &inner, &egress, identity_pk).await;
                 let mut decoded_all: Vec<Vec<u8>> = Vec::new();
                 let mut faults: Vec<Fault> = Vec::new();
                 let mut outs: Vec<(SessionKey, Vec<u8>)> = Vec::new();
@@ -302,21 +307,7 @@ pub(crate) async fn run_subnet(
             }
 
             msg = recv_any(&mut subscriptions) => {
-                let Inbound { from, payload } = msg;
-                if let Some(m) = fault_monitor.as_mut() {
-                    m.on_inbound(from, payload.clone());
-                }
-                let outs: Vec<(SessionKey, Vec<u8>)> = sessions
-                    .iter_mut()
-                    .flat_map(|(key, s)| {
-                        let key = *key;
-                        s.on_inbound(from, payload.clone()).into_iter().map(move |out| (key, out))
-                    })
-                    .collect();
-                for (key, out) in outs {
-                    publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
-                        .await;
-                }
+                handle_inbound(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, msg).await;
             }
 
             Some(stage) = stage_rx.recv() => {
@@ -483,10 +474,11 @@ pub(crate) fn is_server_share(bytes: &[u8]) -> bool {
 
 /// What an ADCNet subnet message tells the committee's liveness observer.
 enum AdcnetObserved {
-    /// Relay at 0-based index `idx` published its decryption share for `round`.
+    /// A relay `signer` published a share for `round`. The slot is derived from
+    /// the signer's roster position, never the self-claimed wire `server_id`.
     Share {
         round: u64,
-        idx: usize,
+        signer: PublicKey,
     },
     /// The leader broadcast the decoded output for `round`.
     Output {
@@ -504,9 +496,9 @@ enum AdcnetObserved {
 fn observe_adcnet(bytes: &[u8]) -> AdcnetObserved {
     match bincode::deserialize::<AdcnetWire>(bytes) {
         Ok(AdcnetWire::Server(signed)) => match signed.recover() {
-            Ok((s, _)) => AdcnetObserved::Share {
+            Ok((s, signer)) => AdcnetObserved::Share {
                 round: s.round as u64,
-                idx: s.server_id.0 as usize,
+                signer: signer.clone(),
             },
             Err(_) => AdcnetObserved::Other,
         },
@@ -526,6 +518,8 @@ fn observe_adcnet(bytes: &[u8]) -> AdcnetObserved {
 /// protocol-agnostic [`OutputFaultTracker`].
 pub struct AdcnetObserverSession {
     tracker: crate::faults::OutputFaultTracker,
+    /// Sorted roster; a share is credited to its signer's slot here.
+    roster: Vec<PeerId>,
     /// Canonical client set size per round — the per-round anonymity set.
     anon_set_by_round: std::collections::BTreeMap<u64, usize>,
     /// Only this peer's `ClientSet`/`Decoded` are trusted (forgery guard).
@@ -537,7 +531,8 @@ const ANON_SET_HISTORY: usize = 16;
 impl AdcnetObserverSession {
     pub fn new(roster: Vec<PeerId>, leader: PeerId, fault_threshold: u64) -> Self {
         AdcnetObserverSession {
-            tracker: crate::faults::OutputFaultTracker::new(roster, fault_threshold),
+            tracker: crate::faults::OutputFaultTracker::new(roster.clone(), fault_threshold),
+            roster,
             anon_set_by_round: std::collections::BTreeMap::new(),
             leader,
         }
@@ -581,8 +576,11 @@ impl Session for AdcnetObserverSession {
 
     fn on_inbound(&mut self, from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
         match observe_adcnet(&payload) {
-            AdcnetObserved::Share { round, idx } => {
-                self.tracker.observe_share(round, idx);
+            AdcnetObserved::Share { round, signer } => {
+                // Credit the signer's own roster slot — a relay can't vouch for another.
+                if let Some(idx) = self.roster.iter().position(|p| PublicKey::from_bytes(&p.0) == signer) {
+                    self.tracker.observe_share(round, idx);
+                }
             }
             AdcnetObserved::Output { round } if from == self.leader => {
                 self.tracker.observe_output(round);
@@ -635,6 +633,41 @@ mod observer_tests {
         assert_eq!(obs.output_frontier(), None, "forged Decoded must not advance output");
         obs.on_inbound(leader_pk, dec);
         assert_eq!(obs.output_frontier(), Some(5));
+
+        // server_id is derived from the signer, not the wire: `other` is roster
+        // index 1, so a share it signs is always credited to slot 1 — even when it
+        // stamps the leader's slot 0. A relay can't occupy or vouch for another slot.
+        let stamp = |sid: u32| {
+            let sh = Signed::new(
+                &other.to_adcnet_signing_key(),
+                ServerShare { server_id: ServerId(sid), round: 3, share: vec![] },
+            )
+            .unwrap();
+            bincode::serialize(&AdcnetWire::Server(sh)).unwrap()
+        };
+        obs.on_inbound(other.pubkey(), stamp(0));
+        assert_eq!(obs.relays_shared_recent(8), vec![1], "credited to the signer's slot, not the stamped one");
+
+        // The leader likewise keys the share by the signer's slot, ignoring the stamp.
+        let one_round =
+            OneRoundConfig { iblt: IbltMsgParamsOwned { estimated_messages: 8, max_payload_bytes: 256 } };
+        let mut leader_srv = AdcnetServerSession::new(
+            one_round,
+            ServerId(0),
+            leader.to_adcnet_signing_key(),
+            leader.exchange().clone(),
+            2,
+            vec![leader_pk, other.pubkey()],
+            0,
+            true,
+            leader_pk,
+            None,
+        );
+        leader_srv.begin_round(3, Instant::now());
+        leader_srv.on_inbound(other.pubkey(), stamp(0));
+        let slots: Vec<u32> =
+            leader_srv.shares_by_round.get(&3).map(|m| m.keys().map(|s| s.0).collect()).unwrap_or_default();
+        assert_eq!(slots, vec![1], "share keyed by the signer's slot, not the stamped id");
     }
 
     #[test]
@@ -849,6 +882,7 @@ impl Session for AdcnetAggregatorSession {
                     signer: self.identity.pubkey(),
                     signature,
                 };
+                debug!(round, group = self.group, members = members.len(), "adcnet aggregator: emit group aggregate");
                 outbound.push(bincode::serialize(&wire).expect("serialise group aggregate"));
                 self.emitted.insert(round);
             }
@@ -874,6 +908,8 @@ pub struct AdcnetServerSession {
     /// Leader only: signed `KeyExchange` per seen client, to put in `ClientSet`.
     client_keys: HashMap<PublicKey, Signed<KeyExchange>>,
     expected_servers: usize,
+    /// Sorted relay roster; a share's `server_id` must equal its signer's index here.
+    roster: Vec<Pubkey>,
     /// Anonymity floor: the leader won't decode a canonical set smaller than this.
     min_clients: usize,
     /// This server leads canonical-set announcement (sorted-first relay).
@@ -917,6 +953,7 @@ impl AdcnetServerSession {
         signing_key: PrivateKey,
         exchange: ExchangeIdentity,
         expected_servers: usize,
+        roster: Vec<Pubkey>,
         min_clients: usize,
         is_leader: bool,
         leader_pk: PeerId,
@@ -930,6 +967,7 @@ impl AdcnetServerSession {
             shared_secrets: HashMap::new(),
             client_keys: HashMap::new(),
             expected_servers,
+            roster,
             min_clients,
             is_leader,
             leader_pk,
@@ -946,6 +984,14 @@ impl AdcnetServerSession {
             aggregation,
             agg_by_round: HashMap::new(),
         }
+    }
+
+    /// The `ServerId` bound to `signer` by the sorted roster, if it's a relay.
+    fn server_id_of(&self, signer: &PublicKey) -> Option<u32> {
+        self.roster
+            .iter()
+            .position(|p| PublicKey::from_bytes(&p.0) == *signer)
+            .map(|i| i as u32)
     }
 
     fn prune_stale(&mut self) {
@@ -1022,6 +1068,7 @@ impl AdcnetServerSession {
             return None;
         }
         let shares = self.shares_by_round.get(&target)?;
+        debug!(target, shares = shares.len(), expected = self.expected_servers, set = set.len(), "adcnet leader: combine check");
         if shares.len() < self.expected_servers {
             return None;
         }
@@ -1056,13 +1103,17 @@ impl AdcnetServerSession {
             self.expected_servers,
         ) {
             Ok(payloads) => {
+                debug!(target, n = payloads.len(), "adcnet leader: combined");
                 self.combined_rounds.insert(target);
                 self.clients_by_round.remove(&target);
                 self.agg_by_round.remove(&target);
                 self.shares_by_round.remove(&target);
                 Some(payloads)
             }
-            Err(_) => None,
+            Err(e) => {
+                debug!(target, error = ?e, "adcnet leader: combine failed");
+                None
+            }
         }
     }
 }
@@ -1120,14 +1171,21 @@ impl Session for AdcnetServerSession {
             }
             AdcnetWire::Server(signed) => {
                 if self.is_leader {
-                    if let Ok((s, _signer)) = signed.recover() {
+                    if let Ok((s, signer)) = signed.recover() {
                         if s.round + ROUND_WINDOW < self.cur_round {
                             return Vec::new();
                         }
+                        // The slot is the signer's roster position, not the self-claimed
+                        // wire id: a relay can't occupy another's slot or forge its count.
+                        let Some(sid) = self.server_id_of(signer) else {
+                            return Vec::new();
+                        };
+                        let mut share = s.clone();
+                        share.server_id = ServerId(sid);
                         self.shares_by_round
-                            .entry(s.round)
+                            .entry(share.round)
                             .or_default()
-                            .insert(s.server_id, s.clone());
+                            .insert(ServerId(sid), share);
                     }
                 }
             }
@@ -1169,6 +1227,7 @@ impl Session for AdcnetServerSession {
                 let Some(roster) = agg.roster.get(&group) else {
                     return Vec::new();
                 };
+                debug!(round, group, cur = self.cur_round, "adcnet leader: group aggregate received");
                 if !roster.contains(&signer)
                     || !signer.verify(
                         &group_aggregate_signing_bytes(round, group, &blinded, &clients),
@@ -1176,6 +1235,7 @@ impl Session for AdcnetServerSession {
                     )
                     || round + ROUND_WINDOW < self.cur_round
                 {
+                    debug!(round, group, cur = self.cur_round, "adcnet leader: rejected group aggregate");
                     return Vec::new();
                 }
                 let mut signers = Vec::with_capacity(clients.len());
@@ -1224,6 +1284,7 @@ impl Session for AdcnetServerSession {
                 let Some(keys) = self.leader_agg_set_for_round(r) else {
                     continue;
                 };
+                debug!(r, set = keys.len(), "adcnet leader: announce aggregated client set");
                 if keys.is_empty() {
                     continue;
                 }

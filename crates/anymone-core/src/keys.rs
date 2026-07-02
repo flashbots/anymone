@@ -143,6 +143,19 @@ pub fn roster_exchange_pubkeys(
         .collect()
 }
 
+/// Version-stable 32-byte seed over `domain` and a sorted roster (SHA-256).
+pub fn derive_seed(domain: &[u8], pubkeys: &[Pubkey]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut sorted = pubkeys.to_vec();
+    sorted.sort();
+    let mut h = Sha256::new();
+    h.update(domain);
+    for pk in &sorted {
+        h.update(pk.0);
+    }
+    h.finalize().into()
+}
+
 /// Long-lived P-256 keypair for the ADCNet/Panetiere ECDH layer. Held alongside
 /// the Ed25519 [`crate::identity::Identity`] and persisted next to it so a node
 /// keeps one stable exchange pubkey across restarts.
@@ -233,5 +246,20 @@ mod tests {
         let s = pk.to_string();
         let pk2 = parse_pubkey_str(&s).unwrap();
         assert_eq!(pk, pk2);
+    }
+
+    #[test]
+    fn derive_seed_stable_and_domain_separated() {
+        // Fixed vector: version-stable across builds, independent of roster order.
+        let a = Pubkey([1u8; 32]);
+        let b = Pubkey([2u8; 32]);
+        let s1 = derive_seed(b"dom", &[a, b]);
+        assert_eq!(s1, derive_seed(b"dom", &[b, a]), "order must not matter");
+        assert_eq!(
+            hex::encode(s1),
+            "2bb5cb3b560c75dd86e1f2adf912d289d555680a4bf29d36ee57936fec8611c5",
+            "seed must be byte-stable"
+        );
+        assert_ne!(s1, derive_seed(b"other", &[a, b]), "domain must separate");
     }
 }

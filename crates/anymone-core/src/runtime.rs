@@ -465,6 +465,11 @@ async fn apply_config(
         if current.get(&id) == Some(&sig) {
             continue; // unchanged — leave the running worker in place
         }
+        // Skip (don't panic on) a subnet we can't run in a signed config.
+        if !subnet_runnable(&subnet) {
+            warn!(id, "skipping unrunnable subnet in config");
+            continue;
+        }
         let topics = subnet_subscription_topics(&subnet, me);
         let mut subscriptions = Vec::with_capacity(topics.len());
         for t in &topics {
@@ -473,7 +478,7 @@ async fn apply_config(
         let (stage_tx, stage_rx) = mpsc::unbounded_channel();
         let inner_for_task = inner.clone();
         // The one place that dispatches on protocol: each runs its own self-contained
-        // subnet driver. ScheduledAdcnet/Nym are not wired yet.
+        // subnet driver. Unsupported protocols were filtered by subnet_runnable above.
         let handle = match &subnet.protocol {
             ProtocolConfig::Adcnet(_) => tokio::spawn(crate::adcnet::run_subnet(
                 subnet, inner_for_task, stage_rx, subscriptions, base_round, epoch_unix_ms,
@@ -485,7 +490,7 @@ async fn apply_config(
                 subnet, inner_for_task, stage_rx, subscriptions, base_round, epoch_unix_ms,
             )),
             ProtocolConfig::ScheduledAdcnet(_) | ProtocolConfig::Nym(_) => {
-                unimplemented!("ScheduledAdcnet / Nym runtime wiring is not yet implemented")
+                unreachable!("filtered by subnet_runnable")
             }
         };
         built.push((id, sig, stage_tx, handle));
@@ -624,6 +629,48 @@ pub(crate) async fn publish_and_loop_back(
     inner.transport.publish(&dest, out).await;
 }
 
+/// Feed one inbound message to every session, publishing whatever they produce.
+pub(crate) async fn handle_inbound(
+    sessions: &mut HashMap<SessionKey, Box<dyn Session>>,
+    fault_monitor: &mut Option<Box<dyn Session>>,
+    inner: &Arc<AnymoneInner>,
+    egress: &impl Fn(&SessionKey, &[u8]) -> String,
+    identity_pk: Pubkey,
+    msg: Inbound,
+) {
+    let Inbound { from, payload } = msg;
+    if let Some(m) = fault_monitor.as_mut() {
+        m.on_inbound(from, payload.clone());
+    }
+    let outs: Vec<(SessionKey, Vec<u8>)> = sessions
+        .iter_mut()
+        .flat_map(|(key, s)| {
+            let key = *key;
+            s.on_inbound(from, payload.clone()).into_iter().map(move |out| (key, out))
+        })
+        .collect();
+    for (key, out) in outs {
+        publish_and_loop_back(sessions, fault_monitor, inner, egress, identity_pk, key, out).await;
+    }
+}
+
+/// Deliver already-arrived messages before a timer action: a round cutoff must
+/// never outrun inbound delivered before it fired (a one-shot payload would be lost).
+pub(crate) async fn drain_inbound(
+    subscriptions: &mut [Subscription],
+    sessions: &mut HashMap<SessionKey, Box<dyn Session>>,
+    fault_monitor: &mut Option<Box<dyn Session>>,
+    inner: &Arc<AnymoneInner>,
+    egress: &impl Fn(&SessionKey, &[u8]) -> String,
+    identity_pk: Pubkey,
+) {
+    for i in 0..subscriptions.len() {
+        while let Some(msg) = subscriptions[i].try_recv() {
+            handle_inbound(sessions, fault_monitor, inner, egress, identity_pk, msg).await;
+        }
+    }
+}
+
 /// Gossip every observed fault for the committee/auditors and surface it locally
 /// on the events stream. Shared by every protocol's subnet driver.
 pub(crate) async fn gossip_faults(
@@ -664,6 +711,15 @@ pub(crate) fn deadline_for(
     let boundary_ms = epoch_unix_ms + (round - base_round + 1) * dur_ms;
     let wait = boundary_ms.saturating_sub(now_ms);
     tokio::time::Instant::now() + std::time::Duration::from_millis(wait)
+}
+
+/// A non-empty roster and a protocol with runtime wiring.
+pub fn subnet_runnable(subnet: &Subnet) -> bool {
+    !subnet.relays.is_empty()
+        && matches!(
+            subnet.protocol,
+            ProtocolConfig::Adcnet(_) | ProtocolConfig::Panetiere(_) | ProtocolConfig::Noop(_)
+        )
 }
 
 /// Subnet leader (ADCNet canonical-set announcer / Panetiere `Decoded`
@@ -822,6 +878,7 @@ pub(crate) fn route_to_pipe(inner: &AnymoneInner, bytes: &[u8]) {
         Err(_) => return,
     };
     let sender = inner.pipes.lock().unwrap().get(&outer_tag).cloned();
+    tracing::debug!(dst = ?outer_tag, matched = sender.is_some(), "route to pipe");
     if let Some(tx) = sender {
         let _ = tx.send(PipeIncoming {
             return_tag: pipe_msg.return_tag,
@@ -840,26 +897,57 @@ pub(crate) fn resolve_send_subnet(
     dst: RouteTag,
 ) -> Option<SubnetId> {
     let cfg = inner.config.read().unwrap();
+    // Only runnable subnets carry workers — never route to one we skipped.
     let (candidates, key): (Vec<SubnetId>, RouteTag) = match peer_tag {
         Some(service) => (
             cfg.body
                 .subnets
                 .iter()
-                .filter(|s| s.services.iter().any(|svc| svc.tag == service))
+                .filter(|s| subnet_runnable(s) && s.services.iter().any(|svc| svc.tag == service))
                 .map(|s| s.id)
                 .collect(),
             return_tag,
         ),
-        None => (cfg.body.subnets.iter().map(|s| s.id).collect(), dst),
+        None => (
+            cfg.body
+                .subnets
+                .iter()
+                .filter(|s| subnet_runnable(s))
+                .map(|s| s.id)
+                .collect(),
+            dst,
+        ),
     };
+    select_subnet(candidates, key)
+}
+
+/// Pick one subnet for `key`, sorting first so the choice is independent of the
+/// config's subnet order — every node must resolve a tag to the same subnet.
+fn select_subnet(mut candidates: Vec<SubnetId>, key: RouteTag) -> Option<SubnetId> {
     if candidates.is_empty() {
         return None;
     }
+    candidates.sort();
     let h = key
         .0
         .iter()
         .fold(0usize, |a, b| a.wrapping_mul(31).wrapping_add(*b as usize));
     Some(candidates[h % candidates.len()])
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    #[test]
+    fn select_subnet_is_order_independent() {
+        let key = RouteTag([7u8; SERVICE_TAG_LEN]);
+        let a = select_subnet(vec![0, 1, 2, 3], key);
+        let b = select_subnet(vec![3, 1, 0, 2], key);
+        assert_eq!(a, b, "placement must not depend on candidate order");
+        assert!(a.is_some());
+        assert_eq!(select_subnet(vec![], key), None);
+    }
 }
 
 pub(crate) fn stage_outbound(

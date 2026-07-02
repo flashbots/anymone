@@ -399,6 +399,7 @@ impl Subnet {
                     sorted[i].to_adcnet_signing_key(),
                     sorted[i].exchange().clone(),
                     sorted.len(),
+                    relay_pks.clone(),
                     0,
                     i == 0,
                     leader_pk,
@@ -561,6 +562,13 @@ fn committee_holds_new_subnet_through_rehome_transient() {
     // Once the low load has held for the full grace window, one subnet is removed.
     let shrunk = staged_body(&core.tick(8, 0)).expect("shrink proposal after the grace window");
     assert_eq!(shrunk.subnets.len(), 1, "removes a subnet only after the grace window");
+
+    // Convergent: the same low load must not oscillate back up after shrinking.
+    for r in 9..12u64 {
+        if let Some(b) = staged_body(&core.tick(r, 0)) {
+            assert_eq!(b.subnets.len(), 1, "must not re-grow after shrinking (round {r})");
+        }
+    }
 }
 
 /// Below the grow mark ADCNet stays one subnet but sizes its `client_set_max` to

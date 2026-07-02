@@ -29,13 +29,13 @@ use crate::config::{PanetiereConfig, ProtocolConfig, Round, Subnet};
 use crate::identity::{ExchangeIdentity, Identity, Pubkey};
 use crate::faults::{Attribution, Fault, FaultKind, OutputFaultTracker};
 use crate::runtime::{
-    aggregator_group_of, client_aggregator_topic, deadline_for, egress_dest, gossip_faults,
-    publish_and_loop_back, recv_any, round_at, route_to_pipe, subnet_aggregation, subnet_leader_pk,
-    AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
+    aggregator_group_of, client_aggregator_topic, deadline_for, drain_inbound, egress_dest,
+    gossip_faults, handle_inbound, publish_and_loop_back, recv_any, round_at, route_to_pipe,
+    subnet_aggregation, subnet_leader_pk, AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
 };
 use crate::scheduler_core::expected_active;
 use crate::session::{LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
-use crate::transport::{Inbound, Subscription};
+use crate::transport::Subscription;
 use crate::wire::RouteTag;
 
 /// Two bytes per MSE symbol — safely below `t = 2^18`, so no value wraps and the
@@ -285,6 +285,7 @@ pub(crate) async fn run_subnet(
 
             _ = tokio::time::sleep_until(mid_deadline), if !mid_done => {
                 mid_done = true;
+                drain_inbound(&mut subscriptions, &mut sessions, &mut fault_monitor, &inner, &egress, identity_pk).await;
                 let outs: Vec<(SessionKey, Vec<u8>)> = sessions
                     .iter_mut()
                     .flat_map(|(key, s)| {
@@ -299,6 +300,7 @@ pub(crate) async fn run_subnet(
             }
 
             _ = tokio::time::sleep_until(deadline) => {
+                drain_inbound(&mut subscriptions, &mut sessions, &mut fault_monitor, &inner, &egress, identity_pk).await;
                 let mut decoded_all: Vec<Vec<u8>> = Vec::new();
                 let mut faults: Vec<Fault> = Vec::new();
                 let mut outs: Vec<(SessionKey, Vec<u8>)> = Vec::new();
@@ -354,21 +356,7 @@ pub(crate) async fn run_subnet(
             }
 
             msg = recv_any(&mut subscriptions) => {
-                let Inbound { from, payload } = msg;
-                if let Some(m) = fault_monitor.as_mut() {
-                    m.on_inbound(from, payload.clone());
-                }
-                let outs: Vec<(SessionKey, Vec<u8>)> = sessions
-                    .iter_mut()
-                    .flat_map(|(key, s)| {
-                        let key = *key;
-                        s.on_inbound(from, payload.clone()).into_iter().map(move |out| (key, out))
-                    })
-                    .collect();
-                for (key, out) in outs {
-                    publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
-                        .await;
-                }
+                handle_inbound(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, msg).await;
             }
 
             Some(stage) = stage_rx.recv() => {

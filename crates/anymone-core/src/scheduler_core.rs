@@ -42,14 +42,12 @@ use crate::wire::ServiceTag;
 /// The public subnet the committee schedules + observes (singleton, id 0).
 pub const SUBNET_ID: SubnetId = 0;
 
-/// Add a subnet once the per-subnet load (total ÷ subnet count) reaches this;
-/// drop one when it sits at/below the low
-/// mark. Growth is immediate; removal waits [`SUBNET_SHRINK_GRACE`] consecutive
-/// ticks so the re-home transient — where clients have left a subnet but the
-/// newly-scheduled one hasn't announced its set yet, momentarily undercounting
-/// the total — can't flap a subnet straight back off.
+/// Add a subnet once the per-subnet load (total ÷ subnet count) reaches this.
+/// Growth is immediate; removal waits [`SUBNET_SHRINK_GRACE`] consecutive ticks so
+/// the re-home transient — where clients have left a subnet but the newly-scheduled
+/// one hasn't announced its set yet, momentarily undercounting the total — can't
+/// flap a subnet straight back off.
 pub(crate) const SUBNET_GROW_AT: u32 = 63;
-const SUBNET_SHRINK_AT: u32 = 24;
 /// Consecutive ticks the shrink condition must hold before a subnet is removed.
 const SUBNET_SHRINK_GRACE: u32 = 3;
 /// Most public subnets the committee will schedule (matches the committee's
@@ -155,6 +153,41 @@ mod sizing_tests {
             5,
         );
         assert!(over > MAX_SUBNET_WIRE, "validate_body must reject this");
+
+        // A subnet with no relays is rejected outright (would otherwise panic the
+        // runtime's leader election).
+        let id = Identity::generate();
+        let core = SchedulerCore::new(
+            id.clone(),
+            vec![id.pubkey()],
+            1,
+            SchedulerParams {
+                public_round_duration: Duration::from_secs(1),
+                min_relays: 1,
+                min_services: 1,
+                fault_threshold: 2,
+                escalation_grace: ESCALATION_GRACE,
+                grow_at: SUBNET_GROW_AT,
+                message_size: 256,
+            },
+        );
+        let body = AnymoneRoundConfigurationBody {
+            round: 0,
+            epoch_unix_ms: 0,
+            subnets: vec![Subnet {
+                id: 0,
+                services: vec![],
+                relays: vec![],
+                protocol: ProtocolConfig::Noop(crate::config::NoopConfig {
+                    round_duration_ms: 1000,
+                    message_size: 256,
+                    client_set_min: 0,
+                    client_set_max: MIN_CAPACITY,
+                }),
+                cover_rate: 1.0,
+            }],
+        };
+        assert!(!core.validate_body(&body), "empty relay set must be rejected");
     }
 }
 
@@ -495,11 +528,15 @@ impl SchedulerCore {
         // — never converge on a config to publish. `total / subnet_count`
         // converges: at total=63 it grows 1→2 (63≥63) then holds (31<63).
         let per_subnet = (total / self.subnet_count.max(1)) as u32;
+        // Shrink only when merging back to one fewer subnet would still leave the
+        // load below grow_at (10% hysteresis), so a shrink never immediately re-grows.
+        let merged_per_subnet = (total / (self.subnet_count.max(2) - 1)) as u32;
+        let shrink_floor = self.params.grow_at.saturating_sub(self.params.grow_at / 10);
         if per_subnet >= self.params.grow_at && self.subnet_count < MAX_SUBNETS {
             // Grow immediately.
             self.subnet_count += 1;
             self.shrink_streak = 0;
-        } else if per_subnet <= SUBNET_SHRINK_AT && self.subnet_count > 1 {
+        } else if self.subnet_count > 1 && merged_per_subnet <= shrink_floor {
             // Shrink only after the condition holds for a few ticks, so the
             // re-home transient (total briefly undercounted) can't flap a
             // freshly-added subnet straight back off.
@@ -722,6 +759,9 @@ impl SchedulerCore {
             return false;
         }
         for s in &body.subnets {
+            if s.relays.is_empty() {
+                return false;
+            }
             if subnet_max_wire(&s.protocol, s.relays.len()) > MAX_SUBNET_WIRE {
                 return false;
             }
@@ -840,7 +880,7 @@ impl SchedulerCore {
                         client_set_min: 0,
                         client_set_max: self.capacity,
                         threshold: (n / 2 + 1).max(n.saturating_sub(2)),
-                        setup_seed: derive_setup_seed(&relay_vec),
+                        setup_seed: crate::keys::derive_seed(b"anymone/subnet-seed", &relay_vec),
                         relay_exchange_keys: relay_xk.clone(),
                         aggregation: aggregation.clone(),
                     }),
@@ -1014,24 +1054,4 @@ fn build_observer(
         )),
         _ => None,
     }
-}
-
-/// Deterministic 32-byte Panetiere setup seed from the sorted relay roster.
-fn derive_setup_seed(relays: &[Pubkey]) -> [u8; 32] {
-    use std::hash::Hasher;
-    let mut sorted = relays.to_vec();
-    sorted.sort();
-    let mut state = [0u8; 32];
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    for pk in &sorted {
-        h.write(&pk.0);
-    }
-    state[..8].copy_from_slice(&h.finish().to_le_bytes());
-    for chunk in 1..4 {
-        let mut h2 = std::collections::hash_map::DefaultHasher::new();
-        h2.write(&state[..chunk * 8]);
-        h2.write_u8(chunk as u8);
-        state[chunk * 8..(chunk + 1) * 8].copy_from_slice(&h2.finish().to_le_bytes());
-    }
-    state
 }

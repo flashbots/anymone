@@ -361,6 +361,9 @@ fn spawn_config_loop(transport: Arc<dyn Transport>, obs: Shared, committee: Vec<
                 }
             });
             for subnet in &cfg.body.subnets {
+                if !anymone_core::runtime::subnet_runnable(subnet) {
+                    continue;
+                }
                 let sig = subnet_sig(subnet);
                 let needs_respawn = watchers.get(&subnet.id).map_or(true, |(s, _)| *s != sig);
                 if needs_respawn {

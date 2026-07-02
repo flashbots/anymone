@@ -16,7 +16,7 @@ use std::time::Duration;
 use anymone_core::test_util::Node;
 use anymone_core::{
     AnymoneRoundConfiguration, GovernanceBootstrap, InMemoryNetwork, NoopConfig,
-    ProtocolConfig, ServiceEntry, ServiceTag, Transport, TOPIC_CONFIG,
+    ProtocolConfig, ServiceEntry, ServiceTag, Subnet, Transport, TOPIC_CONFIG,
 };
 
 fn echo_tag() -> ServiceTag {
@@ -40,7 +40,7 @@ async fn echo_via_governance_topic() {
 
     // Build and sign the static configuration. One subnet, Noop, with all
     // three relays and the echo service.
-    let unsigned = AnymoneRoundConfiguration::singleton_subnet(
+    let mut unsigned = AnymoneRoundConfiguration::singleton_subnet(
         0,
         ProtocolConfig::Noop(NoopConfig {
             round_duration_ms: 30,
@@ -51,6 +51,20 @@ async fn echo_via_governance_topic() {
         relays.iter().map(|r| r.pubkey()).collect(),
         vec![ServiceEntry { tag: echo_tag(), pubkey: service.pubkey() }],
     );
+    // A malformed (empty-relay) subnet in the signed config must be skipped, not
+    // panic the runtime — the echo below still round-trips on subnet 0.
+    unsigned.body.subnets.push(Subnet {
+        id: 1,
+        services: vec![],
+        relays: vec![],
+        protocol: ProtocolConfig::Noop(NoopConfig {
+            round_duration_ms: 30,
+            message_size: 1024,
+            client_set_min: 0,
+            client_set_max: 256,
+        }),
+        cover_rate: 1.0,
+    });
     let signed_cfg = unsigned.sign_with(&[committee.identity()]);
     let signed_bytes = bincode::serialize(&signed_cfg).expect("serialise cfg");
 

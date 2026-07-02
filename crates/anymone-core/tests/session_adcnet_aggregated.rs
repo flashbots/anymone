@@ -34,7 +34,7 @@ fn run_adcnet_aggregated(
     let mut relay_ids: Vec<Identity> = (0..n_servers).map(|_| Identity::generate()).collect();
     relay_ids.sort_by_key(|i| i.pubkey());
     let relay_pks: Vec<Pubkey> = relay_ids.iter().map(|i| i.pubkey()).collect();
-    let server_ids: Vec<ServerId> = (1..=n_servers as u32).map(ServerId).collect();
+    let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let leader_pk = relay_pks[0];
 
     let agg_ids: Vec<Vec<Identity>> = (0..group_count)
@@ -71,6 +71,7 @@ fn run_adcnet_aggregated(
                 relay_ids[i].to_adcnet_signing_key(),
                 relay_ids[i].exchange().clone(),
                 n_servers,
+                relay_pks.clone(),
                 0,
                 i == 0,
                 leader_pk,
@@ -146,7 +147,7 @@ fn run_realtime(aggregated: bool, payload: &[u8]) -> Vec<u64> {
     let mut relay_ids: Vec<Identity> = (0..n_servers).map(|_| Identity::generate()).collect();
     relay_ids.sort_by_key(|i| i.pubkey());
     let relay_pks: Vec<Pubkey> = relay_ids.iter().map(|i| i.pubkey()).collect();
-    let server_ids: Vec<ServerId> = (1..=n_servers as u32).map(ServerId).collect();
+    let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let leader_pk = relay_pks[0];
 
     let agg_ids: Vec<Identity> = (0..group_count).map(|_| Identity::generate()).collect();
@@ -178,6 +179,7 @@ fn run_realtime(aggregated: bool, payload: &[u8]) -> Vec<u64> {
                 relay_ids[i].to_adcnet_signing_key(),
                 relay_ids[i].exchange().clone(),
                 n_servers,
+                relay_pks.clone(),
                 0,
                 i == 0,
                 leader_pk,

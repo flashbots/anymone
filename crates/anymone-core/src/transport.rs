@@ -47,6 +47,18 @@ impl Subscription {
             }
         }
     }
+
+    /// Non-blocking `recv`: the next already-delivered message, or `None`.
+    pub fn try_recv(&mut self) -> Option<Inbound> {
+        loop {
+            match self.rx.try_recv() {
+                Ok(msg) if Some(msg.from) == self.owner => continue,
+                Ok(msg) => return Some(msg),
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => return None,
+            }
+        }
+    }
 }
 
 #[async_trait]
