@@ -582,7 +582,7 @@ impl SchedulerCore {
                 self.last_content = Some(content);
             }
             if self.published_round != Some(self.public_round) {
-                let body = self.build_body(&protos, now_unix_ms);
+                let body = self.build_body(&protos);
                 let signature = self.identity.sign(&body.canonical_bytes());
                 let proposal = SignedProposal {
                     body,
@@ -594,6 +594,21 @@ impl SchedulerCore {
             }
         }
         actions
+    }
+
+    /// Raise the round counters to a network-adopted config, so a restarted
+    /// member proposes above the network instead of wedging on stale-round rejections.
+    pub fn on_published_config(&mut self, cfg: &AnymoneRoundConfiguration) -> bool {
+        if cfg.verify_multisig(&self.committee, self.threshold).is_err() {
+            return false;
+        }
+        let r = cfg.body.round;
+        self.last_accepted_round = Some(self.last_accepted_round.map_or(r, |l| l.max(r)));
+        self.public_round = self.public_round.max(r);
+        self.published_round = Some(self.published_round.map_or(r, |p| p.max(r)));
+        self.published.insert(cfg.body.canonical_bytes());
+        self.learn_config(&cfg.body);
+        true
     }
 
     /// A committee-Panetiere round decoded a proposed body. Before signing,
@@ -844,11 +859,7 @@ impl SchedulerCore {
             .collect()
     }
 
-    fn build_body(
-        &self,
-        protos: &[SchedulerProtocol],
-        epoch_unix_ms: u64,
-    ) -> AnymoneRoundConfigurationBody {
+    fn build_body(&self, protos: &[SchedulerProtocol]) -> AnymoneRoundConfigurationBody {
         let mut relay_vec: Vec<Pubkey> = self.registered.iter().copied().collect();
         relay_vec.sort();
         let mut service_vec: Vec<ServiceEntry> = self
@@ -906,7 +917,8 @@ impl SchedulerCore {
             .collect();
         AnymoneRoundConfigurationBody {
             round: self.public_round,
-            epoch_unix_ms,
+            // fixed epoch: re-stages of one round must stay byte-identical
+            epoch_unix_ms: 0,
             subnets,
         }
     }

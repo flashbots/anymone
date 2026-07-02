@@ -32,8 +32,8 @@ pub fn now_unix_ms() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AnymoneRoundConfigurationBody {
     pub round: Round,
-    /// Wall-clock (unix ms) at which `round` begins; subnet drivers derive the
-    /// current round label from this epoch and the round duration.
+    /// Round-clock epoch (unix ms). The scheduler stamps the fixed genesis 0;
+    /// `round` is the config version, not the clock.
     pub epoch_unix_ms: u64,
     pub subnets: Vec<Subnet>,
 }

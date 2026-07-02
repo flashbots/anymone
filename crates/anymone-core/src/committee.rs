@@ -167,6 +167,7 @@ pub async fn spawn_panetiere_committee_scheduler(
     let mut faults_sub = transport.subscribe(TOPIC_FAULTS).await;
     let mut panetiere_sub = transport.subscribe(TOPIC_COMMITTEE_PANETIERE).await;
     let mut sigs_sub = transport.subscribe(TOPIC_COMMITTEE_SIGS).await;
+    let mut config_sub = transport.subscribe(crate::governance::TOPIC_CONFIG).await;
     let committee_xpubs: std::collections::HashMap<Pubkey, crate::config::ExchangePublicKeyWire> =
         committee.iter().cloned().collect();
     let committee: Vec<Pubkey> = committee.into_iter().map(|(pk, _)| pk).collect();
@@ -233,6 +234,10 @@ pub async fn spawn_panetiere_committee_scheduler(
         let round_duration = config.committee_round_duration;
 
         let mut core = SchedulerCore::new(identity.clone(), committee.clone(), threshold, params);
+        let mut seeded = match pull_config(&transport).await {
+            Some(cfg) => core.on_published_config(&cfg),
+            None => false,
+        };
         let committee_server_pubkeys = sorted_committee
             .iter()
             .enumerate()
@@ -325,6 +330,11 @@ pub async fn spawn_panetiere_committee_scheduler(
                     anymone_round = crate::runtime::round_at(0, 0, dur_ms, now_ms).max(anymone_round + 1);
                     deadline = crate::runtime::deadline_for(anymone_round, 0, 0, dur_ms, now_ms);
 
+                    if !seeded {
+                        if let Some(cfg) = pull_config(&transport).await {
+                            seeded = core.on_published_config(&cfg);
+                        }
+                    }
                     core.set_cover_rate(f32::from_bits(config.cover_rate.load(Ordering::Relaxed)));
                     for action in core.tick(anymone_round, now_ms) {
                         execute!(action);
@@ -368,6 +378,12 @@ pub async fn spawn_panetiere_committee_scheduler(
                     }
                 }
 
+                Some(msg) = config_sub.recv() => {
+                    if let Ok(cfg) = bincode::deserialize::<crate::config::AnymoneRoundConfiguration>(&msg.payload) {
+                        seeded = core.on_published_config(&cfg) || seeded;
+                    }
+                }
+
                 Some(msg) = sigs_sub.recv() => {
                     if let Ok(sig) = bincode::deserialize::<crate::scheduler_core::CommitteeSig>(&msg.payload) {
                         for action in core.on_committee_sig(sig) {
@@ -378,6 +394,13 @@ pub async fn spawn_panetiere_committee_scheduler(
             }
         }
     })
+}
+
+async fn pull_config(
+    transport: &Arc<dyn Transport>,
+) -> Option<crate::config::AnymoneRoundConfiguration> {
+    let bytes = transport.fetch_config().await?;
+    bincode::deserialize(&bytes).ok()
 }
 
 /// Send a member's own committee-Panetiere output to peers and feed it back into

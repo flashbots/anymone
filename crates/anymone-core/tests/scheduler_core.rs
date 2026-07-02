@@ -247,26 +247,30 @@ fn multisig_assembles_via_committee_sig() {
     let lead = sorted[0].clone();
     let peer = sorted[1].clone();
     let pks: Vec<_> = committee.iter().map(|i| i.pubkey()).collect();
-    let mut core = SchedulerCore::new(
-        lead.clone(),
-        pks.clone(),
-        2,
-        SchedulerParams {
-            public_round_duration: Duration::from_millis(200),
-            min_relays: 1,
-            min_services: 1,
-            fault_threshold: 2,
-            escalation_grace: 5,
-            grow_at: 31,
-            message_size: 16,
-        },
-    );
+    let params = SchedulerParams {
+        public_round_duration: Duration::from_millis(200),
+        min_relays: 1,
+        min_services: 1,
+        fault_threshold: 2,
+        escalation_grace: 5,
+        grow_at: 31,
+        message_size: 16,
+    };
+    let mut core = SchedulerCore::new(lead.clone(), pks.clone(), 2, params.clone());
 
     let relay = Identity::generate();
     let service = Identity::generate();
     register_relays_and_service(&mut core, std::slice::from_ref(&relay), &service);
 
     let proposal = staged_proposal(&core.tick(0, 0)).expect("staged");
+    // Re-staging the same logical round at a later wall clock must be
+    // byte-identical, or members' signatures scatter across sig keys.
+    let restaged = staged_proposal(&core.tick(1, 5_000)).expect("re-staged until published");
+    assert_eq!(
+        proposal.body.canonical_bytes(),
+        restaged.body.canonical_bytes(),
+        "re-staged proposal must have deterministic canonical bytes"
+    );
     let body = proposal.body.clone();
 
     // The committee Panetiere decodes the body back to the lead → 1 sig, no config.
@@ -293,6 +297,33 @@ fn multisig_assembles_via_committee_sig() {
         .expect("config must be published once threshold signatures are in");
     let cfg: AnymoneRoundConfiguration = bincode::deserialize(&cfg_bytes).unwrap();
     cfg.verify_multisig(&pks, 2).expect("assembled config verifies at threshold");
+
+    // A restarted (fresh) core seeded from the published config resumes above
+    // the network's round; an unverifiable config must not seed.
+    let mut forged = cfg.clone();
+    forged.signatures.clear();
+    let mut fresh = SchedulerCore::new(lead.clone(), pks.clone(), 2, params.clone());
+    assert!(!fresh.on_published_config(&forged), "unverifiable config must not seed");
+    assert!(fresh.on_published_config(&cfg));
+    register_relays_and_service(&mut fresh, std::slice::from_ref(&relay), &service);
+    let reproposal = staged_proposal(&fresh.tick(0, 0)).expect("restarted lead proposes");
+    assert!(
+        reproposal.body.round > cfg.body.round,
+        "restarted lead must propose above the adopted round"
+    );
+
+    // A seeded member rejects a lead-signed proposal below the adopted round.
+    let mut member = SchedulerCore::new(peer.clone(), pks, 2, params);
+    assert!(member.on_published_config(&cfg));
+    register_relays_and_service(&mut member, std::slice::from_ref(&relay), &service);
+    let mut stale_body = cfg.body.clone();
+    stale_body.round -= 1;
+    let signature = lead.sign(&stale_body.canonical_bytes());
+    let stale = SignedProposal { body: stale_body, proposer: lead.pubkey(), signature };
+    assert!(
+        member.on_decoded_body(stale).is_empty(),
+        "rollback below the seeded round must be rejected"
+    );
 }
 
 #[test]
