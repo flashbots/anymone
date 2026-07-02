@@ -38,11 +38,16 @@ pub struct Pipe {
     /// Our own delivery address — for client pipes a random per-pipe return
     /// path, for service pipes the service tag as a delivery address.
     return_tag: RouteTag,
-    /// Subnet this pipe last staged on. When a send resolves a different subnet
-    /// (the committee re-homed us across a reconfig), we retire the client
-    /// session on the old one so we stop contributing there.
+    /// Subnet this pipe last staged on, or joined at construction. When a send
+    /// resolves a different subnet (the committee re-homed us across a
+    /// reconfig), or when the pipe is dropped, we retire the client session on
+    /// this subnet so we stop contributing there.
     last_subnet: Mutex<Option<SubnetId>>,
     inbound: mpsc::UnboundedReceiver<PipeIncoming>,
+    /// Clone of the sender registered under `return_tag` in `AnymoneInner.pipes`,
+    /// so `Drop` only removes that entry if a later `bind`/`subscribe` on the
+    /// same tag hasn't since overwritten it.
+    self_tx: mpsc::UnboundedSender<PipeIncoming>,
 }
 
 impl Pipe {
@@ -50,9 +55,11 @@ impl Pipe {
         anymone: Weak<AnymoneInner>,
         peer_tag: Option<ServiceTag>,
         return_tag: RouteTag,
+        initial_subnet: Option<SubnetId>,
         inbound: mpsc::UnboundedReceiver<PipeIncoming>,
+        self_tx: mpsc::UnboundedSender<PipeIncoming>,
     ) -> Self {
-        Pipe { anymone, peer_tag, return_tag, last_subnet: Mutex::new(None), inbound }
+        Pipe { anymone, peer_tag, return_tag, last_subnet: Mutex::new(initial_subnet), inbound, self_tx }
     }
 
     /// Our own delivery address.
@@ -117,6 +124,22 @@ impl Pipe {
     /// Receive the next inbound message, or `None` once the pipe is closed.
     pub async fn recv(&mut self) -> Option<PipeIncoming> {
         self.inbound.recv().await
+    }
+}
+
+impl Drop for Pipe {
+    fn drop(&mut self) {
+        let Some(inner) = self.anymone.upgrade() else { return };
+        let mut pipes = inner.pipes.lock().unwrap();
+        if pipes.get(&self.return_tag).map_or(false, |tx| tx.same_channel(&self.self_tx)) {
+            pipes.remove(&self.return_tag);
+        }
+        drop(pipes);
+        if self.peer_tag.is_some() {
+            if let Some(subnet) = *self.last_subnet.lock().unwrap() {
+                retire_outbound(&self.anymone, subnet, self.return_tag);
+            }
+        }
     }
 }
 

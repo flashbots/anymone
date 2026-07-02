@@ -242,10 +242,11 @@ impl Anymone {
         let return_tag = RouteTag(return_bytes);
 
         let (in_tx, in_rx) = mpsc::unbounded_channel();
-        self.inner.pipes.lock().unwrap().insert(return_tag, in_tx);
+        self.inner.pipes.lock().unwrap().insert(return_tag, in_tx.clone());
 
         // Join the home subnet so the pipe contributes cover before any send.
-        if let Some(subnet) = resolve_send_subnet(&self.inner, Some(tag), return_tag, tag.into()) {
+        let subnet = resolve_send_subnet(&self.inner, Some(tag), return_tag, tag.into());
+        if let Some(subnet) = subnet {
             let tx = self.inner.subnets.lock().unwrap().get(&subnet).cloned();
             if let Some(tx) = tx {
                 let _ = tx.send(StageMsg::Join {
@@ -258,7 +259,9 @@ impl Anymone {
             Arc::downgrade(&self.inner),
             Some(tag),
             return_tag,
+            subnet,
             in_rx,
+            in_tx,
         ))
     }
 
@@ -283,9 +286,9 @@ impl Anymone {
         }
 
         let (in_tx, in_rx) = mpsc::unbounded_channel();
-        self.inner.pipes.lock().unwrap().insert(tag.into(), in_tx);
+        self.inner.pipes.lock().unwrap().insert(tag.into(), in_tx.clone());
 
-        Ok(Pipe::new(Arc::downgrade(&self.inner), None, tag.into(), in_rx))
+        Ok(Pipe::new(Arc::downgrade(&self.inner), None, tag.into(), None, in_rx, in_tx))
     }
 
     /// Join a broadcast room on `tag`: receive every message addressed to `tag`
@@ -307,10 +310,11 @@ impl Anymone {
         }
 
         let (in_tx, in_rx) = mpsc::unbounded_channel();
-        self.inner.pipes.lock().unwrap().insert(tag.into(), in_tx);
+        self.inner.pipes.lock().unwrap().insert(tag.into(), in_tx.clone());
 
         // Join one carrier for cover; receiving is route-by-tag on every subnet.
-        if let Some(subnet) = resolve_send_subnet(&self.inner, Some(tag), tag.into(), tag.into()) {
+        let subnet = resolve_send_subnet(&self.inner, Some(tag), tag.into(), tag.into());
+        if let Some(subnet) = subnet {
             let tx = self.inner.subnets.lock().unwrap().get(&subnet).cloned();
             if let Some(tx) = tx {
                 let _ = tx.send(StageMsg::Join { client_tag: tag.into() });
@@ -321,7 +325,9 @@ impl Anymone {
             Arc::downgrade(&self.inner),
             Some(tag),
             tag.into(),
+            subnet,
             in_rx,
+            in_tx,
         ))
     }
 

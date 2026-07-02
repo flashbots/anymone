@@ -3,9 +3,11 @@
 //! Layout: a background swarm task owns the libp2p `Swarm` and pumps events.
 //! [`Libp2pNetwork`] is the front-end: it holds a command channel and a
 //! per-topic `broadcast::Sender`. `subscribe` returns a fresh receiver from
-//! that sender; `publish` does two things — deliver locally (libp2p
-//! gossipsub does not loop publishes back to the publisher) and forward to
-//! the swarm task to broadcast on the network.
+//! that sender; `publish` only forwards to the swarm task to broadcast on the
+//! network — gossipsub never loops a publish back to its own publisher,
+//! matching [`Transport`](crate::transport::Transport)'s documented contract.
+//! Components that must observe their own output feed it back in-process at
+//! emit time (see `committee.rs::emit`, `runtime.rs::publish_and_loop_back`).
 //!
 //! Authentication: we run gossipsub with `MessageAuthenticity::Signed`, so
 //! every message carries the publisher's libp2p key. We reverse that into
@@ -40,6 +42,10 @@ use crate::transport::{Inbound, Subscription, Transport};
 
 /// gossipsub per-message ceiling; the committee sizes subnets under it (`scheduler_core::MAX_SUBNET_WIRE`).
 pub const MAX_TRANSMIT_SIZE: usize = 16 * 1024 * 1024;
+
+/// Cap on buffered publishes per topic while its mesh hasn't grafted yet; a
+/// stalled topic drops its oldest buffered publish rather than growing forever.
+const MAX_PENDING_PER_TOPIC: usize = 256;
 
 /// Bootstrap parameters for [`Libp2pNetwork::start`].
 #[derive(Debug, Clone)]
@@ -318,7 +324,12 @@ async fn swarm_loop(
                         Ok(id) => tracing::debug!(topic = %name, len, n_subs = subs.len(), msg = %id, "publish ok"),
                         Err(gossipsub::PublishError::InsufficientPeers) => {
                             tracing::debug!(topic = %name, len, n_subs = subs.len(), "publish buffered (InsufficientPeers)");
-                            pending.entry(name).or_default().push_back(bytes);
+                            let queue = pending.entry(name.clone()).or_default();
+                            if queue.len() >= MAX_PENDING_PER_TOPIC {
+                                queue.pop_front();
+                                tracing::warn!(topic = %name, cap = MAX_PENDING_PER_TOPIC, "pending publish queue full; dropping oldest");
+                            }
+                            queue.push_back(bytes);
                         }
                         Err(e) => tracing::warn!(topic = %name, len, limit = MAX_TRANSMIT_SIZE, error = %e, "publish dropped"),
                     }

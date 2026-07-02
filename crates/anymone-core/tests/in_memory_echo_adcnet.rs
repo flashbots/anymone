@@ -681,3 +681,88 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
 
     drop(keep);
 }
+
+/// Dropping a never-sent-on pipe must still retire its local client session.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn pipe_drop_retires_client_without_further_sends() {
+    let net = InMemoryNetwork::new();
+    let committee = Identity::generate();
+    let gov = GovernanceBootstrap { committee: vec![committee.pubkey()], threshold: 1 };
+    let relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
+    let service = Identity::generate();
+    let client = Identity::generate();
+
+    let mut relay_pks: Vec<_> = relays.iter().map(|i| i.pubkey()).collect();
+    relay_pks.sort();
+    let leader = relay_pks[0];
+    let cfg = build_config(&committee, &relays, &service, &client);
+
+    // The leader never broadcasts an empty ClientSet, so retirement shows up
+    // as this count freezing, not as it reaching zero.
+    let anon_broadcasts = Arc::new(AtomicU64::new(0));
+    {
+        let mut sub0 = net.handle(Identity::generate().pubkey()).subscribe(&subnet_broadcast_topic(0)).await;
+        let anon_broadcasts = anon_broadcasts.clone();
+        let roster = relay_pks.clone();
+        tokio::spawn(async move {
+            let mut o = AdcnetObserverSession::new(roster, leader, 2);
+            let mut last_round = None;
+            while let Some(m) = sub0.recv().await {
+                o.on_inbound(m.from, m.payload);
+                if let (Some(r), Some(sz)) = (o.anon_set_round(), o.anonymity_set()) {
+                    if sz >= 1 && last_round != Some(r) {
+                        last_round = Some(r);
+                        anon_broadcasts.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+    }
+
+    let mut relay_preps = Vec::new();
+    for id in &relays {
+        relay_preps.push(Anymone::prepare(id.clone(), Arc::new(net.handle(id.pubkey())), gov.clone()).await);
+    }
+    let client_prep = Anymone::prepare(client.clone(), Arc::new(net.handle(client.pubkey())), gov.clone()).await;
+
+    net.handle(committee.pubkey()).publish(TOPIC_CONFIG, bincode::serialize(&cfg).unwrap()).await;
+
+    let mut relays_running = Vec::new();
+    for p in relay_preps {
+        relays_running.push(p.start().await.expect("relay start"));
+    }
+
+    let client_anymone = client_prep.start().await.expect("client start");
+    // Never sends — cover traffic alone must be enough to join and to retire.
+    let pipe = client_anymone.open(echo_tag()).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while anon_broadcasts.load(Ordering::Relaxed) < 2 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("client never settled into the observed canonical set via cover traffic");
+
+    drop(pipe); // Anymone/subnet worker stay alive; only the Pipe goes away.
+
+    // One already in-flight round may still land after Retire; the count must
+    // then stabilize rather than keep climbing.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let mut prev = anon_broadcasts.load(Ordering::Relaxed);
+        loop {
+            tokio::time::sleep(Duration::from_millis(2000)).await;
+            let cur = anon_broadcasts.load(Ordering::Relaxed);
+            if cur == prev {
+                break;
+            }
+            prev = cur;
+        }
+    })
+    .await
+    .expect("client kept padding the anonymity set after its Pipe was dropped");
+
+    drop(client_anymone);
+    drop(relays_running);
+}
