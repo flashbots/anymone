@@ -12,7 +12,7 @@ use anymone_core::config::{
     now_unix_ms, AdcnetConfig, Aggregation, AggregatorGroup, AnymoneRoundConfigurationBody,
     ExchangePublicKeyWire, Subnet,
 };
-use anymone_core::runtime::subnet_broadcast_topic;
+use anymone_core::runtime::{subnet_broadcast_topic, subnet_ingress_topic};
 use anymone_core::session::Session;
 use anymone_core::transport::Transport;
 use anymone_core::{
@@ -431,6 +431,7 @@ async fn live_reconfiguration_moves_service_to_a_new_subnet() {
     let relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
     let service = Identity::generate();
     let client = Identity::generate();
+    let listener = Identity::generate();
 
     let mut relay_pks: Vec<_> = relays.iter().map(|i| i.pubkey()).collect();
     relay_pks.sort();
@@ -466,6 +467,8 @@ async fn live_reconfiguration_moves_service_to_a_new_subnet() {
         Anymone::prepare(service.clone(), Arc::new(net.handle(service.pubkey())), gov.clone()).await;
     let cli_prep =
         Anymone::prepare(client.clone(), Arc::new(net.handle(client.pubkey())), gov.clone()).await;
+    let listener_prep =
+        Anymone::prepare(listener.clone(), Arc::new(net.handle(listener.pubkey())), gov.clone()).await;
 
     let publisher = net.handle(committee.pubkey());
     publisher.publish(TOPIC_CONFIG, bincode::serialize(&v0).unwrap()).await;
@@ -476,6 +479,7 @@ async fn live_reconfiguration_moves_service_to_a_new_subnet() {
     }
     let svc = svc_prep.start().await.expect("service start");
     let cli = cli_prep.start().await.expect("client start");
+    let listener_anymone = listener_prep.start().await.expect("listener start");
 
     let mut svc_pipe = svc.bind(echo_tag()).await.unwrap();
     tokio::spawn(async move {
@@ -485,6 +489,9 @@ async fn live_reconfiguration_moves_service_to_a_new_subnet() {
     });
 
     let mut pipe = cli.open(echo_tag()).await.unwrap();
+    // Opened but never sent: exercises the re-Join path on its own, with no
+    // send-triggered re-home to paper over a missing Join.
+    let _listen_pipe = listener_anymone.open(echo_tag()).await.unwrap();
 
     // Echo works under v0 (service on subnet 0). Resend each round until the
     // reply lands, so the test doesn't hinge on a single round's timing.
@@ -532,6 +539,21 @@ async fn live_reconfiguration_moves_service_to_a_new_subnet() {
     .expect("no echo after reconfiguration to subnet 1");
     assert_eq!(&reply.payload[..reply.payload.len().min(8)], b"v1 hello");
 
+    // The listen-only pipe's worker respawned on subnet 1's roster change; it
+    // must have been re-Joined there to keep contributing cover.
+    let mut ingress1 = net.handle(Identity::generate().pubkey()).subscribe(&subnet_ingress_topic(1)).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let msg = ingress1.recv().await.expect("ingress topic closed");
+            if msg.from == listener.pubkey() {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("listen-only pipe never contributed cover on the new subnet");
+
+    drop(listener_anymone);
     drop(anymones);
 }
 

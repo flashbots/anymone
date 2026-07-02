@@ -249,6 +249,8 @@ pub struct SchedulerParams {
 struct SubnetEscalation {
     general: bool,
     clean_streak: u32,
+    /// Share frontier the streak last advanced at; a frozen frontier holds it.
+    streak_frontier: Option<u64>,
     relays: HashSet<Pubkey>,
 }
 
@@ -474,12 +476,20 @@ impl SchedulerCore {
             }
             self.apply_observed_faults(id, faults, now_unix_ms);
         }
-        // A subnet with no fault this tick advances its clean streak; its
-        // `general` flag clears once the streak reaches the grace.
+        // A subnet's clean streak only advances on real progress — a stalled
+        // subnet also emits no fault and must not read as healthy.
         let grace = self.params.escalation_grace;
+        let observers = &self.observers;
         for (id, esc) in self.escalation.iter_mut() {
-            if !faulted.contains(id) {
+            let frontier = observers.get(id).and_then(|o| o.share_frontier());
+            let advanced = match (frontier, esc.streak_frontier) {
+                (Some(f), Some(prev)) => f > prev,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if !faulted.contains(id) && advanced {
                 esc.clean_streak = esc.clean_streak.saturating_add(1);
+                esc.streak_frontier = frontier;
             }
             if esc.general && esc.clean_streak >= grace {
                 esc.general = false;
@@ -1045,6 +1055,13 @@ impl PublicObserver {
         match self {
             PublicObserver::Adcnet(o) => o.anonymity_set(),
             PublicObserver::Panetiere(o) => o.anonymity_set(),
+        }
+    }
+
+    fn share_frontier(&self) -> Option<u64> {
+        match self {
+            PublicObserver::Adcnet(o) => o.share_frontier(),
+            PublicObserver::Panetiere(o) => o.share_frontier(),
         }
     }
 }

@@ -8,7 +8,9 @@ use std::sync::{Mutex, Weak};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::runtime::{resolve_send_subnet, retire_outbound, stage_outbound, AnymoneInner};
+use crate::runtime::{
+    resolve_send_subnet, retire_outbound, retire_outbound_everywhere, stage_outbound, AnymoneInner,
+};
 use crate::wire::{Frame, RouteTag, ServiceTag, SERVICE_TAG_LEN};
 use crate::SubnetId;
 
@@ -131,14 +133,15 @@ impl Drop for Pipe {
     fn drop(&mut self) {
         let Some(inner) = self.anymone.upgrade() else { return };
         let mut pipes = inner.pipes.lock().unwrap();
-        if pipes.get(&self.return_tag).map_or(false, |tx| tx.same_channel(&self.self_tx)) {
+        let still_owner = pipes.get(&self.return_tag).map_or(false, |tx| tx.same_channel(&self.self_tx));
+        if still_owner {
             pipes.remove(&self.return_tag);
         }
         drop(pipes);
-        if self.peer_tag.is_some() {
-            if let Some(subnet) = *self.last_subnet.lock().unwrap() {
-                retire_outbound(&self.anymone, subnet, self.return_tag);
-            }
+        if still_owner && self.peer_tag.is_some() {
+            let mut joined = inner.joined.lock().unwrap();
+            joined.remove(&self.return_tag);
+            retire_outbound_everywhere(&self.anymone, self.return_tag);
         }
     }
 }

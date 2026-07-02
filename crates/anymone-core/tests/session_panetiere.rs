@@ -10,7 +10,9 @@ use anymone_core::config::{
     now_unix_ms, AdcnetConfig, AnymoneRoundConfigurationBody, ExchangePublicKeyWire, ProtocolConfig,
     Subnet,
 };
-use anymone_core::panetiere::{PanetiereClientSession, PanetiereServerSession, SetMode};
+use anymone_core::panetiere::{
+    PanetiereClientSession, PanetiereObserverSession, PanetiereServerSession, SetMode,
+};
 use anymone_core::faults::{Attribution, FaultKind};
 use anymone_core::session::{Misbehavior, Session};
 use anymone_core::{Identity, Pubkey, ServiceEntry, ServiceTag};
@@ -261,6 +263,7 @@ fn panetiere_corrupt_share_attributes_integrity() {
         })
         .collect();
     servers[2].set_misbehavior(Some(Misbehavior::CorruptShare));
+    let mut monitor = PanetiereObserverSession::new(server_pks.clone(), Some(server_pks[0]), 2);
 
     let payload = b"integrity-checked payload".to_vec();
     client.stage(payload.clone());
@@ -280,6 +283,12 @@ fn panetiere_corrupt_share_attributes_integrity() {
             }
         }
     }
+    for (j, o) in mid.iter().enumerate() {
+        for m in &o.outbound {
+            monitor.on_inbound(server_pks[j], m.clone());
+        }
+    }
+    let faults = monitor.end_round(0, now).faults;
     let finals: Vec<_> = servers.iter_mut().map(|s| s.end_round(1, now)).collect();
     let leader = &finals[0];
 
@@ -290,8 +299,8 @@ fn panetiere_corrupt_share_attributes_integrity() {
         .expect("leader decodes from the honest shares despite the bad one");
     assert_eq!(&decoded[..payload.len()], payload.as_slice());
 
-    assert_eq!(leader.faults.len(), 1, "one integrity fault, got {:?}", leader.faults);
-    let fault = &leader.faults[0];
+    assert_eq!(faults.len(), 1, "one integrity fault, got {:?}", faults);
+    let fault = &faults[0];
     assert_eq!(fault.kind, FaultKind::Integrity);
     assert_eq!(fault.attribution, Attribution::Peers(vec![server_pks[2]]));
     assert!(!fault.evidence.is_empty(), "evidence is the offending ServerPublic bytes");

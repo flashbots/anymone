@@ -17,7 +17,9 @@ use anymone_core::scheduler_core::{
     CommitteeSig, SchedulerAction, SchedulerCore, SchedulerParams, SignedProposal,
 };
 use anymone_core::faults::{Attribution, Fault, FaultKind};
-use anymone_core::panetiere::{PanetiereClientSession, PanetiereServerSession, SetMode};
+use anymone_core::panetiere::{
+    PanetiereClientSession, PanetiereObserverSession, PanetiereServerSession, SetMode,
+};
 use anymone_core::session::{Misbehavior, Session};
 use anymone_core::{FaultReport, Identity, Pubkey, Registration, ServiceTag, TOPIC_CONFIG};
 
@@ -178,20 +180,36 @@ fn unattributable_fault_escalates_without_dropping() {
     }], 0);
 
     // Escalate to Panetiere but keep all 3 relays (nobody specific to drop).
-    let body = staged_body(&core.tick(1, 0)).expect("escalation proposal");
-    assert_eq!(proto_name(&body), "panetiere");
-    assert_eq!(body.subnets[0].relays.len(), 3);
+    let esc = staged_proposal(&core.tick(1, 0)).expect("escalation proposal");
+    assert_eq!(proto_name(&esc.body), "panetiere");
+    assert_eq!(esc.body.subnets[0].relays.len(), 3);
+    enact(&mut core, &committee, esc);
 
     // A relay re-announcing must NOT de-escalate: the general fault names no
-    // culprit, so only a fault-free streak proves the cause is gone.
+    // culprit, so only a fault-free streak proves the cause is gone. Content
+    // unchanged means no re-proposal at all.
     core.on_registration(Registration::relay(&relays[0], xkw(&relays[0])));
-    assert_eq!(proto_name(&staged_body(&core.tick(2, 0)).expect("still escalated")), "panetiere");
+    assert!(staged_body(&core.tick(2, 0)).is_none());
 
-    // After ESCALATION_GRACE (5) fault-free rounds, de-escalate to ADCNet.
-    for r in 3..5 {
-        assert_eq!(proto_name(&staged_body(&core.tick(r, 0)).expect("still escalated")), "panetiere");
+    // Ticking well past the grace with the subnet fully silent must not heal
+    // it — silence produces no fault either, but it isn't a clean round.
+    for r in 3..10 {
+        assert!(staged_body(&core.tick(r, 0)).is_none(), "silence must not heal the subnet");
     }
-    assert_eq!(proto_name(&staged_body(&core.tick(5, 0)).expect("de-escalation")), "adcnet");
+
+    // Real signed Panetiere traffic for the grace period does heal it.
+    let mut net = PanetiereSubnet::new(&relays, None);
+    let mut healed = None;
+    for r in 0..6u64 {
+        let (wire, _, _) = net.round(r);
+        for (from, bytes) in wire {
+            core.on_subnet_message(0, from, bytes);
+        }
+        if let Some(b) = staged_body(&core.tick(10 + r, 0)) {
+            healed = Some(proto_name(&b));
+        }
+    }
+    assert_eq!(healed, Some("adcnet"));
 }
 
 /// An *integrity* offender is sidelined like a liveness fault but, unlike one,
@@ -767,13 +785,14 @@ struct PanetiereSubnet {
     client_pk: Pubkey,
     servers: Vec<PanetiereServerSession>,
     server_pks: Vec<Pubkey>,
+    monitor: PanetiereObserverSession,
     share_bus: Vec<(Pubkey, Vec<u8>)>,
     now: Instant,
     seq: u64,
 }
 
 impl PanetiereSubnet {
-    fn new(relay_ids: &[Identity]) -> Self {
+    fn new(relay_ids: &[Identity], server2_misbehavior: Option<Misbehavior>) -> Self {
         let n = relay_ids.len();
         let mut setup_rng = ChaCha20Rng::from_seed([7u8; 32]);
         // One real sender per round (the rest of the demo's clients re-home
@@ -817,13 +836,16 @@ impl PanetiereSubnet {
                 )
             })
             .collect();
-        servers[2].set_misbehavior(Some(Misbehavior::CorruptShare));
+        servers[2].set_misbehavior(server2_misbehavior);
+
+        let monitor = PanetiereObserverSession::new(server_pks.clone(), Some(server_pks[0]), 2);
 
         PanetiereSubnet {
             client,
             client_pk: client_id.pubkey(),
             servers,
             server_pks,
+            monitor,
             share_bus: Vec::new(),
             now: Instant::now(),
             seq: 0,
@@ -853,20 +875,22 @@ impl PanetiereSubnet {
             produced.push((self.client_pk, m.clone()));
         }
 
-        let mut faults = Vec::new();
         let mut decoded = 0usize;
         for i in 0..self.servers.len() {
             let out = self.servers[i].end_round(r, self.now);
             let pk = self.server_pks[i];
             if i == 0 {
                 decoded = out.decoded.len();
-                faults = out.faults;
             }
             for m in out.outbound {
                 self.share_bus.push((pk, m.clone()));
                 produced.push((pk, m));
             }
         }
+        for (from, m) in &produced {
+            self.monitor.on_inbound(*from, m.clone());
+        }
+        let faults = self.monitor.end_round(r, self.now).faults;
         (produced, faults, decoded)
     }
 }
@@ -913,7 +937,7 @@ fn corrupt_panetiere_keeps_escalation() {
 
     // Run the corrupt Panetiere subnet into the committee observer well past the
     // escalation grace, ticking the core each round as the daemon would.
-    let mut net = PanetiereSubnet::new(&relays);
+    let mut net = PanetiereSubnet::new(&relays, Some(Misbehavior::CorruptShare));
     let mut saw_integrity = false;
     let mut total_output = 0usize;
     let mut deescalated = false;
@@ -990,7 +1014,7 @@ fn committee_acts_on_verified_leader_integrity_report() {
 
     // Run the corrupt subnet to capture the leader's integrity fault (evidence =
     // the offending ServerPublic) and an honest relay's consistent ServerPublic.
-    let mut net = PanetiereSubnet::new(&relays);
+    let mut net = PanetiereSubnet::new(&relays, Some(Misbehavior::CorruptShare));
     let mut integrity: Option<Fault> = None;
     let mut honest_sp: Option<Vec<u8>> = None;
     let mut corrupt_sp: Option<Vec<u8>> = None;

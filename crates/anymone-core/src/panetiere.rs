@@ -1396,7 +1396,7 @@ impl Session for PanetiereServerSession {
         // earlier rounds first. A round's shares arrive during the next anymone
         // round, so the round just ended usually isn't decodable yet; an earlier
         // one is.
-        let mut faults: Vec<Fault> = Vec::new();
+        let faults: Vec<Fault> = Vec::new();
         for (r, state) in self.rounds.iter_mut() {
             if state.decoded {
                 continue;
@@ -1407,7 +1407,7 @@ impl Session for PanetiereServerSession {
                 self.client_set_by_round.get(r).cloned()
             };
             // Culprits excluded to reach decode are reported by the leader's
-            // fault monitor (from the same wire evidence), not here — see N5.
+            // fault monitor (from the same wire evidence), not duplicated here.
             let (decoded_round, _bad) = match self.aggregation.as_ref() {
                 Some(agg) => {
                     try_decode_round_aggregated(&self.pp, agg, state, anchor.as_deref(), self.min_clients)

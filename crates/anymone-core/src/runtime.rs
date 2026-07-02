@@ -97,6 +97,9 @@ pub(crate) struct AnymoneInner {
     pub(crate) config: RwLock<AnymoneRoundConfiguration>,
     /// `service_tag` → inbox for the matching `Pipe` (service tags and return tags).
     pub(crate) pipes: Mutex<HashMap<RouteTag, mpsc::UnboundedSender<PipeIncoming>>>,
+    /// Joined client pipes (`open`/`subscribe`), by client tag, to their carrier
+    /// service — reconfig uses this to re-Join a respawned/re-homed worker.
+    pub(crate) joined: Mutex<HashMap<RouteTag, ServiceTag>>,
     pub(crate) subnets: Mutex<HashMap<SubnetId, mpsc::UnboundedSender<StageMsg>>>,
     /// Fan-out of subnet/round events ([`Event`]). Workers publish; callers
     /// subscribe via [`Anymone::events`].
@@ -195,6 +198,7 @@ impl Anymone {
             transport: transport.clone(),
             config: RwLock::new(config.clone()),
             pipes: Mutex::new(HashMap::new()),
+            joined: Mutex::new(HashMap::new()),
             subnets: Mutex::new(HashMap::new()),
             events: broadcast::channel(EVENTS_CAPACITY).0,
             misbehavior: AtomicU8::new(0),
@@ -243,6 +247,7 @@ impl Anymone {
 
         let (in_tx, in_rx) = mpsc::unbounded_channel();
         self.inner.pipes.lock().unwrap().insert(return_tag, in_tx.clone());
+        self.inner.joined.lock().unwrap().insert(return_tag, tag);
 
         // Join the home subnet so the pipe contributes cover before any send.
         let subnet = resolve_send_subnet(&self.inner, Some(tag), return_tag, tag.into());
@@ -311,6 +316,7 @@ impl Anymone {
 
         let (in_tx, in_rx) = mpsc::unbounded_channel();
         self.inner.pipes.lock().unwrap().insert(tag.into(), in_tx.clone());
+        self.inner.joined.lock().unwrap().insert(tag.into(), tag);
 
         // Join one carrier for cover; receiving is route-by-tag on every subnet.
         let subnet = resolve_send_subnet(&self.inner, Some(tag), tag.into(), tag.into());
@@ -528,6 +534,26 @@ async fn apply_config(
         for subnet in &config.body.subnets {
             if let Some(tx) = stage_map.get(&subnet.id) {
                 let _ = tx.send(StageMsg::SetCoverRate(subnet.cover_rate));
+            }
+        }
+    }
+    // Re-home every joined pipe against the new config: a respawned worker
+    // starts with no joined pipes, and a re-home moves a listen-only pipe's
+    // home without it ever sending. Held across the whole loop so a
+    // concurrent `Pipe::drop` (same lock) can't interleave a stale Join
+    // after this drop's retire.
+    {
+        let joined = inner.joined.lock().unwrap();
+        let stage_map = inner.subnets.lock().unwrap();
+        for (&client_tag, &service) in joined.iter() {
+            let home = resolve_send_subnet(inner, Some(service), client_tag, service.into());
+            for (&id, tx) in stage_map.iter() {
+                let msg = if Some(id) == home {
+                    StageMsg::Join { client_tag }
+                } else {
+                    StageMsg::Retire { client_tag }
+                };
+                let _ = tx.send(msg);
             }
         }
     }
@@ -988,6 +1014,15 @@ pub(crate) fn retire_outbound(
     let Some(inner) = inner.upgrade() else { return };
     let tx = inner.subnets.lock().unwrap().get(&subnet).cloned();
     if let Some(tx) = tx {
+        let _ = tx.send(StageMsg::Retire { client_tag });
+    }
+}
+
+/// Retire `client_tag` from every worker, not just its last known home — a
+/// reconfig can move a listen-only pipe's home without it ever sending.
+pub(crate) fn retire_outbound_everywhere(inner: &Weak<AnymoneInner>, client_tag: RouteTag) {
+    let Some(inner) = inner.upgrade() else { return };
+    for tx in inner.subnets.lock().unwrap().values() {
         let _ = tx.send(StageMsg::Retire { client_tag });
     }
 }

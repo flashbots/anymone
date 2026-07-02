@@ -34,6 +34,7 @@ struct Reported {
     victim: Pubkey,
     leader_pk: Pubkey,
     saw_event: bool,
+    dup_count: usize,
 }
 
 /// Stand up a live ADCNet echo subnet, make the chosen non-leader relay adopt
@@ -157,8 +158,21 @@ async fn fault_for(mode: Misbehavior, panetiere: bool) -> Reported {
     .await
     .unwrap_or(false);
 
+    let mut dup_count = 0usize;
+    let _ = tokio::time::timeout(Duration::from_millis(600), async {
+        loop {
+            let msg = faults_sub.recv().await.expect("faults topic closed");
+            if let Some(r) = FaultReport::decode(&msg.payload) {
+                if r.round == report.round && r.fault.kind == report.fault.kind {
+                    dup_count += 1;
+                }
+            }
+        }
+    })
+    .await;
+
     drop(relay_nodes);
-    Reported { report, victim, leader_pk, saw_event }
+    Reported { report, victim, leader_pk, saw_event, dup_count }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -211,4 +225,5 @@ async fn panetiere_corrupt_share_is_attributed_integrity() {
     );
     assert!(!r.report.fault.evidence.is_empty(), "evidence is the offending ServerPublic bytes");
     assert!(r.saw_event, "leader's events() never yielded the Integrity fault");
+    assert_eq!(r.dup_count, 0, "only one source should report the fault for a given round");
 }
