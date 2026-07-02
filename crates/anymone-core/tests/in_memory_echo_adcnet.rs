@@ -12,7 +12,7 @@ use anymone_core::config::{
     now_unix_ms, AdcnetConfig, Aggregation, AggregatorGroup, AnymoneRoundConfigurationBody,
     ExchangePublicKeyWire, Subnet,
 };
-use anymone_core::runtime::{subnet_broadcast_topic, subnet_ingress_topic};
+use anymone_core::runtime::{subnet_broadcast_topic, subnet_ingress_topic, subnet_shares_topic};
 use anymone_core::session::Session;
 use anymone_core::transport::Transport;
 use anymone_core::{
@@ -552,6 +552,26 @@ async fn live_reconfiguration_moves_service_to_a_new_subnet() {
     })
     .await
     .expect("listen-only pipe never contributed cover on the new subnet");
+
+    // v1's admission policy binds subnet 1's shares topic to its relay roster;
+    // an outsider's publish there must not reach anyone (real relay share
+    // traffic keeps flowing on the same topic, so filter for the forged payload).
+    let outsider = Identity::generate();
+    let mut shares1 = net.handle(Identity::generate().pubkey()).subscribe(&subnet_shares_topic(1)).await;
+    net.handle(outsider.pubkey())
+        .publish(&subnet_shares_topic(1), b"forged share".to_vec())
+        .await;
+    let saw_forged = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            let msg = shares1.recv().await.expect("shares topic closed");
+            if msg.payload == b"forged share" {
+                return;
+            }
+        }
+    })
+    .await
+    .is_ok();
+    assert!(!saw_forged, "publish from outside subnet 1's relay roster must be rejected");
 
     drop(listener_anymone);
     drop(anymones);

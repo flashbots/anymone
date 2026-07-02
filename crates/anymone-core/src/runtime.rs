@@ -101,6 +101,9 @@ pub(crate) struct AnymoneInner {
     /// service — reconfig uses this to re-Join a respawned/re-homed worker.
     pub(crate) joined: Mutex<HashMap<RouteTag, ServiceTag>>,
     pub(crate) subnets: Mutex<HashMap<SubnetId, mpsc::UnboundedSender<StageMsg>>>,
+    /// Set only under governance; `None` for `start_with_config` (fixed-config
+    /// tests). Drives topic admission on every adopted config.
+    pub(crate) committee: Option<Vec<Pubkey>>,
     /// Fan-out of subnet/round events ([`Event`]). Workers publish; callers
     /// subscribe via [`Anymone::events`].
     pub(crate) events: broadcast::Sender<Event>,
@@ -193,6 +196,7 @@ impl Anymone {
         config: AnymoneRoundConfiguration,
         governance: Option<(Subscription, GovernanceBootstrap)>,
     ) -> Self {
+        let committee = governance.as_ref().map(|(_, gb)| gb.committee.clone());
         let inner = Arc::new(AnymoneInner {
             identity,
             transport: transport.clone(),
@@ -200,6 +204,7 @@ impl Anymone {
             pipes: Mutex::new(HashMap::new()),
             joined: Mutex::new(HashMap::new()),
             subnets: Mutex::new(HashMap::new()),
+            committee,
             events: broadcast::channel(EVENTS_CAPACITY).0,
             misbehavior: AtomicU8::new(0),
         });
@@ -537,6 +542,11 @@ async fn apply_config(
             }
         }
     }
+    if let Some(committee) = &inner.committee {
+        inner
+            .transport
+            .set_topic_policy(crate::governance::topic_policy(&config.body, committee));
+    }
     // Re-home every joined pipe against the new config: a respawned worker
     // starts with no joined pipes, and a re-home moves a listen-only pipe's
     // home without it ever sending. Held across the whole loop so a
@@ -704,15 +714,15 @@ pub(crate) async fn drain_inbound(
 }
 
 /// Gossip every observed fault for the committee/auditors and surface it locally
-/// on the events stream. Shared by every protocol's subnet driver.
+/// on the events stream. Shared by every protocol's subnet driver; each fault
+/// carries its own round since one tick can span faults from different rounds.
 pub(crate) async fn gossip_faults(
     inner: &AnymoneInner,
     subnet_id: SubnetId,
-    round: Round,
     reporter: Pubkey,
-    faults: Vec<Fault>,
+    faults: Vec<(Round, Fault)>,
 ) {
-    for fault in faults {
+    for (round, fault) in faults {
         let report = FaultReport {
             round,
             subnet: subnet_id,

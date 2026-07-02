@@ -4,16 +4,13 @@
 //! committee. Every node verifies the multisig before acting on a config.
 //! Registration goes on `anymone/registration`; faults on `anymone/faults`.
 
-use std::time::Duration;
-
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::time::sleep;
 
-use crate::config::{AnymoneRoundConfiguration, ExchangePublicKeyWire, Round, SubnetId};
+use crate::config::{AnymoneRoundConfigurationBody, ExchangePublicKeyWire, Round, SubnetId};
 use crate::identity::Pubkey;
 use crate::faults::Fault;
-use crate::transport::Transport;
+use crate::transport::TopicPolicy;
 
 /// The committee + threshold a deployment configures (the `[governance]` section
 /// of the bootstrap TOML).
@@ -87,4 +84,29 @@ impl GovernanceBootstrap {
 pub enum GovernanceError {
     #[error("config topic closed before any valid configuration arrived")]
     TopicClosed,
+}
+
+/// Topic admission for an adopted config: subnet shares/broadcast topics bound
+/// to that subnet's relays (+ aggregators), faults to the union of all relays,
+/// config to the committee. Ingress and per-group aggregator topics stay open
+/// — clients are permissionless and can't be bound to a fixed roster.
+pub fn topic_policy(body: &AnymoneRoundConfigurationBody, committee: &[Pubkey]) -> TopicPolicy {
+    use std::collections::HashSet;
+    let mut policy = TopicPolicy::new();
+    let mut all_relays: HashSet<Pubkey> = HashSet::new();
+    for subnet in &body.subnets {
+        let mut shares: HashSet<Pubkey> = subnet.relays.iter().copied().collect();
+        if let Some(agg) = crate::runtime::subnet_aggregation(subnet) {
+            shares.extend(agg.groups.iter().flat_map(|g| g.aggregators.iter().copied()));
+        }
+        policy.insert(crate::runtime::subnet_shares_topic(subnet.id), shares);
+        policy.insert(
+            crate::runtime::subnet_broadcast_topic(subnet.id),
+            subnet.relays.iter().copied().collect(),
+        );
+        all_relays.extend(subnet.relays.iter().copied());
+    }
+    policy.insert(TOPIC_FAULTS.to_string(), all_relays);
+    policy.insert(TOPIC_CONFIG.to_string(), committee.iter().copied().collect());
+    policy
 }

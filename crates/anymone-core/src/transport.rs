@@ -1,13 +1,16 @@
 //! Transport abstraction: subscribe/publish over named topics with
 //! peer-authenticated delivery.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
 use crate::identity::Pubkey;
+
+/// Pubkeys allowed to publish on each bound topic; a topic absent from the map is open.
+pub type TopicPolicy = HashMap<String, HashSet<Pubkey>>;
 
 /// A message arriving on a topic, tagged with its publisher.
 #[derive(Debug, Clone)]
@@ -26,13 +29,14 @@ pub struct Inbound {
 pub struct Subscription {
     rx: broadcast::Receiver<Inbound>,
     owner: Option<Pubkey>,
+    topic: String,
 }
 
 impl Subscription {
     /// Construct a `Subscription` from an existing broadcast receiver. Used by
     /// the libp2p backend, where gossipsub already excludes the publisher.
-    pub fn from_broadcast_receiver(rx: broadcast::Receiver<Inbound>) -> Self {
-        Subscription { rx, owner: None }
+    pub fn from_broadcast_receiver(rx: broadcast::Receiver<Inbound>, topic: String) -> Self {
+        Subscription { rx, owner: None, topic }
     }
 }
 
@@ -43,7 +47,10 @@ impl Subscription {
                 Ok(msg) if Some(msg.from) == self.owner => continue,
                 Ok(msg) => return Some(msg),
                 Err(broadcast::error::RecvError::Closed) => return None,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(topic = %self.topic, skipped = n, "subscription lagged; oldest messages dropped");
+                    continue;
+                }
             }
         }
     }
@@ -54,7 +61,10 @@ impl Subscription {
             match self.rx.try_recv() {
                 Ok(msg) if Some(msg.from) == self.owner => continue,
                 Ok(msg) => return Some(msg),
-                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                    tracing::warn!(topic = %self.topic, skipped = n, "subscription lagged; oldest messages dropped");
+                    continue;
+                }
                 Err(_) => return None,
             }
         }
@@ -75,6 +85,9 @@ pub trait Transport: Send + Sync + 'static {
 
     /// Pull the latest signed config from a peer; `None` if none answers yet.
     async fn fetch_config(&self) -> Option<Vec<u8>>;
+
+    /// Adopt a roster-bound topic policy; default no-op for backends that don't enforce admission.
+    fn set_topic_policy(&self, _policy: TopicPolicy) {}
 }
 
 /// In-memory broadcast network shared by multiple `Anymone` instances in a
@@ -83,6 +96,8 @@ pub struct InMemoryNetwork {
     topics: Mutex<HashMap<String, broadcast::Sender<Inbound>>>,
     /// Signed config each node serves, keyed by node pubkey — backs `fetch_config`.
     configs: Mutex<HashMap<Pubkey, Vec<u8>>>,
+    /// Kept on the network, not the publishing handle, so a rogue handle can't bypass it.
+    policy: Mutex<TopicPolicy>,
 }
 
 impl InMemoryNetwork {
@@ -90,6 +105,7 @@ impl InMemoryNetwork {
         Arc::new(InMemoryNetwork {
             topics: Mutex::new(HashMap::new()),
             configs: Mutex::new(HashMap::new()),
+            policy: Mutex::new(TopicPolicy::new()),
         })
     }
 
@@ -114,6 +130,7 @@ impl Default for InMemoryNetwork {
         InMemoryNetwork {
             topics: Mutex::new(HashMap::new()),
             configs: Mutex::new(HashMap::new()),
+            policy: Mutex::new(TopicPolicy::new()),
         }
     }
 }
@@ -131,10 +148,17 @@ impl Transport for InMemoryHandle {
         Subscription {
             rx: tx.subscribe(),
             owner: Some(self.identity),
+            topic: topic.to_string(),
         }
     }
 
     async fn publish(&self, topic: &str, bytes: Vec<u8>) {
+        if let Some(roster) = self.net.policy.lock().unwrap().get(topic) {
+            if !roster.contains(&self.identity) {
+                tracing::warn!(topic, from = %self.identity, "publish rejected: sender not in topic roster");
+                return;
+            }
+        }
         crate::wire_debug::trace(topic, &self.identity, &bytes);
         let tx = self.net.topic_sender(topic);
         let _ = tx.send(Inbound {
@@ -159,6 +183,10 @@ impl Transport for InMemoryHandle {
             .find(|(pk, _)| **pk != self.identity)
             .or_else(|| configs.iter().next())
             .map(|(_, bytes)| bytes.clone())
+    }
+
+    fn set_topic_policy(&self, policy: TopicPolicy) {
+        *self.net.policy.lock().unwrap() = policy;
     }
 }
 
@@ -194,5 +222,23 @@ mod tests {
                 .is_err(),
             "publisher must not receive its own message"
         );
+
+        // A topic policy binding "t" to `a` rejects a publish from `b`.
+        let mut policy = TopicPolicy::new();
+        policy.insert("t".to_string(), HashSet::from([a.pubkey()]));
+        handle_a.set_topic_policy(policy);
+        handle_b.publish("t", b"forged".to_vec()).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), sub_a.recv())
+                .await
+                .is_err(),
+            "publish from outside the topic roster must be rejected"
+        );
+        handle_a.publish("t", b"authorized".to_vec()).await;
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(100), sub_b.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg.payload, b"authorized");
     }
 }

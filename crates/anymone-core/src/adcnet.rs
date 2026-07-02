@@ -279,7 +279,7 @@ pub(crate) async fn run_subnet(
                         n_messages: n_decoded,
                     });
                 }
-                gossip_faults(&inner, subnet.id, round, identity_pk, faults).await;
+                gossip_faults(&inner, subnet.id, identity_pk, faults.into_iter().map(|f| (round, f)).collect()).await;
 
                 let now_ms = crate::config::now_unix_ms();
                 round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms).max(round + 1);

@@ -19,7 +19,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use libp2p::futures::StreamExt;
-use libp2p::gossipsub::{self, IdentTopic, MessageAuthenticity};
+use libp2p::gossipsub::{
+    self, IdentTopic, MessageAcceptance, MessageAuthenticity, PeerScoreParams,
+    PeerScoreThresholds, TopicScoreParams,
+};
 use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport};
 use libp2p::swarm::SwarmEvent;
@@ -46,6 +49,9 @@ pub const MAX_TRANSMIT_SIZE: usize = 16 * 1024 * 1024;
 /// Cap on buffered publishes per topic while its mesh hasn't grafted yet; a
 /// stalled topic drops its oldest buffered publish rather than growing forever.
 const MAX_PENDING_PER_TOPIC: usize = 256;
+
+/// Bounds the command channel so a fast publisher backpressures instead of growing memory unboundedly.
+const CMD_CHANNEL_CAPACITY: usize = 1024;
 
 /// Bootstrap parameters for [`Libp2pNetwork::start`].
 #[derive(Debug, Clone)]
@@ -94,11 +100,12 @@ pub struct TopicGossip {
 }
 
 pub struct Libp2pNetwork {
-    cmd_tx: mpsc::UnboundedSender<Cmd>,
+    cmd_tx: mpsc::Sender<Cmd>,
     topics: Arc<Mutex<HashMap<String, broadcast::Sender<Inbound>>>>,
     peers: Arc<Mutex<HashSet<PeerId>>>,
     /// Signed config this node answers config-pull requests with.
     served_config: Arc<Mutex<Option<Vec<u8>>>>,
+    policy: Arc<Mutex<crate::transport::TopicPolicy>>,
     local_pubkey: Pubkey,
     local_peer_id: PeerId,
     _task: JoinHandle<()>,
@@ -144,11 +151,12 @@ impl Libp2pNetwork {
             let _ = swarm.behaviour_mut().kademlia.bootstrap();
         }
 
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CHANNEL_CAPACITY);
         let topics: Arc<Mutex<HashMap<String, broadcast::Sender<Inbound>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let peers: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
         let served_config: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+        let policy: Arc<Mutex<crate::transport::TopicPolicy>> = Arc::new(Mutex::new(HashMap::new()));
 
         let task = tokio::spawn(swarm_loop(
             swarm,
@@ -156,6 +164,7 @@ impl Libp2pNetwork {
             topics.clone(),
             peers.clone(),
             served_config.clone(),
+            policy.clone(),
         ));
 
         Ok(Arc::new(Libp2pNetwork {
@@ -163,6 +172,7 @@ impl Libp2pNetwork {
             topics,
             peers,
             served_config,
+            policy,
             local_pubkey,
             local_peer_id,
             _task: task,
@@ -190,7 +200,7 @@ impl Libp2pNetwork {
     /// Debug observability: gossipsub's current per-topic subscriber + mesh sets.
     pub async fn gossip_snapshot(&self) -> Vec<TopicGossip> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        if self.cmd_tx.send(Cmd::GossipSnapshot(tx)).is_err() {
+        if self.cmd_tx.send(Cmd::GossipSnapshot(tx)).await.is_err() {
             return Vec::new();
         }
         rx.await.unwrap_or_default()
@@ -200,19 +210,20 @@ impl Libp2pNetwork {
 #[async_trait]
 impl Transport for Libp2pNetwork {
     async fn subscribe(&self, topic: &str) -> Subscription {
-        let mut topics = self.topics.lock().unwrap();
-        let sender = topics
-            .entry(topic.to_string())
-            .or_insert_with(|| broadcast::channel(1024).0);
-        let rx = sender.subscribe();
-        drop(topics);
-        let _ = self.cmd_tx.send(Cmd::Subscribe(topic.to_string()));
-        Subscription::from_broadcast_receiver(rx)
+        let rx = {
+            let mut topics = self.topics.lock().unwrap();
+            topics
+                .entry(topic.to_string())
+                .or_insert_with(|| broadcast::channel(1024).0)
+                .subscribe()
+        };
+        let _ = self.cmd_tx.send(Cmd::Subscribe(topic.to_string())).await;
+        Subscription::from_broadcast_receiver(rx, topic.to_string())
     }
 
     async fn publish(&self, topic: &str, bytes: Vec<u8>) {
         crate::wire_debug::trace(topic, &self.local_pubkey, &bytes);
-        let _ = self.cmd_tx.send(Cmd::Publish(topic.to_string(), bytes));
+        let _ = self.cmd_tx.send(Cmd::Publish(topic.to_string(), bytes)).await;
     }
 
     fn serve_config(&self, bytes: Vec<u8>) {
@@ -222,17 +233,34 @@ impl Transport for Libp2pNetwork {
     async fn fetch_config(&self) -> Option<Vec<u8>> {
         let peer = self.peers.lock().unwrap().iter().next().copied()?;
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx.send(Cmd::FetchConfig { peer, reply: tx }).ok()?;
+        self.cmd_tx.send(Cmd::FetchConfig { peer, reply: tx }).await.ok()?;
         match tokio::time::timeout(Duration::from_secs(3), rx).await {
             Ok(Ok(resp)) => resp,
             _ => None,
         }
     }
+
+    fn set_topic_policy(&self, policy: crate::transport::TopicPolicy) {
+        *self.policy.lock().unwrap() = policy;
+    }
 }
 
 impl Drop for Libp2pNetwork {
     fn drop(&mut self) {
-        let _ = self.cmd_tx.send(Cmd::Shutdown);
+        let _ = self.cmd_tx.try_send(Cmd::Shutdown);
+    }
+}
+
+/// P3/mesh-delivery-timing disabled (low-fanout topics would penalize honest
+/// slow-mesh peers); P4 (invalid messages) strongly negative.
+fn gossip_topic_score_params() -> TopicScoreParams {
+    TopicScoreParams {
+        topic_weight: 1.0,
+        time_in_mesh_weight: 0.01,
+        mesh_message_deliveries_weight: 0.0,
+        mesh_failure_penalty_weight: 0.0,
+        invalid_message_deliveries_weight: -20.0,
+        ..Default::default()
     }
 }
 
@@ -243,8 +271,12 @@ fn build_behaviour(
         .heartbeat_interval(Duration::from_millis(200))
         .validation_mode(gossipsub::ValidationMode::Strict)
         .max_transmit_size(MAX_TRANSMIT_SIZE)
+        .validate_messages()
         .build()?;
-    let gossipsub = gossipsub::Behaviour::new(MessageAuthenticity::Signed(kp.clone()), cfg)?;
+    let mut gossipsub = gossipsub::Behaviour::new(MessageAuthenticity::Signed(kp.clone()), cfg)?;
+    gossipsub
+        .with_peer_score(PeerScoreParams::default(), PeerScoreThresholds::default())
+        .map_err(|e| format!("peer score params: {e}"))?;
 
     let peer_id = PeerId::from(kp.public());
     let mut kad_cfg = kad::Config::default();
@@ -285,10 +317,11 @@ fn split_peer_addr(addr: &Multiaddr) -> Option<(PeerId, Multiaddr)> {
 
 async fn swarm_loop(
     mut swarm: Swarm<Behaviour>,
-    mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
+    mut cmd_rx: mpsc::Receiver<Cmd>,
     topics: Arc<Mutex<HashMap<String, broadcast::Sender<Inbound>>>>,
     peers: Arc<Mutex<HashSet<PeerId>>>,
     served_config: Arc<Mutex<Option<Vec<u8>>>>,
+    policy: Arc<Mutex<crate::transport::TopicPolicy>>,
 ) {
     use std::collections::VecDeque;
     let mut pending_fetch: HashMap<OutboundRequestId, oneshot::Sender<Option<Vec<u8>>>> =
@@ -305,6 +338,7 @@ async fn swarm_loop(
                 Some(Cmd::Subscribe(name)) => {
                     let topic = IdentTopic::new(name);
                     let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
+                    let _ = swarm.behaviour_mut().gossipsub.set_topic_params(topic, gossip_topic_score_params());
                 }
                 Some(Cmd::Publish(name, bytes)) => {
                     // Observability: who does gossipsub think is subscribed to this
@@ -360,13 +394,29 @@ async fn swarm_loop(
             },
             event = swarm.select_next_some() => match event {
                 SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
-                    gossipsub::Event::Message { message, .. }
+                    gossipsub::Event::Message { propagation_source, message_id, message }
                 )) => {
                     let topic_name = message.topic.as_str().to_string();
                     let from = message
                         .source
                         .and_then(|pid| peer_id_to_pubkey(&pid))
                         .unwrap_or(Pubkey([0u8; 32]));
+                    let admitted = policy
+                        .lock()
+                        .unwrap()
+                        .get(&topic_name)
+                        .is_none_or(|roster| roster.contains(&from));
+                    if !admitted {
+                        // Ignore avoids penalizing an honest forwarder during reconfig skew.
+                        tracing::warn!(topic = %topic_name, from = %from, "publish ignored: sender not in topic roster");
+                        swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                            &message_id, &propagation_source, MessageAcceptance::Ignore,
+                        );
+                        continue;
+                    }
+                    swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                        &message_id, &propagation_source, MessageAcceptance::Accept,
+                    );
                     crate::wire_debug::trace_in(&topic_name, &from, &message.data);
                     tracing::debug!(topic = %topic_name, from = %from, len = message.data.len(), "recv");
                     let topics = topics.lock().unwrap();

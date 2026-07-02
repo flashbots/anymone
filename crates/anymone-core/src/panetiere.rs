@@ -336,7 +336,11 @@ pub(crate) async fn run_subnet(
                         n_messages: n_decoded,
                     });
                 }
-                gossip_faults(&inner, subnet.id, round, identity_pk, faults).await;
+                let faults = faults
+                    .into_iter()
+                    .map(|f| (evidence_round(&f.evidence).unwrap_or(round), f))
+                    .collect();
+                gossip_faults(&inner, subnet.id, identity_pk, faults).await;
 
                 let now_ms = crate::config::now_unix_ms();
                 round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms).max(round + 1);
@@ -559,6 +563,19 @@ fn server_public_consistent(agg_open: &[u8], agg_share: &[u8]) -> bool {
     match panetiere::cs::unpack_cs_shares(agg_share, n_shares) {
         Some(share) => share.as_slice() == open.s(),
         None => true,
+    }
+}
+
+/// The wire round embedded in a fault's evidence, when decodable as a
+/// `PanetiereWire` — distinct from the anymone tick that observed it.
+fn evidence_round(evidence: &[u8]) -> Option<Round> {
+    match bincode::deserialize::<PanetiereWire>(evidence).ok()? {
+        PanetiereWire::ClientPublic { round, .. }
+        | PanetiereWire::Opening { round, .. }
+        | PanetiereWire::ServerPublic { round, .. }
+        | PanetiereWire::Decoded { round, .. }
+        | PanetiereWire::GroupAggregate { round, .. }
+        | PanetiereWire::ClientSet { round, .. } => Some(round),
     }
 }
 

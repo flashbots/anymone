@@ -234,8 +234,11 @@ pub async fn spawn_panetiere_committee_scheduler(
 
         let mut core = SchedulerCore::new(identity.clone(), committee.clone(), threshold, params);
         let mut seeded = match pull_config(&transport).await {
-            Some(cfg) => core.on_published_config(&cfg),
-            None => false,
+            Some(cfg) if core.on_published_config(&cfg) => {
+                transport.set_topic_policy(crate::governance::topic_policy(&cfg.body, &committee));
+                true
+            }
+            _ => false,
         };
         let committee_server_pubkeys = sorted_committee
             .iter()
@@ -292,6 +295,9 @@ pub async fn spawn_panetiere_committee_scheduler(
                             debug!("committee: publishing config");
                             // Serve it so a joining node can pull rather than await a push.
                             transport.serve_config(bytes.clone());
+                            if let Ok(cfg) = bincode::deserialize::<crate::config::AnymoneRoundConfiguration>(&bytes) {
+                                transport.set_topic_policy(crate::governance::topic_policy(&cfg.body, &committee));
+                            }
                         }
                         transport.publish(&topic, bytes).await;
                     }
@@ -330,7 +336,10 @@ pub async fn spawn_panetiere_committee_scheduler(
 
                     if !seeded {
                         if let Some(cfg) = pull_config(&transport).await {
-                            seeded = core.on_published_config(&cfg);
+                            if core.on_published_config(&cfg) {
+                                transport.set_topic_policy(crate::governance::topic_policy(&cfg.body, &committee));
+                                seeded = true;
+                            }
                         }
                     }
                     core.set_cover_rate(f32::from_bits(config.cover_rate.load(Ordering::Relaxed)));
@@ -378,7 +387,10 @@ pub async fn spawn_panetiere_committee_scheduler(
 
                 Some(msg) = config_sub.recv() => {
                     if let Ok(cfg) = bincode::deserialize::<crate::config::AnymoneRoundConfiguration>(&msg.payload) {
-                        seeded = core.on_published_config(&cfg) || seeded;
+                        if core.on_published_config(&cfg) {
+                            transport.set_topic_policy(crate::governance::topic_policy(&cfg.body, &committee));
+                            seeded = true;
+                        }
                     }
                 }
 
