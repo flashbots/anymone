@@ -9,15 +9,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use adcnet::crypto::ExchangePublicKey;
 use chipmunk_code::KahePoly;
 use panetiere::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
 use panetiere::cs::{Cs, HidingMerkleCommitment, Opening, PackedOpening};
 use panetiere::kahe::{Kahe, KaheScheme};
 use panetiere::mse::{MseEncoding, MseParams};
+use panetiere::pke;
 use panetiere::protocol::aggregator::run_aggregator_round;
 use panetiere::protocol::client::run_client_round;
-use panetiere::protocol::server::{run_server_round, ServerInbox};
+use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use panetiere::protocol::verify::{aggregate_and_decrypt, decrypt_aggregate, VerifyError};
 use panetiere::protocol::{message_polys, ClientId, ProtocolParams, ServerId};
 use rand::{Rng, RngCore, SeedableRng};
@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::config::{PanetiereConfig, ProtocolConfig, Round, Subnet};
-use crate::identity::{ExchangeIdentity, Identity, Pubkey};
+use crate::identity::{Identity, Pubkey};
 use crate::faults::{Attribution, Fault, FaultKind, OutputFaultTracker};
 use crate::runtime::{
     aggregator_group_of, client_aggregator_topic, deadline_for, drain_inbound, egress_dest,
@@ -124,18 +124,27 @@ fn client_id_from_pubkey(pk: Pubkey) -> ClientId {
     ClientId(u32::from_be_bytes([pk.0[0], pk.0[1], pk.0[2], pk.0[3]]))
 }
 
-/// Panetiere `ServerId` → relay exchange pubkey, for sealing client openings.
-fn server_xpubs(cfg: &PanetiereConfig, subnet: &Subnet) -> HashMap<ServerId, ExchangePublicKey> {
+/// Panetiere `(ServerId, pke::PublicKey)` roster for sealing client openings —
+/// relays whose exchange key is missing or undecodable are skipped.
+fn seal_roster(cfg: &PanetiereConfig, subnet: &Subnet) -> Vec<(ServerId, pke::PublicKey)> {
     crate::keys::roster_exchange_pubkeys(&subnet.relays, &cfg.relay_exchange_keys)
         .into_iter()
-        .map(|(i, xk)| (ServerId(i as u32), xk))
+        .filter_map(|(i, xk)| {
+            let pk = pke::PublicKey::from_sec1_bytes(&xk.to_sec1_bytes()).ok()?;
+            Some((ServerId(i as u32), pk))
+        })
         .collect()
 }
 
 fn client_session(pp: &Arc<ProtocolParams>, mse: &MseParams, cfg: &PanetiereConfig, subnet: &Subnet, identity: &Identity) -> Box<dyn Session> {
-    let mut sorted = subnet.relays.clone();
-    sorted.sort();
-    let server_ids: Vec<ServerId> = (0..sorted.len() as u32).map(ServerId).collect();
+    let servers = seal_roster(cfg, subnet);
+    if servers.len() != subnet.relays.len() {
+        tracing::warn!(
+            have = servers.len(),
+            need = subnet.relays.len(),
+            "panetiere client: relay exchange keys incomplete"
+        );
+    }
     // Secret entropy: a seed from the (public) return tag would let anyone
     // replay the client's round.
     let mut seed = [0u8; 32];
@@ -144,8 +153,7 @@ fn client_session(pp: &Arc<ProtocolParams>, mse: &MseParams, cfg: &PanetiereConf
         pp.clone(),
         mse.clone(),
         client_id_from_pubkey(identity.pubkey()),
-        server_ids,
-        server_xpubs(cfg, subnet),
+        servers,
         seed,
     ))
 }
@@ -181,7 +189,7 @@ fn server_session(
         mse.clone(),
         server_id,
         expected_active(cfg.client_set_max),
-        identity.exchange().clone(),
+        identity.clone(),
         mode,
         cfg.client_set_min,
         server_pubkeys,
@@ -408,8 +416,9 @@ enum PanetiereWire {
         round: u64,
         client_id: u32,
         target_server: u32,
-        /// ECIES-sealed `PackedOpeningWire`, opened only by the target server.
-        /// Never plaintext: ≥t openings reconstruct the client's message.
+        /// ECIES envelope (`panetiere::pke`) over the packed `Opening`, opened
+        /// only by the target server. Never plaintext: ≥t openings reconstruct
+        /// the client's message.
         #[serde(with = "serde_bytes")]
         sealed: Vec<u8>,
     },
@@ -417,10 +426,16 @@ enum PanetiereWire {
         round: u64,
         server_id: u32,
         clients: Vec<u32>,
-        agg_open: PackedOpeningWire,
-        /// Bit-packed κ_kahe CsPoly shares (count = `agg_open.mu_cs`).
+        /// `PackedOpening::to_bytes` of the aggregated opening.
+        #[serde(with = "serde_bytes")]
+        agg_open: Vec<u8>,
+        /// Bit-packed κ_kahe CsPoly shares (count = the packed `mu_cs`).
         #[serde(with = "serde_bytes")]
         agg_share: Vec<u8>,
+        /// By `roster[server_id]` over [`server_public_signing_bytes`] —
+        /// attribution binds to the key, not the self-declared slot.
+        #[serde(with = "serde_bytes")]
+        signature: Vec<u8>,
     },
     /// Decoded round result, published on broadcast by the subnet leader only
     /// (every relay decodes; one publishes).
@@ -443,6 +458,23 @@ enum PanetiereWire {
     ClientSet { round: u64, clients: Vec<u32> },
 }
 
+/// Bytes a relay signs over its `ServerPublic` (and every consumer verifies
+/// against `roster[server_id]`).
+fn server_public_signing_bytes(
+    round: u64,
+    server_id: u32,
+    clients: &[u32],
+    agg_open: &[u8],
+    agg_share: &[u8],
+) -> Vec<u8> {
+    let mut m = b"anymone/panetiere/server-public".to_vec();
+    m.extend_from_slice(
+        &bincode::serialize(&(round, server_id, clients, agg_open, agg_share))
+            .expect("serialise signing bytes"),
+    );
+    m
+}
+
 /// Bytes an aggregator signs over (and the leader verifies): the round, group,
 /// sorted client ids, and the packed aggregate entry.
 fn group_aggregate_signing_bytes(round: u64, group: u32, clients: &[u32], entry: &[u8]) -> Vec<u8> {
@@ -454,56 +486,6 @@ fn group_aggregate_signing_bytes(round: u64, group: u32, clients: &[u32], entry:
     }
     m.extend_from_slice(entry);
     m
-}
-
-/// Serde mirror of `panetiere::cs::PackedOpening`. Fields are identical;
-/// kept here so we don't depend on upstream serde derives.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PackedOpeningWire {
-    server_index: u32,
-    path_index: u32,
-    kappa_cs: u32,
-    mu_cs: u32,
-    block_size: u32,
-    stored_path_len: u32,
-    r_bound: u32,
-    s_bound: u32,
-    tree_bound: u32,
-    bytes: Vec<u8>,
-}
-
-impl From<&PackedOpening> for PackedOpeningWire {
-    fn from(p: &PackedOpening) -> Self {
-        PackedOpeningWire {
-            server_index: p.server_index,
-            path_index: p.path_index,
-            kappa_cs: p.kappa_cs,
-            mu_cs: p.mu_cs,
-            block_size: p.block_size,
-            stored_path_len: p.stored_path_len,
-            r_bound: p.r_bound,
-            s_bound: p.s_bound,
-            tree_bound: p.tree_bound,
-            bytes: p.bytes.clone(),
-        }
-    }
-}
-
-impl From<PackedOpeningWire> for PackedOpening {
-    fn from(w: PackedOpeningWire) -> Self {
-        PackedOpening {
-            server_index: w.server_index,
-            path_index: w.path_index,
-            kappa_cs: w.kappa_cs,
-            mu_cs: w.mu_cs,
-            block_size: w.block_size,
-            stored_path_len: w.stored_path_len,
-            r_bound: w.r_bound,
-            s_bound: w.s_bound,
-            tree_bound: w.tree_bound,
-            bytes: w.bytes,
-        }
-    }
 }
 
 pub(crate) fn describe(bytes: &[u8]) -> Option<String> {
@@ -566,9 +548,12 @@ pub(crate) fn is_client_public(bytes: &[u8]) -> bool {
 /// The self-contained `ShareOpeningMismatch` check (no canonical set, no
 /// decryption); `true` when the wire can't be reconstructed, so malformed bytes
 /// never frame a relay.
-fn server_public_consistent(agg_open: &PackedOpeningWire, agg_share: &[u8]) -> bool {
-    let n_shares = agg_open.mu_cs as usize;
-    let Ok(open) = Opening::from_packed(&PackedOpening::from(agg_open.clone())) else {
+fn server_public_consistent(agg_open: &[u8], agg_share: &[u8]) -> bool {
+    let Some(packed) = PackedOpening::from_bytes(agg_open) else {
+        return true;
+    };
+    let n_shares = packed.mu_cs as usize;
+    let Ok(open) = Opening::from_packed(&packed) else {
         return true;
     };
     match panetiere::cs::unpack_cs_shares(agg_share, n_shares) {
@@ -577,12 +562,23 @@ fn server_public_consistent(agg_open: &PackedOpeningWire, agg_share: &[u8]) -> b
     }
 }
 
-/// Culprit `ServerId` iff `evidence` is a `ServerPublic` with a mismatched share
-/// — lets the committee re-verify a leader's report instead of trusting it.
-pub(crate) fn integrity_culprit_from_evidence(evidence: &[u8]) -> Option<ServerId> {
+/// Culprit iff `evidence` is a `ServerPublic` with a mismatched share that the
+/// claimed slot's owner actually signed — lets the committee re-verify a
+/// leader's report instead of trusting it.
+pub(crate) fn integrity_culprit_from_evidence(
+    evidence: &[u8],
+    roster: &[Pubkey],
+) -> Option<Pubkey> {
     match bincode::deserialize::<PanetiereWire>(evidence).ok()? {
-        PanetiereWire::ServerPublic { server_id, agg_open, agg_share, .. } => {
-            (!server_public_consistent(&agg_open, &agg_share)).then_some(ServerId(server_id))
+        PanetiereWire::ServerPublic { round, server_id, clients, agg_open, agg_share, signature } => {
+            let culprit = *roster.get(server_id as usize)?;
+            if !culprit.verify(
+                &server_public_signing_bytes(round, server_id, &clients, &agg_open, &agg_share),
+                &signature,
+            ) {
+                return None;
+            }
+            (!server_public_consistent(&agg_open, &agg_share)).then_some(culprit)
         }
         _ => None,
     }
@@ -686,7 +682,20 @@ impl Session for PanetiereObserverSession {
                     clients,
                     agg_open,
                     agg_share,
+                    signature,
                 } => {
+                    // Liveness credit and attribution bind to the slot owner's key.
+                    let Some(&expected) = self.roster.get(*server_id as usize) else {
+                        return Vec::new();
+                    };
+                    if from != expected
+                        || !expected.verify(
+                            &server_public_signing_bytes(*round, *server_id, clients, agg_open, agg_share),
+                            signature,
+                        )
+                    {
+                        return Vec::new();
+                    }
                     // Panetiere server ids are the 0-based sorted-roster index.
                     self.tracker.observe_share(*round, *server_id as usize);
                     // Leaderless committee has no ClientSet; read the set off shares.
@@ -699,13 +708,11 @@ impl Session for PanetiereObserverSession {
                     if !server_public_consistent(agg_open, agg_share)
                         && self.integrity_seen.insert((*round, *server_id))
                     {
-                        if let Some(pk) = self.roster.get(*server_id as usize).copied() {
-                            self.integrity_pending.push(Fault {
-                                kind: FaultKind::Integrity,
-                                attribution: Attribution::Peers(vec![pk]),
-                                evidence: payload.clone(),
-                            });
-                        }
+                        self.integrity_pending.push(Fault {
+                            kind: FaultKind::Integrity,
+                            attribution: Attribution::Peers(vec![expected]),
+                            evidence: payload.clone(),
+                        });
                     }
                 }
                 PanetiereWire::ClientSet { round, clients } if self.leader == Some(from) => {
@@ -736,8 +743,7 @@ pub struct PanetiereClientSession {
     pp: Arc<ProtocolParams>,
     mse: MseParams,
     client_id: ClientId,
-    server_ids: Vec<ServerId>,
-    server_xpubs: HashMap<ServerId, ExchangePublicKey>,
+    servers: Vec<(ServerId, pke::PublicKey)>,
     pending: Option<Vec<KahePoly>>,
     rng_seed: [u8; 32],
     cover_rate: f32,
@@ -754,8 +760,7 @@ impl PanetiereClientSession {
         pp: Arc<ProtocolParams>,
         mse: MseParams,
         client_id: ClientId,
-        server_ids: Vec<ServerId>,
-        server_xpubs: HashMap<ServerId, ExchangePublicKey>,
+        servers: Vec<(ServerId, pke::PublicKey)>,
         rng_seed: [u8; 32],
     ) -> Self {
         // Domain-separate the cover and MSE-r streams from the protocol seed.
@@ -767,8 +772,7 @@ impl PanetiereClientSession {
             pp,
             mse,
             client_id,
-            server_ids,
-            server_xpubs,
+            servers,
             pending: None,
             rng_seed,
             cover_rate: 1.0,
@@ -780,6 +784,16 @@ impl PanetiereClientSession {
 
 impl Session for PanetiereClientSession {
     fn begin_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
+        // Sealing (and Shamir sharing) needs every relay's exchange key; a
+        // partial set would poison the servers' all-or-nothing rounds.
+        if self.servers.len() != self.pp.cs.n_servers {
+            tracing::debug!(
+                have = self.servers.len(),
+                need = self.pp.cs.n_servers,
+                "panetiere client: missing relay exchange keys; skipping round"
+            );
+            return Vec::new();
+        }
         let msg = match self.pending.take() {
             Some(m) => m,
             None if self.cover_rng.gen::<f32>() < self.cover_rate => {
@@ -794,11 +808,9 @@ impl Session for PanetiereClientSession {
         let mut seed = self.rng_seed;
         seed[24..32].copy_from_slice(&round.to_le_bytes());
         let mut rng = ChaCha20Rng::from_seed(seed);
-        let round_out = run_client_round(&mut rng, &self.pp, self.client_id, msg, &self.server_ids);
+        let round_out = run_client_round(&mut rng, &self.pp, self.client_id, msg, &self.servers);
 
-        let (r_b, s_b, t_b) = panetiere::cs::fresh_opening_pack_bounds(&self.pp.cs);
-
-        let mut out: Vec<Vec<u8>> = Vec::with_capacity(1 + self.server_ids.len());
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(1 + self.servers.len());
 
         let pub_msg = PanetiereWire::ClientPublic {
             round,
@@ -807,20 +819,12 @@ impl Session for PanetiereClientSession {
         };
         out.push(bincode::serialize(&pub_msg).expect("serialise client public"));
 
-        for (server_id, opening) in round_out.encrypted_openings {
-            let packed = PackedOpeningWire::from(&opening.pack(r_b, s_b, t_b));
-            let Some(xpub) = self.server_xpubs.get(&server_id) else {
-                continue;
-            };
-            let plain = bincode::serialize(&packed).expect("serialise packed opening");
-            let Ok(sealed) = adcnet::crypto::encrypt(xpub, &plain) else {
-                continue;
-            };
+        for (server_id, sealed) in round_out.sealed_openings {
             let opening_msg = PanetiereWire::Opening {
                 round,
                 client_id: round_out.client_id.0,
                 target_server: server_id.0,
-                sealed: sealed.to_bytes(),
+                sealed,
             };
             out.push(bincode::serialize(&opening_msg).expect("serialise opening"));
         }
@@ -862,8 +866,6 @@ struct PanetiereRoundState {
     publics: HashMap<ClientId, ClientBulletinEntry>,
     inbox_items: Vec<(ClientId, Opening)>,
     peer_server_publics: HashMap<ServerId, ServerBulletinEntry>,
-    raw_server_publics: HashMap<ServerId, Vec<u8>>,
-    reported_bad: HashSet<ServerId>,
     emitted_my_public: bool,
     decoded: bool,
     /// Leader-only (aggregated flow): the agreed summed entry per group.
@@ -899,7 +901,7 @@ pub struct PanetiereServerSession {
     mse: MseParams,
     server_id: ServerId,
     max_clients: u32,
-    exchange: ExchangeIdentity,
+    identity: Identity,
     mode: SetMode,
     /// Anonymity floor: never decode a canonical set smaller than this.
     min_clients: usize,
@@ -929,7 +931,7 @@ impl PanetiereServerSession {
         mse: MseParams,
         server_id: ServerId,
         max_clients: u32,
-        exchange: ExchangeIdentity,
+        identity: Identity,
         mode: SetMode,
         min_clients: u32,
         server_pubkeys: HashMap<ServerId, Pubkey>,
@@ -940,7 +942,7 @@ impl PanetiereServerSession {
             mse,
             server_id,
             max_clients,
-            exchange,
+            identity,
             mode,
             min_clients: min_clients as usize,
             server_pubkeys,
@@ -1139,13 +1141,10 @@ impl Session for PanetiereServerSession {
                 sealed,
             } => {
                 if target_server == self.server_id.0 {
-                    let Some(plain) = self.exchange.unseal(&sealed) else {
-                        return Vec::new();
-                    };
-                    let Ok(packed) = bincode::deserialize::<PackedOpeningWire>(&plain) else {
-                        return Vec::new();
-                    };
-                    let Ok(opening) = Opening::from_packed(&PackedOpening::from(packed)) else {
+                    let Some(opening) =
+                        unseal_opening(self.identity.exchange().pke(), &sealed)
+                    else {
+                        tracing::debug!(client_id, "panetiere server: undecodable sealed opening");
                         return Vec::new();
                     };
                     self.rounds
@@ -1161,16 +1160,29 @@ impl Session for PanetiereServerSession {
                 clients,
                 agg_open,
                 agg_share,
+                signature,
             } => {
-                let n_shares = agg_open.mu_cs as usize;
-                let Ok(agg_open) = Opening::from_packed(&PackedOpening::from(agg_open)) else {
+                // Attribution binds to the slot owner's key.
+                let Some(&expected) = self.server_pubkeys.get(&ServerId(server_id)) else {
+                    return Vec::new();
+                };
+                if from != expected
+                    || !expected.verify(
+                        &server_public_signing_bytes(round, server_id, &clients, &agg_open, &agg_share),
+                        &signature,
+                    )
+                {
+                    return Vec::new();
+                }
+                let Some(packed) = PackedOpening::from_bytes(&agg_open) else {
+                    return Vec::new();
+                };
+                let n_shares = packed.mu_cs as usize;
+                let Ok(agg_open) = Opening::from_packed(&packed) else {
                     return Vec::new();
                 };
                 if let Some(agg_share) = panetiere::cs::unpack_cs_shares(&agg_share, n_shares) {
                     let bucket = self.rounds.entry(round).or_default();
-                    bucket
-                        .raw_server_publics
-                        .insert(ServerId(server_id), payload.clone());
                     bucket.peer_server_publics.insert(
                         ServerId(server_id),
                         ServerBulletinEntry {
@@ -1254,6 +1266,7 @@ impl Session for PanetiereServerSession {
         let self_derived = self.mode == SetMode::SelfDerived;
         let cs = &self.pp.cs;
         let sid = self.server_id;
+        let identity = self.identity.clone();
 
         // Phase A (leader only): announce the one canonical set per settled round,
         // exactly once, seeding our own `client_set_by_round` from it.
@@ -1357,12 +1370,19 @@ impl Session for PanetiereServerSession {
                             *b ^= 0x01;
                         }
                     }
+                    let clients: Vec<u32> = sp.clients.iter().map(|c| c.0).collect();
+                    let agg_open = packed.to_bytes();
+                    // Sign what we publish — a corrupted share stays attributable.
+                    let signature = identity.sign(&server_public_signing_bytes(
+                        r, sp.server_id.0, &clients, &agg_open, &agg_share,
+                    ));
                     let wire = PanetiereWire::ServerPublic {
                         round: r,
                         server_id: sp.server_id.0,
-                        clients: sp.clients.iter().map(|c| c.0).collect(),
-                        agg_open: PackedOpeningWire::from(&packed),
+                        clients,
+                        agg_open,
                         agg_share,
+                        signature,
                     };
                     // Cache our own honest public so try_decode sees it as a peer entry.
                     state.peer_server_publics.insert(sp.server_id, sp);
@@ -1386,30 +1406,14 @@ impl Session for PanetiereServerSession {
             } else {
                 self.client_set_by_round.get(r).cloned()
             };
-            let (decoded_round, bad) = match self.aggregation.as_ref() {
+            // Culprits excluded to reach decode are reported by the leader's
+            // fault monitor (from the same wire evidence), not here — see N5.
+            let (decoded_round, _bad) = match self.aggregation.as_ref() {
                 Some(agg) => {
                     try_decode_round_aggregated(&self.pp, agg, state, anchor.as_deref(), self.min_clients)
                 }
                 None => try_decode_round(&self.pp, state, anchor.as_deref(), self.min_clients),
             };
-            if is_leader {
-                for sid in bad {
-                    if !state.reported_bad.insert(sid) {
-                        continue;
-                    }
-                    if let Some(pk) = self.server_pubkeys.get(&sid) {
-                        faults.push(Fault {
-                            kind: FaultKind::Integrity,
-                            attribution: Attribution::Peers(vec![*pk]),
-                            evidence: state
-                                .raw_server_publics
-                                .get(&sid)
-                                .cloned()
-                                .unwrap_or_default(),
-                        });
-                    }
-                }
-            }
             if let Some(plain) = decoded_round {
                 // Peel every client's MSE element out of the summed plaintext —
                 // each is one message, so concurrent senders don't collide. A
@@ -1439,7 +1443,6 @@ impl Session for PanetiereServerSession {
                 state.publics.clear();
                 state.inbox_items.clear();
                 state.peer_server_publics.clear();
-                state.raw_server_publics.clear();
             }
         }
 
@@ -1576,8 +1579,10 @@ mod observer_tests {
 
     #[test]
     fn anon_set_only_from_leader_client_set() {
-        let leader = Identity::generate().pubkey();
-        let other = Identity::generate().pubkey();
+        let leader_id = Identity::generate();
+        let other_id = Identity::generate();
+        let leader = leader_id.pubkey();
+        let other = other_id.pubkey();
         let mut obs = PanetiereObserverSession::new(vec![leader, other], Some(leader), 2);
         let cs = bincode::serialize(&PanetiereWire::ClientSet {
             round: 1,
@@ -1594,19 +1599,44 @@ mod observer_tests {
         assert_eq!(obs.output_frontier(), None, "forged Decoded must not advance output");
         obs.on_inbound(leader, dec);
         assert_eq!(obs.output_frontier(), Some(7));
+
+        // ServerPublic liveness credit binds to the slot owner: wrong signer or
+        // wrong sender must not count as that slot's share.
+        let agg_open = PackedOpening {
+            server_index: 1, path_index: 0, kappa_cs: 0, mu_cs: 0, block_size: 0,
+            stored_path_len: 0, r_bound: 0, s_bound: 0, tree_bound: 0, bytes: Vec::new(),
+        }
+        .to_bytes();
+        let sp = |signature: Vec<u8>| {
+            bincode::serialize(&PanetiereWire::ServerPublic {
+                round: 9, server_id: 1, clients: vec![10],
+                agg_open: agg_open.clone(), agg_share: Vec::new(), signature,
+            })
+            .unwrap()
+        };
+        let signing = server_public_signing_bytes(9, 1, &[10], &agg_open, &[]);
+        obs.on_inbound(other, sp(leader_id.sign(&signing)));
+        assert_eq!(obs.share_frontier(), None, "slot 1 share signed by another key must be dropped");
+        obs.on_inbound(leader, sp(other_id.sign(&signing)));
+        assert_eq!(obs.share_frontier(), None, "valid signature replayed from another sender must be dropped");
+        obs.on_inbound(other, sp(other_id.sign(&signing)));
+        assert_eq!(obs.share_frontier(), Some(9));
     }
 
     #[test]
     fn wire_estimate_covers_real_messages() {
-        use std::collections::HashMap;
         let (msg_size, est_msgs, cset, n_relays) = (256usize, 4u32, 40u32, 3usize);
         let est = max_wire_estimate(msg_size, est_msgs, cset, n_relays);
 
         let mse = channel_mse_params(est_msgs, msg_size, [1u8; 32]);
         let pp = setup_pp(&mse, n_relays, [1u8; 32]);
-        let server_ids: Vec<ServerId> = (0..n_relays as u32).map(ServerId).collect();
+        let servers: Vec<(ServerId, pke::PublicKey)> = (0..n_relays as u32)
+            .map(|i| {
+                (ServerId(i), pke::PrivateKey::generate(&mut rand::rngs::OsRng).public())
+            })
+            .collect();
         let mut c =
-            PanetiereClientSession::new(pp.clone(), mse, ClientId(1), server_ids, HashMap::new(), [2u8; 32]);
+            PanetiereClientSession::new(pp.clone(), mse, ClientId(1), servers, [2u8; 32]);
         let client_public = c
             .begin_round(0, Instant::now())
             .iter()

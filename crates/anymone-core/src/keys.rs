@@ -156,18 +156,25 @@ pub fn derive_seed(domain: &[u8], pubkeys: &[Pubkey]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// Long-lived P-256 keypair for the ADCNet/Panetiere ECDH layer. Held alongside
-/// the Ed25519 [`crate::identity::Identity`] and persisted next to it so a node
-/// keeps one stable exchange pubkey across restarts.
+/// Long-lived P-256 keypair for the ADCNet ECDH layer and the Panetiere ECIES
+/// (`panetiere::pke`) sealing layer — one scalar, both protocol-native key
+/// types. Held alongside the Ed25519 [`crate::identity::Identity`] and
+/// persisted next to it so a node keeps one stable exchange pubkey across
+/// restarts.
 pub struct ExchangeIdentity {
     key: adcnet::crypto::ExchangePrivateKey,
+    pke: panetiere::pke::PrivateKey,
 }
 
 impl ExchangeIdentity {
+    fn from_adcnet_key(key: adcnet::crypto::ExchangePrivateKey) -> Self {
+        let pke = panetiere::pke::PrivateKey::from_bytes(&key.to_bytes())
+            .expect("same P-256 scalar");
+        ExchangeIdentity { key, pke }
+    }
+
     pub fn generate() -> Self {
-        ExchangeIdentity {
-            key: adcnet::crypto::ExchangePrivateKey::generate(),
-        }
+        Self::from_adcnet_key(adcnet::crypto::ExchangePrivateKey::generate())
     }
 
     pub fn public(&self) -> adcnet::crypto::ExchangePublicKey {
@@ -178,10 +185,9 @@ impl ExchangeIdentity {
         self.key.ecdh(other)
     }
 
-    /// Open an ECIES envelope sealed to this key (`adcnet::crypto::encrypt`).
-    pub fn unseal(&self, sealed: &[u8]) -> Option<Vec<u8>> {
-        let msg = adcnet::crypto::parse_encrypted_message(sealed).ok()?;
-        adcnet::crypto::decrypt(&self.key, &msg).ok()
+    /// The key ECIES envelopes (`panetiere::pke`) are opened with.
+    pub fn pke(&self) -> &panetiere::pke::PrivateKey {
+        &self.pke
     }
 
     pub fn save(&self, path: &Path) -> Result<(), IdentityError> {
@@ -196,7 +202,7 @@ impl ExchangeIdentity {
         let bytes = fs::read(path)?;
         let key = adcnet::crypto::ExchangePrivateKey::from_bytes(&bytes)
             .map_err(|e| IdentityError::Decode(e.to_string()))?;
-        Ok(ExchangeIdentity { key })
+        Ok(Self::from_adcnet_key(key))
     }
 
     pub fn load_or_generate(path: &Path) -> Result<Self, IdentityError> {
@@ -212,10 +218,10 @@ impl ExchangeIdentity {
 
 impl Clone for ExchangeIdentity {
     fn clone(&self) -> Self {
-        ExchangeIdentity {
-            key: adcnet::crypto::ExchangePrivateKey::from_bytes(&self.key.to_bytes())
+        Self::from_adcnet_key(
+            adcnet::crypto::ExchangePrivateKey::from_bytes(&self.key.to_bytes())
                 .expect("ExchangePrivateKey round-trips its own bytes"),
-        }
+        )
     }
 }
 

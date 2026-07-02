@@ -7,27 +7,28 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anymone_core::identity::ExchangeIdentity;
 use anymone_core::panetiere::{
     PanetiereAggregatorSession, PanetiereClientSession, PanetiereServerSession, SetMode,
 };
 use anymone_core::session::{LeaderAggregation, Session};
 use anymone_core::{Identity, Pubkey};
 
-use adcnet::crypto::ExchangePublicKey;
 use panetiere::mse::{MseEncoding, MseParams};
+use panetiere::pke;
 use panetiere::protocol::{ClientId, ProtocolParams, ServerId};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
-fn exchange_env(n: usize) -> (Vec<ExchangeIdentity>, HashMap<ServerId, ExchangePublicKey>) {
-    let exchanges: Vec<ExchangeIdentity> = (0..n).map(|_| ExchangeIdentity::generate()).collect();
-    let xpubs = exchanges
+fn server_env(n: usize) -> (Vec<Identity>, Vec<Pubkey>, Vec<(ServerId, pke::PublicKey)>) {
+    let mut ids: Vec<Identity> = (0..n).map(|_| Identity::generate()).collect();
+    ids.sort_by_key(|i| i.pubkey());
+    let pks = ids.iter().map(|i| i.pubkey()).collect();
+    let xpubs = ids
         .iter()
         .enumerate()
-        .map(|(i, e)| (ServerId(i as u32), e.public()))
+        .map(|(i, id)| (ServerId(i as u32), id.exchange().pke().public()))
         .collect();
-    (exchanges, xpubs)
+    (ids, pks, xpubs)
 }
 
 fn server_pubkeys(server_pks: &[Pubkey]) -> HashMap<ServerId, Pubkey> {
@@ -51,8 +52,7 @@ fn run_aggregated(
     let n_polys = MseEncoding::n_polys(&mse);
     let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(&mut setup_rng, n_servers, n_polys, 1));
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
-    let server_pks: Vec<Pubkey> = (0..n_servers).map(|_| Identity::generate().pubkey()).collect();
-    let (exchanges, xpubs) = exchange_env(n_servers);
+    let (ids, server_pks, xpubs) = server_env(n_servers);
 
     // Aggregator identities: `replication` per group.
     let agg_ids: Vec<Vec<Identity>> = (0..group_count)
@@ -70,7 +70,7 @@ fn run_aggregated(
         .map(|i| {
             let mut seed = [0u8; 32];
             seed[..4].copy_from_slice(&i.to_le_bytes());
-            PanetiereClientSession::new(pp.clone(), mse.clone(), ClientId(i), server_ids.clone(), xpubs.clone(), seed)
+            PanetiereClientSession::new(pp.clone(), mse.clone(), ClientId(i), xpubs.clone(), seed)
         })
         .collect();
     clients[0].stage(payload.to_vec());
@@ -84,7 +84,7 @@ fn run_aggregated(
                 mse.clone(),
                 *sid,
                 64,
-                exchanges[sid.0 as usize].clone(),
+                ids[sid.0 as usize].clone(),
                 if sid.0 == 0 { SetMode::Leader } else { SetMode::SelfDerived },
                 0,
                 server_pubkeys(&server_pks),

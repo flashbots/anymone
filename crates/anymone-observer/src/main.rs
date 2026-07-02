@@ -572,7 +572,10 @@ fn spawn_committee_loop(transport: Arc<dyn Transport>, obs: Shared, committee: V
         let mut sigs = transport.subscribe(anymone_core::committee::TOPIC_COMMITTEE_SIGS).await;
         // Read the committee's round off its genuine Panetiere messages (each
         // carries the round) rather than guessing from a clock or message count.
-        let mut observer = PanetiereObserverSession::new(committee.clone(), None, 0);
+        // Members stamp their sorted-committee index, so the roster must be sorted.
+        let mut roster = committee.clone();
+        roster.sort();
+        let mut observer = PanetiereObserverSession::new(roster, None, 0);
         loop {
             tokio::select! {
                 Some(msg) = sub.recv() => {

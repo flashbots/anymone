@@ -208,16 +208,15 @@ pub async fn spawn_panetiere_committee_scheduler(
             .position(|p| *p == our_pk)
             .expect("identity in committee") as u32,
     );
-    let server_ids: Vec<ServerId> = (0..sorted_committee.len() as u32).map(ServerId).collect();
-    let server_xpubs: std::collections::HashMap<ServerId, adcnet::crypto::ExchangePublicKey> =
-        sorted_committee
-            .iter()
-            .enumerate()
-            .filter_map(|(i, pk)| {
-                let xk = committee_xpubs.get(pk)?.to_key().ok()?;
-                Some((ServerId(i as u32), xk))
-            })
-            .collect();
+    let seal_roster: Vec<(ServerId, panetiere::pke::PublicKey)> = sorted_committee
+        .iter()
+        .enumerate()
+        .filter_map(|(i, pk)| {
+            let xk = committee_xpubs.get(pk)?;
+            let pk256 = panetiere::pke::PublicKey::from_sec1_bytes(&xk.0).ok()?;
+            Some((ServerId(i as u32), pk256))
+        })
+        .collect();
 
     let params = SchedulerParams {
         public_round_duration: config.public_round_duration,
@@ -248,7 +247,7 @@ pub async fn spawn_panetiere_committee_scheduler(
             committee_mse.clone(),
             my_server_id,
             committee.len() as u32,
-            identity.exchange().clone(),
+            identity.clone(),
             // Leaderless, all-to-all: every member derives its own set and decodes
             // locally; no announcer, no Decoded on the committee topic.
             SetMode::SelfDerived,
@@ -281,8 +280,7 @@ pub async fn spawn_panetiere_committee_scheduler(
                                 pp.clone(),
                                 committee_mse.clone(),
                                 ClientId(my_server_id.0),
-                                server_ids.clone(),
-                                server_xpubs.clone(),
+                                seal_roster.clone(),
                                 seed,
                             ))
                         });

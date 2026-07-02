@@ -427,8 +427,8 @@ impl SchedulerCore {
 
     /// Ingest an integrity `FaultReport` gossiped on `TOPIC_FAULTS`. Accepted only
     /// from the subnet's leader and only when we can re-verify the evidence
-    /// ourselves and it attributes the named relay — so a lying leader can't frame
-    /// an honest one. Liveness stays the observer's job.
+    /// ourselves — it must be signed by the very relay it attributes — so a lying
+    /// leader can't frame an honest one. Liveness stays the observer's job.
     pub fn on_fault_report(&mut self, from: Pubkey, report: FaultReport, now_unix_ms: u64) {
         if report.fault.kind != FaultKind::Integrity {
             return;
@@ -444,11 +444,9 @@ impl SchedulerCore {
         if from != roster[(report.subnet as usize) % roster.len()] {
             return;
         }
-        let Some(sid) = crate::panetiere::integrity_culprit_from_evidence(&report.fault.evidence)
+        let Some(culprit) =
+            crate::panetiere::integrity_culprit_from_evidence(&report.fault.evidence, &roster)
         else {
-            return;
-        };
-        let Some(culprit) = roster.get(sid.0 as usize).copied() else {
             return;
         };
         if report.fault.attribution != Attribution::Peers(vec![culprit]) {

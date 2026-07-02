@@ -11,28 +11,29 @@ use anymone_core::config::{
     Subnet,
 };
 use anymone_core::panetiere::{PanetiereClientSession, PanetiereServerSession, SetMode};
-use anymone_core::identity::ExchangeIdentity;
 use anymone_core::faults::{Attribution, FaultKind};
 use anymone_core::session::{Misbehavior, Session};
 use anymone_core::{Identity, Pubkey, ServiceEntry, ServiceTag};
 
-use adcnet::crypto::ExchangePublicKey;
 use panetiere::mse::{MseEncoding, MseParams};
+use panetiere::pke;
 use panetiere::protocol::ProtocolParams;
 use panetiere::protocol::{ClientId, ServerId};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
-/// Per-server exchange identities + the client's view of their pubkeys
-/// (openings are sealed per server).
-fn exchange_env(n: usize) -> (Vec<ExchangeIdentity>, HashMap<ServerId, ExchangePublicKey>) {
-    let exchanges: Vec<ExchangeIdentity> = (0..n).map(|_| ExchangeIdentity::generate()).collect();
-    let xpubs = exchanges
+/// Per-server identities (sorted by pubkey, matching the runtime's slot order)
+/// plus the client's view of their exchange pubkeys.
+fn server_env(n: usize) -> (Vec<Identity>, Vec<Pubkey>, Vec<(ServerId, pke::PublicKey)>) {
+    let mut ids: Vec<Identity> = (0..n).map(|_| Identity::generate()).collect();
+    ids.sort_by_key(|i| i.pubkey());
+    let pks = ids.iter().map(|i| i.pubkey()).collect();
+    let xpubs = ids
         .iter()
         .enumerate()
-        .map(|(i, e)| (ServerId(i as u32), e.public()))
+        .map(|(i, id)| (ServerId(i as u32), id.exchange().pke().public()))
         .collect();
-    (exchanges, xpubs)
+    (ids, pks, xpubs)
 }
 
 fn server_pubkeys(server_pks: &[Pubkey]) -> HashMap<ServerId, Pubkey> {
@@ -63,15 +64,13 @@ fn panetiere_session_happy_path() {
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_id = ClientId(0);
     let client_pk = Identity::generate().pubkey();
-    let server_pks: Vec<_> = (0..n_servers).map(|_| Identity::generate().pubkey()).collect();
-
-    let (exchanges, xpubs) = exchange_env(n_servers);
+    let (ids, server_pks, xpubs) = server_env(n_servers);
     let mut client = PanetiereClientSession::new(
-        pp.clone(), mse.clone(), client_id, server_ids.clone(), xpubs, [42u8; 32]);
+        pp.clone(), mse.clone(), client_id, xpubs, [42u8; 32]);
     let mut servers: Vec<PanetiereServerSession> = server_ids
         .iter()
         .map(|sid| {
-            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, 8, exchanges[sid.0 as usize].clone(), SetMode::SelfDerived, 0, server_pubkeys(&server_pks), None)
+            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, 8, ids[sid.0 as usize].clone(), SetMode::SelfDerived, 0, server_pubkeys(&server_pks), None)
         })
         .collect();
 
@@ -124,15 +123,13 @@ fn committee_panetiere_roundtrip(payload: &[u8]) -> Vec<u8> {
     let (mse, pp) = channel(&mut setup_rng, n_servers, 3, 4096);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_pk = Identity::generate().pubkey();
-    let server_pks: Vec<_> = (0..n_servers).map(|_| Identity::generate().pubkey()).collect();
-
-    let (exchanges, xpubs) = exchange_env(n_servers);
+    let (ids, server_pks, xpubs) = server_env(n_servers);
     let mut client = PanetiereClientSession::new(
-        pp.clone(), mse.clone(), ClientId(0), server_ids.clone(), xpubs, [42u8; 32]);
+        pp.clone(), mse.clone(), ClientId(0), xpubs, [42u8; 32]);
     let mut servers: Vec<PanetiereServerSession> = server_ids
         .iter()
         .map(|sid| {
-            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, 8, exchanges[sid.0 as usize].clone(), SetMode::SelfDerived, 0, server_pubkeys(&server_pks), None)
+            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, 8, ids[sid.0 as usize].clone(), SetMode::SelfDerived, 0, server_pubkeys(&server_pks), None)
         })
         .collect();
 
@@ -175,15 +172,13 @@ fn panetiere_back_to_back_rounds_lose_nothing() {
     let (mse, pp) = channel(&mut setup_rng, n_servers, 1, 64);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_pk = Identity::generate().pubkey();
-    let server_pks: Vec<_> = (0..n_servers).map(|_| Identity::generate().pubkey()).collect();
-
-    let (exchanges, xpubs) = exchange_env(n_servers);
+    let (ids, server_pks, xpubs) = server_env(n_servers);
     let mut client = PanetiereClientSession::new(
-        pp.clone(), mse.clone(), ClientId(0), server_ids.clone(), xpubs, [42u8; 32]);
+        pp.clone(), mse.clone(), ClientId(0), xpubs, [42u8; 32]);
     let mut servers: Vec<PanetiereServerSession> = server_ids
         .iter()
         .map(|sid| {
-            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, 8, exchanges[sid.0 as usize].clone(), SetMode::SelfDerived, 0, server_pubkeys(&server_pks), None)
+            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, 8, ids[sid.0 as usize].clone(), SetMode::SelfDerived, 0, server_pubkeys(&server_pks), None)
         })
         .collect();
 
@@ -244,11 +239,10 @@ fn panetiere_corrupt_share_attributes_integrity() {
     let (mse, pp) = channel(&mut setup_rng, n_servers, 1, 64);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_pk = Identity::generate().pubkey();
-    let server_pks: Vec<_> = (0..n_servers).map(|_| Identity::generate().pubkey()).collect();
-    let (exchanges, xpubs) = exchange_env(n_servers);
+    let (ids, server_pks, xpubs) = server_env(n_servers);
 
     let mut client = PanetiereClientSession::new(
-        pp.clone(), mse.clone(), ClientId(0), server_ids.clone(), xpubs, [42u8; 32]);
+        pp.clone(), mse.clone(), ClientId(0), xpubs, [42u8; 32]);
     // Server 0 is the decoding leader; server 2 corrupts its share.
     let mut servers: Vec<PanetiereServerSession> = server_ids
         .iter()
@@ -258,7 +252,7 @@ fn panetiere_corrupt_share_attributes_integrity() {
                 mse.clone(),
                 *sid,
                 8,
-                exchanges[sid.0 as usize].clone(),
+                ids[sid.0 as usize].clone(),
                 if sid.0 == 0 { SetMode::Leader } else { SetMode::SelfDerived },
                 0,
                 server_pubkeys(&server_pks),
@@ -316,8 +310,7 @@ fn panetiere_concurrent_clients_all_decode() {
     let (mse, pp) = channel(&mut setup_rng, n_servers, active, 64);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_pks: Vec<Pubkey> = (0..total).map(|_| Identity::generate().pubkey()).collect();
-    let server_pks: Vec<_> = (0..n_servers).map(|_| Identity::generate().pubkey()).collect();
-    let (exchanges, xpubs) = exchange_env(n_servers);
+    let (ids, server_pks, xpubs) = server_env(n_servers);
 
     let mut clients: Vec<PanetiereClientSession> = (0..total)
         .map(|i| {
@@ -325,7 +318,6 @@ fn panetiere_concurrent_clients_all_decode() {
                 pp.clone(),
                 mse.clone(),
                 ClientId(i as u32),
-                server_ids.clone(),
                 xpubs.clone(),
                 [40 + i as u8; 32],
             )
@@ -334,7 +326,7 @@ fn panetiere_concurrent_clients_all_decode() {
     let mut servers: Vec<PanetiereServerSession> = server_ids
         .iter()
         .map(|sid| {
-            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, 8, exchanges[sid.0 as usize].clone(), if sid.0 == 0 { SetMode::Leader } else { SetMode::SelfDerived }, 0, server_pubkeys(&server_pks), None)
+            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, 8, ids[sid.0 as usize].clone(), if sid.0 == 0 { SetMode::Leader } else { SetMode::SelfDerived }, 0, server_pubkeys(&server_pks), None)
         })
         .collect();
 
@@ -391,16 +383,14 @@ fn panetiere_followers_use_leader_set_with_min_floor() {
         let (mse, pp) = channel(&mut setup_rng, n_servers, n_clients, 64);
         let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
         let client_pks: Vec<Pubkey> = (0..n_clients).map(|_| Identity::generate().pubkey()).collect();
-        let mut server_pks: Vec<Pubkey> = (0..n_servers).map(|_| Identity::generate().pubkey()).collect();
-        server_pks.sort();
+        let (ids, server_pks, xpubs) = server_env(n_servers);
         let leader_pk = server_pks[0];
-        let (exchanges, xpubs) = exchange_env(n_servers);
 
         let mut clients: Vec<PanetiereClientSession> = (0..n_clients)
             .map(|i| {
                 PanetiereClientSession::new(
                     pp.clone(), mse.clone(), ClientId(i as u32),
-                    server_ids.clone(), xpubs.clone(), [50 + i as u8; 32],
+                    xpubs.clone(), [50 + i as u8; 32],
                 )
             })
             .collect();
@@ -416,7 +406,7 @@ fn panetiere_followers_use_leader_set_with_min_floor() {
                     SetMode::Follower { leader: leader_pk }
                 };
                 PanetiereServerSession::new(
-                    pp.clone(), mse.clone(), *sid, 8, exchanges[sid.0 as usize].clone(),
+                    pp.clone(), mse.clone(), *sid, 8, ids[sid.0 as usize].clone(),
                     mode, min_clients, server_pubkeys(&server_pks), None,
                 )
             })
@@ -511,15 +501,13 @@ fn panetiere_fixed_seed_multiround_no_stall() {
     let (mse, pp) = channel(&mut setup_rng, n_servers, 1, 64);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_pk = Identity::generate().pubkey();
-    let server_pks: Vec<_> = (0..n_servers).map(|_| Identity::generate().pubkey()).collect();
-
-    let (exchanges, xpubs) = exchange_env(n_servers);
+    let (ids, server_pks, xpubs) = server_env(n_servers);
     let mut client = PanetiereClientSession::new(
-        pp.clone(), mse.clone(), ClientId(0), server_ids.clone(), xpubs, [42u8; 32]);
+        pp.clone(), mse.clone(), ClientId(0), xpubs, [42u8; 32]);
     let mut servers: Vec<PanetiereServerSession> = server_ids
         .iter()
         .map(|sid| {
-            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, 8, exchanges[sid.0 as usize].clone(), SetMode::SelfDerived, 0, server_pubkeys(&server_pks), None)
+            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, 8, ids[sid.0 as usize].clone(), SetMode::SelfDerived, 0, server_pubkeys(&server_pks), None)
         })
         .collect();
 

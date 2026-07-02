@@ -17,12 +17,11 @@ use anymone_core::scheduler_core::{
     CommitteeSig, SchedulerAction, SchedulerCore, SchedulerParams, SignedProposal,
 };
 use anymone_core::faults::{Attribution, Fault, FaultKind};
-use anymone_core::identity::ExchangeIdentity;
 use anymone_core::panetiere::{PanetiereClientSession, PanetiereServerSession, SetMode};
 use anymone_core::session::{Misbehavior, Session};
 use anymone_core::{FaultReport, Identity, Pubkey, Registration, ServiceTag, TOPIC_CONFIG};
 
-use adcnet::crypto::{ExchangePublicKey, ServerId, SharedKey};
+use adcnet::crypto::{ServerId, SharedKey};
 use adcnet::protocol::session::one_round::{IbltMsgParamsOwned, OneRoundConfig};
 use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::protocol::{ClientId, ProtocolParams, ServerId as PanServerId};
@@ -793,17 +792,15 @@ impl PanetiereSubnet {
             .map(|(i, pk)| (PanServerId(i as u32), *pk))
             .collect();
 
-        let exchanges: Vec<ExchangeIdentity> =
-            (0..n).map(|_| ExchangeIdentity::generate()).collect();
-        let xpubs: HashMap<PanServerId, ExchangePublicKey> = exchanges
+        let xpubs: Vec<(PanServerId, panetiere::pke::PublicKey)> = sorted
             .iter()
             .enumerate()
-            .map(|(i, e)| (PanServerId(i as u32), e.public()))
+            .map(|(i, id)| (PanServerId(i as u32), id.exchange().pke().public()))
             .collect();
 
         let client_id = Identity::generate();
         let client = PanetiereClientSession::new(
-            pp.clone(), mse.clone(), ClientId(0), server_ids.clone(), xpubs, [42u8; 32]);
+            pp.clone(), mse.clone(), ClientId(0), xpubs, [42u8; 32]);
         let mut servers: Vec<PanetiereServerSession> = server_ids
             .iter()
             .map(|sid| {
@@ -812,7 +809,7 @@ impl PanetiereSubnet {
                     mse.clone(),
                     *sid,
                     8,
-                    exchanges[sid.0 as usize].clone(),
+                    sorted[sid.0 as usize].clone(),
                     if sid.0 == 0 { SetMode::Leader } else { SetMode::SelfDerived },
                     0,
                     server_pubkeys.clone(),
@@ -996,21 +993,26 @@ fn committee_acts_on_verified_leader_integrity_report() {
     let mut net = PanetiereSubnet::new(&relays);
     let mut integrity: Option<Fault> = None;
     let mut honest_sp: Option<Vec<u8>> = None;
+    let mut corrupt_sp: Option<Vec<u8>> = None;
     for r in 0..4u64 {
         let (wire, faults, _) = net.round(r);
         if honest_sp.is_none() {
             honest_sp = wire.iter().find(|(from, _)| *from == honest_pk).map(|(_, b)| b.clone());
         }
+        if corrupt_sp.is_none() {
+            corrupt_sp = wire.iter().find(|(from, _)| *from == corrupt_pk).map(|(_, b)| b.clone());
+        }
         if integrity.is_none() {
             integrity = faults.into_iter().find(|f| f.kind == FaultKind::Integrity);
         }
-        if integrity.is_some() && honest_sp.is_some() {
+        if integrity.is_some() && honest_sp.is_some() && corrupt_sp.is_some() {
             break;
         }
     }
     let fault = integrity.expect("leader emits an integrity fault");
     assert_eq!(fault.attribution, Attribution::Peers(vec![corrupt_pk]));
     let honest_sp = honest_sp.expect("captured an honest ServerPublic");
+    let corrupt_sp = corrupt_sp.expect("captured the corrupt ServerPublic");
 
     // Verified report from the leader sidelines the offender; subnet stays Panetiere.
     let mut core = escalated_panetiere_core(&committee, &relays, &service);
@@ -1053,4 +1055,26 @@ fn committee_acts_on_verified_leader_integrity_report() {
     core.set_cover_rate(0.7);
     let body = staged_body(&core.tick(2, 0)).expect("cover change re-proposes");
     assert!(body.subnets[0].relays.contains(&honest_pk));
+
+    // Genuine (signed, inconsistent) evidence attributes only its signer: a
+    // report pairing it with a different relay is ignored entirely.
+    let mut core = escalated_panetiere_core(&committee, &relays, &service);
+    core.on_fault_report(
+        leader_pk,
+        FaultReport {
+            round: 5,
+            subnet: 0,
+            reporter: leader_pk,
+            fault: Fault {
+                kind: FaultKind::Integrity,
+                attribution: Attribution::Peers(vec![honest_pk]),
+                evidence: corrupt_sp,
+            },
+        },
+        0,
+    );
+    core.set_cover_rate(0.9);
+    let body = staged_body(&core.tick(2, 0)).expect("cover change re-proposes");
+    assert!(body.subnets[0].relays.contains(&honest_pk));
+    assert!(body.subnets[0].relays.contains(&corrupt_pk), "mis-attributed report must be ignored entirely");
 }
