@@ -1562,6 +1562,7 @@ impl ScheduledAdcnetServerSession {
         signing_key: PrivateKey,
         exchange_key: ExchangePrivateKey,
         clients: &[(PublicKey, adcnet::crypto::ExchangePublicKey)],
+        peer_servers: &[(ServerId, PublicKey)],
         starting_round: i64,
     ) -> Self {
         assert!(
@@ -1571,6 +1572,9 @@ impl ScheduledAdcnetServerSession {
         let svc = ServerService::new(config.clone(), server_id, signing_key, exchange_key);
         for (pk, xpub) in clients {
             svc.register_client(pk, xpub).expect("register client");
+        }
+        for (sid, pk) in peer_servers {
+            svc.register_peer_server(*sid, pk.clone());
         }
         svc.advance_to_round(UpstreamRound::new(starting_round, RoundContext::Client));
         ScheduledAdcnetServerSession {

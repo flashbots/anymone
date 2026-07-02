@@ -51,6 +51,13 @@ fn scheduled_adcnet_session_happy_path() {
         .zip(server_xpubs.iter())
         .map(|(sid, xpub)| (*sid, xpub.clone()))
         .collect();
+    // Server-side peer roster (trusted signing pubkeys), required to accept
+    // one another's partial-decryption shares.
+    let peer_servers: Vec<_> = server_ids
+        .iter()
+        .zip(server_signing.iter())
+        .map(|(sid, sk)| (*sid, sk.public_key().expect("server signing key must yield a public key")))
+        .collect();
 
     // Empty initial broadcast for round 0 — clients/servers anchor on this.
     let initial_bc = RoundBroadcast {
@@ -75,6 +82,7 @@ fn scheduled_adcnet_session_happy_path() {
                 server_signing[i].clone(),
                 server_xks[i].clone(),
                 &clients_for_servers,
+                &peer_servers,
                 starting_round,
             )
         })
