@@ -261,11 +261,19 @@ pub(crate) async fn run_subnet(
     };
 
     let dur_ms = (subnet.protocol.round_duration().as_millis() as u64).max(1);
+    // Aggregated subnets get a third checkpoint between mid and end (2/3, 1/3);
+    // direct subnets keep mid at 1/2 with commit coinciding with (a no-op at) end.
+    let aggregated_subnet = subnet_aggregation(&subnet).is_some();
+    let (mid_offset_ms, commit_offset_ms) =
+        if aggregated_subnet { (2 * dur_ms / 3, dur_ms / 3) } else { (dur_ms / 2, 0) };
+
     let now_ms = crate::config::now_unix_ms();
     let mut round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms);
     let mut deadline = deadline_for(round, base_round, epoch_unix_ms, dur_ms, now_ms);
-    let mut mid_deadline = deadline - std::time::Duration::from_millis(dur_ms / 2);
+    let mut mid_deadline = deadline - std::time::Duration::from_millis(mid_offset_ms);
+    let mut commit_deadline = deadline - std::time::Duration::from_millis(commit_offset_ms);
     let mut mid_done = false;
+    let mut commit_done = false;
 
     if let Some(m) = fault_monitor.as_mut() {
         m.begin_round(round, Instant::now());
@@ -298,6 +306,22 @@ pub(crate) async fn run_subnet(
                     .flat_map(|(key, s)| {
                         let key = *key;
                         s.mid_round(round, Instant::now()).into_iter().map(move |out| (key, out))
+                    })
+                    .collect();
+                for (key, out) in outs {
+                    publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
+                        .await;
+                }
+            }
+
+            _ = tokio::time::sleep_until(commit_deadline), if !commit_done => {
+                commit_done = true;
+                drain_inbound(&mut subscriptions, &mut sessions, &mut fault_monitor, &inner, &egress, identity_pk).await;
+                let outs: Vec<(SessionKey, Vec<u8>)> = sessions
+                    .iter_mut()
+                    .flat_map(|(key, s)| {
+                        let key = *key;
+                        s.commit_round(round, Instant::now()).into_iter().map(move |out| (key, out))
                     })
                     .collect();
                 for (key, out) in outs {
@@ -344,8 +368,10 @@ pub(crate) async fn run_subnet(
                 let now_ms = crate::config::now_unix_ms();
                 round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms).max(round + 1);
                 deadline = deadline_for(round, base_round, epoch_unix_ms, dur_ms, now_ms);
-                mid_deadline = deadline - std::time::Duration::from_millis(dur_ms / 2);
+                mid_deadline = deadline - std::time::Duration::from_millis(mid_offset_ms);
+                commit_deadline = deadline - std::time::Duration::from_millis(commit_offset_ms);
                 mid_done = false;
+                commit_done = false;
                 if let Some(m) = fault_monitor.as_mut() {
                     m.begin_round(round, Instant::now());
                 }
@@ -966,6 +992,54 @@ impl PanetiereServerSession {
             aggregation,
         }
     }
+
+    /// Leader-only: announce the one canonical set per settled round, once.
+    /// Called from `end_round` (direct flow) or `commit_round` (aggregated).
+    fn announce_settled(&mut self, round: Round) -> Vec<Vec<u8>> {
+        let aggregated = self.aggregation.is_some();
+        let mut outbound = Vec::new();
+        let mut announce: Vec<(Round, Vec<ClientId>)> = Vec::new();
+        for (&r, state) in self.rounds.iter() {
+            let empty = if aggregated {
+                state.group_aggregates.is_empty()
+            } else {
+                state.inbox_items.is_empty()
+            };
+            if r > round || self.announced_rounds.contains(&r) || empty {
+                continue;
+            }
+            let mut canonical: Vec<ClientId> = if aggregated {
+                state
+                    .group_aggregates
+                    .values()
+                    .flat_map(|g| g.clients.iter().copied())
+                    .collect()
+            } else {
+                state
+                    .inbox_items
+                    .iter()
+                    .filter_map(|(cid, _)| state.publics.get(cid).map(|_| *cid))
+                    .collect()
+            };
+            canonical.sort();
+            canonical.dedup();
+            if !canonical.is_empty() {
+                announce.push((r, canonical));
+            }
+        }
+        for (r, canonical) in announce {
+            outbound.push(
+                bincode::serialize(&PanetiereWire::ClientSet {
+                    round: r,
+                    clients: canonical.iter().map(|c| c.0).collect(),
+                })
+                .expect("serialise client set"),
+            );
+            self.client_set_by_round.insert(r, canonical);
+            self.announced_rounds.insert(r);
+        }
+        outbound
+    }
 }
 
 /// Decode `state`'s round, excluding any server whose share fails its opening.
@@ -1051,13 +1125,12 @@ fn try_decode_round(
 }
 
 /// Aggregated-flow decode (leader): re-sum the per-group aggregates instead of
-/// the individual `ClientPublic`s, then verify+decrypt against the relays'
-/// openings. Needs every group's aggregate, and their union must equal the
-/// servers' canonical set (else the summed ctxt/comm cover a different set than
-/// the openings — treat as not-yet-decodable).
+/// the individual `ClientPublic`s. Partitions canonical by group
+/// (`client_id % group_count`) rather than comparing a live union against it —
+/// a still-arriving group is just "not yet decodable", not a permanent mismatch.
 fn try_decode_round_aggregated(
     pp: &ProtocolParams,
-    _agg: &LeaderAggregation,
+    agg: &LeaderAggregation,
     state: &PanetiereRoundState,
     anchor: Option<&[ClientId]>,
     min_clients: usize,
@@ -1082,32 +1155,44 @@ fn try_decode_round_aggregated(
     if canonical.len() < min_clients {
         return (None, culprits);
     }
-    let mut union: Vec<ClientId> = state
-        .group_aggregates
-        .values()
-        .flat_map(|g| g.clients.iter().copied())
-        .collect();
-    union.sort();
-    union.dedup();
-    if union != canonical {
-        return (None, culprits);
-    }
 
-    let ctxts: Vec<Vec<KahePoly>> = state
-        .group_aggregates
-        .values()
-        .map(|g| g.entry.ctxt.clone())
-        .collect();
-    let comms: Vec<_> = state
-        .group_aggregates
-        .values()
-        .map(|g| g.entry.comm.clone())
-        .collect();
+    let group_count = agg.roster.len() as u32;
+    let mut by_group: HashMap<u32, Vec<ClientId>> = HashMap::new();
+    for c in &canonical {
+        by_group.entry(c.0 % group_count).or_default().push(*c);
+    }
+    let mut ctxts: Vec<Vec<KahePoly>> = Vec::with_capacity(by_group.len());
+    let mut comms = Vec::with_capacity(by_group.len());
+    for (group, mut expected) in by_group {
+        expected.sort();
+        let Some(g) = state.group_aggregates.get(&group) else {
+            return (None, culprits);
+        };
+        let mut got = g.clients.clone();
+        got.sort();
+        if got != expected {
+            return (None, culprits);
+        }
+        ctxts.push(g.entry.ctxt.clone());
+        comms.push(g.entry.comm.clone());
+    }
     let total_ctxt = Kahe::agg_ctxt(&ctxts);
     let total_comm = HidingMerkleCommitment::sum_commitments(&comms);
 
-    let mut outputs: Vec<ServerBulletinEntry> =
-        state.peer_server_publics.values().cloned().collect();
+    // As in the direct flow: a share over a different set than canonical would
+    // fail its opening against `total_comm` and read as a culprit — drop it here
+    // instead of framing the relay.
+    let mut outputs: Vec<ServerBulletinEntry> = state
+        .peer_server_publics
+        .values()
+        .filter(|sp| {
+            let mut c = sp.clients.clone();
+            c.sort();
+            c.dedup();
+            c == canonical
+        })
+        .cloned()
+        .collect();
     loop {
         if outputs.len() < pp.shamir.t {
             return (None, culprits);
@@ -1127,6 +1212,17 @@ fn try_decode_round_aggregated(
 impl Session for PanetiereServerSession {
     fn begin_round(&mut self, _round: Round, _now: Instant) -> Vec<Vec<u8>> {
         Vec::new()
+    }
+
+    /// Freeze the canonical set for the aggregated flow, ahead of `end_round`.
+    fn commit_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
+        let is_leader = self.mode == SetMode::Leader;
+        let withholding = self.misbehavior == Some(Misbehavior::Withhold);
+        if is_leader && !withholding && self.aggregation.is_some() {
+            self.announce_settled(round)
+        } else {
+            Vec::new()
+        }
     }
 
     fn on_inbound(&mut self, from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
@@ -1240,6 +1336,14 @@ impl Session for PanetiereServerSession {
                 {
                     return Vec::new();
                 }
+                // A client outside the group's partition would poison the frozen
+                // canonical set: decode expects it in another group's aggregate,
+                // which can never match, so the round would stay undecodable.
+                let group_count = agg.roster.len() as u32;
+                if clients.iter().any(|c| c % group_count != group) {
+                    tracing::debug!(round, group, "panetiere: aggregate with out-of-group client");
+                    return Vec::new();
+                }
                 let Some(parsed) = ClientBulletinEntry::from_bytes(&entry) else {
                     return Vec::new();
                 };
@@ -1277,54 +1381,15 @@ impl Session for PanetiereServerSession {
         let aggregated = self.aggregation.is_some();
         let is_leader = self.mode == SetMode::Leader;
         let self_derived = self.mode == SetMode::SelfDerived;
+
+        // Aggregated flow announces at `commit_round` instead.
+        if is_leader && !withholding && !aggregated {
+            outbound.extend(self.announce_settled(round));
+        }
+
         let cs = &self.pp.cs;
         let sid = self.server_id;
         let identity = self.identity.clone();
-
-        // Phase A (leader only): announce the one canonical set per settled round,
-        // exactly once, seeding our own `client_set_by_round` from it.
-        if is_leader && !withholding {
-            let mut announce: Vec<(Round, Vec<ClientId>)> = Vec::new();
-            for (&r, state) in self.rounds.iter() {
-                let empty = if aggregated {
-                    state.group_aggregates.is_empty()
-                } else {
-                    state.inbox_items.is_empty()
-                };
-                if r > round || self.announced_rounds.contains(&r) || empty {
-                    continue;
-                }
-                let mut canonical: Vec<ClientId> = if aggregated {
-                    state
-                        .group_aggregates
-                        .values()
-                        .flat_map(|g| g.clients.iter().copied())
-                        .collect()
-                } else {
-                    state
-                        .inbox_items
-                        .iter()
-                        .filter_map(|(cid, _)| state.publics.get(cid).map(|_| *cid))
-                        .collect()
-                };
-                canonical.sort();
-                canonical.dedup();
-                if !canonical.is_empty() {
-                    announce.push((r, canonical));
-                }
-            }
-            for (r, canonical) in announce {
-                outbound.push(
-                    bincode::serialize(&PanetiereWire::ClientSet {
-                        round: r,
-                        clients: canonical.iter().map(|c| c.0).collect(),
-                    })
-                    .expect("serialise client set"),
-                );
-                self.client_set_by_round.insert(r, canonical);
-                self.announced_rounds.insert(r);
-            }
-        }
 
         if !withholding {
             for (&r, state) in self.rounds.iter_mut() {

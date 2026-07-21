@@ -56,6 +56,11 @@ pub trait Session: Send {
         Vec::new()
     }
 
+    /// Freeze a decision between `mid_round` and `end_round`. Default: nothing.
+    fn commit_round(&mut self, _round: Round, _now: Instant) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+
     /// Stage a payload for transmission on the next round.
     /// Default impl: no-op (server / watch sessions ignore this).
     fn stage(&mut self, _payload: Vec<u8>) {}
