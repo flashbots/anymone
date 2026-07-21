@@ -120,19 +120,25 @@ bootstrap_peers = ["/dns4/seed/tcp/7100/p2p/12D3KooW..."]
 threshold = 2
 {members}
 [committee]
-public_round_ms = 2000"#
+public_round_ms = 2000
+protocol = "panetiere"
+aggregation = false"#
         );
         let cfg = BootstrapConfig::from_toml_str(&toml).unwrap();
         assert_eq!(cfg.governance.committee.len(), 3);
         assert_eq!(cfg.governance.threshold, 2);
         assert_eq!(cfg.network.bootstrap_peers.len(), 1);
         assert!(cfg.governance.committee[0].exchange_pubkey.to_key().is_ok());
-        // Present field parses; omitted committee fields fall back to defaults.
+        // Present fields parse; omitted committee fields fall back to defaults.
         assert_eq!(cfg.committee.public_round_ms, 2000);
         assert_eq!(cfg.committee.committee_round_ms, 10_000);
+        assert_eq!(cfg.committee.protocol.as_deref(), Some("panetiere"));
+        assert!(!cfg.committee.aggregation);
         // A config with no `[committee]` section at all uses all defaults.
-        let no_committee = BootstrapConfig::from_toml_str(&toml.replace("[committee]\npublic_round_ms = 2000", "")).unwrap();
+        let no_committee = BootstrapConfig::from_toml_str(&toml.replace("[committee]\npublic_round_ms = 2000\nprotocol = \"panetiere\"\naggregation = false", "")).unwrap();
         assert_eq!(no_committee.committee.public_round_ms, 4000);
+        assert_eq!(no_committee.committee.protocol, None);
+        assert!(no_committee.committee.aggregation);
     }
 
     #[test]

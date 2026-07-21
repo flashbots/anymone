@@ -14,7 +14,7 @@ use anymone_core::transport::Transport;
 use anymone_core::{
     announce_relay_registration, announce_service_registration,
     spawn_panetiere_committee_scheduler, Anymone, BootstrapConfig, GovernanceBootstrap, Identity,
-    ServiceTag,
+    Misbehavior, ServiceTag,
 };
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -90,10 +90,27 @@ impl Role {
     }
 }
 
-fn spawn_peers_endpoint(net: Arc<Libp2pNetwork>, role: &'static str, port: u16) {
-    use axum::{routing::get, Json, Router};
+/// Slot the relay role fills with its `Anymone` handle once started; the
+/// misbehavior route answers 503 until then, so the endpoint itself can come
+/// up before the first config is adopted.
+type AnymoneSlot = Arc<std::sync::RwLock<Option<Arc<Anymone>>>>;
+
+/// `anymone` is `Some` only for the relay role — it's what backs the
+/// `/state/misbehavior` fault-injection knob (corrupt/withhold shares live, to
+/// showcase Panetiere's attribution). Other roles get no such route. The knob
+/// only accepts loopback connections; `/state/peers` stays open for scrapes.
+fn spawn_peers_endpoint(
+    net: Arc<Libp2pNetwork>,
+    role: &'static str,
+    port: u16,
+    anymone: Option<AnymoneSlot>,
+) {
+    use axum::extract::ConnectInfo;
+    use axum::http::StatusCode;
+    use axum::{routing::get, routing::post, Json, Router};
+    use std::net::SocketAddr;
     let pubkey = net.local_pubkey();
-    let app = Router::new().route(
+    let mut app = Router::new().route(
         "/state/peers",
         get({
             let net = net.clone();
@@ -111,12 +128,49 @@ fn spawn_peers_endpoint(net: Arc<Libp2pNetwork>, role: &'static str, port: u16) 
             }
         }),
     );
+    if let Some(slot) = anymone {
+        #[derive(serde::Deserialize)]
+        struct MisbehaviorBody {
+            mode: String,
+        }
+        app = app.route(
+            "/state/misbehavior",
+            post(move |ConnectInfo(peer): ConnectInfo<SocketAddr>, Json(body): Json<MisbehaviorBody>| {
+                let slot = slot.clone();
+                async move {
+                    if !peer.ip().is_loopback() {
+                        return (StatusCode::FORBIDDEN, "loopback only");
+                    }
+                    let Some(anymone) = slot.read().unwrap().clone() else {
+                        return (StatusCode::SERVICE_UNAVAILABLE, "no config adopted yet");
+                    };
+                    let mode = match body.mode.as_str() {
+                        "honest" => Some(None),
+                        "withhold" => Some(Some(Misbehavior::Withhold)),
+                        "corrupt_share" => Some(Some(Misbehavior::CorruptShare)),
+                        _ => None,
+                    };
+                    match mode {
+                        Some(mode) => {
+                            anymone.set_misbehavior(mode);
+                            (StatusCode::OK, "ok")
+                        }
+                        None => (StatusCode::BAD_REQUEST, "mode must be honest|withhold|corrupt_share"),
+                    }
+                }
+            }),
+        );
+    }
     tokio::spawn(async move {
-        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+        let addr = SocketAddr::from(([0, 0, 0, 0], port));
         match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => {
                 tracing::info!(%port, "serving /state/peers");
-                let _ = axum::serve(listener, app).await;
+                let _ = axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await;
             }
             Err(e) => tracing::warn!("peers endpoint bind {port}: {e}"),
         }
@@ -208,8 +262,13 @@ async fn run(args: RunArgs) -> Result<()> {
     let transport: Arc<dyn Transport> = net.clone();
     let gov = GovernanceBootstrap::from_bootstrap_config(&bootstrap);
 
+    // Endpoint comes up before Anymone start (which blocks on the first
+    // config), so scrapes work during bootstrap. The relay's misbehavior route
+    // answers 503 until its slot is filled below.
+    let misbehavior_slot: Option<AnymoneSlot> =
+        (args.role == Role::Relay).then(|| Arc::new(std::sync::RwLock::new(None)));
     if let Some(port) = args.peers_port {
-        spawn_peers_endpoint(net.clone(), args.role.as_str(), port);
+        spawn_peers_endpoint(net.clone(), args.role.as_str(), port, misbehavior_slot.clone());
     }
 
     match args.role {
@@ -226,11 +285,16 @@ async fn run(args: RunArgs) -> Result<()> {
         Role::Relay => {
             let xk = ExchangePublicKeyWire::from_key(&identity.exchange_pubkey());
             let _reannounce = announce_relay_registration(transport.clone(), &identity, xk).await;
-            let _anymone = Anymone::prepare(identity, transport, gov)
-                .await
-                .start()
-                .await
-                .map_err(|e| anyhow!("anymone start: {e}"))?;
+            let anymone = Arc::new(
+                Anymone::prepare(identity, transport, gov)
+                    .await
+                    .start()
+                    .await
+                    .map_err(|e| anyhow!("anymone start: {e}"))?,
+            );
+            if let Some(slot) = &misbehavior_slot {
+                *slot.write().unwrap() = Some(anymone.clone());
+            }
             tracing::info!("relay online; waiting for ctrl-c");
             tokio::signal::ctrl_c().await.ok();
         }

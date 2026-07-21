@@ -83,7 +83,6 @@ fn run_aggregated(
                 pp.clone(),
                 mse.clone(),
                 *sid,
-                64,
                 ids[sid.0 as usize].clone(),
                 if sid.0 == 0 { SetMode::Leader } else { SetMode::SelfDerived },
                 0,

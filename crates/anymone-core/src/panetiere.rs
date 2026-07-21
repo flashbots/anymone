@@ -33,13 +33,13 @@ use crate::runtime::{
     gossip_faults, handle_inbound, publish_and_loop_back, recv_any, round_at, route_to_pipe,
     subnet_aggregation, subnet_leader_pk, AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
 };
-use crate::scheduler_core::expected_active;
 use crate::session::{LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
 use crate::transport::Subscription;
 use crate::wire::RouteTag;
 
-/// Two bytes per MSE symbol — safely below `t = 2^18`, so no value wraps and the
-/// byte↔symbol map is a plain little-endian `u16`.
+/// Two bytes per MSE symbol — safely below `t = 2^37`, so no value wraps and the
+/// byte↔symbol map is a plain little-endian `u16`. The wider modulus would fit
+/// 4-byte symbols; kept at 2 until the MSE sizing is re-benchmarked.
 const BYTES_PER_SYMBOL: usize = 2;
 
 /// MSE parameters for a Panetiere channel carrying up to `rho` real messages of
@@ -68,7 +68,7 @@ pub(crate) fn setup_pp(params: &MseParams, n_servers: usize, setup_seed: [u8; 32
 }
 
 /// Pack message bytes into `xi` little-endian `u16` MSE symbols (zero-padded).
-fn bytes_to_symbols(payload: &[u8], xi: usize) -> Vec<i32> {
+fn bytes_to_symbols(payload: &[u8], xi: usize) -> Vec<i64> {
     debug_assert!(
         payload.len() <= xi * BYTES_PER_SYMBOL,
         "payload exceeds channel capacity; the pipe send gate should have rejected it"
@@ -76,13 +76,13 @@ fn bytes_to_symbols(payload: &[u8], xi: usize) -> Vec<i32> {
     let mut buf = payload.to_vec();
     buf.resize(xi * BYTES_PER_SYMBOL, 0);
     (0..xi)
-        .map(|i| u16::from_le_bytes([buf[2 * i], buf[2 * i + 1]]) as i32)
+        .map(|i| u16::from_le_bytes([buf[2 * i], buf[2 * i + 1]]) as i64)
         .collect()
 }
 
 /// Inverse of [`bytes_to_symbols`]; trailing zero padding is left for
 /// `Frame::decode` to ignore (the frame is self-delimiting).
-fn symbols_to_bytes(symbols: &[i32]) -> Vec<u8> {
+fn symbols_to_bytes(symbols: &[i64]) -> Vec<u8> {
     let mut out = Vec::with_capacity(symbols.len() * BYTES_PER_SYMBOL);
     for &s in symbols {
         out.extend_from_slice(&(s as u16).to_le_bytes());
@@ -188,7 +188,6 @@ fn server_session(
         pp.clone(),
         mse.clone(),
         server_id,
-        expected_active(cfg.client_set_max),
         identity.clone(),
         mode,
         cfg.client_set_min,
@@ -917,7 +916,6 @@ pub struct PanetiereServerSession {
     pp: Arc<ProtocolParams>,
     mse: MseParams,
     server_id: ServerId,
-    max_clients: u32,
     identity: Identity,
     mode: SetMode,
     /// Anonymity floor: never decode a canonical set smaller than this.
@@ -947,7 +945,6 @@ impl PanetiereServerSession {
         pp: Arc<ProtocolParams>,
         mse: MseParams,
         server_id: ServerId,
-        max_clients: u32,
         identity: Identity,
         mode: SetMode,
         min_clients: u32,
@@ -958,7 +955,6 @@ impl PanetiereServerSession {
             pp,
             mse,
             server_id,
-            max_clients,
             identity,
             mode,
             min_clients: min_clients as usize,
@@ -1665,6 +1661,189 @@ mod observer_tests {
             est >= pp.cs.aggregated_server_crypto_len(cset),
             "estimate omits the ServerPublic crypto term"
         );
+    }
+}
+
+/// Per-stage checks (ingest, canonical-set agreement, peer exchange, decode)
+/// for concurrent multi-client decode, so a regression localizes to one stage.
+#[cfg(test)]
+mod concurrent_decode_tests {
+    use super::*;
+    use crate::identity::Identity;
+
+    #[test]
+    fn concurrent_clients_decode_stage_by_stage() {
+        let n_servers = 3usize;
+        let active = 4usize;
+        let cover = 2usize;
+        let total = active + cover;
+
+        let mut server_ids: Vec<Identity> = (0..n_servers).map(|_| Identity::generate()).collect();
+        server_ids.sort_by_key(|i| i.pubkey());
+        let server_pks: Vec<Pubkey> = server_ids.iter().map(|i| i.pubkey()).collect();
+        let server_pubkeys: HashMap<ServerId, Pubkey> = server_pks
+            .iter()
+            .enumerate()
+            .map(|(i, pk)| (ServerId(i as u32), *pk))
+            .collect();
+        let xpubs: Vec<(ServerId, pke::PublicKey)> = server_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (ServerId(i as u32), id.exchange().pke().public()))
+            .collect();
+
+        let mse = channel_mse_params(active as u32, 64, [7u8; 32]);
+        let n_polys = MseEncoding::n_polys(&mse);
+        assert_eq!(n_polys, 1, "sanity: a 64-byte payload should pack into exactly one poly");
+        let pp = setup_pp(&mse, n_servers, [7u8; 32]);
+
+        let client_pks: Vec<Pubkey> = (0..total).map(|_| Identity::generate().pubkey()).collect();
+        let mut clients: Vec<PanetiereClientSession> = (0..total)
+            .map(|i| {
+                PanetiereClientSession::new(
+                    pp.clone(), mse.clone(), ClientId(i as u32), xpubs.clone(), [40 + i as u8; 32],
+                )
+            })
+            .collect();
+        let payloads: Vec<Vec<u8>> =
+            (0..active).map(|i| format!("client-{i}-says-hi").into_bytes()).collect();
+        for (i, p) in payloads.iter().enumerate() {
+            clients[i].stage(p.clone());
+        }
+        // Cover clients (indices `active..total`) send cover at the default rate.
+
+        let mut servers: Vec<PanetiereServerSession> = (0..n_servers)
+            .map(|i| {
+                let mode = if i == 0 { SetMode::Leader } else { SetMode::SelfDerived };
+                PanetiereServerSession::new(
+                    pp.clone(), mse.clone(), ServerId(i as u32), server_ids[i].clone(),
+                    mode, 0, server_pubkeys.clone(), None,
+                )
+            })
+            .collect();
+
+        let now = Instant::now();
+
+        // Stage 1: ingest.
+        for (i, c) in clients.iter_mut().enumerate() {
+            for m in c.begin_round(0, now) {
+                for s in servers.iter_mut() {
+                    s.on_inbound(client_pks[i], m.clone());
+                }
+            }
+        }
+        for (si, s) in servers.iter().enumerate() {
+            let state = s.rounds.get(&0).expect("round 0 bucket must exist after ingest");
+            assert_eq!(
+                state.publics.len(), total,
+                "server {si}: expected {total} ClientPublics, got {}", state.publics.len()
+            );
+            assert_eq!(
+                state.inbox_items.len(), total,
+                "server {si}: expected {total} openings targeted at it, got {}", state.inbox_items.len()
+            );
+        }
+
+        // Stage 2: share generation — canonical sets must agree with the leader's.
+        let outs: Vec<Vec<Vec<u8>>> =
+            servers.iter_mut().map(|s| s.end_round(0, now).outbound).collect();
+        let mut announced: Option<Vec<u32>> = None;
+        let mut server_publics: Vec<(u32, Vec<u32>)> = Vec::new();
+        for (si, out) in outs.iter().enumerate() {
+            for msg in out {
+                match bincode::deserialize::<PanetiereWire>(msg).expect("decode wire message") {
+                    PanetiereWire::ClientSet { clients, .. } => {
+                        assert_eq!(si, 0, "only the leader (server 0) should announce a ClientSet");
+                        announced = Some(clients);
+                    }
+                    PanetiereWire::ServerPublic { server_id, clients, .. } => {
+                        assert_eq!(server_id, si as u32, "ServerPublic must self-attribute the right slot");
+                        server_publics.push((server_id, clients));
+                    }
+                    other => panic!("unexpected wire message from server {si}: {other:?}"),
+                }
+            }
+        }
+        let announced = announced.expect("leader must announce a ClientSet for round 0");
+        assert_eq!(
+            announced.len(), total,
+            "leader's announced set must cover all {total} clients, got {}", announced.len()
+        );
+        assert_eq!(
+            server_publics.len(), n_servers,
+            "every server must emit exactly one ServerPublic, got {}", server_publics.len()
+        );
+        for (sid, set) in &server_publics {
+            let mut got = set.clone();
+            got.sort();
+            let mut want = announced.clone();
+            want.sort();
+            assert_eq!(
+                got, want,
+                "server {sid}'s ServerPublic canonical set disagrees with the leader's announced set \
+                 (self-derived followers must independently reach the same set)"
+            );
+        }
+
+        // Stage 3: exchange.
+        for (i, out) in outs.iter().enumerate() {
+            for (j, s) in servers.iter_mut().enumerate() {
+                if i == j {
+                    continue;
+                }
+                for msg in out {
+                    s.on_inbound(server_pks[i], msg.clone());
+                }
+            }
+        }
+        for (si, s) in servers.iter().enumerate() {
+            let state = s.rounds.get(&0).unwrap();
+            assert_eq!(
+                state.peer_server_publics.len(), n_servers,
+                "server {si}: expected all {n_servers} ServerPublics (own + peers) cached, got {}",
+                state.peer_server_publics.len()
+            );
+        }
+
+        // Stage 4: decode — distinguishes a verify/anchor rejection from an MSE peel stall.
+        let anchor: Vec<ClientId> = announced.iter().map(|&c| ClientId(c)).collect();
+        for (si, s) in servers.iter().enumerate() {
+            let state = s.rounds.get(&0).unwrap();
+            let (plain, culprits) = try_decode_round(&pp, state, Some(&anchor), 0);
+            assert!(culprits.is_empty(), "server {si}: unexpected culprits {culprits:?}");
+            let plain = plain.unwrap_or_else(|| {
+                panic!("server {si}: try_decode_round returned None (verify or anchor rejection)")
+            });
+            let n = MseEncoding::n_polys(&mse).min(plain.len());
+            let recovered = MseEncoding::unpack(&mse, &plain[..n]).decode().unwrap_or_else(|e| {
+                panic!("server {si}: MSE decode failed (peel stalled): {e:?}")
+            });
+            let recovered_msgs: Vec<Vec<u8>> = recovered
+                .into_iter()
+                .map(|symbols| symbols_to_bytes(&symbols))
+                .filter(|b| b.iter().any(|x| *x != 0))
+                .collect();
+            for p in &payloads {
+                assert!(
+                    recovered_msgs.iter().any(|d| d.windows(p.len()).any(|w| w == p.as_slice())),
+                    "server {si}: message {:?} not recovered; got {} non-cover buffers",
+                    String::from_utf8_lossy(p), recovered_msgs.len()
+                );
+            }
+        }
+
+        // Cross-check against the production path.
+        let finals: Vec<RoundOutcome> =
+            servers.iter_mut().map(|s| s.end_round(1, now)).collect();
+        for (si, outcome) in finals.iter().enumerate() {
+            for p in &payloads {
+                assert!(
+                    outcome.decoded.iter().any(|d| d.windows(p.len()).any(|w| w == p.as_slice())),
+                    "server {si}: end_round(1) did not decode message {:?}",
+                    String::from_utf8_lossy(p)
+                );
+            }
+        }
     }
 }
 

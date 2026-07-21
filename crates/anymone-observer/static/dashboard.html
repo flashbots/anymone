@@ -116,6 +116,7 @@
     text-transform: uppercase; border: 1px solid currentColor; }
   .proto-Panetiere { color: var(--accent); } .proto-Adcnet { color: var(--blue); } .proto-Noop { color: var(--dim); }
   .escalated { font-size: 10px; color: var(--bad); margin-left: 4px; }
+  .pinned { font-size: 10px; color: var(--dim); margin-left: 4px; }
 
   .round-row { display: flex; align-items: center; gap: 16px; margin-bottom: 12px; }
   .ring { width: 56px; height: 56px; flex: none; }
@@ -542,7 +543,11 @@ function card(s, rps, series) {
       if (te >= t0 && t1 > t0) escFrac = (te - t0) / (t1 - t0);
     }
   }
-  const escTag = s.escalated_at != null ? `<span class="escalated">↑ escalated @r${s.escalated_at}</span>` : "";
+  // Panetiere reached without an observed escalation transition can only be a
+  // governance pin (an unpinned network always starts on ADCNet).
+  const escTag = s.escalated_at != null
+    ? `<span class="escalated">↑ escalated @r${s.escalated_at}</span>`
+    : (s.protocol === "Panetiere" && !s._committee ? `<span class="pinned">📌 pinned</span>` : "");
 
   el.innerHTML = `
     <div class="card-head">

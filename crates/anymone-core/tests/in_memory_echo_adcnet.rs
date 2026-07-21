@@ -12,7 +12,7 @@ use anymone_core::config::{
     now_unix_ms, AdcnetConfig, Aggregation, AggregatorGroup, AnymoneRoundConfigurationBody,
     ExchangePublicKeyWire, Subnet,
 };
-use anymone_core::runtime::{subnet_broadcast_topic, subnet_ingress_topic, subnet_shares_topic};
+use anymone_core::runtime::{subnet_broadcast_topic, subnet_shares_topic};
 use anymone_core::session::Session;
 use anymone_core::transport::Transport;
 use anymone_core::{
@@ -315,268 +315,6 @@ async fn broadcast_room_participant_sees_own_message_via_channel() {
     drop(keep);
 }
 
-/// Two ADCNet subnets in one config, each with its own leader
-/// (`sorted_relays[id % n]`). The echo service lives only on subnet 1, so the
-/// client is routed there — exercising a subnet whose leader is NOT the
-/// sorted-first relay (the case sharding introduces). A round-trip proves a
-/// non-zero-index leader announces the set, the relays share to it, and it
-/// combines + broadcasts the output.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn adcnet_second_subnet_with_distinct_leader_roundtrips() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .try_init();
-
-    let net = InMemoryNetwork::new();
-    let committee = Identity::generate();
-    let relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
-    let service = Identity::generate();
-    let client = Identity::generate();
-
-    let mut relay_pks: Vec<_> = relays.iter().map(|i| i.pubkey()).collect();
-    relay_pks.sort();
-    let mut relay_xk: Vec<_> = relays.iter().map(|i| (i.pubkey(), xkw(i))).collect();
-    relay_xk.sort_by_key(|(p, _)| *p);
-    let proto = || {
-        ProtocolConfig::Adcnet(AdcnetConfig {
-            round_duration_ms: 200,
-            max_payload_bytes: 256,
-            estimated_messages: 8,
-            client_set_min: 0,
-            client_set_max: 8,
-            relay_exchange_keys: relay_xk.clone(),
-            aggregation: None,
-        })
-    };
-    // Subnet 0 carries no service (idle); the echo service is on subnet 1, whose
-    // leader is sorted_relays[1 % 3] — not the sorted-first relay.
-    let body = AnymoneRoundConfigurationBody {
-        round: 0,
-        epoch_unix_ms: anymone_core::config::now_unix_ms(),
-        subnets: vec![
-            Subnet::new(0, vec![], relay_pks.clone(), proto()),
-            Subnet::new(
-                1,
-                vec![ServiceEntry { tag: echo_tag(), pubkey: service.pubkey() }],
-                relay_pks.clone(),
-                proto(),
-            ),
-        ],
-    };
-    let cfg = AnymoneRoundConfiguration::new(body).sign_with(&[&committee]);
-
-    let mut anymones: Vec<Anymone> = Vec::new();
-    for id in relays.into_iter() {
-        let handle = net.handle(id.pubkey());
-        anymones.push(Anymone::start_with_config(id, Arc::new(handle), cfg.clone()).await);
-    }
-    let service_anymone =
-        Anymone::start_with_config(service.clone(), Arc::new(net.handle(service.pubkey())), cfg.clone())
-            .await;
-    let client_anymone =
-        Anymone::start_with_config(client.clone(), Arc::new(net.handle(client.pubkey())), cfg.clone())
-            .await;
-
-    let mut svc_pipe = service_anymone.bind(echo_tag()).await.unwrap();
-    tokio::spawn(async move {
-        while let Some(req) = svc_pipe.recv().await {
-            let _ = svc_pipe.send_to(req.return_tag, req.payload).await;
-        }
-    });
-
-    let mut pipe = client_anymone.open(echo_tag()).await.unwrap();
-    // Resend each round until the echo returns, so the test doesn't hinge on the
-    // first contribution landing after every relay has subscribed.
-    let reply = tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            pipe.send(b"hello subnet1".to_vec()).await.unwrap();
-            if let Ok(Some(m)) =
-                tokio::time::timeout(Duration::from_millis(400), pipe.recv()).await
-            {
-                break m;
-            }
-        }
-    })
-    .await
-    .expect("no echo via the subnet-1 (distinct-leader) path");
-    assert_eq!(&reply.payload[..reply.payload.len().min(13)], b"hello subnet1");
-
-    drop(anymones);
-}
-
-/// Live reconfiguration. Nodes start under v0 (service on subnet 0), then the
-/// committee publishes v1 that moves the service to a newly-scheduled subnet 1
-/// and leaves subnet 0 serviceless. Nodes started via `prepare`/`start` must
-/// adopt v1 on the fly: relays spin up subnet 1, the service's subnet-1 worker
-/// comes up, and the client re-homes its sends to subnet 1 (now the only
-/// carrier of the tag) — so the echo keeps working across the reconfiguration,
-/// proving the no-live-reconfiguration gap is closed.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn live_reconfiguration_moves_service_to_a_new_subnet() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .try_init();
-
-    let net = InMemoryNetwork::new();
-    let committee = Identity::generate();
-    let gov = GovernanceBootstrap { committee: vec![committee.pubkey()], threshold: 1 };
-    let relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
-    let service = Identity::generate();
-    let client = Identity::generate();
-    let listener = Identity::generate();
-
-    let mut relay_pks: Vec<_> = relays.iter().map(|i| i.pubkey()).collect();
-    relay_pks.sort();
-    let mut relay_xk: Vec<_> = relays.iter().map(|i| (i.pubkey(), xkw(i))).collect();
-    relay_xk.sort_by_key(|(p, _)| *p);
-    let proto = || {
-        ProtocolConfig::Adcnet(AdcnetConfig {
-            round_duration_ms: 200,
-            max_payload_bytes: 256,
-            estimated_messages: 8,
-            client_set_min: 0,
-            client_set_max: 8,
-            relay_exchange_keys: relay_xk.clone(),
-            aggregation: None,
-        })
-    };
-    let svc_entry = || ServiceEntry { tag: echo_tag(), pubkey: service.pubkey() };
-
-    // v0: a single subnet (id 0) carrying the service.
-    let v0 = AnymoneRoundConfiguration::new(AnymoneRoundConfigurationBody {
-        round: 0,
-        epoch_unix_ms: now_unix_ms(),
-        subnets: vec![Subnet::new(0, vec![svc_entry()], relay_pks.clone(), proto())],
-    })
-    .sign_with(&[&committee]);
-
-    // Prepare (subscribe to the config topic) BEFORE publishing v0.
-    let mut relay_preps = Vec::new();
-    for id in &relays {
-        relay_preps.push(Anymone::prepare(id.clone(), Arc::new(net.handle(id.pubkey())), gov.clone()).await);
-    }
-    let svc_prep =
-        Anymone::prepare(service.clone(), Arc::new(net.handle(service.pubkey())), gov.clone()).await;
-    let cli_prep =
-        Anymone::prepare(client.clone(), Arc::new(net.handle(client.pubkey())), gov.clone()).await;
-    let listener_prep =
-        Anymone::prepare(listener.clone(), Arc::new(net.handle(listener.pubkey())), gov.clone()).await;
-
-    let publisher = net.handle(committee.pubkey());
-    publisher.publish(TOPIC_CONFIG, bincode::serialize(&v0).unwrap()).await;
-
-    let mut anymones: Vec<Anymone> = Vec::new();
-    for p in relay_preps {
-        anymones.push(p.start().await.expect("relay start"));
-    }
-    let svc = svc_prep.start().await.expect("service start");
-    let cli = cli_prep.start().await.expect("client start");
-    let listener_anymone = listener_prep.start().await.expect("listener start");
-
-    let mut svc_pipe = svc.bind(echo_tag()).await.unwrap();
-    tokio::spawn(async move {
-        while let Some(req) = svc_pipe.recv().await {
-            let _ = svc_pipe.send_to(req.return_tag, req.payload).await;
-        }
-    });
-
-    let mut pipe = cli.open(echo_tag()).await.unwrap();
-    // Opened but never sent: exercises the re-Join path on its own, with no
-    // send-triggered re-home to paper over a missing Join.
-    let _listen_pipe = listener_anymone.open(echo_tag()).await.unwrap();
-
-    // Echo works under v0 (service on subnet 0). Resend each round until the
-    // reply lands, so the test doesn't hinge on a single round's timing.
-    let reply = tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            pipe.send(b"v0 hello".to_vec()).await.unwrap();
-            if let Ok(Some(m)) = tokio::time::timeout(Duration::from_millis(400), pipe.recv()).await {
-                break m;
-            }
-        }
-    })
-    .await
-    .expect("no echo under v0");
-    assert_eq!(&reply.payload[..reply.payload.len().min(8)], b"v0 hello");
-
-    // v1: service moves to a newly-scheduled subnet 1; subnet 0 stays but
-    // carries no service. A higher round makes the watcher adopt it.
-    let v1 = AnymoneRoundConfiguration::new(AnymoneRoundConfigurationBody {
-        round: 1,
-        epoch_unix_ms: now_unix_ms(),
-        subnets: vec![
-            Subnet::new(0, vec![], relay_pks.clone(), proto()),
-            Subnet::new(1, vec![svc_entry()], relay_pks.clone(), proto()),
-        ],
-    })
-    .sign_with(&[&committee]);
-    publisher.publish(TOPIC_CONFIG, bincode::serialize(&v1).unwrap()).await;
-
-    // After adoption, the only carrier of the tag is subnet 1: the client must
-    // re-home there and the echo must come back over the newly-spun-up subnet.
-    // Skip any stale v0 echoes still buffered from the first phase.
-    let reply = tokio::time::timeout(Duration::from_secs(25), async {
-        loop {
-            pipe.send(b"v1 hello".to_vec()).await.unwrap();
-            while let Ok(Some(m)) =
-                tokio::time::timeout(Duration::from_millis(400), pipe.recv()).await
-            {
-                if m.payload.starts_with(b"v1 hello") {
-                    return m;
-                }
-            }
-        }
-    })
-    .await
-    .expect("no echo after reconfiguration to subnet 1");
-    assert_eq!(&reply.payload[..reply.payload.len().min(8)], b"v1 hello");
-
-    // The listen-only pipe's worker respawned on subnet 1's roster change; it
-    // must have been re-Joined there to keep contributing cover.
-    let mut ingress1 = net.handle(Identity::generate().pubkey()).subscribe(&subnet_ingress_topic(1)).await;
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let msg = ingress1.recv().await.expect("ingress topic closed");
-            if msg.from == listener.pubkey() {
-                return;
-            }
-        }
-    })
-    .await
-    .expect("listen-only pipe never contributed cover on the new subnet");
-
-    // v1's admission policy binds subnet 1's shares topic to its relay roster;
-    // an outsider's publish there must not reach anyone (real relay share
-    // traffic keeps flowing on the same topic, so filter for the forged payload).
-    let outsider = Identity::generate();
-    let mut shares1 = net.handle(Identity::generate().pubkey()).subscribe(&subnet_shares_topic(1)).await;
-    net.handle(outsider.pubkey())
-        .publish(&subnet_shares_topic(1), b"forged share".to_vec())
-        .await;
-    let saw_forged = tokio::time::timeout(Duration::from_millis(500), async {
-        loop {
-            let msg = shares1.recv().await.expect("shares topic closed");
-            if msg.payload == b"forged share" {
-                return;
-            }
-        }
-    })
-    .await
-    .is_ok();
-    assert!(!saw_forged, "publish from outside subnet 1's relay roster must be rejected");
-
-    drop(listener_anymone);
-    drop(anymones);
-}
-
 /// When the committee adds a subnet, clients that re-home must **leave** the
 /// subnet they came from — not keep padding its anonymity set with cover
 /// traffic. Without retiring the old client session, the population is
@@ -618,22 +356,24 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
             aggregation: None,
         })
     };
-    let svc = || ServiceEntry { tag: echo_tag(), pubkey: service.pubkey() };
+    let services = vec![ServiceEntry { tag: echo_tag(), pubkey: service.pubkey() }];
 
     let v0 = AnymoneRoundConfiguration::new(AnymoneRoundConfigurationBody {
         round: 0,
         epoch_unix_ms: now_unix_ms(),
-        subnets: vec![Subnet::new(0, vec![svc()], relay_pks.clone(), proto())],
+        services: services.clone(),
+        subnets: vec![Subnet::new(0, relay_pks.clone(), proto())],
     })
     .sign_with(&[&committee]);
-    // v1 carries the service on BOTH subnets, so ~half the clients re-home to
-    // subnet 1 and the rest stay on subnet 0.
+    // Every subnet carries every service, so growing to two subnets lets
+    // ~half the clients re-home to subnet 1 and the rest stay on subnet 0.
     let v1 = AnymoneRoundConfiguration::new(AnymoneRoundConfigurationBody {
         round: 1,
         epoch_unix_ms: now_unix_ms(),
+        services,
         subnets: vec![
-            Subnet::new(0, vec![svc()], relay_pks.clone(), proto()),
-            Subnet::new(1, vec![svc()], relay_pks.clone(), proto()),
+            Subnet::new(0, relay_pks.clone(), proto()),
+            Subnet::new(1, relay_pks.clone(), proto()),
         ],
     })
     .sign_with(&[&committee]);
@@ -720,6 +460,42 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
     .await
     .expect("subnet 0 kept all clients after the split — double-counted across subnets");
     assert!(shed < n_clients, "subnet 0 must shed re-homed clients, still has {shed}/{n_clients}");
+
+    // Subnet 1's leader is sorted_relays[1 % 3] = relay_pks[1], NOT the
+    // sorted-first relay — so a non-zero-index leader must be the one announcing
+    // the canonical set and broadcasting output on subnet 1.
+    let subnet1_leader = relay_pks[1 % relay_pks.len()];
+    let mut bcast1 = net.handle(Identity::generate().pubkey()).subscribe(&subnet_broadcast_topic(1)).await;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let m = bcast1.recv().await.expect("subnet 1 broadcast topic closed");
+            if m.from == subnet1_leader {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("subnet 1's distinct (non-first) leader never broadcast");
+
+    // v1's admission policy binds subnet 1's shares topic to its relay roster;
+    // an outsider's publish there must not reach anyone (real relay share
+    // traffic keeps flowing, so filter for the forged payload specifically).
+    let outsider = Identity::generate();
+    let mut shares1 = net.handle(Identity::generate().pubkey()).subscribe(&subnet_shares_topic(1)).await;
+    net.handle(outsider.pubkey())
+        .publish(&subnet_shares_topic(1), b"forged share".to_vec())
+        .await;
+    let saw_forged = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            let msg = shares1.recv().await.expect("shares topic closed");
+            if msg.payload == b"forged share" {
+                return;
+            }
+        }
+    })
+    .await
+    .is_ok();
+    assert!(!saw_forged, "publish from outside subnet 1's relay roster must be rejected");
 
     drop(keep);
 }

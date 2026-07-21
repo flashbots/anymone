@@ -141,7 +141,7 @@ fn spawn_reannounce(transport: Arc<dyn Transport>, reg: Vec<u8>) -> JoinHandle<(
 /// per subnet (ADCNet optimistic, Panetiere when escalated); it is not a global
 /// knob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SchedulerProtocol {
+pub enum SchedulerProtocol {
     /// ADCNet 1-round IBLT-message flow. Non-threshold; optimistic default.
     Adcnet,
     /// Real Panetiere threshold ABC. Strict mode on fault.

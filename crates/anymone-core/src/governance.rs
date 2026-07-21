@@ -89,7 +89,9 @@ pub enum GovernanceError {
 /// Topic admission for an adopted config: subnet shares/broadcast topics bound
 /// to that subnet's relays (+ aggregators), faults to the union of all relays,
 /// config to the committee. Ingress and per-group aggregator topics stay open
-/// — clients are permissionless and can't be bound to a fixed roster.
+/// — clients are permissionless and can't be bound to a fixed roster. Noop
+/// subnets run their whole protocol (client contributions included) over the
+/// broadcast topic, so theirs stays open too.
 pub fn topic_policy(body: &AnymoneRoundConfigurationBody, committee: &[Pubkey]) -> TopicPolicy {
     use std::collections::HashSet;
     let mut policy = TopicPolicy::new();
@@ -100,10 +102,12 @@ pub fn topic_policy(body: &AnymoneRoundConfigurationBody, committee: &[Pubkey]) 
             shares.extend(agg.groups.iter().flat_map(|g| g.aggregators.iter().copied()));
         }
         policy.insert(crate::runtime::subnet_shares_topic(subnet.id), shares);
-        policy.insert(
-            crate::runtime::subnet_broadcast_topic(subnet.id),
-            subnet.relays.iter().copied().collect(),
-        );
+        if !matches!(subnet.protocol, crate::config::ProtocolConfig::Noop(_)) {
+            policy.insert(
+                crate::runtime::subnet_broadcast_topic(subnet.id),
+                subnet.relays.iter().copied().collect(),
+            );
+        }
         all_relays.extend(subnet.relays.iter().copied());
     }
     policy.insert(TOPIC_FAULTS.to_string(), all_relays);

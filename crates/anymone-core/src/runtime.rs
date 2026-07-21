@@ -239,9 +239,9 @@ impl Anymone {
             .read()
             .unwrap()
             .body
-            .subnets
+            .services
             .iter()
-            .any(|s| s.services.iter().any(|svc| svc.tag == tag));
+            .any(|svc| svc.tag == tag);
         if !has_carrier {
             return Err(OpenError::TagNotInConfig);
         }
@@ -283,9 +283,8 @@ impl Anymone {
             .read()
             .unwrap()
             .body
-            .subnets
+            .services
             .iter()
-            .flat_map(|s| s.services.iter())
             .find(|svc| svc.tag == tag)
             .map(|svc| svc.pubkey);
 
@@ -312,9 +311,9 @@ impl Anymone {
             .read()
             .unwrap()
             .body
-            .subnets
+            .services
             .iter()
-            .any(|s| s.services.iter().any(|svc| svc.tag == tag));
+            .any(|svc| svc.tag == tag);
         if !has_carrier {
             return Err(OpenError::TagNotInConfig);
         }
@@ -930,8 +929,9 @@ pub(crate) fn route_to_pipe(inner: &AnymoneInner, bytes: &[u8]) {
 }
 
 /// Resolve which subnet a send goes on, from the *current* config (so a pipe
-/// re-homes across reconfigs). Client pipes (`peer_tag = Some`) hash their
-/// return tag over the service's carriers; service replies (`None`) hash `dst`.
+/// re-homes across reconfigs). Every subnet carries every service, so the
+/// candidate set is just the runnable subnets; client pipes hash their return
+/// tag, service replies hash `dst`.
 pub(crate) fn resolve_send_subnet(
     inner: &AnymoneInner,
     peer_tag: Option<ServiceTag>,
@@ -940,26 +940,14 @@ pub(crate) fn resolve_send_subnet(
 ) -> Option<SubnetId> {
     let cfg = inner.config.read().unwrap();
     // Only runnable subnets carry workers — never route to one we skipped.
-    let (candidates, key): (Vec<SubnetId>, RouteTag) = match peer_tag {
-        Some(service) => (
-            cfg.body
-                .subnets
-                .iter()
-                .filter(|s| subnet_runnable(s) && s.services.iter().any(|svc| svc.tag == service))
-                .map(|s| s.id)
-                .collect(),
-            return_tag,
-        ),
-        None => (
-            cfg.body
-                .subnets
-                .iter()
-                .filter(|s| subnet_runnable(s))
-                .map(|s| s.id)
-                .collect(),
-            dst,
-        ),
-    };
+    let candidates: Vec<SubnetId> = cfg
+        .body
+        .subnets
+        .iter()
+        .filter(|s| subnet_runnable(s))
+        .map(|s| s.id)
+        .collect();
+    let key = if peer_tag.is_some() { return_tag } else { dst };
     select_subnet(candidates, key)
 }
 

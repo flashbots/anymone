@@ -35,6 +35,9 @@ pub struct AnymoneRoundConfigurationBody {
     /// Round-clock epoch (unix ms). The scheduler stamps the fixed genesis 0;
     /// `round` is the config version, not the clock.
     pub epoch_unix_ms: u64,
+    /// Every service is carried on every subnet, so services are a single
+    /// global list rather than per-subnet.
+    pub services: Vec<ServiceEntry>,
     pub subnets: Vec<Subnet>,
 }
 
@@ -54,7 +57,6 @@ pub struct Signature {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Subnet {
     pub id: SubnetId,
-    pub services: Vec<ServiceEntry>,
     pub relays: Vec<Pubkey>,
     pub protocol: ProtocolConfig,
     /// Probability an idle client sends a cover (zero) message each round.
@@ -63,15 +65,9 @@ pub struct Subnet {
 
 impl Subnet {
     /// Subnet with the default cover rate (1.0).
-    pub fn new(
-        id: SubnetId,
-        services: Vec<ServiceEntry>,
-        relays: Vec<Pubkey>,
-        protocol: ProtocolConfig,
-    ) -> Self {
+    pub fn new(id: SubnetId, relays: Vec<Pubkey>, protocol: ProtocolConfig) -> Self {
         Subnet {
             id,
-            services,
             relays,
             protocol,
             cover_rate: 1.0,
@@ -357,7 +353,8 @@ impl AnymoneRoundConfiguration {
         let body = AnymoneRoundConfigurationBody {
             round,
             epoch_unix_ms: now_unix_ms(),
-            subnets: vec![Subnet::new(0, services, relays, protocol)],
+            services,
+            subnets: vec![Subnet::new(0, relays, protocol)],
         };
         AnymoneRoundConfiguration::new(body)
     }
@@ -379,12 +376,12 @@ mod tests {
         AnymoneRoundConfigurationBody {
             round: 42,
             epoch_unix_ms: 0,
+            services: vec![ServiceEntry {
+                tag: ServiceTag::from_label("anymone.echo"),
+                pubkey: Identity::generate().pubkey(),
+            }],
             subnets: vec![Subnet::new(
                 0,
-                vec![ServiceEntry {
-                    tag: ServiceTag::from_label("anymone.echo"),
-                    pubkey: Identity::generate().pubkey(),
-                }],
                 (0..3).map(|_| Identity::generate().pubkey()).collect(),
                 ProtocolConfig::Noop(NoopConfig::default()),
             )],

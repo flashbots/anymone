@@ -54,12 +54,14 @@ const SUBNET_SHRINK_GRACE: u32 = 3;
 /// observability subscriptions; a safety cap, not an expected count).
 pub const MAX_SUBNETS: usize = 16;
 
-/// Subnet capacity before any client population has been observed.
-const INITIAL_CAPACITY: u32 = 8;
+/// Subnet capacity before any client population has been observed, and the
+/// default [`SchedulerParams::min_capacity`].
+pub const INITIAL_CAPACITY: u32 = 8;
 /// Smallest capacity we'll size down to (keeps a little headroom for churn).
 const MIN_CAPACITY: u32 = 8;
-/// How long an integrity offender stays barred from re-registration.
-const INTEGRITY_BACKOFF_MS: u64 = 6 * 60 * 1000;
+/// Default bar on an integrity offender's re-registration. Overridable via
+/// [`SchedulerParams::integrity_backoff_ms`].
+pub const INTEGRITY_BACKOFF_MS: u64 = 6 * 60 * 1000;
 /// Default fault-free rounds before a general (unattributable) escalation
 /// de-escalates. Overridable via [`SchedulerParams::escalation_grace`]; keep it
 /// above the observer's `fault_threshold` so a recurring cause re-trips first.
@@ -131,11 +133,13 @@ mod sizing_tests {
     #[test]
     fn reference_capacity_fits_budget() {
         // At the capacity ceiling the biggest message stays well under the wire budget.
-        let (msg, n_relays) = (256usize, 5usize);
+        let msg = 256usize;
         let est = expected_active(MAX_SUBNET_CLIENTS);
-        let worst = crate::adcnet::max_wire_estimate(msg, est, MAX_SUBNET_CLIENTS, n_relays)
-            .max(crate::panetiere::max_wire_estimate(msg, est, MAX_SUBNET_CLIENTS, n_relays));
-        assert!(worst <= MAX_SUBNET_WIRE, "reference message {worst} exceeds budget");
+        for n_relays in [5usize, 8] {
+            let worst = crate::adcnet::max_wire_estimate(msg, est, MAX_SUBNET_CLIENTS, n_relays)
+                .max(crate::panetiere::max_wire_estimate(msg, est, MAX_SUBNET_CLIENTS, n_relays));
+            assert!(worst <= MAX_SUBNET_WIRE, "reference message {worst} at {n_relays} relays exceeds budget");
+        }
     }
 
     #[test]
@@ -169,14 +173,19 @@ mod sizing_tests {
                 escalation_grace: ESCALATION_GRACE,
                 grow_at: SUBNET_GROW_AT,
                 message_size: 256,
+                integrity_backoff_ms: 6 * 60 * 1000,
+                sideline: true,
+                min_capacity: 8,
+                pin: None,
+                aggregation: true,
             },
         );
         let body = AnymoneRoundConfigurationBody {
             round: 0,
             epoch_unix_ms: 0,
+            services: vec![],
             subnets: vec![Subnet {
                 id: 0,
-                services: vec![],
                 relays: vec![],
                 protocol: ProtocolConfig::Noop(crate::config::NoopConfig {
                     round_duration_ms: 1000,
@@ -240,6 +249,26 @@ pub struct SchedulerParams {
     /// Per-message payload bound the scheduled subnets carry — the dominant
     /// per-round crypto cost, so tests shrink it to stay cheap.
     pub message_size: usize,
+    /// How long an integrity offender stays barred from re-registration
+    /// (default [`INTEGRITY_BACKOFF_MS`]).
+    pub integrity_backoff_ms: u64,
+    /// Hard floor and initial value for subnet capacity. Setting it above the
+    /// expected client load holds capacity constant, so the subnet never
+    /// respawns its workers to resize mid-demo (default [`INITIAL_CAPACITY`]).
+    pub min_capacity: u32,
+    /// Whether attributed faults drop the culprit from the roster. `false`
+    /// keeps the fault feed (reports, escalation state, dashboard attribution)
+    /// but leaves the roster intact — for showcases where a corrupted relay
+    /// should be *seen*, not removed.
+    pub sideline: bool,
+    /// Force every subnet onto one protocol, bypassing the escalation ladder
+    /// (`None` keeps the default ADCNet-unless-escalated behavior). Escalation
+    /// state (sidelining, fault attribution) still runs underneath; only the
+    /// protocol *choice* is fixed.
+    pub pin: Option<SchedulerProtocol>,
+    /// Whether the committee may route large Panetiere subnets through an
+    /// aggregator layer above [`AGGREGATION_THRESHOLD`].
+    pub aggregation: bool,
 }
 
 /// One public subnet's escalation state: `general` (unattributable fault, heals
@@ -328,6 +357,7 @@ impl SchedulerCore {
         sorted.sort();
         let lead = sorted.first().copied().unwrap_or(our_pk);
         let is_lead = lead == our_pk;
+        let capacity = params.min_capacity.max(INITIAL_CAPACITY);
         SchedulerCore {
             identity,
             committee,
@@ -346,7 +376,7 @@ impl SchedulerCore {
             current_subnets_sig: Vec::new(),
             subnet_count: 1,
             shrink_streak: 0,
-            capacity: INITIAL_CAPACITY,
+            capacity,
             cover_rate: 1.0,
             last_content: None,
             public_round: 0,
@@ -400,8 +430,9 @@ impl SchedulerCore {
     }
 
     /// Apply faults observed on `subnet`: sideline attributed relays (globally —
-    /// relays are shared across subnets) and escalate this subnet. Public so
-    /// tests can inject faults without crafting wire bytes.
+    /// relays are shared across subnets; skipped when `params.sideline` is off)
+    /// and escalate this subnet. Public so tests can inject faults without
+    /// crafting wire bytes.
     pub fn apply_observed_faults(&mut self, subnet: SubnetId, faults: Vec<Fault>, now_unix_ms: u64) {
         if faults.is_empty() {
             return;
@@ -412,12 +443,15 @@ impl SchedulerCore {
             match fault.attribution {
                 Attribution::Peers(pks) => {
                     for pk in pks {
+                        self.escalation.entry(subnet).or_default().relays.insert(pk);
+                        if !self.params.sideline {
+                            continue;
+                        }
                         self.registered.remove(&pk);
                         self.sidelined.insert(pk);
                         if integrity {
                             self.integrity_offenders.insert(pk, now_unix_ms);
                         }
-                        self.escalation.entry(subnet).or_default().relays.insert(pk);
                     }
                 }
                 Attribution::None => {
@@ -496,7 +530,7 @@ impl SchedulerCore {
             }
         }
         self.integrity_offenders
-            .retain(|_, t| now_unix_ms.saturating_sub(*t) < INTEGRITY_BACKOFF_MS);
+            .retain(|_, t| now_unix_ms.saturating_sub(*t) < self.params.integrity_backoff_ms);
 
         // Busiest subnet's own anon set (each subnet sizes its IBLT to its load).
         // Clients hash across all current subnets, so the per-subnet load is
@@ -557,8 +591,10 @@ impl SchedulerCore {
             self.shrink_streak = 0;
         }
         // Size capacity to the busiest observed set (every subnet's IBLT uses it),
-        // with hysteresis so cover-traffic jitter doesn't churn.
-        let desired = size_capacity(busiest as usize);
+        // with hysteresis so cover-traffic jitter doesn't churn. `min_capacity`
+        // is a hard floor — set it above the expected load to keep the subnet
+        // from resizing (and respawning workers) at all during a demo.
+        let desired = size_capacity(busiest as usize).max(self.params.min_capacity);
         if desired.abs_diff(self.capacity) >= capacity_resize_margin(self.capacity) {
             self.capacity = desired;
         }
@@ -580,6 +616,7 @@ impl SchedulerCore {
             let protos = self.subnet_protocols();
             let content = content_key(
                 &protos,
+                self.params.pin,
                 &self.registered,
                 &self.services,
                 self.capacity,
@@ -781,6 +818,13 @@ impl SchedulerCore {
         if body.subnets.is_empty() || body.subnets.len() > MAX_SUBNETS {
             return false;
         }
+        if !body
+            .services
+            .iter()
+            .all(|svc| self.services.get(&svc.tag) == Some(&svc.pubkey))
+        {
+            return false;
+        }
         for s in &body.subnets {
             if s.relays.is_empty() {
                 return false;
@@ -789,13 +833,6 @@ impl SchedulerCore {
                 return false;
             }
             if !s.relays.iter().all(|pk| self.registered.contains(pk)) {
-                return false;
-            }
-            if !s
-                .services
-                .iter()
-                .all(|svc| self.services.get(&svc.tag) == Some(&svc.pubkey))
-            {
                 return false;
             }
             match &s.protocol {
@@ -854,15 +891,19 @@ impl SchedulerCore {
         })
     }
 
-    /// Per-subnet protocol: escalated subnets run Panetiere, the rest ADCNet.
+    /// Per-subnet protocol: escalated subnets run Panetiere, the rest ADCNet —
+    /// unless `params.pin` fixes every subnet to one protocol (escalation
+    /// state is still tracked underneath; only the protocol choice is fixed).
     fn subnet_protocols(&self) -> Vec<SchedulerProtocol> {
         (0..self.subnet_count.max(1))
             .map(|i| {
-                if self.subnet_escalated(i as SubnetId) {
-                    SchedulerProtocol::Panetiere
-                } else {
-                    SchedulerProtocol::Adcnet
-                }
+                self.params.pin.unwrap_or_else(|| {
+                    if self.subnet_escalated(i as SubnetId) {
+                        SchedulerProtocol::Panetiere
+                    } else {
+                        SchedulerProtocol::Adcnet
+                    }
+                })
             })
             .collect()
     }
@@ -885,7 +926,11 @@ impl SchedulerCore {
             .iter()
             .filter_map(|pk| self.relay_xpubs.get(pk).map(|xk| (*pk, xk.clone())))
             .collect();
-        let aggregation = build_subnet_aggregation(self.capacity, &relay_vec, &relay_xk);
+        let aggregation = self
+            .params
+            .aggregation
+            .then(|| build_subnet_aggregation(self.capacity, &relay_vec, &relay_xk))
+            .flatten();
         let n = relay_vec.len() as u32;
         let subnets = protos
             .iter()
@@ -916,7 +961,6 @@ impl SchedulerCore {
                 };
                 Subnet {
                     id: i as SubnetId,
-                    services: service_vec.clone(),
                     relays: relay_vec.clone(),
                     protocol,
                     cover_rate: self.cover_rate,
@@ -927,6 +971,7 @@ impl SchedulerCore {
             round: self.public_round,
             // fixed epoch: re-stages of one round must stay byte-identical
             epoch_unix_ms: 0,
+            services: service_vec,
             subnets,
         }
     }
@@ -938,6 +983,7 @@ impl SchedulerCore {
 /// appear in the config (they key-exchange directly with relays on the subnet).
 fn content_key(
     protos: &[SchedulerProtocol],
+    pin: Option<SchedulerProtocol>,
     relays: &HashSet<Pubkey>,
     services: &HashMap<ServiceTag, Pubkey>,
     capacity: u32,
@@ -952,6 +998,12 @@ fn content_key(
             SchedulerProtocol::Panetiere => 2,
         });
     }
+    // Toggling the pin must re-propose even if it doesn't (yet) change `protos`.
+    key.push(match pin {
+        None => 0,
+        Some(SchedulerProtocol::Adcnet) => 1,
+        Some(SchedulerProtocol::Panetiere) => 2,
+    });
     key.extend_from_slice(&capacity.to_le_bytes());
     // Quantize so a change in the committee's cover target re-proposes a config.
     key.push((cover_rate.clamp(0.0, 1.0) * 100.0).round() as u8);

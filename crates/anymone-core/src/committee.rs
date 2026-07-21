@@ -82,8 +82,22 @@ pub struct PanetiereCommitteeConfig {
     pub subnet_grow_at: u32,
     /// Per-message payload bound the scheduled subnets carry.
     pub message_size: usize,
+    /// How long an integrity offender stays barred from re-registration.
+    pub integrity_backoff_ms: u64,
+    /// Whether attributed faults drop the culprit from the roster; `false`
+    /// reports faults without removing relays.
+    pub sideline: bool,
+    /// Hard floor / initial subnet capacity; set above expected load to hold
+    /// capacity constant and avoid resize-driven worker respawns.
+    pub min_capacity: u32,
     /// Cover rate (f32 bits) shared so a caller can retune it live.
     pub cover_rate: Arc<AtomicU32>,
+    /// Force every subnet onto one protocol ("adcnet" | "panetiere"), bypassing
+    /// the escalation ladder. `None` keeps the default ADCNet-unless-escalated
+    /// behavior.
+    pub protocol: Option<String>,
+    /// Whether large Panetiere subnets may route through an aggregator layer.
+    pub aggregation: bool,
 }
 
 impl Default for PanetiereCommitteeConfig {
@@ -97,7 +111,12 @@ impl Default for PanetiereCommitteeConfig {
             escalation_grace: crate::scheduler_core::ESCALATION_GRACE,
             subnet_grow_at: crate::scheduler_core::SUBNET_GROW_AT,
             message_size: 256,
+            integrity_backoff_ms: crate::scheduler_core::INTEGRITY_BACKOFF_MS,
+            sideline: true,
+            min_capacity: crate::scheduler_core::INITIAL_CAPACITY,
             cover_rate: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            protocol: None,
+            aggregation: true,
         }
     }
 }
@@ -117,6 +136,16 @@ pub struct CommitteeParams {
     pub escalation_grace: u32,
     pub subnet_grow_at: u32,
     pub message_size: usize,
+    pub integrity_backoff_ms: u64,
+    /// Whether attributed faults drop the culprit from the roster.
+    pub sideline: bool,
+    /// Hard floor / initial subnet capacity.
+    pub min_capacity: u32,
+    /// Force every subnet onto one protocol ("adcnet" | "panetiere"); absent
+    /// or unrecognized keeps the default ADCNet-unless-escalated ladder.
+    pub protocol: Option<String>,
+    /// Whether large Panetiere subnets may route through an aggregator layer.
+    pub aggregation: bool,
 }
 
 impl Default for CommitteeParams {
@@ -130,6 +159,11 @@ impl Default for CommitteeParams {
             escalation_grace: crate::scheduler_core::ESCALATION_GRACE,
             subnet_grow_at: crate::scheduler_core::SUBNET_GROW_AT,
             message_size: 256,
+            integrity_backoff_ms: crate::scheduler_core::INTEGRITY_BACKOFF_MS,
+            sideline: true,
+            min_capacity: crate::scheduler_core::INITIAL_CAPACITY,
+            protocol: None,
+            aggregation: true,
         }
     }
 }
@@ -145,7 +179,12 @@ impl CommitteeParams {
             escalation_grace: self.escalation_grace,
             subnet_grow_at: self.subnet_grow_at,
             message_size: self.message_size,
+            integrity_backoff_ms: self.integrity_backoff_ms,
+            sideline: self.sideline,
+            min_capacity: self.min_capacity,
             cover_rate: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            protocol: self.protocol,
+            aggregation: self.aggregation,
         }
     }
 }
@@ -218,6 +257,15 @@ pub async fn spawn_panetiere_committee_scheduler(
         })
         .collect();
 
+    let pin = match config.protocol.as_deref() {
+        Some("adcnet") => Some(crate::scheduling::SchedulerProtocol::Adcnet),
+        Some("panetiere") => Some(crate::scheduling::SchedulerProtocol::Panetiere),
+        Some(other) => {
+            tracing::warn!(protocol = other, "unrecognized committee protocol pin, ignoring");
+            None
+        }
+        None => None,
+    };
     let params = SchedulerParams {
         public_round_duration: config.public_round_duration,
         min_relays: config.min_relays,
@@ -226,6 +274,11 @@ pub async fn spawn_panetiere_committee_scheduler(
         escalation_grace: config.escalation_grace,
         grow_at: config.subnet_grow_at,
         message_size: config.message_size,
+        integrity_backoff_ms: config.integrity_backoff_ms,
+        sideline: config.sideline,
+        min_capacity: config.min_capacity,
+        pin,
+        aggregation: config.aggregation,
     };
 
     tokio::spawn(async move {
@@ -249,7 +302,6 @@ pub async fn spawn_panetiere_committee_scheduler(
             pp.clone(),
             committee_mse.clone(),
             my_server_id,
-            committee.len() as u32,
             identity.clone(),
             // Leaderless, all-to-all: every member derives its own set and decodes
             // locally; no announcer, no Decoded on the committee topic.

@@ -38,7 +38,7 @@ pub struct DemoArgs {
     pub dashboard_port: u16,
 
     /// Number of relays to run.
-    #[arg(long, default_value = "3")]
+    #[arg(long, default_value = "4")]
     pub relays: usize,
 
     /// Initial number of active clients. The dashboard "clients" knob raises or
@@ -101,6 +101,10 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
         min_services: 1,
         fault_grace: 2,
         cover_rate: cover_target.clone(),
+        // Panetiere-only demo: pin the protocol so the subnet runs Panetiere
+        // from the first config instead of starting on ADCNet and escalating.
+        // Sidelining on a corrupt-share fault still runs (the fault knob).
+        protocol: Some("panetiere".to_string()),
         ..PanetiereCommitteeConfig::default()
     };
     // Schedulers subscribe to the registration topic before returning, so it's

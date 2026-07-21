@@ -120,10 +120,7 @@ async fn committee_panetiere_publishes_multisig_config() {
         .relays
         .iter()
         .any(|p| *p == relay_pk));
-    assert!(cfg.body.subnets[0]
-        .services
-        .iter()
-        .any(|s| s.pubkey == svc_pk));
+    assert!(cfg.body.services.iter().any(|s| s.pubkey == svc_pk));
 }
 
 /// Committee members spawned several rounds apart (vs run.sh's simultaneous

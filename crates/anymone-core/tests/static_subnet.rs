@@ -55,7 +55,6 @@ async fn echo_via_governance_topic() {
     // panic the runtime — the echo below still round-trips on subnet 0.
     unsigned.body.subnets.push(Subnet {
         id: 1,
-        services: vec![],
         relays: vec![],
         protocol: ProtocolConfig::Noop(NoopConfig {
             round_duration_ms: 30,

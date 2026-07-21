@@ -91,6 +91,11 @@ fn lead_core(committee: &[Identity], threshold: u32) -> SchedulerCore {
             escalation_grace: 5,
             grow_at: 31,
             message_size: 16,
+            integrity_backoff_ms: 6 * 60 * 1000,
+            sideline: true,
+            min_capacity: 8,
+            pin: None,
+            aggregation: true,
         },
     )
 }
@@ -157,6 +162,79 @@ fn renegotiates_adcnet_panetiere_adcnet() {
     let body = staged_body(&core.tick(4, 0)).expect("heal proposal staged");
     assert_eq!(proto_name(&body), "adcnet");
     assert_eq!(body.subnets[0].relays.len(), 3);
+
+    // Pinned core: proposes Panetiere from round 0 with zero faults, and a
+    // liveness fault still sidelines the culprit — escalation bookkeeping keeps
+    // running underneath the pin, only the protocol *choice* is fixed.
+    let pinned_committee: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
+    let mut sorted = pinned_committee.clone();
+    sorted.sort_by_key(|i| i.pubkey());
+    let pinned_pks: Vec<_> = pinned_committee.iter().map(|i| i.pubkey()).collect();
+    let mut pinned = SchedulerCore::new(
+        sorted[0].clone(),
+        pinned_pks,
+        2,
+        SchedulerParams {
+            public_round_duration: Duration::from_millis(200),
+            min_relays: 2,
+            min_services: 1,
+            fault_threshold: 2,
+            escalation_grace: 5,
+            grow_at: 31,
+            message_size: 16,
+            integrity_backoff_ms: 6 * 60 * 1000,
+            sideline: true,
+            min_capacity: 8,
+            pin: Some(anymone_core::SchedulerProtocol::Panetiere),
+            aggregation: true,
+        },
+    );
+    let pinned_relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
+    let pinned_service = Identity::generate();
+    register_relays_and_service(&mut pinned, &pinned_relays, &pinned_service);
+    let body = staged_body(&pinned.tick(0, 0)).expect("pinned core stages on round 0");
+    assert_eq!(proto_name(&body), "panetiere", "pin must hold with zero faults");
+
+    let pinned_victim = pinned_relays[1].pubkey();
+    pinned.apply_observed_faults(0, vec![Fault {
+        kind: FaultKind::Liveness,
+        attribution: Attribution::Peers(vec![pinned_victim]),
+        evidence: Vec::new(),
+    }], 0);
+    let body = staged_body(&pinned.tick(1, 0)).expect("pinned core re-proposes after fault");
+    assert_eq!(proto_name(&body), "panetiere", "pin must hold across a fault");
+    assert!(!body.subnets[0].relays.contains(&pinned_victim), "sidelining still runs under the pin");
+
+    // sideline: false — the same attributed fault is recorded but the roster
+    // stays intact; the staged body keeps all 3 relays.
+    let mut reporting = SchedulerCore::new(
+        sorted[0].clone(),
+        pinned_committee.iter().map(|i| i.pubkey()).collect(),
+        2,
+        SchedulerParams {
+            public_round_duration: Duration::from_millis(200),
+            min_relays: 2,
+            min_services: 1,
+            fault_threshold: 2,
+            escalation_grace: 5,
+            grow_at: 31,
+            message_size: 16,
+            integrity_backoff_ms: 6 * 60 * 1000,
+            sideline: false,
+            min_capacity: 8,
+            pin: Some(anymone_core::SchedulerProtocol::Panetiere),
+            aggregation: true,
+        },
+    );
+    register_relays_and_service(&mut reporting, &pinned_relays, &pinned_service);
+    let _ = reporting.tick(0, 0);
+    reporting.apply_observed_faults(0, vec![Fault {
+        kind: FaultKind::Integrity,
+        attribution: Attribution::Peers(vec![pinned_victim]),
+        evidence: Vec::new(),
+    }], 0);
+    let body = staged_body(&reporting.tick(1, 0)).expect("re-stage until published");
+    assert_eq!(body.subnets[0].relays.len(), 3, "sideline: false must not drop the culprit");
 }
 
 #[test]
@@ -272,6 +350,11 @@ fn multisig_assembles_via_committee_sig() {
         escalation_grace: 5,
         grow_at: 31,
         message_size: 16,
+        integrity_backoff_ms: 6 * 60 * 1000,
+        sideline: true,
+        min_capacity: 8,
+        pin: None,
+        aggregation: true,
     };
     let mut core = SchedulerCore::new(lead.clone(), pks.clone(), 2, params.clone());
 
@@ -361,6 +444,11 @@ fn non_lead_core_never_stages() {
             escalation_grace: 5,
             grow_at: 31,
             message_size: 16,
+            integrity_backoff_ms: 6 * 60 * 1000,
+            sideline: true,
+            min_capacity: 8,
+            pin: None,
+            aggregation: true,
         },
     );
     assert!(!core.is_lead());
@@ -504,6 +592,11 @@ fn live_core(committee: &[Identity]) -> SchedulerCore {
             escalation_grace: 5,
             grow_at: 31,
             message_size: 16,
+            integrity_backoff_ms: 6 * 60 * 1000,
+            sideline: true,
+            min_capacity: 8,
+            pin: None,
+            aggregation: true,
         },
     )
 }
@@ -522,27 +615,64 @@ fn adcnet_cfg_of(body: &AnymoneRoundConfigurationBody) -> AdcnetConfig {
 fn committee_schedules_second_subnet_when_one_nears_capacity() {
     let committee: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
     let mut core = live_core(&committee);
+    // A second core, identically registered and fed the same traffic, but with
+    // aggregation disabled — proves the gate actually suppresses the layer
+    // rather than it just never crossing the threshold.
+    let mut core_no_agg = {
+        let mut sorted_c = committee.clone();
+        sorted_c.sort_by_key(|i| i.pubkey());
+        let pks: Vec<_> = committee.iter().map(|i| i.pubkey()).collect();
+        SchedulerCore::new(
+            sorted_c[0].clone(),
+            pks,
+            2,
+            SchedulerParams {
+                public_round_duration: Duration::from_millis(80),
+                min_relays: 2,
+                min_services: 1,
+                fault_threshold: 2,
+                escalation_grace: 5,
+                grow_at: 31,
+                message_size: 16,
+                integrity_backoff_ms: 6 * 60 * 1000,
+                sideline: true,
+                min_capacity: 8,
+                pin: None,
+                aggregation: false,
+            },
+        )
+    };
 
     let relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
     let service = Identity::generate();
     register_relays_and_service(&mut core, &relays, &service);
+    register_relays_and_service(&mut core_no_agg, &relays, &service);
 
     let proposal = staged_proposal(&core.tick(0, 0)).expect("first proposal");
     let body = proposal.body.clone();
     assert_eq!(body.subnets.len(), 1, "v0 starts with a single subnet");
     let cfg = adcnet_cfg_of(&body);
     core.on_decoded_body(proposal);
+    let proposal_no_agg = staged_proposal(&core_no_agg.tick(0, 0)).expect("first proposal (no-agg)");
+    core_no_agg.on_decoded_body(proposal_no_agg);
 
     let clients: Vec<Identity> = (0..32).map(|_| Identity::generate()).collect();
     let mut net = Subnet::new(&cfg, &relays, &clients);
 
     let mut grown: Option<AnymoneRoundConfigurationBody> = None;
+    let mut grown_no_agg: Option<AnymoneRoundConfigurationBody> = None;
     for round in 0..8u64 {
         for (from, msg) in net.round(round, &[0, 1, 2]) {
-            core.on_subnet_message(0, from, msg);
+            core.on_subnet_message(0, from, msg.clone());
+            core_no_agg.on_subnet_message(0, from, msg);
         }
         if let Some(b) = staged_body(&core.tick(round, 0)) {
             grown = Some(b);
+        }
+        if let Some(b) = staged_body(&core_no_agg.tick(round, 0)) {
+            grown_no_agg = Some(b);
+        }
+        if grown.is_some() && grown_no_agg.is_some() {
             break;
         }
     }
@@ -550,6 +680,11 @@ fn committee_schedules_second_subnet_when_one_nears_capacity() {
     let body = grown.expect("committee must schedule a second subnet once a subnet nears capacity");
     assert_eq!(proto_name(&body), "adcnet", "scaling stays on ADCNet (not a fault escalation)");
     assert!(body.subnets.len() >= 2, "expected ≥2 subnets, got {}", body.subnets.len());
+    let grown_no_agg = grown_no_agg.expect("no-agg core must also schedule a second subnet");
+    assert!(
+        grown_no_agg.subnets.iter().all(|s| s.protocol.aggregation().is_none()),
+        "aggregation: false must suppress the layer even above the capacity threshold"
+    );
 
     // Per-subnet escalation (#19/#21): an unattributable fault on subnet 1
     // escalates only subnet 1 to Panetiere; subnet 0 stays optimistic ADCNet.
@@ -563,6 +698,7 @@ fn committee_schedules_second_subnet_when_one_nears_capacity() {
     assert_eq!(mixed.subnets.len(), count, "a fault must not change the subnet count");
     assert!(matches!(mixed.subnets[0].protocol, ProtocolConfig::Adcnet(_)), "unfaulted subnet 0 stays ADCNet");
     assert!(matches!(mixed.subnets[1].protocol, ProtocolConfig::Panetiere(_)), "faulted subnet 1 escalates to Panetiere");
+    assert!(mixed.subnets[1].protocol.aggregation().is_some(), "capacity above threshold should aggregate by default");
 }
 
 /// Reproduces the demo's subnet *flapping*: after growing to two subnets and
@@ -827,7 +963,6 @@ impl PanetiereSubnet {
                     pp.clone(),
                     mse.clone(),
                     *sid,
-                    8,
                     sorted[sid.0 as usize].clone(),
                     if sid.0 == 0 { SetMode::Leader } else { SetMode::SelfDerived },
                     0,

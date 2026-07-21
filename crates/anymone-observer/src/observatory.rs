@@ -10,7 +10,9 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use anymone_core::config::{AnymoneRoundConfiguration, ProtocolConfig, Subnet, SubnetId};
+use anymone_core::config::{
+    AnymoneRoundConfiguration, ProtocolConfig, ServiceEntry, Subnet, SubnetId,
+};
 use anymone_core::faults::{Attribution, Fault};
 use anymone_core::{Pubkey, ServiceTag};
 use serde_json::{json, Value};
@@ -330,10 +332,10 @@ impl Observatory {
             return "committee";
         }
         if let Some(cfg) = &self.config {
+            if cfg.body.services.iter().any(|svc| svc.pubkey == *pk) {
+                return "service";
+            }
             for s in &cfg.body.subnets {
-                if s.services.iter().any(|svc| svc.pubkey == *pk) {
-                    return "service";
-                }
                 if s.relays.contains(pk) {
                     return "relay";
                 }
@@ -358,8 +360,8 @@ impl Observatory {
         if let Some(cfg) = &self.config {
             for s in &cfg.body.subnets {
                 nodes.extend(s.relays.iter().copied());
-                nodes.extend(s.services.iter().map(|svc| svc.pubkey));
             }
+            nodes.extend(cfg.body.services.iter().map(|svc| svc.pubkey));
         }
 
         let mut nodes: Vec<Pubkey> = nodes.into_iter().collect();
@@ -394,7 +396,13 @@ impl Observatory {
         let subnets: Vec<Value> = self
             .config
             .as_ref()
-            .map(|cfg| cfg.body.subnets.iter().map(|s| self.subnet_json(s)).collect())
+            .map(|cfg| {
+                cfg.body
+                    .subnets
+                    .iter()
+                    .map(|s| self.subnet_json(s, &cfg.body.services))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let faults: Vec<Value> = self
@@ -457,7 +465,7 @@ impl Observatory {
         })
     }
 
-    fn subnet_json(&self, s: &Subnet) -> Value {
+    fn subnet_json(&self, s: &Subnet, all_services: &[ServiceEntry]) -> Value {
         let live = self.live.get(&s.id).cloned().unwrap_or_default();
         // ADCNet's canonical-set leader is sorted_relays[id % n] (spread across
         // subnets so each has a distinct leader — see runtime::adcnet_leader_pk),
@@ -484,8 +492,7 @@ impl Observatory {
             })
             .unwrap_or_default();
         let msgs_round = ring.and_then(|r| r.back()).map(|st| st.msgs).unwrap_or(0);
-        let services: Vec<Value> = s
-            .services
+        let services: Vec<Value> = all_services
             .iter()
             .map(|svc| json!({ "tag": tag_label(&svc.tag), "pubkey": svc.pubkey }))
             .collect();
@@ -596,6 +603,7 @@ mod tests {
         AnymoneRoundConfiguration::new(AnymoneRoundConfigurationBody {
             round,
             epoch_unix_ms: 0,
+            services: vec![],
             subnets: vec![],
         })
     }

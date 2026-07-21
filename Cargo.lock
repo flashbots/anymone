@@ -607,7 +607,6 @@ dependencies = [
 [[package]]
 name = "chipmunk_code"
 version = "0.1.0"
-source = "git+https://github.com/Ruteri/Chipmunk?branch=main#ca405fb108cda8ae755e220ac2c7128eea866bcf"
 dependencies = [
  "ark-std",
  "env_logger",
@@ -2548,7 +2547,6 @@ dependencies = [
 [[package]]
 name = "panetiere"
 version = "0.1.0"
-source = "git+ssh://git@github.com/flashbots/panetiere?branch=main#54bd1cae53db50e7435d08f0212aa43d0e760c2b"
 dependencies = [
  "aes-gcm",
  "chipmunk_code",
@@ -2556,6 +2554,7 @@ dependencies = [
  "rand 0.8.6",
  "rand_chacha 0.3.1",
  "rand_distr",
+ "rayon",
  "sha2",
 ]
 

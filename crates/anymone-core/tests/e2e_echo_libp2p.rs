@@ -219,7 +219,7 @@ async fn deployment_schedules_subnet_via_bootnode() {
 
     let cfg = scheduled.expect("committee never scheduled a subnet over the bootnode mesh");
     assert!(
-        cfg.body.subnets.iter().any(|s| s.services.iter().any(|svc| svc.tag == echo_tag)),
+        cfg.body.services.iter().any(|svc| svc.tag == echo_tag) && !cfg.body.subnets.is_empty(),
         "scheduled config carries no subnet for the registered service"
     );
 

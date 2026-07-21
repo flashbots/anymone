@@ -21,7 +21,7 @@ use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::pke;
 use panetiere::protocol::ProtocolParams;
 use panetiere::protocol::{ClientId, ServerId};
-use rand::SeedableRng;
+use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
 /// Per-server identities (sorted by pubkey, matching the runtime's slot order)
@@ -52,7 +52,11 @@ fn channel(
 ) -> (MseParams, Arc<ProtocolParams>) {
     let delta = (3 * rho.max(1)).div_ceil(4);
     let xi = msg_bytes.div_ceil(2).max(1);
-    let mse = MseParams::new(4, delta, xi, [0xAA; 32]);
+    // Draw the PRF key from the test's own RNG rather than a fixed constant —
+    // one magic key reused everywhere can coincidentally peel-stall at a tight delta.
+    let mut prf_key = [0u8; 32];
+    rng.fill_bytes(&mut prf_key);
+    let mse = MseParams::new(4, delta, xi, prf_key);
     let n_polys = MseEncoding::n_polys(&mse);
     let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(rng, n_servers, n_polys, 1));
     (mse, pp)
@@ -72,7 +76,7 @@ fn panetiere_session_happy_path() {
     let mut servers: Vec<PanetiereServerSession> = server_ids
         .iter()
         .map(|sid| {
-            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, 8, ids[sid.0 as usize].clone(), SetMode::SelfDerived, 0, server_pubkeys(&server_pks), None)
+            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, ids[sid.0 as usize].clone(), SetMode::SelfDerived, 0, server_pubkeys(&server_pks), None)
         })
         .collect();
 
@@ -131,7 +135,7 @@ fn committee_panetiere_roundtrip(payload: &[u8]) -> Vec<u8> {
     let mut servers: Vec<PanetiereServerSession> = server_ids
         .iter()
         .map(|sid| {
-            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, 8, ids[sid.0 as usize].clone(), SetMode::SelfDerived, 0, server_pubkeys(&server_pks), None)
+            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, ids[sid.0 as usize].clone(), SetMode::SelfDerived, 0, server_pubkeys(&server_pks), None)
         })
         .collect();
 
@@ -180,7 +184,7 @@ fn panetiere_back_to_back_rounds_lose_nothing() {
     let mut servers: Vec<PanetiereServerSession> = server_ids
         .iter()
         .map(|sid| {
-            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, 8, ids[sid.0 as usize].clone(), SetMode::SelfDerived, 0, server_pubkeys(&server_pks), None)
+            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, ids[sid.0 as usize].clone(), SetMode::SelfDerived, 0, server_pubkeys(&server_pks), None)
         })
         .collect();
 
@@ -253,7 +257,6 @@ fn panetiere_corrupt_share_attributes_integrity() {
                 pp.clone(),
                 mse.clone(),
                 *sid,
-                8,
                 ids[sid.0 as usize].clone(),
                 if sid.0 == 0 { SetMode::Leader } else { SetMode::SelfDerived },
                 0,
@@ -335,7 +338,7 @@ fn panetiere_concurrent_clients_all_decode() {
     let mut servers: Vec<PanetiereServerSession> = server_ids
         .iter()
         .map(|sid| {
-            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, 8, ids[sid.0 as usize].clone(), if sid.0 == 0 { SetMode::Leader } else { SetMode::SelfDerived }, 0, server_pubkeys(&server_pks), None)
+            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, ids[sid.0 as usize].clone(), if sid.0 == 0 { SetMode::Leader } else { SetMode::SelfDerived }, 0, server_pubkeys(&server_pks), None)
         })
         .collect();
 
@@ -415,7 +418,7 @@ fn panetiere_followers_use_leader_set_with_min_floor() {
                     SetMode::Follower { leader: leader_pk }
                 };
                 PanetiereServerSession::new(
-                    pp.clone(), mse.clone(), *sid, 8, ids[sid.0 as usize].clone(),
+                    pp.clone(), mse.clone(), *sid, ids[sid.0 as usize].clone(),
                     mode, min_clients, server_pubkeys(&server_pks), None,
                 )
             })
@@ -466,7 +469,6 @@ fn adcnet_config_body(n_subnets: usize) -> AnymoneRoundConfigurationBody {
         .map(|id| {
             Subnet::new(
                 id as u32,
-                vec![ServiceEntry { tag: ServiceTag::from_label("anymone.chat"), pubkey: svc.pubkey() }],
                 relay_pks.clone(),
                 ProtocolConfig::Adcnet(AdcnetConfig {
                     round_duration_ms: 3000,
@@ -480,7 +482,12 @@ fn adcnet_config_body(n_subnets: usize) -> AnymoneRoundConfigurationBody {
             )
         })
         .collect();
-    AnymoneRoundConfigurationBody { round: 1, epoch_unix_ms: now_unix_ms(), subnets }
+    AnymoneRoundConfigurationBody {
+        round: 1,
+        epoch_unix_ms: now_unix_ms(),
+        services: vec![ServiceEntry { tag: ServiceTag::from_label("anymone.chat"), pubkey: svc.pubkey() }],
+        subnets,
+    }
 }
 
 /// Reproduces the demo's "stuck at one subnet" bug at the committee layer: a
@@ -516,7 +523,7 @@ fn panetiere_fixed_seed_multiround_no_stall() {
     let mut servers: Vec<PanetiereServerSession> = server_ids
         .iter()
         .map(|sid| {
-            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, 8, ids[sid.0 as usize].clone(), SetMode::SelfDerived, 0, server_pubkeys(&server_pks), None)
+            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, ids[sid.0 as usize].clone(), SetMode::SelfDerived, 0, server_pubkeys(&server_pks), None)
         })
         .collect();
 
