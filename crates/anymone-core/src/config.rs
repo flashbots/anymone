@@ -319,6 +319,24 @@ impl AnymoneRoundConfigurationBody {
             .with_big_endian()
             .deserialize(bytes)
     }
+
+    /// Bytes the committee lead signs when proposing this body — domain-tagged
+    /// separately from [`Self::approve_bytes`] so a proposal signature can't
+    /// double as an approval.
+    pub fn propose_bytes(&self) -> Vec<u8> {
+        tagged_bytes(b"anymone/config/propose", self)
+    }
+
+    /// Bytes every committee member signs to approve this body.
+    pub fn approve_bytes(&self) -> Vec<u8> {
+        tagged_bytes(b"anymone/config/approve", self)
+    }
+}
+
+fn tagged_bytes(tag: &[u8], body: &AnymoneRoundConfigurationBody) -> Vec<u8> {
+    let mut m = tag.to_vec();
+    m.extend_from_slice(&body.canonical_bytes());
+    m
 }
 
 impl AnymoneRoundConfiguration {
@@ -330,9 +348,10 @@ impl AnymoneRoundConfiguration {
     }
 
     /// Append signatures from the given identities. Each identity signs the
-    /// canonical body bytes. Duplicate signers are not added.
+    /// approve-tagged body bytes (matching `verify_multisig`). Duplicate
+    /// signers are not added.
     pub fn sign_with(mut self, identities: &[&Identity]) -> Self {
-        let msg = self.body.canonical_bytes();
+        let msg = self.body.approve_bytes();
         for id in identities {
             let pk = id.pubkey();
             if self.signatures.iter().any(|s| s.signer == pk) {
@@ -353,7 +372,7 @@ impl AnymoneRoundConfiguration {
                 committee: committee.len() as u32,
             });
         }
-        let msg = self.body.canonical_bytes();
+        let msg = self.body.approve_bytes();
         let mut seen: Vec<Pubkey> = Vec::with_capacity(self.signatures.len());
         for sig in &self.signatures {
             if !committee.contains(&sig.signer) {

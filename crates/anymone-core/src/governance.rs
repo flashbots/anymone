@@ -84,6 +84,8 @@ impl GovernanceBootstrap {
 pub enum GovernanceError {
     #[error("config topic closed before any valid configuration arrived")]
     TopicClosed,
+    #[error("no valid configuration arrived within the startup deadline")]
+    Timeout,
 }
 
 /// Topic admission for an adopted config: subnet shares/broadcast topics bound

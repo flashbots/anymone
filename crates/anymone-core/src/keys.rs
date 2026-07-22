@@ -6,11 +6,26 @@
 use std::fmt;
 use std::fs;
 use std::io;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use libp2p_identity::ed25519;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
+
+/// Write `bytes` to `path` at mode 0600 — key material must never be group/world-readable.
+pub(crate) fn write_secret(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(bytes)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
 
 /// 32-byte Ed25519 public key. Serialised as `"ed25519:<hex>"` (human-readable)
 /// or the raw array (bincode).
@@ -194,7 +209,7 @@ impl ExchangeIdentity {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, self.key.to_bytes())?;
+        write_secret(path, &self.key.to_bytes())?;
         Ok(())
     }
 

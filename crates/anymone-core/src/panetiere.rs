@@ -120,7 +120,7 @@ pub(crate) fn server_index(relays: &[Pubkey], pk: Pubkey) -> Option<u32> {
 
 /// Deterministic `ClientId` from a pubkey's first 4 bytes; stable per node+pipe
 /// so the decoder merges a round's publics with its openings.
-pub(crate) fn client_id_from_pubkey(pk: Pubkey) -> ClientId {
+pub fn client_id_from_pubkey(pk: Pubkey) -> ClientId {
     ClientId(u32::from_be_bytes([pk.0[0], pk.0[1], pk.0[2], pk.0[3]]))
 }
 
@@ -184,7 +184,7 @@ fn server_session(
     } else {
         SetMode::Follower { leader: leader_pk }
     };
-    Box::new(PanetiereServerSession::new(
+    let mut session = PanetiereServerSession::new(
         pp.clone(),
         mse.clone(),
         server_id,
@@ -193,7 +193,9 @@ fn server_session(
         cfg.client_set_min,
         server_pubkeys,
         aggregation,
-    ))
+    );
+    session.set_client_set_max(cfg.client_set_max as usize);
+    Box::new(session)
 }
 
 /// Self-contained Panetiere subnet driver: builds this node's sessions, then owns
@@ -230,14 +232,10 @@ pub(crate) async fn run_subnet(
     }
     if let Some(a) = subnet_aggregation(&subnet) {
         if let Some(group) = aggregator_group_of(a, identity_pk) {
-            sessions.insert(
-                SessionKey::Aggregator,
-                Box::new(PanetiereAggregatorSession::new(
-                    group,
-                    a.groups.len() as u32,
-                    inner.identity.clone(),
-                )),
-            );
+            let mut agg_session =
+                PanetiereAggregatorSession::new(group, a.groups.len() as u32, inner.identity.clone());
+            agg_session.set_client_set_max(cfg.client_set_max as usize);
+            sessions.insert(SessionKey::Aggregator, Box::new(agg_session));
         }
     }
     let mut fault_monitor: Option<Box<dyn Session>> = if leader_pk == identity_pk {
@@ -491,6 +489,33 @@ pub(crate) enum PanetiereWire {
     Reservations { round: u64, entries: Vec<(u16, u16)> },
 }
 
+impl PanetiereWire {
+    /// The `round` field carried by every variant.
+    pub(crate) fn round(&self) -> u64 {
+        match self {
+            PanetiereWire::ClientPublic { round, .. }
+            | PanetiereWire::Opening { round, .. }
+            | PanetiereWire::ServerPublic { round, .. }
+            | PanetiereWire::Decoded { round, .. }
+            | PanetiereWire::GroupAggregate { round, .. }
+            | PanetiereWire::ClientSet { round, .. }
+            | PanetiereWire::Reservations { round, .. } => *round,
+        }
+    }
+}
+
+/// True if `round` falls within `PANETIERE_ROUND_WINDOW` of `cur`, in either
+/// direction. `cur = None` (no round observed yet) always accepts.
+pub(crate) fn round_in_window(round: u64, cur: Option<u64>) -> bool {
+    match cur {
+        Some(cur) => {
+            round <= cur.saturating_add(PANETIERE_ROUND_WINDOW)
+                && round.saturating_add(PANETIERE_ROUND_WINDOW) >= cur
+        }
+        None => true,
+    }
+}
+
 /// Bytes a relay signs over its `ServerPublic` (and every consumer verifies
 /// against `roster[server_id]`).
 pub(crate) fn server_public_signing_bytes(
@@ -643,6 +668,8 @@ pub struct PanetiereObserverSession {
     /// `None` for the leaderless committee, which reads the set off `ServerPublic`s.
     leader: Option<PeerId>,
     max_round: Option<u64>,
+    /// Own round clock, from `begin_round`; bounds accepted wire rounds.
+    cur_round: Option<u64>,
     /// Canonical client set size per round — the per-round anonymity set.
     anon_set_by_round: std::collections::BTreeMap<u64, usize>,
     /// Total decoded payload bytes per round — the scheduler's upgrade signal
@@ -662,6 +689,7 @@ impl PanetiereObserverSession {
             roster,
             leader,
             max_round: None,
+            cur_round: None,
             anon_set_by_round: std::collections::BTreeMap::new(),
             decoded_bytes_by_round: std::collections::BTreeMap::new(),
             integrity_pending: Vec::new(),
@@ -738,21 +766,17 @@ impl PanetiereObserverSession {
 }
 
 impl Session for PanetiereObserverSession {
-    fn begin_round(&mut self, _round: Round, _now: Instant) -> Vec<Vec<u8>> {
+    fn begin_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
+        self.cur_round = Some(round);
         Vec::new()
     }
 
     fn on_inbound(&mut self, from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
         if let Ok(msg) = bincode::deserialize::<PanetiereWire>(&payload) {
-            let round = match &msg {
-                PanetiereWire::ClientPublic { round, .. }
-                | PanetiereWire::Opening { round, .. }
-                | PanetiereWire::ServerPublic { round, .. }
-                | PanetiereWire::Decoded { round, .. }
-                | PanetiereWire::GroupAggregate { round, .. }
-                | PanetiereWire::ClientSet { round, .. }
-                | PanetiereWire::Reservations { round, .. } => *round,
-            };
+            let round = msg.round();
+            if !round_in_window(round, self.cur_round) {
+                return Vec::new();
+            }
             self.max_round = Some(self.max_round.map_or(round, |m| m.max(round)));
             match &msg {
                 PanetiereWire::ServerPublic {
@@ -958,6 +982,31 @@ struct PanetiereRoundState {
     decoded: bool,
     /// Leader-only (aggregated flow): the agreed summed entry per group.
     group_aggregates: HashMap<u32, GroupAgg>,
+    /// First pubkey to claim each `ClientId` this round. Binds client input to
+    /// its gossipsub-authenticated origin and blocks a second signer from
+    /// grinding a colliding 4-byte id to clobber another client's slot.
+    owners: HashMap<ClientId, Pubkey>,
+}
+
+/// Admits `from` as (or confirms it already is) the owner of `client_id` in
+/// `owners`, subject to a cap on distinct clients per round. Rejects unless
+/// `client_id` is actually derived from `from` — closing the unauthenticated
+/// self-chosen `client_id` gap — and rejects a second distinct signer trying
+/// to claim an id already owned by someone else.
+fn admit_client(owners: &mut HashMap<ClientId, Pubkey>, client_id: ClientId, from: Pubkey, max: usize) -> bool {
+    if client_id_from_pubkey(from) != client_id {
+        return false;
+    }
+    match owners.get(&client_id) {
+        Some(&owner) => owner == from,
+        None => {
+            if owners.len() >= max {
+                return false;
+            }
+            owners.insert(client_id, from);
+            true
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1004,12 +1053,22 @@ pub struct PanetiereServerSession {
     /// relays), and decode re-sums the signed group aggregates instead of
     /// individual `ClientPublic`s.
     aggregation: Option<LeaderAggregation>,
+    /// Own round clock, from `begin_round`; bounds accepted wire rounds.
+    cur_round: Option<Round>,
+    /// Upper bound on distinct clients admitted per round (also the canonical
+    /// set size ceiling); unbounded until [`Self::set_client_set_max`] is called.
+    client_set_max: usize,
 }
 
 /// Rounds kept after they go quiet. A bucket decodes at `end_round(r+1)`; one
 /// that never reaches `t` (a stalled round) is dropped this many rounds later so
 /// memory stays bounded.
 pub(crate) const PANETIERE_ROUND_RETENTION: Round = 4;
+
+/// How far a wire `round` may sit ahead of (or behind) the session's own round
+/// clock. Ties to retention: a stalled round legitimately emits shares/outputs
+/// up to `PANETIERE_ROUND_RETENTION` rounds late.
+pub(crate) const PANETIERE_ROUND_WINDOW: Round = PANETIERE_ROUND_RETENTION;
 
 impl PanetiereServerSession {
     #[allow(clippy::too_many_arguments)]
@@ -1036,7 +1095,17 @@ impl PanetiereServerSession {
             announced_rounds: HashSet::new(),
             misbehavior: None,
             aggregation,
+            cur_round: None,
+            client_set_max: usize::MAX,
         }
+    }
+
+    /// Caps distinct clients admitted per round and the accepted canonical set
+    /// size. Call with the subnet's real `client_set_max` on public subnets,
+    /// where the client set is attacker-influenced; the committee's own
+    /// internal channel is naturally bounded by committee size and can skip this.
+    pub(crate) fn set_client_set_max(&mut self, max: usize) {
+        self.client_set_max = max;
     }
 
     /// Leader-only: announce the one canonical set per settled round, once.
@@ -1160,6 +1229,9 @@ fn try_decode_round(
                 Ok(plain) => return (Some(plain), culprits),
                 Err(VerifyError::InvalidServerOpening(i))
                 | Err(VerifyError::ShareOpeningMismatch(i)) => {
+                    if i >= outputs.len() {
+                        break;
+                    }
                     culprits.push(outputs[i].server_id);
                     outputs.remove(i);
                 }
@@ -1202,7 +1274,7 @@ fn try_decode_round_aggregated(
         return (None, culprits);
     }
 
-    let group_count = agg.roster.len() as u32;
+    let group_count = (agg.roster.len() as u32).max(1);
     let mut by_group: HashMap<u32, Vec<ClientId>> = HashMap::new();
     for c in &canonical {
         by_group.entry(c.0 % group_count).or_default().push(*c);
@@ -1247,6 +1319,9 @@ fn try_decode_round_aggregated(
             Ok(plain) => return (Some(plain), culprits),
             Err(VerifyError::InvalidServerOpening(i))
             | Err(VerifyError::ShareOpeningMismatch(i)) => {
+                if i >= outputs.len() {
+                    return (None, culprits);
+                }
                 culprits.push(outputs[i].server_id);
                 outputs.remove(i);
             }
@@ -1256,7 +1331,8 @@ fn try_decode_round_aggregated(
 }
 
 impl Session for PanetiereServerSession {
-    fn begin_round(&mut self, _round: Round, _now: Instant) -> Vec<Vec<u8>> {
+    fn begin_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
+        self.cur_round = Some(round);
         Vec::new()
     }
 
@@ -1278,18 +1354,23 @@ impl Session for PanetiereServerSession {
         let Ok(msg) = bincode::deserialize::<PanetiereWire>(&payload) else {
             return Vec::new();
         };
+        if !round_in_window(msg.round(), self.cur_round) {
+            return Vec::new();
+        }
         match msg {
             PanetiereWire::ClientPublic {
                 round,
                 client_id,
                 entry,
             } => {
+                let cid = ClientId(client_id);
+                let max = self.client_set_max;
+                let bucket = self.rounds.entry(round).or_default();
+                if !admit_client(&mut bucket.owners, cid, from, max) {
+                    return Vec::new();
+                }
                 if let Some(entry) = ClientBulletinEntry::from_bytes(&entry) {
-                    self.rounds
-                        .entry(round)
-                        .or_default()
-                        .publics
-                        .insert(ClientId(client_id), entry);
+                    bucket.publics.insert(cid, entry);
                 }
             }
             PanetiereWire::Opening {
@@ -1299,17 +1380,23 @@ impl Session for PanetiereServerSession {
                 sealed,
             } => {
                 if target_server == self.server_id.0 {
+                    let cid = ClientId(client_id);
+                    let max = self.client_set_max;
+                    if !admit_client(&mut self.rounds.entry(round).or_default().owners, cid, from, max) {
+                        return Vec::new();
+                    }
                     let Some(opening) =
                         unseal_opening(self.identity.exchange().pke(), &sealed)
                     else {
                         tracing::debug!(client_id, "panetiere server: undecodable sealed opening");
                         return Vec::new();
                     };
-                    self.rounds
-                        .entry(round)
-                        .or_default()
-                        .inbox_items
-                        .push((ClientId(client_id), opening));
+                    let bucket = self.rounds.entry(round).or_default();
+                    // First-writer-wins per client per round.
+                    if bucket.inbox_items.iter().any(|(c, _)| *c == cid) {
+                        return Vec::new();
+                    }
+                    bucket.inbox_items.push((cid, opening));
                 }
             }
             PanetiereWire::ServerPublic {
@@ -1358,7 +1445,7 @@ impl Session for PanetiereServerSession {
             PanetiereWire::Reservations { .. } => {}
             PanetiereWire::ClientSet { round, clients } => {
                 if let SetMode::Follower { leader } = self.mode {
-                    if from == leader {
+                    if from == leader && clients.len() <= self.client_set_max {
                         self.client_set_by_round
                             .entry(round)
                             .or_insert_with(|| clients.into_iter().map(ClientId).collect());
@@ -1390,9 +1477,13 @@ impl Session for PanetiereServerSession {
                 // A client outside the group's partition would poison the frozen
                 // canonical set: decode expects it in another group's aggregate,
                 // which can never match, so the round would stay undecodable.
-                let group_count = agg.roster.len() as u32;
+                let group_count = (agg.roster.len() as u32).max(1);
                 if clients.iter().any(|c| c % group_count != group) {
                     tracing::debug!(round, group, "panetiere: aggregate with out-of-group client");
+                    return Vec::new();
+                }
+                if clients.len() > self.client_set_max {
+                    tracing::debug!(round, group, n = clients.len(), "panetiere: oversized group aggregate");
                     return Vec::new();
                 }
                 let Some(parsed) = ClientBulletinEntry::from_bytes(&entry) else {
@@ -1648,7 +1739,14 @@ pub struct PanetiereAggregatorSession {
     group_count: u32,
     identity: Identity,
     rounds: std::collections::BTreeMap<Round, HashMap<ClientId, ClientBulletinEntry>>,
+    /// Per round: first pubkey to claim each `ClientId` (see [`admit_client`]).
+    owners: std::collections::BTreeMap<Round, HashMap<ClientId, Pubkey>>,
     emitted: HashSet<Round>,
+    /// Own round clock, from `begin_round`; bounds accepted wire rounds.
+    cur_round: Option<Round>,
+    /// Upper bound on distinct clients admitted per round; unbounded until
+    /// [`Self::set_client_set_max`] is called.
+    client_set_max: usize,
 }
 
 impl PanetiereAggregatorSession {
@@ -1658,29 +1756,43 @@ impl PanetiereAggregatorSession {
             group_count,
             identity,
             rounds: std::collections::BTreeMap::new(),
+            owners: std::collections::BTreeMap::new(),
             emitted: HashSet::new(),
+            cur_round: None,
+            client_set_max: usize::MAX,
         }
+    }
+
+    /// See [`PanetiereServerSession::set_client_set_max`].
+    pub(crate) fn set_client_set_max(&mut self, max: usize) {
+        self.client_set_max = max;
     }
 }
 
 impl Session for PanetiereAggregatorSession {
-    fn begin_round(&mut self, _round: Round, _now: Instant) -> Vec<Vec<u8>> {
+    fn begin_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
+        self.cur_round = Some(round);
         Vec::new()
     }
 
-    fn on_inbound(&mut self, _from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
+    fn on_inbound(&mut self, from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
         if let Ok(PanetiereWire::ClientPublic {
             round,
             client_id,
             entry,
         }) = bincode::deserialize::<PanetiereWire>(&payload)
         {
+            if !round_in_window(round, self.cur_round) {
+                return Vec::new();
+            }
             if client_id % self.group_count == self.group {
+                let cid = ClientId(client_id);
+                let max = self.client_set_max;
+                if !admit_client(self.owners.entry(round).or_default(), cid, from, max) {
+                    return Vec::new();
+                }
                 if let Some(entry) = ClientBulletinEntry::from_bytes(&entry) {
-                    self.rounds
-                        .entry(round)
-                        .or_default()
-                        .insert(ClientId(client_id), entry);
+                    self.rounds.entry(round).or_default().insert(cid, entry);
                 }
             }
         }
@@ -1726,6 +1838,7 @@ impl Session for PanetiereAggregatorSession {
     fn end_round(&mut self, round: Round, _now: Instant) -> RoundOutcome {
         let cutoff = round.saturating_sub(PANETIERE_ROUND_RETENTION);
         self.rounds.retain(|r, _| *r >= cutoff);
+        self.owners.retain(|r, _| *r >= cutoff);
         self.emitted.retain(|r| *r >= cutoff);
         RoundOutcome::default()
     }
@@ -1798,6 +1911,25 @@ mod observer_tests {
         assert_eq!(obs.share_frontier(), None, "valid signature replayed from another sender must be dropped");
         obs.on_inbound(other, sp(other_id.sign(&signing)));
         assert_eq!(obs.share_frontier(), Some(9));
+
+        // A far-future round must be dropped once the observer's clock advances.
+        obs.begin_round(9, Instant::now());
+        let far_signing = server_public_signing_bytes(u64::MAX, 1, &[10], &agg_open, &[]);
+        let far = bincode::serialize(&PanetiereWire::ServerPublic {
+            round: u64::MAX,
+            server_id: 1,
+            clients: vec![10],
+            agg_open: agg_open.clone(),
+            agg_share: Vec::new(),
+            signature: other_id.sign(&far_signing),
+        })
+        .unwrap();
+        obs.on_inbound(other, far);
+        assert_eq!(
+            obs.share_frontier(),
+            Some(9),
+            "far-future round must be dropped by the round-window clamp"
+        );
     }
 
     #[test]
@@ -1865,7 +1997,7 @@ mod concurrent_decode_tests {
         let mut clients: Vec<PanetiereClientSession> = (0..total)
             .map(|i| {
                 PanetiereClientSession::new(
-                    pp.clone(), mse.clone(), ClientId(i as u32), xpubs.clone(), [40 + i as u8; 32],
+                    pp.clone(), mse.clone(), client_id_from_pubkey(client_pks[i]), xpubs.clone(), [40 + i as u8; 32],
                 )
             })
             .collect();

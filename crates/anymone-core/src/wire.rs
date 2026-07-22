@@ -32,13 +32,14 @@ impl ServiceTag {
         ServiceTag(bytes)
     }
 
-    /// Derive a tag from a human-readable string via blake2-like truncation.
-    /// Simple, deterministic, no crypto-strength requirements.
+    /// Derive a tag from a human-readable string: SHA-256, truncated to the tag
+    /// length. Two labels sharing a raw prefix must not collide into the same
+    /// tag, so this hashes rather than copying bytes directly.
     pub fn from_label(s: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(s.as_bytes());
         let mut out = [0u8; SERVICE_TAG_LEN];
-        let bytes = s.as_bytes();
-        let n = bytes.len().min(SERVICE_TAG_LEN);
-        out[..n].copy_from_slice(&bytes[..n]);
+        out.copy_from_slice(&digest[..SERVICE_TAG_LEN]);
         ServiceTag(out)
     }
 }

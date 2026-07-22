@@ -130,9 +130,13 @@ pub async fn announce_service_registration(
 
 fn spawn_reannounce(transport: Arc<dyn Transport>, reg: Vec<u8>) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // `interval`, not a `sleep` loop: a `sleep` restarts its countdown after
+        // each publish completes, so cadence skews forward by however long the
+        // publish itself takes; `interval` ticks on a fixed schedule regardless.
+        let mut tick = tokio::time::interval(REGISTRATION_REANNOUNCE_INTERVAL);
         loop {
+            tick.tick().await;
             transport.publish(TOPIC_REGISTRATION, reg.clone()).await;
-            tokio::time::sleep(REGISTRATION_REANNOUNCE_INTERVAL).await;
         }
     })
 }

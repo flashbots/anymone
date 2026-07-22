@@ -11,14 +11,15 @@ use std::time::{Duration, Instant};
 use anymone_core::adcnet::{AdcnetClientSession, AdcnetServerSession};
 use anymone_core::config::{
     AdcnetConfig, AnymoneRoundConfiguration, AnymoneRoundConfigurationBody, ExchangePublicKeyWire,
-    ProtocolConfig,
+    NoopConfig, ProtocolConfig,
 };
 use anymone_core::scheduler_core::{
     CommitteeSig, SchedulerAction, SchedulerCore, SchedulerParams, SignedProposal,
 };
 use anymone_core::faults::{Attribution, Fault, FaultKind};
 use anymone_core::panetiere::{
-    PanetiereClientSession, PanetiereObserverSession, PanetiereServerSession, SetMode,
+    client_id_from_pubkey, PanetiereClientSession, PanetiereObserverSession, PanetiereServerSession,
+    SetMode,
 };
 use anymone_core::session::{Misbehavior, Session};
 use anymone_core::{FaultReport, Identity, Pubkey, Registration, ServiceTag, TOPIC_CONFIG};
@@ -26,7 +27,7 @@ use anymone_core::{FaultReport, Identity, Pubkey, Registration, ServiceTag, TOPI
 use adcnet::crypto::{ServerId, SharedKey};
 use adcnet::protocol::session::one_round::{IbltMsgParamsOwned, OneRoundConfig};
 use panetiere::mse::{MseEncoding, MseParams};
-use panetiere::protocol::{ClientId, ProtocolParams, ServerId as PanServerId};
+use panetiere::protocol::{ProtocolParams, ServerId as PanServerId};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
@@ -50,6 +51,7 @@ fn staged_body(actions: &[SchedulerAction]) -> Option<AnymoneRoundConfigurationB
 /// The core records it published, so the lead stops re-staging the same content.
 fn enact(core: &mut SchedulerCore, committee: &[Identity], proposal: SignedProposal) {
     let canonical = proposal.body.canonical_bytes();
+    let approve_bytes = proposal.body.approve_bytes();
     core.on_decoded_body(proposal);
     let mut sorted = committee.to_vec();
     sorted.sort_by_key(|i| i.pubkey());
@@ -57,7 +59,7 @@ fn enact(core: &mut SchedulerCore, committee: &[Identity], proposal: SignedPropo
     let actions = core.on_committee_sig(CommitteeSig {
         body_bytes: canonical.clone(),
         signer: peer.pubkey(),
-        signature: peer.sign(&canonical),
+        signature: peer.sign(&approve_bytes),
     });
     assert!(
         actions.iter().any(|a| matches!(a, SchedulerAction::Publish { topic, .. } if topic == TOPIC_CONFIG)),
@@ -405,6 +407,12 @@ fn multisig_assembles_via_committee_sig() {
     );
     let body = proposal.body.clone();
 
+    // A proposal signature must not double as a valid approval.
+    assert!(
+        !lead.pubkey().verify(&body.approve_bytes(), &proposal.signature),
+        "a proposal signature must not verify as a valid approval"
+    );
+
     // The committee Panetiere decodes the body back to the lead → 1 sig, no config.
     let actions = core.on_decoded_body(proposal);
     assert!(
@@ -417,7 +425,7 @@ fn multisig_assembles_via_committee_sig() {
     let peer_sig = CommitteeSig {
         body_bytes: canonical.clone(),
         signer: peer.pubkey(),
-        signature: peer.sign(&canonical),
+        signature: peer.sign(&body.approve_bytes()),
     };
     let actions = core.on_committee_sig(peer_sig);
     let cfg_bytes = actions
@@ -436,6 +444,30 @@ fn multisig_assembles_via_committee_sig() {
     forged.signatures.clear();
     let mut fresh = SchedulerCore::new(lead.clone(), pks.clone(), 2, params.clone());
     assert!(!fresh.on_published_config(&forged), "unverifiable config must not seed");
+
+    // A multisig-valid but empty-relay body must be rejected, not panic in leader_of.
+    let empty_relay_cfg = AnymoneRoundConfiguration::new(AnymoneRoundConfigurationBody {
+        round: cfg.body.round,
+        epoch_unix_ms: cfg.body.epoch_unix_ms,
+        services: vec![],
+        subnets: vec![anymone_core::config::Subnet::new(
+            0,
+            vec![],
+            ProtocolConfig::Noop(NoopConfig {
+                round_duration_ms: 1000,
+                message_size: 256,
+                client_set_min: 0,
+                client_set_max: 8,
+            }),
+        )],
+    })
+    .sign_with(&sorted.iter().collect::<Vec<_>>());
+    let mut fresh_for_bad_cfg = SchedulerCore::new(lead.clone(), pks.clone(), 2, params.clone());
+    assert!(
+        !fresh_for_bad_cfg.on_published_config(&empty_relay_cfg),
+        "multisig-valid but structurally broken (empty-relay) config must be rejected"
+    );
+
     assert!(fresh.on_published_config(&cfg));
     register_relays_and_service(&mut fresh, std::slice::from_ref(&relay), &service);
     let reproposal = staged_proposal(&fresh.tick(0, 0)).expect("restarted lead proposes");
@@ -450,7 +482,7 @@ fn multisig_assembles_via_committee_sig() {
     register_relays_and_service(&mut member, std::slice::from_ref(&relay), &service);
     let mut stale_body = cfg.body.clone();
     stale_body.round -= 1;
-    let signature = lead.sign(&stale_body.canonical_bytes());
+    let signature = lead.sign(&stale_body.propose_bytes());
     let stale = SignedProposal { body: stale_body, proposer: lead.pubkey(), signature };
     assert!(
         member.on_decoded_body(stale).is_empty(),
@@ -840,7 +872,7 @@ fn lead_of(committee: &[Identity]) -> Identity {
 }
 
 fn sign_proposal(id: &Identity, body: AnymoneRoundConfigurationBody) -> SignedProposal {
-    let signature = id.sign(&body.canonical_bytes());
+    let signature = id.sign(&body.propose_bytes());
     SignedProposal { body, proposer: id.pubkey(), signature }
 }
 
@@ -987,7 +1019,7 @@ impl PanetiereSubnet {
 
         let client_id = Identity::generate();
         let client = PanetiereClientSession::new(
-            pp.clone(), mse.clone(), ClientId(0), xpubs, [42u8; 32]);
+            pp.clone(), mse.clone(), client_id_from_pubkey(client_id.pubkey()), xpubs, [42u8; 32]);
         let mut servers: Vec<PanetiereServerSession> = server_ids
             .iter()
             .map(|sid| {
@@ -1062,15 +1094,13 @@ impl PanetiereSubnet {
     }
 }
 
-/// RED repro — fails until the integrity-fault path is fixed. A relay that
-/// corrupts its Panetiere shares is tolerated by t-of-n decode, so the subnet
-/// keeps producing output (liveness met) and the leader attributes an
-/// `Integrity` fault every round. But the committee's only fault source is its
-/// liveness observer, which never sees integrity faults — so after
-/// `escalation_grace` "clean" ticks it silently de-escalates back to optimistic
-/// ADCNet with the corrupt relay still in the roster. Correct behaviour: stay
-/// escalated and sideline the offender. (This is not a stall: the subnet decodes
-/// fine; the ignored signal is the integrity fault, not missing output.)
+/// A relay that corrupts its Panetiere shares is tolerated by t-of-n decode, so
+/// the subnet keeps producing output (liveness met) and the leader attributes
+/// an `Integrity` fault every round. The committee must not de-escalate back to
+/// optimistic ADCNet while that fault keeps recurring, even though its liveness
+/// observer alone would see nothing wrong. (This is not a stall: the subnet
+/// decodes fine; the signal that must be honored is the integrity fault, not
+/// missing output.)
 #[test]
 fn corrupt_panetiere_keeps_escalation() {
     let committee: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
@@ -1132,8 +1162,8 @@ fn corrupt_panetiere_keeps_escalation() {
     assert!(total_output > 0, "subnet must keep producing output (liveness met)");
     assert!(saw_integrity, "leader must attribute an integrity fault to the corrupt relay");
 
-    // Desired behaviour (fails today): the ongoing integrity fault keeps the
-    // subnet escalated; it must NOT fall back to ADCNet with the offender re-included.
+    // The ongoing integrity fault must keep the subnet escalated; it must NOT
+    // fall back to ADCNet with the offender re-included.
     assert!(
         !deescalated,
         "subnet de-escalated to ADCNet despite an ongoing integrity fault \

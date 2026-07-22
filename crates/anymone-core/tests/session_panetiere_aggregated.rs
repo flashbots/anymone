@@ -8,14 +8,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anymone_core::panetiere::{
-    PanetiereAggregatorSession, PanetiereClientSession, PanetiereServerSession, SetMode,
+    client_id_from_pubkey, PanetiereAggregatorSession, PanetiereClientSession, PanetiereServerSession,
+    SetMode,
 };
 use anymone_core::session::{LeaderAggregation, Session};
 use anymone_core::{Identity, Pubkey};
 
 use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::pke;
-use panetiere::protocol::{ClientId, ProtocolParams, ServerId};
+use panetiere::protocol::{ProtocolParams, ServerId};
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
@@ -74,11 +75,14 @@ fn run_aggregated(
     let leader_agg = || LeaderAggregation { roster: roster.clone() };
 
     // Clients: client 0 carries `payload`, the rest send cover (zero) traffic.
-    let mut clients: Vec<PanetiereClientSession> = (0..n_clients)
+    let client_pks: Vec<Pubkey> = (0..n_clients).map(|_| Identity::generate().pubkey()).collect();
+    let mut clients: Vec<PanetiereClientSession> = (0..n_clients as usize)
         .map(|i| {
             let mut seed = [0u8; 32];
-            seed[..4].copy_from_slice(&i.to_le_bytes());
-            PanetiereClientSession::new(pp.clone(), mse.clone(), ClientId(i), xpubs.clone(), seed)
+            seed[..4].copy_from_slice(&(i as u32).to_le_bytes());
+            PanetiereClientSession::new(
+                pp.clone(), mse.clone(), client_id_from_pubkey(client_pks[i]), xpubs.clone(), seed,
+            )
         })
         .collect();
     clients[0].stage(payload.to_vec());
@@ -118,15 +122,15 @@ fn run_aggregated(
     let now = Instant::now();
 
     // Round 0: clients emit ClientPublic (→ aggregators) + openings (→ relays).
-    for c in clients.iter_mut() {
+    for (i, c) in clients.iter_mut().enumerate() {
         let out = c.begin_round(0, now);
         let (client_public, openings) = out.split_first().expect("ClientPublic + openings");
         for a in aggregators.iter_mut() {
-            a.on_inbound(server_pks[0], client_public.clone());
+            a.on_inbound(client_pks[i], client_public.clone());
         }
         for s in servers.iter_mut() {
             for op in openings {
-                s.on_inbound(server_pks[0], op.clone());
+                s.on_inbound(client_pks[i], op.clone());
             }
         }
     }
@@ -212,10 +216,24 @@ fn late_group_aggregate_does_not_zero_the_round() {
 
     let payload_a = b"group zero's message survives".to_vec();
     let payload_b = b"group one arrives too late this round".to_vec();
+    // Pick two client pubkeys landing in distinct groups: `pk_a`'s group gets
+    // payload_a (arrives before the freeze), `pk_b`'s group gets payload_b (late).
+    let (pk_a, pk_b) = loop {
+        let a = Identity::generate().pubkey();
+        let b = Identity::generate().pubkey();
+        let ga = client_id_from_pubkey(a).0 % group_count;
+        let gb = client_id_from_pubkey(b).0 % group_count;
+        if ga == 0 && gb != 0 {
+            break (a, b);
+        }
+        if gb == 0 && ga != 0 {
+            break (b, a);
+        }
+    };
     let mut client0 =
-        PanetiereClientSession::new(pp.clone(), mse.clone(), ClientId(0), xpubs.clone(), [10u8; 32]);
+        PanetiereClientSession::new(pp.clone(), mse.clone(), client_id_from_pubkey(pk_a), xpubs.clone(), [10u8; 32]);
     let mut client1 =
-        PanetiereClientSession::new(pp.clone(), mse.clone(), ClientId(1), xpubs.clone(), [11u8; 32]);
+        PanetiereClientSession::new(pp.clone(), mse.clone(), client_id_from_pubkey(pk_b), xpubs.clone(), [11u8; 32]);
     client0.stage(payload_a.clone());
     client1.stage(payload_b.clone());
 
@@ -247,15 +265,15 @@ fn late_group_aggregate_does_not_zero_the_round() {
 
     let now = Instant::now();
 
-    for c in [&mut client0, &mut client1] {
+    for (c, pk) in [(&mut client0, pk_a), (&mut client1, pk_b)] {
         let out = c.begin_round(0, now);
         let (client_public, openings) = out.split_first().expect("ClientPublic + openings");
         for a in aggregators.iter_mut() {
-            a.on_inbound(server_pks[0], client_public.clone());
+            a.on_inbound(pk, client_public.clone());
         }
         for s in servers.iter_mut() {
             for op in openings {
-                s.on_inbound(server_pks[0], op.clone());
+                s.on_inbound(pk, op.clone());
             }
         }
     }

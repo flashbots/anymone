@@ -524,6 +524,10 @@ pub struct AdcnetObserverSession {
     anon_set_by_round: std::collections::BTreeMap<u64, usize>,
     /// Only this peer's `ClientSet`/`Decoded` are trusted (forgery guard).
     leader: PeerId,
+    /// Own round clock, from `begin_round`, truncated to the ADCNet u32 wire
+    /// round — every wire round is `anymone_round as u32`, so the window
+    /// comparison must happen in that same wrapped space.
+    cur_round: Option<u32>,
 }
 
 const ANON_SET_HISTORY: usize = 16;
@@ -535,6 +539,7 @@ impl AdcnetObserverSession {
             roster,
             anon_set_by_round: std::collections::BTreeMap::new(),
             leader,
+            cur_round: None,
         }
     }
 
@@ -570,22 +575,41 @@ impl AdcnetObserverSession {
 }
 
 impl Session for AdcnetObserverSession {
-    fn begin_round(&mut self, _round: Round, _now: Instant) -> Vec<Vec<u8>> {
+    fn begin_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
+        self.cur_round = Some(round as u32);
         Vec::new()
     }
 
     fn on_inbound(&mut self, from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
-        match observe_adcnet(&payload) {
+        let observed = observe_adcnet(&payload);
+        // Observed rounds are u32 wire values widened to u64; compare wrapped.
+        let future = |round: u64| {
+            self.cur_round.is_some_and(|cur| round as u32 > cur.saturating_add(FUTURE_ROUND_SLACK))
+        };
+        match observed {
             AdcnetObserved::Share { round, signer } => {
+                if future(round)
+                    || self.cur_round.is_some_and(|cur| (round as u32).saturating_add(ROUND_WINDOW) < cur)
+                {
+                    return Vec::new();
+                }
                 // Credit the signer's own roster slot — a relay can't vouch for another.
                 if let Some(idx) = self.roster.iter().position(|p| PublicKey::from_bytes(&p.0) == signer) {
                     self.tracker.observe_share(round, idx);
                 }
             }
+            // `round` names which past round this is for, not "now" — a decode/set
+            // announcement can legitimately land late, so only a future claim rejects.
             AdcnetObserved::Output { round } if from == self.leader => {
+                if future(round) {
+                    return Vec::new();
+                }
                 self.tracker.observe_output(round);
             }
             AdcnetObserved::ClientSet { size, round } if from == self.leader => {
+                if future(round) {
+                    return Vec::new();
+                }
                 self.anon_set_by_round.insert(round, size);
                 while self.anon_set_by_round.len() > ANON_SET_HISTORY {
                     let oldest = *self.anon_set_by_round.keys().next().unwrap();
@@ -637,16 +661,26 @@ mod observer_tests {
         // server_id is derived from the signer, not the wire: `other` is roster
         // index 1, so a share it signs is always credited to slot 1 — even when it
         // stamps the leader's slot 0. A relay can't occupy or vouch for another slot.
-        let stamp = |sid: u32| {
+        let stamp_r = |sid: u32, round: u32| {
             let sh = Signed::new(
                 &other.to_adcnet_signing_key(),
-                ServerShare { server_id: ServerId(sid), round: 3, share: vec![] },
+                ServerShare { server_id: ServerId(sid), round, share: vec![] },
             )
             .unwrap();
             bincode::serialize(&AdcnetWire::Server(sh)).unwrap()
         };
+        let stamp = |sid: u32| stamp_r(sid, 3);
         obs.on_inbound(other.pubkey(), stamp(0));
         assert_eq!(obs.relays_shared_recent(8), vec![1], "credited to the signer's slot, not the stamped one");
+
+        // A far-future round must be dropped once the observer's clock advances.
+        obs.begin_round(3, Instant::now());
+        obs.on_inbound(other.pubkey(), stamp_r(0, u32::MAX));
+        assert_eq!(
+            obs.share_frontier(),
+            Some(3),
+            "far-future round must be dropped by the round-window clamp"
+        );
 
         // The leader likewise keys the share by the signer's slot, ignoring the stamp.
         let one_round =
@@ -668,6 +702,12 @@ mod observer_tests {
         let slots: Vec<u32> =
             leader_srv.shares_by_round.get(&3).map(|m| m.keys().map(|s| s.0).collect()).unwrap_or_default();
         assert_eq!(slots, vec![1], "share keyed by the signer's slot, not the stamped id");
+
+        leader_srv.on_inbound(other.pubkey(), stamp_r(0, u32::MAX));
+        assert!(
+            !leader_srv.shares_by_round.contains_key(&u32::MAX),
+            "far-future round must be dropped by the round-window clamp"
+        );
     }
 
     #[test]
@@ -845,6 +885,8 @@ impl Session for AdcnetAggregatorSession {
             };
             if key_signer != signer
                 || adcnet_client_group(signer.as_bytes(), self.group_count) != self.group
+                || c.round.saturating_add(ROUND_WINDOW) < self.cur_round
+                || c.round > self.cur_round.saturating_add(FUTURE_ROUND_SLACK)
             {
                 return Vec::new();
             }
@@ -947,6 +989,10 @@ pub struct AdcnetServerSession {
 /// Rounds of per-round state to keep behind the current round — enough to cover
 /// the share→combine pipeline's one-or-two-round lag; older state is pruned.
 const ROUND_WINDOW: u32 = 3;
+
+/// Upper bound on how far ahead a wire `round` may sit, wider than
+/// [`ROUND_WINDOW`] since legitimate multi-hop delivery can lag a few rounds.
+const FUTURE_ROUND_SLACK: u32 = 64;
 
 impl AdcnetServerSession {
     #[allow(clippy::too_many_arguments)]
@@ -1071,7 +1117,9 @@ impl AdcnetServerSession {
             return None;
         }
         let shares = self.shares_by_round.get(&target)?;
-        debug!(target, shares = shares.len(), expected = self.expected_servers, set = set.len(), "adcnet leader: combine check");
+        let mut got_ids: Vec<u32> = shares.keys().map(|s| s.0).collect();
+        got_ids.sort();
+        debug!(target, shares = shares.len(), expected = self.expected_servers, set = set.len(), ?got_ids, "adcnet leader: combine check");
         if shares.len() < self.expected_servers {
             return None;
         }
@@ -1147,13 +1195,13 @@ impl Session for AdcnetServerSession {
                         return Vec::new();
                     }
                     // Late: the set for `c.round` is already finalized.
-                    if c.round < self.cur_round {
+                    if c.round < self.cur_round || c.round > self.cur_round.saturating_add(FUTURE_ROUND_SLACK) {
                         debug!(
                             signer = %hex::encode(&signer.as_bytes()[..4]),
                             c_round = c.round,
                             cur = self.cur_round,
                             now_ms = crate::config::now_unix_ms(),
-                            "adcnet leader: dropped LATE client contribution"
+                            "adcnet leader: dropped out-of-window client contribution"
                         );
                         return Vec::new();
                     }
@@ -1175,7 +1223,9 @@ impl Session for AdcnetServerSession {
             AdcnetWire::Server(signed) => {
                 if self.is_leader {
                     if let Ok((s, signer)) = signed.recover() {
-                        if s.round + ROUND_WINDOW < self.cur_round {
+                        if s.round.saturating_add(ROUND_WINDOW) < self.cur_round
+                            || s.round > self.cur_round.saturating_add(FUTURE_ROUND_SLACK)
+                        {
                             return Vec::new();
                         }
                         // The slot is the signer's roster position, not the self-claimed
@@ -1193,7 +1243,9 @@ impl Session for AdcnetServerSession {
                 }
             }
             AdcnetWire::ClientSet { round, clients } => {
-                if round + ROUND_WINDOW < self.cur_round {
+                if round.saturating_add(ROUND_WINDOW) < self.cur_round
+                    || round > self.cur_round.saturating_add(FUTURE_ROUND_SLACK)
+                {
                     return Vec::new();
                 }
                 if from == self.leader_pk {
@@ -1211,7 +1263,10 @@ impl Session for AdcnetServerSession {
                 }
             }
             AdcnetWire::Decoded { round, payloads } => {
-                if from == self.leader_pk && !self.routed_rounds.contains(&round) {
+                // `round` is a past round's label, not "now" — combine legitimately
+                // lands late, so only a future claim (mod boundary skew) is rejected.
+                let in_window = round <= self.cur_round.saturating_add(ROUND_WINDOW);
+                if from == self.leader_pk && in_window && !self.routed_rounds.contains(&round) {
                     self.routed_rounds.insert(round);
                     self.pending_decoded.extend(payloads);
                 }
@@ -1236,7 +1291,8 @@ impl Session for AdcnetServerSession {
                         &group_aggregate_signing_bytes(round, group, &blinded, &clients),
                         &signature,
                     )
-                    || round + ROUND_WINDOW < self.cur_round
+                    || round.saturating_add(ROUND_WINDOW) < self.cur_round
+                    || round > self.cur_round.saturating_add(FUTURE_ROUND_SLACK)
                 {
                     debug!(round, group, cur = self.cur_round, "adcnet leader: rejected group aggregate");
                     return Vec::new();

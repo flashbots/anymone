@@ -26,7 +26,7 @@ use crate::scheduling::Registration;
 use crate::session::Session;
 use crate::transport::Transport;
 
-use panetiere::protocol::{ClientId, ServerId};
+use panetiere::protocol::ServerId;
 
 pub const TOPIC_COMMITTEE_PANETIERE: &str = "anymone/committee/0";
 pub const TOPIC_COMMITTEE_SIGS: &str = "anymone/committee/sigs";
@@ -304,7 +304,7 @@ pub async fn spawn_panetiere_committee_scheduler(
             .enumerate()
             .map(|(i, pk)| (ServerId(i as u32), *pk))
             .collect();
-        let mut server_session: Box<dyn Session> = Box::new(PanetiereServerSession::new(
+        let mut server_session_inner = PanetiereServerSession::new(
             pp.clone(),
             committee_mse.clone(),
             my_server_id,
@@ -315,7 +315,10 @@ pub async fn spawn_panetiere_committee_scheduler(
             0,
             committee_server_pubkeys,
             None, // committee runs the direct flow, never aggregated
-        ));
+        );
+        // Clients here are committee members themselves — bounded by committee size.
+        server_session_inner.set_client_set_max(committee.len());
+        let mut server_session: Box<dyn Session> = Box::new(server_session_inner);
         let mut client_session: Option<Box<dyn Session>> = None;
 
         // Round from the shared wall clock (epoch 0), so staggered members agree
@@ -340,7 +343,7 @@ pub async fn spawn_panetiere_committee_scheduler(
                             Box::new(PanetiereClientSession::new(
                                 pp.clone(),
                                 committee_mse.clone(),
-                                ClientId(my_server_id.0),
+                                crate::panetiere::client_id_from_pubkey(our_pk),
                                 seal_roster.clone(),
                                 seed,
                             ))

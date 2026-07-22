@@ -80,6 +80,7 @@ struct Behaviour {
 
 enum Cmd {
     Subscribe(String),
+    Unsubscribe(String),
     Publish(String, Vec<u8>),
     /// Dial and mark as gossipsub explicit peers, independent of kademlia adjacency.
     EnsurePeers(Vec<PeerId>),
@@ -221,6 +222,25 @@ impl Transport for Libp2pNetwork {
         };
         let _ = self.cmd_tx.send(Cmd::Subscribe(topic.to_string())).await;
         Subscription::from_broadcast_receiver(rx, topic.to_string())
+    }
+
+    async fn unsubscribe(&self, topic: &str) {
+        // Other components (e.g. the committee's subnet observers) may hold
+        // their own `Subscription`s on this topic via the same transport —
+        // only actually leave once no local receiver remains.
+        let no_listeners = {
+            let mut topics = self.topics.lock().unwrap();
+            match topics.get(topic) {
+                Some(tx) if tx.receiver_count() > 0 => false,
+                _ => {
+                    topics.remove(topic);
+                    true
+                }
+            }
+        };
+        if no_listeners {
+            let _ = self.cmd_tx.send(Cmd::Unsubscribe(topic.to_string())).await;
+        }
     }
 
     async fn publish(&self, topic: &str, bytes: Vec<u8>) {
@@ -371,6 +391,11 @@ async fn swarm_loop(
                     let topic = IdentTopic::new(name);
                     let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
                     let _ = swarm.behaviour_mut().gossipsub.set_topic_params(topic, gossip_topic_score_params());
+                }
+                Some(Cmd::Unsubscribe(name)) => {
+                    let topic = IdentTopic::new(name.clone());
+                    let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&topic);
+                    pending.remove(&name);
                 }
                 Some(Cmd::Publish(name, bytes)) => {
                     // Observability: who does gossipsub think is subscribed to this

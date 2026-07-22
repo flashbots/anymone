@@ -64,7 +64,7 @@ impl Identity {
             fs::create_dir_all(parent)?;
         }
         let bytes = self.keypair.secret().as_ref().to_vec();
-        fs::write(path, &bytes)?;
+        crate::keys::write_secret(path, &bytes)?;
         self.exchange.save(&Self::exchange_path(path))?;
         Ok(())
     }
@@ -77,7 +77,10 @@ impl Identity {
         let secret = ed25519::SecretKey::try_from_bytes(&mut bytes)
             .map_err(|e| IdentityError::Decode(e.to_string()))?;
         bytes.zeroize();
-        let exchange = ExchangeIdentity::load_or_generate(&Self::exchange_path(path))?;
+        // The seed exists, so this is a restart, not a first run: a missing
+        // `.exchange` file is corruption, not "generate a fresh one" — silently
+        // rotating it here would break ECDH with every peer that cached the old key.
+        let exchange = ExchangeIdentity::load(&Self::exchange_path(path))?;
         Ok(Identity {
             keypair: secret.into(),
             exchange,
@@ -165,6 +168,15 @@ mod tests {
         let msg = b"hello";
         let sig = id2.sign(msg);
         assert!(pk1.verify(msg, &sig));
+
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600, "identity seed file must be mode 0600");
+        assert_eq!(
+            mode(&Identity::exchange_path(&path)),
+            0o600,
+            "exchange key file must be mode 0600"
+        );
     }
 
     #[test]

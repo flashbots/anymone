@@ -178,7 +178,7 @@ fn server_session(
     } else {
         SetMode::Follower { leader: leader_pk }
     };
-    Box::new(ScheduledPanetiereServerSession::new(
+    let mut session = ScheduledPanetiereServerSession::new(
         pp.clone(),
         sched_mse.clone(),
         vector_bytes,
@@ -189,7 +189,9 @@ fn server_session(
         cfg.client_set_min,
         server_pubkeys,
         aggregation,
-    ))
+    );
+    session.set_client_set_max(cfg.client_set_max as usize);
+    Box::new(session)
 }
 
 pub struct ScheduledPanetiereClientSession {
@@ -409,6 +411,8 @@ pub struct ScheduledPanetiereServerSession {
     entries_by_round: BTreeMap<Round, Vec<(u16, u16)>>,
     /// Msg sections awaiting their reservation round's entries.
     pending_msg: BTreeMap<Round, Vec<KahePoly>>,
+    /// Own round clock, from `begin_round`; bounds accepted `Reservations` rounds.
+    cur_round: Option<Round>,
 }
 
 impl ScheduledPanetiereServerSession {
@@ -447,12 +451,19 @@ impl ScheduledPanetiereServerSession {
             leader_pk,
             entries_by_round: BTreeMap::new(),
             pending_msg: BTreeMap::new(),
+            cur_round: None,
         }
+    }
+
+    /// See [`crate::panetiere::PanetiereServerSession::set_client_set_max`].
+    pub(crate) fn set_client_set_max(&mut self, max: usize) {
+        self.inner.set_client_set_max(max);
     }
 }
 
 impl Session for ScheduledPanetiereServerSession {
     fn begin_round(&mut self, round: Round, now: Instant) -> Vec<Vec<u8>> {
+        self.cur_round = Some(round);
         self.inner.begin_round(round, now)
     }
 
@@ -461,7 +472,9 @@ impl Session for ScheduledPanetiereServerSession {
             if let Ok(PanetiereWire::Reservations { round, entries }) =
                 bincode::deserialize::<PanetiereWire>(&payload)
             {
-                self.entries_by_round.entry(round).or_insert(entries);
+                if crate::panetiere::round_in_window(round, self.cur_round) {
+                    self.entries_by_round.entry(round).or_insert(entries);
+                }
             }
         }
         self.inner.on_inbound(from, payload)
@@ -620,14 +633,10 @@ pub(crate) async fn run_subnet(
     }
     if let Some(a) = subnet_aggregation(&subnet) {
         if let Some(group) = aggregator_group_of(a, identity_pk) {
-            sessions.insert(
-                SessionKey::Aggregator,
-                Box::new(ScheduledAggregatorSession(PanetiereAggregatorSession::new(
-                    group,
-                    a.groups.len() as u32,
-                    inner.identity.clone(),
-                ))),
-            );
+            let mut agg_session =
+                PanetiereAggregatorSession::new(group, a.groups.len() as u32, inner.identity.clone());
+            agg_session.set_client_set_max(cfg.client_set_max as usize);
+            sessions.insert(SessionKey::Aggregator, Box::new(ScheduledAggregatorSession(agg_session)));
         }
     }
     let mut fault_monitor: Option<Box<dyn Session>> = if leader_pk == identity_pk {

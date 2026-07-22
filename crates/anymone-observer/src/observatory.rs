@@ -574,15 +574,19 @@ fn proto_name(p: &ProtocolConfig) -> &'static str {
     }
 }
 
-/// Render a service tag as its label (trailing-zero-trimmed UTF-8) if it's
-/// printable, else hex — `ServiceTag::from_label` packs the UTF-8 bytes.
+/// Demo/dashboard service labels — `ServiceTag::from_label` hashes the label,
+/// so display can't recover it from the tag bytes; matching against this known
+/// set is what makes the dashboard show "anymone.echo" instead of raw hex.
+const KNOWN_LABELS: &[&str] = &["anymone.echo", "anymone.chat"];
+
+/// Render a service tag as its label if it matches a known demo service,
+/// else hex.
 fn tag_label(tag: &ServiceTag) -> String {
-    let end = tag.0.iter().rposition(|b| *b != 0).map(|i| i + 1).unwrap_or(0);
-    let slice = &tag.0[..end];
-    match std::str::from_utf8(slice) {
-        Ok(s) if s.chars().all(|c| !c.is_control()) && !s.is_empty() => s.to_string(),
-        _ => hex::encode(tag.0),
-    }
+    KNOWN_LABELS
+        .iter()
+        .find(|label| ServiceTag::from_label(label) == *tag)
+        .map(|label| label.to_string())
+        .unwrap_or_else(|| hex::encode(tag.0))
 }
 
 fn short(pk: &Pubkey) -> String {

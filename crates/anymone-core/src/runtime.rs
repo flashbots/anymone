@@ -68,6 +68,9 @@ pub struct Anymone {
 /// roster/protocol change (respawn) from an unchanged subnet (leave running).
 struct SubnetWorker {
     sig: Vec<u8>,
+    /// Topics this worker subscribed to, so tearing it down can also leave
+    /// them (gossipsub subscription outlives a dropped local `Subscription`).
+    topics: Vec<String>,
     handle: JoinHandle<()>,
 }
 
@@ -389,6 +392,10 @@ pub struct AnymonePrep {
     config_sub: Subscription,
 }
 
+/// Overall bound on waiting for a first valid config at startup, so an
+/// unreachable committee fails loudly instead of looping forever.
+const STARTUP_CONFIG_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl AnymonePrep {
     /// Await the first valid signed config, bring up its subnets, and hand the
     /// subscription to the reconfig watcher for later versions.
@@ -397,29 +404,34 @@ impl AnymonePrep {
         let threshold = self.bootstrap.threshold;
         let verify =
             |c: &AnymoneRoundConfiguration| c.verify_multisig(&committee, threshold).is_ok();
-        let cfg = loop {
-            // Prefer pulling the current config from a connected peer.
-            if let Some(c) = self
-                .transport
-                .fetch_config()
-                .await
-                .and_then(|b| bincode::deserialize::<AnymoneRoundConfiguration>(&b).ok())
-                .filter(&verify)
-            {
-                break c;
-            }
-            // No peer answered yet — briefly await a pushed config, then retry the pull.
-            tokio::select! {
-                msg = self.config_sub.recv() => {
-                    let msg = msg.ok_or(GovernanceError::TopicClosed)?;
-                    if let Ok(c) = bincode::deserialize::<AnymoneRoundConfiguration>(&msg.payload) {
-                        if verify(&c) {
-                            break c;
+        let fetch_loop = async {
+            loop {
+                // Prefer pulling the current config from a connected peer.
+                match self.transport.fetch_config().await {
+                    Some(b) => match bincode::deserialize::<AnymoneRoundConfiguration>(&b) {
+                        Ok(c) if verify(&c) => break Ok(c),
+                        Ok(_) => tracing::debug!("anymone: fetched config failed multisig verification"),
+                        Err(e) => tracing::debug!(error = %e, "anymone: fetched config failed to deserialize"),
+                    },
+                    None => {}
+                }
+                // No peer answered yet — briefly await a pushed config, then retry the pull.
+                tokio::select! {
+                    msg = self.config_sub.recv() => {
+                        let msg = msg.ok_or(GovernanceError::TopicClosed)?;
+                        match bincode::deserialize::<AnymoneRoundConfiguration>(&msg.payload) {
+                            Ok(c) if verify(&c) => break Ok(c),
+                            Ok(_) => tracing::debug!("anymone: pushed config failed multisig verification"),
+                            Err(e) => tracing::debug!(error = %e, "anymone: pushed config failed to deserialize"),
                         }
                     }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
             }
+        };
+        let cfg = match tokio::time::timeout(STARTUP_CONFIG_DEADLINE, fetch_loop).await {
+            Ok(result) => result?,
+            Err(_) => return Err(GovernanceError::Timeout),
         };
         Ok(Anymone::build_from_config(
             self.identity,
@@ -491,6 +503,7 @@ async fn apply_config(
     let mut built: Vec<(
         SubnetId,
         Vec<u8>,
+        Vec<String>,
         mpsc::UnboundedSender<StageMsg>,
         JoinHandle<()>,
     )> = Vec::new();
@@ -531,28 +544,44 @@ async fn apply_config(
                 unreachable!("filtered by subnet_runnable")
             }
         };
-        built.push((id, sig, stage_tx, handle));
+        built.push((id, sig, topics, stage_tx, handle));
     }
 
-    let mut workers = tasks.workers.lock().unwrap();
-    let mut stage_map = inner.subnets.lock().unwrap();
-    workers.retain(|id, w| {
-        if present.contains(id) {
-            true
-        } else {
-            w.handle.abort();
-            stage_map.remove(id);
-            false
+    let mut stale: Vec<SubnetWorker> = Vec::new();
+    let live_topics: std::collections::HashSet<String>;
+    {
+        let mut workers = tasks.workers.lock().unwrap();
+        let mut stage_map = inner.subnets.lock().unwrap();
+        let removed: Vec<SubnetId> =
+            workers.keys().copied().filter(|id| !present.contains(id)).collect();
+        for id in removed {
+            if let Some(w) = workers.remove(&id) {
+                w.handle.abort();
+                stage_map.remove(&id);
+                stale.push(w);
+            }
         }
-    });
-    for (id, sig, stage_tx, handle) in built {
-        if let Some(old) = workers.insert(id, SubnetWorker { sig, handle }) {
-            old.handle.abort();
+        for (id, sig, topics, stage_tx, handle) in built {
+            if let Some(old) = workers.insert(id, SubnetWorker { sig, topics, handle }) {
+                old.handle.abort();
+                stale.push(old);
+            }
+            stage_map.insert(id, stage_tx);
         }
-        stage_map.insert(id, stage_tx);
+        live_topics = workers.values().flat_map(|w| w.topics.iter().cloned()).collect();
     }
-    drop(workers);
-    drop(stage_map);
+    // Leave topics no current worker uses. A respawned subnet reuses its topic
+    // names, so only topics outside the live set may be unsubscribed — and only
+    // after the stale worker has actually terminated and dropped its
+    // `Subscription`s, else the transport still counts it as a listener.
+    for w in stale {
+        let _ = w.handle.await;
+        for topic in w.topics {
+            if !live_topics.contains(&topic) {
+                inner.transport.unsubscribe(&topic).await;
+            }
+        }
+    }
     // Deliver each subnet's cover rate to its (surviving) worker; a cover-only
     // change isn't in `subnet_sig`, so the worker isn't rebuilt for it.
     {

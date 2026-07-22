@@ -51,6 +51,8 @@ pub struct OutputFaultTracker {
 }
 
 const DEFAULT_STALL_MARGIN: u64 = 4;
+/// Hard cap on rounds walked per `evaluate()` call, regardless of upstream clamps.
+const MAX_EVALUATE_SPAN: u64 = 4096;
 
 impl OutputFaultTracker {
     pub fn new(roster: Vec<PeerId>, threshold: u64) -> Self {
@@ -107,6 +109,7 @@ impl OutputFaultTracker {
             || self.shares.keys().min().copied().unwrap_or(frontier),
             |r| r + 1,
         );
+        let frontier = frontier.min(start.saturating_add(MAX_EVALUATE_SPAN));
         for r in start..frontier {
             if self.outputs.contains(&r) {
                 self.evaluated_through = Some(r);

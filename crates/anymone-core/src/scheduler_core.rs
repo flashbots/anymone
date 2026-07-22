@@ -129,6 +129,69 @@ fn subnet_max_wire(p: &ProtocolConfig, n_relays: usize) -> usize {
     }
 }
 
+/// Shape checks independent of local state; an empty `groups`/zero `replication`
+/// would otherwise reach `agg.roster.len() % group_count` downstream and panic.
+fn aggregation_structural_ok(agg: &Option<Aggregation>) -> bool {
+    let Some(a) = agg else { return true };
+    a.replication > 0
+        && !a.groups.is_empty()
+        && a.groups.iter().all(|g| g.aggregators.len() == a.replication as usize)
+}
+
+/// Checks independent of local state — safe to run before `registered`/`services`
+/// are populated, e.g. on a just-verified published config ahead of `learn_config`.
+fn validate_structure(body: &AnymoneRoundConfigurationBody) -> bool {
+    if body.subnets.is_empty() || body.subnets.len() > MAX_SUBNETS {
+        return false;
+    }
+    for s in &body.subnets {
+        if s.relays.is_empty() {
+            return false;
+        }
+        if subnet_max_wire(&s.protocol, s.relays.len()) > MAX_SUBNET_WIRE {
+            return false;
+        }
+        match &s.protocol {
+            ProtocolConfig::Noop(c) => {
+                if c.client_set_max < MIN_CAPACITY {
+                    return false;
+                }
+            }
+            ProtocolConfig::Adcnet(c) => {
+                if c.client_set_max < MIN_CAPACITY || !aggregation_structural_ok(&c.aggregation) {
+                    return false;
+                }
+            }
+            ProtocolConfig::Panetiere(c) => {
+                let n = s.relays.len() as u32;
+                let threshold_ok = c.threshold >= n / 2 + 1 && c.threshold <= n.max(1);
+                if c.client_set_max < MIN_CAPACITY
+                    || !threshold_ok
+                    || !aggregation_structural_ok(&c.aggregation)
+                {
+                    return false;
+                }
+            }
+            ProtocolConfig::ScheduledPanetiere(c) => {
+                let n = s.relays.len() as u32;
+                let threshold_ok = c.threshold >= n / 2 + 1 && c.threshold <= n.max(1);
+                if c.client_set_max < MIN_CAPACITY
+                    || !threshold_ok
+                    || !aggregation_structural_ok(&c.aggregation)
+                    || c.message_size == 0
+                    || c.message_size > u16::MAX as usize
+                    || c.vector_bytes == 0
+                {
+                    return false;
+                }
+            }
+            // The scheduler only ever proposes Noop / Adcnet / Panetiere / ScheduledPanetiere.
+            ProtocolConfig::ScheduledAdcnet(_) | ProtocolConfig::Nym(_) => return false,
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod sizing_tests {
     use super::*;
@@ -224,8 +287,9 @@ pub struct CommitteeSig {
 }
 
 /// A config body proposed by the committee lead, carried over the committee's
-/// internal Panetiere. The lead's signature over `body.canonical_bytes()` lets
-/// every member confirm the proposal genuinely came from the current lead
+/// internal Panetiere. The lead's signature over `body.propose_bytes()` — a
+/// domain distinct from the `approve_bytes()` multisig signs — lets every
+/// member confirm the proposal genuinely came from the current lead
 /// (`sorted(committee)[0]`) before signing it — without this, any peer that
 /// reconstructs the public-roster-derived Panetiere params could inject an
 /// arbitrary body and have the committee multisig-sign it.
@@ -656,7 +720,7 @@ impl SchedulerCore {
             }
             if self.published_round != Some(self.public_round) {
                 let body = self.build_body(&protos);
-                let signature = self.identity.sign(&body.canonical_bytes());
+                let signature = self.identity.sign(&body.propose_bytes());
                 let proposal = SignedProposal {
                     body,
                     proposer: self.identity.pubkey(),
@@ -673,6 +737,9 @@ impl SchedulerCore {
     /// member proposes above the network instead of wedging on stale-round rejections.
     pub fn on_published_config(&mut self, cfg: &AnymoneRoundConfiguration) -> bool {
         if cfg.verify_multisig(&self.committee, self.threshold).is_err() {
+            return false;
+        }
+        if !validate_structure(&cfg.body) {
             return false;
         }
         let r = cfg.body.round;
@@ -697,7 +764,7 @@ impl SchedulerCore {
             return Vec::new();
         }
         let canonical = proposal.body.canonical_bytes();
-        if !proposal.proposer.verify(&canonical, &proposal.signature) {
+        if !proposal.proposer.verify(&proposal.body.propose_bytes(), &proposal.signature) {
             return Vec::new();
         }
         // 2. Replay freshness: reject a strictly older proposal (rollback). The
@@ -724,7 +791,7 @@ impl SchedulerCore {
         );
 
         let body = proposal.body;
-        let sig = self.identity.sign(&canonical);
+        let sig = self.identity.sign(&body.approve_bytes());
         self.sigs
             .entry(canonical.clone())
             .or_default()
@@ -753,23 +820,21 @@ impl SchedulerCore {
         if !self.committee.contains(&sig_msg.signer) {
             return Vec::new();
         }
-        if !sig_msg
-            .signer
-            .verify(&sig_msg.body_bytes, &sig_msg.signature)
-        {
+        // `body_bytes` is canonical (fixint/big-endian) — decode it the same
+        // way, not with default bincode, or the re-derived canonical key won't
+        // match the stored one and assembly never fires.
+        let Ok(body) = AnymoneRoundConfigurationBody::from_canonical_bytes(&sig_msg.body_bytes) else {
+            return Vec::new();
+        };
+        if !sig_msg.signer.verify(&body.approve_bytes(), &sig_msg.signature) {
             return Vec::new();
         }
         self.sigs
             .entry(sig_msg.body_bytes.clone())
             .or_default()
             .insert(sig_msg.signer, sig_msg.signature);
-        // `body_bytes` is canonical (fixint/big-endian) — decode it the same
-        // way, not with default bincode, or the re-derived canonical key won't
-        // match the stored one and assembly never fires.
-        if let Ok(body) = AnymoneRoundConfigurationBody::from_canonical_bytes(&sig_msg.body_bytes) {
-            if let Some(a) = self.try_assemble(&body) {
-                return vec![a];
-            }
+        if let Some(a) = self.try_assemble(&body) {
+            return vec![a];
         }
         Vec::new()
     }
@@ -843,7 +908,7 @@ impl SchedulerCore {
     /// register, an exchange key that doesn't match what its owner registered, an
     /// out-of-bounds size, or a protocol the scheduler never emits all reject it.
     fn validate_body(&self, body: &AnymoneRoundConfigurationBody) -> bool {
-        if body.subnets.is_empty() || body.subnets.len() > MAX_SUBNETS {
+        if !validate_structure(body) {
             return false;
         }
         if !body
@@ -854,56 +919,28 @@ impl SchedulerCore {
             return false;
         }
         for s in &body.subnets {
-            if s.relays.is_empty() {
-                return false;
-            }
-            if subnet_max_wire(&s.protocol, s.relays.len()) > MAX_SUBNET_WIRE {
-                return false;
-            }
             if !s.relays.iter().all(|pk| self.registered.contains(pk)) {
                 return false;
             }
-            match &s.protocol {
-                ProtocolConfig::Noop(c) => {
-                    if c.client_set_max < MIN_CAPACITY {
-                        return false;
-                    }
-                }
+            let keys_ok = match &s.protocol {
+                ProtocolConfig::Noop(_) => true,
                 ProtocolConfig::Adcnet(c) => {
-                    if c.client_set_max < MIN_CAPACITY
-                        || !self.exchange_keys_match(&c.relay_exchange_keys)
-                        || !self.aggregation_valid(&c.aggregation)
-                    {
-                        return false;
-                    }
+                    self.exchange_keys_match(&c.relay_exchange_keys)
+                        && self.aggregation_valid(&c.aggregation)
                 }
                 ProtocolConfig::Panetiere(c) => {
-                    let n = s.relays.len() as u32;
-                    let threshold_ok = c.threshold >= n / 2 + 1 && c.threshold <= n.max(1);
-                    if c.client_set_max < MIN_CAPACITY
-                        || !threshold_ok
-                        || !self.exchange_keys_match(&c.relay_exchange_keys)
-                        || !self.aggregation_valid(&c.aggregation)
-                    {
-                        return false;
-                    }
+                    self.exchange_keys_match(&c.relay_exchange_keys)
+                        && self.aggregation_valid(&c.aggregation)
                 }
                 ProtocolConfig::ScheduledPanetiere(c) => {
-                    let n = s.relays.len() as u32;
-                    let threshold_ok = c.threshold >= n / 2 + 1 && c.threshold <= n.max(1);
-                    if c.client_set_max < MIN_CAPACITY
-                        || !threshold_ok
-                        || !self.exchange_keys_match(&c.relay_exchange_keys)
-                        || !self.aggregation_valid(&c.aggregation)
-                        || c.message_size == 0
-                        || c.message_size > u16::MAX as usize
-                        || c.vector_bytes == 0
-                    {
-                        return false;
-                    }
+                    self.exchange_keys_match(&c.relay_exchange_keys)
+                        && self.aggregation_valid(&c.aggregation)
                 }
-                // The scheduler only ever proposes Noop / Adcnet / Panetiere / ScheduledPanetiere.
-                ProtocolConfig::ScheduledAdcnet(_) | ProtocolConfig::Nym(_) => return false,
+                // Rejected by validate_structure already.
+                ProtocolConfig::ScheduledAdcnet(_) | ProtocolConfig::Nym(_) => false,
+            };
+            if !keys_ok {
+                return false;
             }
         }
         true
@@ -919,10 +956,12 @@ impl SchedulerCore {
     /// Each aggregator group must be a `replication`-sized committee of
     /// registered relays whose exchange keys match registration.
     fn aggregation_valid(&self, agg: &Option<Aggregation>) -> bool {
+        if !aggregation_structural_ok(agg) {
+            return false;
+        }
         let Some(a) = agg else { return true };
         a.groups.iter().all(|g| {
-            g.aggregators.len() == a.replication as usize
-                && g.aggregators.iter().all(|pk| self.registered.contains(pk))
+            g.aggregators.iter().all(|pk| self.registered.contains(pk))
                 && self.exchange_keys_match(&g.aggregator_exchange_keys)
         })
     }

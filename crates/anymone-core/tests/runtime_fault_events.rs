@@ -165,7 +165,6 @@ async fn fault_for(mode: Misbehavior, panetiere: bool) -> Reported {
             if let Some(r) = FaultReport::decode(&msg.payload) {
                 if r.round == report.round && r.fault.kind == report.fault.kind {
                     dup_count += 1;
-                    eprintln!("DEBUG collision round={} same_evidence={} attribution={:?}", r.round, r.fault.evidence == report.fault.evidence, r.fault.attribution);
                 }
             }
         }

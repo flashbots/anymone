@@ -77,6 +77,12 @@ pub trait Transport: Send + Sync + 'static {
     /// publish from other peers (publisher's own messages are filtered).
     async fn subscribe(&self, topic: &str) -> Subscription;
 
+    /// Leave `topic`: for gossipsub backends, actually leaves the mesh (a
+    /// dropped `Subscription` alone doesn't — gossipsub subscription lives at
+    /// the swarm level, independent of local listeners). Default no-op for
+    /// backends without that distinction (e.g. the in-memory test transport).
+    async fn unsubscribe(&self, _topic: &str) {}
+
     /// Publish `bytes` on `topic` to all current subscribers.
     async fn publish(&self, topic: &str, bytes: Vec<u8>);
 

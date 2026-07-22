@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anymone_core::panetiere::{PanetiereAggregatorSession, SetMode};
+use anymone_core::panetiere::{client_id_from_pubkey, PanetiereAggregatorSession, SetMode};
 use anymone_core::panetiere_scheduled::{ScheduledPanetiereClientSession, ScheduledPanetiereServerSession};
 use anymone_core::session::{LeaderAggregation, Session};
 use anymone_core::{Identity, Pubkey};
@@ -15,7 +15,7 @@ use anymone_core::{Identity, Pubkey};
 use chipmunk_code::N;
 use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::pke;
-use panetiere::protocol::{ClientId, ProtocolParams, ServerId};
+use panetiere::protocol::{ProtocolParams, ServerId};
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
@@ -89,15 +89,16 @@ fn direct_round(
     round: u64,
     now: Instant,
     clients: &mut [ScheduledPanetiereClientSession],
+    client_pks: &[Pubkey],
     servers: &mut [ScheduledPanetiereServerSession],
     server_pks: &[Pubkey],
 ) -> Vec<Vec<Vec<u8>>> {
-    for c in clients.iter_mut() {
+    for (i, c) in clients.iter_mut().enumerate() {
         c.begin_round(round, now);
         let out = c.checkpoint(round, 1, now);
         for s in servers.iter_mut() {
             for m in &out {
-                s.on_inbound(server_pks[0], m.clone());
+                s.on_inbound(client_pks[i], m.clone());
             }
         }
     }
@@ -150,15 +151,16 @@ fn scheduled_direct_flow_pipelines_reservations() {
 
     let payload_a = b"first client message".to_vec();
     let payload_b = b"second client message here".to_vec();
-    let mut clients: Vec<ScheduledPanetiereClientSession> = (0..2u32)
+    let client_pks: Vec<Pubkey> = (0..2).map(|_| Identity::generate().pubkey()).collect();
+    let mut clients: Vec<ScheduledPanetiereClientSession> = (0..2usize)
         .map(|i| {
             let mut seed = [0u8; 32];
-            seed[..4].copy_from_slice(&i.to_le_bytes());
+            seed[..4].copy_from_slice(&(i as u32).to_le_bytes());
             ScheduledPanetiereClientSession::new(
                 pp.clone(),
                 sched_mse.clone(),
                 vector_bytes,
-                ClientId(i),
+                client_id_from_pubkey(client_pks[i]),
                 xpubs.clone(),
                 server_pks[0],
                 seed,
@@ -173,7 +175,7 @@ fn scheduled_direct_flow_pipelines_reservations() {
 
     let mut final_decoded: Vec<Vec<Vec<u8>>> = Vec::new();
     for round in 0..=(GAP + 1) {
-        let decoded = direct_round(round, now, &mut clients, &mut servers, &server_pks);
+        let decoded = direct_round(round, now, &mut clients, &client_pks, &mut servers, &server_pks);
         if round < GAP + 1 {
             for (i, d) in decoded.iter().enumerate() {
                 assert!(d.is_empty(), "relay {i} round {round}: nothing should decode before the fulfillment round");
@@ -195,7 +197,7 @@ fn scheduled_direct_flow_pipelines_reservations() {
 
     // A further cover-only round (nothing staged) must decode nothing new.
     let cover_round = GAP + 2;
-    let decoded = direct_round(cover_round, now, &mut clients, &mut servers, &server_pks);
+    let decoded = direct_round(cover_round, now, &mut clients, &client_pks, &mut servers, &server_pks);
     for (i, d) in decoded.iter().enumerate() {
         assert!(d.is_empty(), "relay {i}: cover-only round must decode nothing");
     }
@@ -222,15 +224,16 @@ fn dropped_reservation_is_retried() {
 
     let payload_a = b"AAAA".to_vec();
     let payload_b = b"BBBB".to_vec();
-    let mut clients: Vec<ScheduledPanetiereClientSession> = (0..2u32)
+    let client_pks: Vec<Pubkey> = (0..2).map(|_| Identity::generate().pubkey()).collect();
+    let mut clients: Vec<ScheduledPanetiereClientSession> = (0..2usize)
         .map(|i| {
             let mut seed = [0u8; 32];
-            seed[..4].copy_from_slice(&i.to_le_bytes());
+            seed[..4].copy_from_slice(&(i as u32).to_le_bytes());
             ScheduledPanetiereClientSession::new(
                 pp.clone(),
                 sched_mse.clone(),
                 vector_bytes,
-                ClientId(i),
+                client_id_from_pubkey(client_pks[i]),
                 xpubs.clone(),
                 server_pks[0],
                 seed,
@@ -248,7 +251,7 @@ fn dropped_reservation_is_retried() {
     // its own full GAP+1 round-trip after that — generous margin here.
     let mut all_decoded: Vec<Vec<u8>> = Vec::new();
     for round in 0..(3 * (GAP + 1)) {
-        let decoded = direct_round(round, now, &mut clients, &mut servers, &server_pks);
+        let decoded = direct_round(round, now, &mut clients, &client_pks, &mut servers, &server_pks);
         all_decoded.extend(decoded[0].clone());
     }
     assert!(all_decoded.contains(&payload_a), "the winning reservation must be delivered");
@@ -263,22 +266,23 @@ fn aggregated_round(
     round: u64,
     now: Instant,
     clients: &mut [ScheduledPanetiereClientSession],
+    client_pks: &[Pubkey],
     aggregators: &mut [PanetiereAggregatorSession],
     servers: &mut [ScheduledPanetiereServerSession],
     server_pks: &[Pubkey],
 ) -> Vec<Vec<Vec<u8>>> {
-    for c in clients.iter_mut() {
+    for (i, c) in clients.iter_mut().enumerate() {
         c.begin_round(round, now);
         let out = c.checkpoint(round, 1, now);
         let Some((client_public, openings)) = out.split_first() else {
             continue;
         };
         for a in aggregators.iter_mut() {
-            a.on_inbound(server_pks[0], client_public.clone());
+            a.on_inbound(client_pks[i], client_public.clone());
         }
         for s in servers.iter_mut() {
             for op in openings {
-                s.on_inbound(server_pks[0], op.clone());
+                s.on_inbound(client_pks[i], op.clone());
             }
         }
     }
@@ -339,16 +343,29 @@ fn scheduled_aggregated_flow_decodes_through_groups() {
 
     let payload_a = b"group zero's scheduled message".to_vec();
     let payload_b = b"group one's scheduled message".to_vec();
-    // Client ids land in distinct groups via `client_id % group_count`.
-    let mut clients: Vec<ScheduledPanetiereClientSession> = (0..2u32)
+    // Pick client pubkeys landing in distinct groups via `client_id % group_count`.
+    let (pk_a, pk_b) = loop {
+        let a = Identity::generate().pubkey();
+        let b = Identity::generate().pubkey();
+        let ga = client_id_from_pubkey(a).0 % group_count;
+        let gb = client_id_from_pubkey(b).0 % group_count;
+        if ga == 0 && gb != 0 {
+            break (a, b);
+        }
+        if gb == 0 && ga != 0 {
+            break (b, a);
+        }
+    };
+    let client_pks = [pk_a, pk_b];
+    let mut clients: Vec<ScheduledPanetiereClientSession> = (0..2usize)
         .map(|i| {
             let mut seed = [0u8; 32];
-            seed[..4].copy_from_slice(&i.to_le_bytes());
+            seed[..4].copy_from_slice(&(i as u32).to_le_bytes());
             ScheduledPanetiereClientSession::new(
                 pp.clone(),
                 sched_mse.clone(),
                 vector_bytes,
-                ClientId(i),
+                client_id_from_pubkey(client_pks[i]),
                 xpubs.clone(),
                 server_pks[0],
                 seed,
@@ -368,7 +385,8 @@ fn scheduled_aggregated_flow_decodes_through_groups() {
 
     let mut final_decoded: Vec<Vec<Vec<u8>>> = Vec::new();
     for round in 0..=(GAP + 1) {
-        let decoded = aggregated_round(round, now, &mut clients, &mut aggregators, &mut servers, &server_pks);
+        let decoded =
+            aggregated_round(round, now, &mut clients, &client_pks, &mut aggregators, &mut servers, &server_pks);
         if round < GAP + 1 {
             for (i, d) in decoded.iter().enumerate() {
                 assert!(d.is_empty(), "relay {i} round {round}: nothing should decode before the fulfillment round");

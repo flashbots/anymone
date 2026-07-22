@@ -187,6 +187,9 @@ impl Subnet {
     /// Run one round; `alive` lists participating relay indices. Returns the
     /// faults the observer emitted.
     fn round(&mut self, r: u64, alive: &[usize]) -> Vec<anymone_core::Fault> {
+        // Every relay's clock advances regardless of participation, as in the real runtime.
+        for relay in self.relays.iter_mut() { relay.begin_round(r, self.now); }
+        self.observer.begin_round(r, self.now);
         for m in self.client.begin_round(r, self.now) { self.bus.push((self.client_pk, m)); }
         self.deliver();
         for i in 0..self.relays.len() {
