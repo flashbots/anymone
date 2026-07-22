@@ -146,5 +146,10 @@ pub enum SchedulerProtocol {
     Adcnet,
     /// Real Panetiere threshold ABC. Strict mode on fault.
     Panetiere,
+    /// Panetiere's staggered two-phase mode, layered onto a `Panetiere`-family
+    /// subnet once its observed traffic passes the scheduled-mode threshold
+    /// (see `SchedulerCore::apply_sched_mode`); not chosen by the escalation
+    /// ladder itself.
+    ScheduledPanetiere,
 }
 

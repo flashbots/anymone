@@ -69,6 +69,7 @@ fn proto_name(body: &AnymoneRoundConfigurationBody) -> &'static str {
     match &body.subnets[0].protocol {
         ProtocolConfig::Adcnet(_) => "adcnet",
         ProtocolConfig::Panetiere(_) => "panetiere",
+        ProtocolConfig::ScheduledPanetiere(_) => "scheduled-panetiere",
         ProtocolConfig::Noop(_) => "noop",
         _ => "other",
     }
@@ -91,6 +92,37 @@ fn lead_core(committee: &[Identity], threshold: u32) -> SchedulerCore {
             escalation_grace: 5,
             grow_at: 31,
             message_size: 16,
+            integrity_backoff_ms: 6 * 60 * 1000,
+            sideline: true,
+            min_capacity: 8,
+            pin: None,
+            aggregation: true,
+        },
+    )
+}
+
+/// Like [`lead_core`] but with a caller-chosen `message_size` — the
+/// scheduled-mode upgrade/downgrade thresholds scale off it (`2x`/`0.5x`), so
+/// mode-selection tests need it small enough for real test traffic to cross.
+/// `escalation_grace` is generous so an unrelated honest-traffic de-escalation
+/// (the original fault healing) doesn't interfere with a mode-selection test
+/// running many rounds of otherwise-clean traffic.
+fn lead_core_msg_size(committee: &[Identity], threshold: u32, message_size: usize) -> SchedulerCore {
+    let mut sorted: Vec<_> = committee.to_vec();
+    sorted.sort_by_key(|i| i.pubkey());
+    let pks: Vec<_> = committee.iter().map(|i| i.pubkey()).collect();
+    SchedulerCore::new(
+        sorted[0].clone(),
+        pks,
+        threshold,
+        SchedulerParams {
+            public_round_duration: Duration::from_millis(200),
+            min_relays: 2,
+            min_services: 1,
+            fault_threshold: 2,
+            escalation_grace: 100,
+            grow_at: 31,
+            message_size,
             integrity_backoff_ms: 6 * 60 * 1000,
             sideline: true,
             min_capacity: 8,
@@ -1236,4 +1268,98 @@ fn committee_acts_on_verified_leader_integrity_report() {
     let body = staged_body(&core.tick(2, 0)).expect("cover change re-proposes");
     assert!(body.subnets[0].relays.contains(&honest_pk));
     assert!(body.subnets[0].relays.contains(&corrupt_pk), "mis-attributed report must be ignored entirely");
+}
+
+/// A fresh escalation always starts one-round Panetiere; sustained real
+/// traffic then upgrades the subnet to scheduled mode, and steady traffic
+/// afterwards re-proposes nothing (content key stable).
+#[test]
+fn sustained_traffic_upgrades_to_scheduled_panetiere() {
+    let committee: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
+    let relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
+    let service = Identity::generate();
+    // message_size=4 -> upgrade at >=8 decoded bytes/round, downgrade at <=2;
+    // the harness's real ~10-byte payload sits above the upgrade bar.
+    let mut core = lead_core_msg_size(&committee, 2, 4);
+    register_relays_and_service(&mut core, &relays, &service);
+
+    let first = staged_proposal(&core.tick(0, 0)).expect("first proposal");
+    assert_eq!(proto_name(&first.body), "adcnet");
+    enact(&mut core, &committee, first);
+
+    core.apply_observed_faults(0, vec![Fault {
+        kind: FaultKind::Liveness,
+        attribution: Attribution::None,
+        evidence: Vec::new(),
+    }], 0);
+    let esc = staged_proposal(&core.tick(1, 0)).expect("escalation proposal");
+    assert_eq!(proto_name(&esc.body), "panetiere", "a fresh escalation always starts one-round");
+    enact(&mut core, &committee, esc);
+
+    let mut net = PanetiereSubnet::new(&relays, None);
+    let mut upgraded_body = None;
+    for r in 0..6u64 {
+        let (wire, _, _) = net.round(r);
+        for (from, bytes) in wire {
+            core.on_subnet_message(0, from, bytes);
+        }
+        if let Some(body) = staged_body(&core.tick(2 + r, 0)) {
+            if proto_name(&body) == "scheduled-panetiere" {
+                upgraded_body = Some(body.clone());
+            }
+            enact(&mut core, &committee, sign_proposal(&lead_of(&committee), body));
+            if upgraded_body.is_some() {
+                break;
+            }
+        }
+    }
+    let upgraded = upgraded_body.expect("sustained real traffic must upgrade the subnet");
+    let ProtocolConfig::ScheduledPanetiere(cfg) = &upgraded.subnets[0].protocol else {
+        panic!("expected ScheduledPanetiere");
+    };
+    assert!(cfg.vector_bytes > 0, "scheduled subnet must get a sized message vector");
+
+    // Steady traffic afterwards must not keep re-proposing (content key stable).
+    let mut restaged = false;
+    for r in 6..10u64 {
+        let (wire, _, _) = net.round(r);
+        for (from, bytes) in wire {
+            core.on_subnet_message(0, from, bytes);
+        }
+        if staged_body(&core.tick(2 + r, 0)).is_some() {
+            restaged = true;
+        }
+    }
+    assert!(!restaged, "steady scheduled-mode traffic must not keep re-proposing");
+
+    // Pinned deployment shapes: "scheduled-panetiere" forces the mode from the
+    // first proposal, no traffic needed.
+    let mut sorted = committee.to_vec();
+    sorted.sort_by_key(|i| i.pubkey());
+    let mut pinned = SchedulerCore::new(
+        sorted[0].clone(),
+        committee.iter().map(|i| i.pubkey()).collect(),
+        2,
+        SchedulerParams {
+            public_round_duration: Duration::from_millis(200),
+            min_relays: 2,
+            min_services: 1,
+            fault_threshold: 2,
+            escalation_grace: 5,
+            grow_at: 31,
+            message_size: 4,
+            integrity_backoff_ms: 6 * 60 * 1000,
+            sideline: true,
+            min_capacity: 8,
+            pin: Some(anymone_core::scheduling::SchedulerProtocol::ScheduledPanetiere),
+            aggregation: true,
+        },
+    );
+    register_relays_and_service(&mut pinned, &relays, &service);
+    let body = staged_body(&pinned.tick(0, 0)).expect("pinned core proposes");
+    assert_eq!(proto_name(&body), "scheduled-panetiere", "pin forces scheduled mode outright");
+    let ProtocolConfig::ScheduledPanetiere(cfg) = &body.subnets[0].protocol else {
+        panic!("expected ScheduledPanetiere");
+    };
+    assert!(cfg.vector_bytes > 0, "pinned scheduled subnet gets the default vector sizing");
 }

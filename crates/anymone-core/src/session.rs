@@ -50,14 +50,8 @@ pub trait Session: Send {
     /// outbound (e.g. final decryption shares).
     fn end_round(&mut self, round: Round, now: Instant) -> RoundOutcome;
 
-    /// Emit partway through `round`, before it closes (e.g. an aggregator
-    /// forwarding its batch early). Default: nothing.
-    fn mid_round(&mut self, _round: Round, _now: Instant) -> Vec<Vec<u8>> {
-        Vec::new()
-    }
-
-    /// Freeze a decision between `mid_round` and `end_round`. Default: nothing.
-    fn commit_round(&mut self, _round: Round, _now: Instant) -> Vec<Vec<u8>> {
+    /// Emit at intra-round checkpoint `k` (1-based, protocol-defined). Default: nothing.
+    fn checkpoint(&mut self, _round: Round, _k: u8, _now: Instant) -> Vec<Vec<u8>> {
         Vec::new()
     }
 

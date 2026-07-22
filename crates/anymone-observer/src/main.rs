@@ -349,6 +349,11 @@ fn spawn_config_loop(transport: Arc<dyn Transport>, obs: Shared, committee: Vec<
             if !is_new {
                 continue;
             }
+            let mut roster: Vec<anymone_core::Pubkey> =
+                cfg.body.subnets.iter().flat_map(|s| s.relays.iter().copied()).collect();
+            roster.sort();
+            roster.dedup();
+            transport.ensure_peers(roster).await;
             let present: std::collections::HashSet<SubnetId> =
                 cfg.body.subnets.iter().map(|s| s.id).collect();
             // drop watchers for subnets no longer in the config
@@ -410,7 +415,7 @@ async fn watch_subnet(subnet: Subnet, transport: Arc<dyn Transport>, obs: Shared
         _ => None,
     };
     let mut panetiere_obs = match subnet.protocol {
-        ProtocolConfig::Panetiere(_) => {
+        ProtocolConfig::Panetiere(_) | ProtocolConfig::ScheduledPanetiere(_) => {
             Some(PanetiereObserverSession::new(roster.clone(), Some(leader), FAULT_THRESHOLD))
         }
         _ => None,
@@ -645,6 +650,7 @@ fn proto_key(p: &ProtocolConfig) -> String {
     match p {
         ProtocolConfig::Noop(_) => "noop",
         ProtocolConfig::Panetiere(_) => "panetiere",
+        ProtocolConfig::ScheduledPanetiere(_) => "scheduledpanetiere",
         ProtocolConfig::Adcnet(_) => "adcnet",
         ProtocolConfig::ScheduledAdcnet(_) => "scheduledadcnet",
         ProtocolConfig::Nym(_) => "nym",

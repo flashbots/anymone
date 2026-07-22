@@ -462,6 +462,25 @@ async fn apply_config(
     let base_round = 0;
     let epoch_unix_ms = 0;
 
+    // gossipsub meshes form only over existing connections, so dial the full
+    // roster rather than relying on kademlia adjacency.
+    let mut roster: Vec<Pubkey> = config
+        .body
+        .subnets
+        .iter()
+        .flat_map(|s| {
+            s.relays.iter().copied().chain(
+                s.protocol
+                    .aggregation()
+                    .into_iter()
+                    .flat_map(|a| a.groups.iter().flat_map(|g| g.aggregators.iter().copied())),
+            )
+        })
+        .collect();
+    roster.sort();
+    roster.dedup();
+    inner.transport.ensure_peers(roster).await;
+
     let current: HashMap<SubnetId, Vec<u8>> = {
         let g = tasks.workers.lock().unwrap();
         g.iter().map(|(id, w)| (*id, w.sig.clone())).collect()
@@ -500,6 +519,9 @@ async fn apply_config(
                 subnet, inner_for_task, stage_rx, subscriptions, base_round, epoch_unix_ms,
             )),
             ProtocolConfig::Panetiere(_) => tokio::spawn(crate::panetiere::run_subnet(
+                subnet, inner_for_task, stage_rx, subscriptions, base_round, epoch_unix_ms,
+            )),
+            ProtocolConfig::ScheduledPanetiere(_) => tokio::spawn(crate::panetiere_scheduled::run_subnet(
                 subnet, inner_for_task, stage_rx, subscriptions, base_round, epoch_unix_ms,
             )),
             ProtocolConfig::Noop(_) => tokio::spawn(crate::noop::run_subnet(
@@ -759,7 +781,10 @@ pub fn subnet_runnable(subnet: &Subnet) -> bool {
     !subnet.relays.is_empty()
         && matches!(
             subnet.protocol,
-            ProtocolConfig::Adcnet(_) | ProtocolConfig::Panetiere(_) | ProtocolConfig::Noop(_)
+            ProtocolConfig::Adcnet(_)
+                | ProtocolConfig::Panetiere(_)
+                | ProtocolConfig::ScheduledPanetiere(_)
+                | ProtocolConfig::Noop(_)
         )
 }
 
@@ -784,7 +809,9 @@ pub fn leader_of(sorted_roster: &[Pubkey], subnet_id: SubnetId) -> Pubkey {
 /// does); everyone else only the broadcast topic.
 fn subnet_subscription_topics(subnet: &Subnet, me: Pubkey) -> Vec<String> {
     let combines = match &subnet.protocol {
-        ProtocolConfig::Panetiere(_) => subnet.relays.contains(&me),
+        ProtocolConfig::Panetiere(_) | ProtocolConfig::ScheduledPanetiere(_) => {
+            subnet.relays.contains(&me)
+        }
         ProtocolConfig::Adcnet(_) => subnet_leader_pk(subnet) == me,
         _ => false,
     };
@@ -796,6 +823,15 @@ fn subnet_subscription_topics(subnet: &Subnet, me: Pubkey) -> Vec<String> {
     } else {
         vec![subnet_broadcast_topic(subnet.id)]
     };
+    // Scheduled Panetiere relays combine over ingress+shares like the one-round
+    // flow, but also need the leader's `Reservations` broadcast — for their own
+    // (possibly co-located) client session and as a follower fallback.
+    if combines && matches!(subnet.protocol, ProtocolConfig::ScheduledPanetiere(_)) {
+        let broadcast = subnet_broadcast_topic(subnet.id);
+        if !topics.contains(&broadcast) {
+            topics.push(broadcast);
+        }
+    }
     // An aggregator listens on its group topic for client messages, and joins the
     // shares mesh to publish its group aggregate there.
     if let Some(a) = subnet_aggregation(subnet) {
@@ -814,6 +850,7 @@ fn subnet_subscription_topics(subnet: &Subnet, me: Pubkey) -> Vec<String> {
 pub(crate) fn subnet_aggregation(subnet: &Subnet) -> Option<&crate::config::Aggregation> {
     match &subnet.protocol {
         ProtocolConfig::Panetiere(c) => c.aggregation.as_ref(),
+        ProtocolConfig::ScheduledPanetiere(c) => c.aggregation.as_ref(),
         ProtocolConfig::Adcnet(c) => c.aggregation.as_ref(),
         _ => None,
     }
@@ -876,7 +913,7 @@ pub fn subnet_shares_topic(id: SubnetId) -> String {
 pub fn subnet_uses_ingress(subnet: &Subnet) -> bool {
     matches!(
         subnet.protocol,
-        ProtocolConfig::Adcnet(_) | ProtocolConfig::Panetiere(_)
+        ProtocolConfig::Adcnet(_) | ProtocolConfig::Panetiere(_) | ProtocolConfig::ScheduledPanetiere(_)
     )
 }
 
@@ -891,7 +928,7 @@ pub fn subnet_aggregator_topic(id: SubnetId, group: u32) -> String {
 pub fn watch_session_for(subnet: &Subnet) -> Box<dyn Session> {
     match &subnet.protocol {
         ProtocolConfig::Noop(c) => noop::server_session(c),
-        ProtocolConfig::Panetiere(_) => {
+        ProtocolConfig::Panetiere(_) | ProtocolConfig::ScheduledPanetiere(_) => {
             Box::new(PanetiereWatchSession::new(subnet_leader_pk(subnet)))
         }
         ProtocolConfig::Adcnet(_) => Box::new(AdcnetWatchSession::new(subnet_leader_pk(subnet))),

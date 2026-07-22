@@ -1,0 +1,384 @@
+//! Scheduled (staggered, two-phase) Panetiere flow, driven directly via
+//! `Vec<u8>` buffers (no transport, no clock): reservation → grant →
+//! fulfillment across the fixed round gap, for both the direct and aggregated
+//! flows, plus a dropped-reservation retry.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
+
+use anymone_core::panetiere::{PanetiereAggregatorSession, SetMode};
+use anymone_core::panetiere_scheduled::{ScheduledPanetiereClientSession, ScheduledPanetiereServerSession};
+use anymone_core::session::{LeaderAggregation, Session};
+use anymone_core::{Identity, Pubkey};
+
+use chipmunk_code::N;
+use panetiere::mse::{MseEncoding, MseParams};
+use panetiere::pke;
+use panetiere::protocol::{ClientId, ProtocolParams, ServerId};
+use rand::{RngCore, SeedableRng};
+use rand_chacha::ChaCha20Rng;
+
+/// Must match `panetiere_scheduled::RESERVATION_TO_MSG_GAP` (crate-private):
+/// a grant from round `R`'s `Reservations` is always due at round `R + GAP`.
+const GAP: u64 = 3;
+const BYTES_PER_POLY: usize = N * 4;
+
+/// PRF key from the test's seeded RNG, like production `channel_mse_params` —
+/// a hardcoded key can land the IBLT on a rare peel stall at tight δ.
+fn prf_key(rng: &mut ChaCha20Rng) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    rng.fill_bytes(&mut key);
+    key
+}
+
+fn server_env(n: usize) -> (Vec<Identity>, Vec<Pubkey>, Vec<(ServerId, pke::PublicKey)>) {
+    let mut ids: Vec<Identity> = (0..n).map(|_| Identity::generate()).collect();
+    ids.sort_by_key(|i| i.pubkey());
+    let pks = ids.iter().map(|i| i.pubkey()).collect();
+    let xpubs = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (ServerId(i as u32), id.exchange().pke().public()))
+        .collect();
+    (ids, pks, xpubs)
+}
+
+fn server_pubkeys(server_pks: &[Pubkey]) -> HashMap<ServerId, Pubkey> {
+    server_pks.iter().enumerate().map(|(i, pk)| (ServerId(i as u32), *pk)).collect()
+}
+
+fn make_servers(
+    pp: &Arc<ProtocolParams>,
+    sched_mse: &MseParams,
+    vector_bytes: usize,
+    ids: &[Identity],
+    server_pks: &[Pubkey],
+    aggregation: Option<&HashMap<u32, Vec<Pubkey>>>,
+) -> Vec<ScheduledPanetiereServerSession> {
+    (0..ids.len())
+        .map(|i| {
+            ScheduledPanetiereServerSession::new(
+                pp.clone(),
+                sched_mse.clone(),
+                vector_bytes,
+                ServerId(i as u32),
+                ids[i].clone(),
+                if i == 0 {
+                    SetMode::Leader
+                } else {
+                    SetMode::Follower { leader: server_pks[0] }
+                },
+                server_pks[0],
+                0,
+                server_pubkeys(server_pks),
+                aggregation.map(|roster| LeaderAggregation { roster: roster.clone() }),
+            )
+        })
+        .collect()
+}
+
+/// One round's cadence for the direct flow: every client submits at
+/// checkpoint 1, the leader announces at checkpoint 3, then every relay's
+/// `end_round` emits shares, decodes whatever is now settled, and broadcasts.
+/// Every relay's outbound is delivered to every other relay and every client —
+/// mirrors gossip (ServerPublics on shares, Reservations/Decoded/ClientSet on
+/// broadcast; each session ignores what it doesn't recognize). Returns each
+/// relay's decoded payloads, index-aligned with `servers`.
+fn direct_round(
+    round: u64,
+    now: Instant,
+    clients: &mut [ScheduledPanetiereClientSession],
+    servers: &mut [ScheduledPanetiereServerSession],
+    server_pks: &[Pubkey],
+) -> Vec<Vec<Vec<u8>>> {
+    for c in clients.iter_mut() {
+        c.begin_round(round, now);
+        let out = c.checkpoint(round, 1, now);
+        for s in servers.iter_mut() {
+            for m in &out {
+                s.on_inbound(server_pks[0], m.clone());
+            }
+        }
+    }
+    for s in servers.iter_mut() {
+        s.begin_round(round, now);
+    }
+    let announce = servers[0].checkpoint(round, 3, now);
+    for s in servers[1..].iter_mut() {
+        for m in &announce {
+            s.on_inbound(server_pks[0], m.clone());
+        }
+    }
+    let mut all_outbound: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut decoded = vec![Vec::new(); servers.len()];
+    for (i, s) in servers.iter_mut().enumerate() {
+        let outcome = s.end_round(round, now);
+        decoded[i] = outcome.decoded;
+        all_outbound.extend(outcome.outbound.into_iter().map(|m| (i, m)));
+    }
+    for (i, m) in &all_outbound {
+        for (j, s) in servers.iter_mut().enumerate() {
+            if j != *i {
+                s.on_inbound(server_pks[*i], m.clone());
+            }
+        }
+        for c in clients.iter_mut() {
+            c.on_inbound(server_pks[*i], m.clone());
+        }
+    }
+    decoded
+}
+
+#[test]
+fn scheduled_direct_flow_pipelines_reservations() {
+    let mut setup_rng = ChaCha20Rng::from_seed([7u8; 32]);
+    let n_servers = 3;
+    let rho = 2u32;
+    let sched_mse = MseParams::new(4, (3 * rho as usize).div_ceil(4), 2, prf_key(&mut setup_rng));
+    let vector_bytes = 128usize;
+    let sched_polys = MseEncoding::n_polys(&sched_mse);
+    let msg_polys = vector_bytes.div_ceil(BYTES_PER_POLY);
+    let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(
+        &mut setup_rng,
+        n_servers,
+        sched_polys + msg_polys,
+        1,
+    ));
+
+    let (ids, server_pks, xpubs) = server_env(n_servers);
+
+    let payload_a = b"first client message".to_vec();
+    let payload_b = b"second client message here".to_vec();
+    let mut clients: Vec<ScheduledPanetiereClientSession> = (0..2u32)
+        .map(|i| {
+            let mut seed = [0u8; 32];
+            seed[..4].copy_from_slice(&i.to_le_bytes());
+            ScheduledPanetiereClientSession::new(
+                pp.clone(),
+                sched_mse.clone(),
+                vector_bytes,
+                ClientId(i),
+                xpubs.clone(),
+                server_pks[0],
+                seed,
+            )
+        })
+        .collect();
+    clients[0].stage(payload_a.clone());
+    clients[1].stage(payload_b.clone());
+
+    let mut servers = make_servers(&pp, &sched_mse, vector_bytes, &ids, &server_pks, None);
+    let now = Instant::now();
+
+    let mut final_decoded: Vec<Vec<Vec<u8>>> = Vec::new();
+    for round in 0..=(GAP + 1) {
+        let decoded = direct_round(round, now, &mut clients, &mut servers, &server_pks);
+        if round < GAP + 1 {
+            for (i, d) in decoded.iter().enumerate() {
+                assert!(d.is_empty(), "relay {i} round {round}: nothing should decode before the fulfillment round");
+            }
+        } else {
+            final_decoded = decoded;
+        }
+    }
+    for (i, decoded) in final_decoded.iter().enumerate() {
+        assert!(
+            decoded.contains(&payload_a),
+            "relay {i}: must decode client 0's payload at the fulfillment round"
+        );
+        assert!(
+            decoded.contains(&payload_b),
+            "relay {i}: must decode client 1's payload at the fulfillment round"
+        );
+    }
+
+    // A further cover-only round (nothing staged) must decode nothing new.
+    let cover_round = GAP + 2;
+    let decoded = direct_round(cover_round, now, &mut clients, &mut servers, &server_pks);
+    for (i, d) in decoded.iter().enumerate() {
+        assert!(d.is_empty(), "relay {i}: cover-only round must decode nothing");
+    }
+}
+
+#[test]
+fn dropped_reservation_is_retried() {
+    let mut setup_rng = ChaCha20Rng::from_seed([9u8; 32]);
+    let n_servers = 3;
+    let rho = 2u32;
+    let sched_mse = MseParams::new(4, (3 * rho as usize).div_ceil(4), 2, prf_key(&mut setup_rng));
+    // Wide enough for exactly one 4-byte payload's aligned slot, not two —
+    // the second reservation each round must overflow `codec::allocate`.
+    let vector_bytes = 4usize;
+    let sched_polys = MseEncoding::n_polys(&sched_mse);
+    let msg_polys = vector_bytes.div_ceil(BYTES_PER_POLY);
+    let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(
+        &mut setup_rng,
+        n_servers,
+        sched_polys + msg_polys,
+        1,
+    ));
+    let (ids, server_pks, xpubs) = server_env(n_servers);
+
+    let payload_a = b"AAAA".to_vec();
+    let payload_b = b"BBBB".to_vec();
+    let mut clients: Vec<ScheduledPanetiereClientSession> = (0..2u32)
+        .map(|i| {
+            let mut seed = [0u8; 32];
+            seed[..4].copy_from_slice(&i.to_le_bytes());
+            ScheduledPanetiereClientSession::new(
+                pp.clone(),
+                sched_mse.clone(),
+                vector_bytes,
+                ClientId(i),
+                xpubs.clone(),
+                server_pks[0],
+                seed,
+            )
+        })
+        .collect();
+    clients[0].stage(payload_a.clone());
+    clients[1].stage(payload_b.clone());
+
+    let mut servers = make_servers(&pp, &sched_mse, vector_bytes, &ids, &server_pks, None);
+    let now = Instant::now();
+
+    // Run well past two fulfillment cycles: the overflowing client's payload
+    // re-reserves at whichever round it lands back in `staged`, so it needs
+    // its own full GAP+1 round-trip after that — generous margin here.
+    let mut all_decoded: Vec<Vec<u8>> = Vec::new();
+    for round in 0..(3 * (GAP + 1)) {
+        let decoded = direct_round(round, now, &mut clients, &mut servers, &server_pks);
+        all_decoded.extend(decoded[0].clone());
+    }
+    assert!(all_decoded.contains(&payload_a), "the winning reservation must be delivered");
+    assert!(all_decoded.contains(&payload_b), "the overflowed reservation must be retried and eventually delivered");
+}
+
+/// One aggregated-flow round: clients submit to the aggregator (openings
+/// still go straight to relays), the aggregator emits its group sum before
+/// the leader announces, then the same shares/decode/broadcast cadence.
+#[allow(clippy::too_many_arguments)]
+fn aggregated_round(
+    round: u64,
+    now: Instant,
+    clients: &mut [ScheduledPanetiereClientSession],
+    aggregators: &mut [PanetiereAggregatorSession],
+    servers: &mut [ScheduledPanetiereServerSession],
+    server_pks: &[Pubkey],
+) -> Vec<Vec<Vec<u8>>> {
+    for c in clients.iter_mut() {
+        c.begin_round(round, now);
+        let out = c.checkpoint(round, 1, now);
+        let Some((client_public, openings)) = out.split_first() else {
+            continue;
+        };
+        for a in aggregators.iter_mut() {
+            a.on_inbound(server_pks[0], client_public.clone());
+        }
+        for s in servers.iter_mut() {
+            for op in openings {
+                s.on_inbound(server_pks[0], op.clone());
+            }
+        }
+    }
+    let group_aggs: Vec<Vec<u8>> =
+        aggregators.iter_mut().flat_map(|a| a.checkpoint(round, 1, now)).collect();
+    for s in servers.iter_mut() {
+        for m in &group_aggs {
+            s.on_inbound(server_pks[0], m.clone());
+        }
+    }
+    let announce = servers[0].checkpoint(round, 3, now);
+    for s in servers[1..].iter_mut() {
+        for m in &announce {
+            s.on_inbound(server_pks[0], m.clone());
+        }
+    }
+    let mut all_outbound: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut decoded = vec![Vec::new(); servers.len()];
+    for (i, s) in servers.iter_mut().enumerate() {
+        let outcome = s.end_round(round, now);
+        decoded[i] = outcome.decoded;
+        all_outbound.extend(outcome.outbound.into_iter().map(|m| (i, m)));
+    }
+    for (i, m) in &all_outbound {
+        for (j, s) in servers.iter_mut().enumerate() {
+            if j != *i {
+                s.on_inbound(server_pks[*i], m.clone());
+            }
+        }
+        for c in clients.iter_mut() {
+            c.on_inbound(server_pks[*i], m.clone());
+        }
+    }
+    decoded
+}
+
+#[test]
+fn scheduled_aggregated_flow_decodes_through_groups() {
+    let mut setup_rng = ChaCha20Rng::from_seed([11u8; 32]);
+    let n_servers = 3;
+    let rho = 2u32;
+    let sched_mse = MseParams::new(4, (3 * rho as usize).div_ceil(4), 2, prf_key(&mut setup_rng));
+    let vector_bytes = 128usize;
+    let sched_polys = MseEncoding::n_polys(&sched_mse);
+    let msg_polys = vector_bytes.div_ceil(BYTES_PER_POLY);
+    let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(
+        &mut setup_rng,
+        n_servers,
+        sched_polys + msg_polys,
+        1,
+    ));
+    let (ids, server_pks, xpubs) = server_env(n_servers);
+
+    let group_count = 2u32;
+    let agg_ids: Vec<Identity> = (0..group_count).map(|_| Identity::generate()).collect();
+    let roster: HashMap<u32, Vec<Pubkey>> =
+        agg_ids.iter().enumerate().map(|(g, id)| (g as u32, vec![id.pubkey()])).collect();
+
+    let payload_a = b"group zero's scheduled message".to_vec();
+    let payload_b = b"group one's scheduled message".to_vec();
+    // Client ids land in distinct groups via `client_id % group_count`.
+    let mut clients: Vec<ScheduledPanetiereClientSession> = (0..2u32)
+        .map(|i| {
+            let mut seed = [0u8; 32];
+            seed[..4].copy_from_slice(&i.to_le_bytes());
+            ScheduledPanetiereClientSession::new(
+                pp.clone(),
+                sched_mse.clone(),
+                vector_bytes,
+                ClientId(i),
+                xpubs.clone(),
+                server_pks[0],
+                seed,
+            )
+        })
+        .collect();
+    clients[0].stage(payload_a.clone());
+    clients[1].stage(payload_b.clone());
+
+    let mut servers = make_servers(&pp, &sched_mse, vector_bytes, &ids, &server_pks, Some(&roster));
+    let mut aggregators: Vec<PanetiereAggregatorSession> = agg_ids
+        .iter()
+        .enumerate()
+        .map(|(g, id)| PanetiereAggregatorSession::new(g as u32, group_count, id.clone()))
+        .collect();
+    let now = Instant::now();
+
+    let mut final_decoded: Vec<Vec<Vec<u8>>> = Vec::new();
+    for round in 0..=(GAP + 1) {
+        let decoded = aggregated_round(round, now, &mut clients, &mut aggregators, &mut servers, &server_pks);
+        if round < GAP + 1 {
+            for (i, d) in decoded.iter().enumerate() {
+                assert!(d.is_empty(), "relay {i} round {round}: nothing should decode before the fulfillment round");
+            }
+        } else {
+            final_decoded = decoded;
+        }
+    }
+    for (i, decoded) in final_decoded.iter().enumerate() {
+        assert!(decoded.contains(&payload_a), "relay {i}: must decode group 0's payload");
+        assert!(decoded.contains(&payload_b), "relay {i}: must decode group 1's payload");
+    }
+}

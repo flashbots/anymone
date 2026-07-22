@@ -567,6 +567,7 @@ fn proto_name(p: &ProtocolConfig) -> &'static str {
     match p {
         ProtocolConfig::Noop(_) => "Noop",
         ProtocolConfig::Panetiere(_) => "Panetiere",
+        ProtocolConfig::ScheduledPanetiere(_) => "Panetiere",
         ProtocolConfig::Adcnet(_) => "Adcnet",
         ProtocolConfig::ScheduledAdcnet(_) => "Adcnet",
         ProtocolConfig::Nym(_) => "Nym",

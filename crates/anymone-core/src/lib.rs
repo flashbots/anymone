@@ -15,6 +15,7 @@ pub mod keys;
 pub mod noop;
 pub mod p2p;
 pub mod panetiere;
+pub mod panetiere_scheduled;
 pub mod pipe;
 pub mod runtime;
 pub mod scheduler_core;

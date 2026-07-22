@@ -241,7 +241,7 @@ pub(crate) async fn run_subnet(
                     .iter_mut()
                     .flat_map(|(key, s)| {
                         let key = *key;
-                        s.mid_round(round, Instant::now()).into_iter().map(move |out| (key, out))
+                        s.checkpoint(round, 1, Instant::now()).into_iter().map(move |out| (key, out))
                     })
                     .collect();
                 for (key, out) in outs {
@@ -856,9 +856,12 @@ impl Session for AdcnetAggregatorSession {
         Vec::new()
     }
 
-    /// Emit the group's batch mid-round, so the leader announces the set and
-    /// combines within the round rather than a round late.
-    fn mid_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
+    /// k=1: emit the group's batch mid-round, so the leader announces the set
+    /// and combines within the round rather than a round late.
+    fn checkpoint(&mut self, round: Round, k: u8, _now: Instant) -> Vec<Vec<u8>> {
+        if k != 1 {
+            return Vec::new();
+        }
         let round = round as u32;
         let mut outbound = Vec::new();
         if !self.emitted.contains(&round) {

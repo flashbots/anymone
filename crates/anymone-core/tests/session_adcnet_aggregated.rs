@@ -115,7 +115,7 @@ fn run_adcnet_aggregated(
             }
         }
         for (pk, a) in aggregators.iter_mut() {
-            for m in a.mid_round(r, now) {
+            for m in a.checkpoint(r, 1, now) {
                 bus.push((*pk, m));
             }
         }
@@ -218,10 +218,10 @@ fn run_realtime(aggregated: bool, payload: &[u8]) -> Vec<u64> {
                 a.on_inbound(*from, msg.clone());
             }
         }
-        // Emitted mid-round, the aggregate reaches the leader before the round
-        // closes — delivered this round, ahead of the servers' end_round.
+        // Emitted at checkpoint 1, the aggregate reaches the leader before the
+        // round closes — delivered this round, ahead of the servers' end_round.
         for (pk, a) in aggregators.iter_mut() {
-            for m in a.mid_round(r, now) {
+            for m in a.checkpoint(r, 1, now) {
                 for s in servers.iter_mut() {
                     s.on_inbound(*pk, m.clone());
                 }

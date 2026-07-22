@@ -81,6 +81,8 @@ struct Behaviour {
 enum Cmd {
     Subscribe(String),
     Publish(String, Vec<u8>),
+    /// Dial and mark as gossipsub explicit peers, independent of kademlia adjacency.
+    EnsurePeers(Vec<PeerId>),
     /// Pull the served config from `peer`; reply carries its answer (or `None`).
     FetchConfig {
         peer: PeerId,
@@ -243,6 +245,17 @@ impl Transport for Libp2pNetwork {
     fn set_topic_policy(&self, policy: crate::transport::TopicPolicy) {
         *self.policy.lock().unwrap() = policy;
     }
+
+    async fn ensure_peers(&self, peers: Vec<Pubkey>) {
+        let pids: Vec<PeerId> = peers
+            .iter()
+            .filter(|pk| **pk != self.local_pubkey)
+            .filter_map(pubkey_to_peer_id)
+            .collect();
+        if !pids.is_empty() {
+            let _ = self.cmd_tx.send(Cmd::EnsurePeers(pids)).await;
+        }
+    }
 }
 
 impl Drop for Libp2pNetwork {
@@ -331,10 +344,29 @@ async fn swarm_loop(
     // they go out once. Drains to empty after delivery; no traffic when idle.
     let mut pending: HashMap<String, VecDeque<Vec<u8>>> = HashMap::new();
     let mut retry = tokio::time::interval(Duration::from_millis(500));
+    let mut wanted: HashSet<PeerId> = HashSet::new();
+    let mut redial = tokio::time::interval(Duration::from_secs(10));
     loop {
         tokio::select! {
             _ = retry.tick() => flush_pending(&mut swarm, &mut pending),
+            _ = redial.tick() => {
+                let connected = peers.lock().unwrap().clone();
+                for pid in wanted.difference(&connected) {
+                    let _ = swarm.dial(*pid);
+                }
+            }
             cmd = cmd_rx.recv() => match cmd {
+                Some(Cmd::EnsurePeers(pids)) => {
+                    let connected = peers.lock().unwrap().clone();
+                    for pid in pids {
+                        if wanted.insert(pid) {
+                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&pid);
+                        }
+                        if !connected.contains(&pid) {
+                            let _ = swarm.dial(pid);
+                        }
+                    }
+                }
                 Some(Cmd::Subscribe(name)) => {
                     let topic = IdentTopic::new(name);
                     let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
@@ -498,6 +530,11 @@ fn flush_pending(
         }
     }
     pending.retain(|_, q| !q.is_empty());
+}
+
+fn pubkey_to_peer_id(pk: &Pubkey) -> Option<PeerId> {
+    let ed = libp2p_id::ed25519::PublicKey::try_from_bytes(&pk.0).ok()?;
+    Some(PeerId::from_public_key(&libp2p_id::PublicKey::from(ed)))
 }
 
 fn peer_id_to_pubkey(peer_id: &PeerId) -> Option<Pubkey> {

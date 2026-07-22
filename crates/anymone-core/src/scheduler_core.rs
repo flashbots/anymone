@@ -119,6 +119,9 @@ fn subnet_max_wire(p: &ProtocolConfig, n_relays: usize) -> usize {
         ProtocolConfig::Panetiere(c) => crate::panetiere::max_wire_estimate(
             c.message_size, c.estimated_messages, c.client_set_max, n_relays,
         ),
+        ProtocolConfig::ScheduledPanetiere(c) => crate::panetiere_scheduled::max_wire_estimate(
+            c.vector_bytes, c.estimated_messages, c.client_set_max, n_relays,
+        ),
         ProtocolConfig::Noop(c) => {
             crate::noop::max_wire_estimate(c.message_size, c.client_set_max, c.client_set_max, n_relays)
         }
@@ -261,10 +264,9 @@ pub struct SchedulerParams {
     /// but leaves the roster intact — for showcases where a corrupted relay
     /// should be *seen*, not removed.
     pub sideline: bool,
-    /// Force every subnet onto one protocol, bypassing the escalation ladder
-    /// (`None` keeps the default ADCNet-unless-escalated behavior). Escalation
-    /// state (sidelining, fault attribution) still runs underneath; only the
-    /// protocol *choice* is fixed.
+    /// Force every subnet onto one protocol, bypassing the escalation ladder.
+    /// `Panetiere` still traffic-upgrades to `ScheduledPanetiere`; pinning
+    /// `ScheduledPanetiere` fixes it outright.
     pub pin: Option<SchedulerProtocol>,
     /// Whether the committee may route large Panetiere subnets through an
     /// aggregator layer above [`AGGREGATION_THRESHOLD`].
@@ -281,6 +283,23 @@ struct SubnetEscalation {
     /// Share frontier the streak last advanced at; a frozen frontier holds it.
     streak_frontier: Option<u64>,
     relays: HashSet<Pubkey>,
+}
+
+const SCHED_WINDOW: u64 = 8;
+const SCHED_DOWNGRADE_GRACE: u32 = 5;
+/// Vector resize hysteresis: re-propose only past this fractional change.
+const SCHED_VECTOR_RESIZE_MARGIN: f64 = 0.25;
+const MAX_VECTOR_BYTES: usize = 128 * 1024;
+
+fn round_up_to(x: usize, to: usize) -> usize {
+    x.div_ceil(to) * to
+}
+
+#[derive(Default)]
+struct SchedModeState {
+    scheduled: bool,
+    downgrade_streak: u32,
+    vector_bytes: usize,
 }
 
 pub struct SchedulerCore {
@@ -307,6 +326,8 @@ pub struct SchedulerCore {
     /// flag so a fault on one subnet escalates only that subnet (and a clean
     /// streak on one doesn't de-escalate another).
     escalation: std::collections::BTreeMap<SubnetId, SubnetEscalation>,
+    /// Per-subnet scheduled-Panetiere mode state (see `apply_sched_mode`).
+    sched_mode: std::collections::BTreeMap<SubnetId, SchedModeState>,
 
     services: HashMap<ServiceTag, Pubkey>,
     relay_xpubs: HashMap<Pubkey, ExchangePublicKeyWire>,
@@ -370,6 +391,7 @@ impl SchedulerCore {
             sidelined: HashSet::new(),
             integrity_offenders: HashMap::new(),
             escalation: std::collections::BTreeMap::new(),
+            sched_mode: std::collections::BTreeMap::new(),
             services: HashMap::new(),
             relay_xpubs: HashMap::new(),
             observers: std::collections::BTreeMap::new(),
@@ -603,6 +625,7 @@ impl SchedulerCore {
         // Drop escalation for subnets that no longer exist, so a reused id starts clean.
         let count = self.subnet_count;
         self.escalation.retain(|id, _| (*id as usize) < count);
+        self.sched_mode.retain(|id, _| (*id as usize) < count);
 
         let mut actions = Vec::new();
         let faulted = !self.sidelined.is_empty() || self.escalation.values().any(|e| e.general);
@@ -613,9 +636,14 @@ impl SchedulerCore {
             || (faulted && !self.registered.is_empty());
         if self.is_lead && enough_relays && self.services.len() >= self.params.min_services {
             // Per-subnet protocol, so a fault escalates only its own subnet.
-            let protos = self.subnet_protocols();
+            let mut protos = self.subnet_protocols();
+            self.apply_sched_mode(&mut protos);
+            let vector_bytes: Vec<usize> = (0..protos.len())
+                .map(|i| self.sched_mode.get(&(i as SubnetId)).map(|s| s.vector_bytes).unwrap_or(0))
+                .collect();
             let content = content_key(
                 &protos,
+                &vector_bytes,
                 self.params.pin,
                 &self.registered,
                 &self.services,
@@ -860,7 +888,21 @@ impl SchedulerCore {
                         return false;
                     }
                 }
-                // The scheduler only ever proposes Noop / Adcnet / Panetiere.
+                ProtocolConfig::ScheduledPanetiere(c) => {
+                    let n = s.relays.len() as u32;
+                    let threshold_ok = c.threshold >= n / 2 + 1 && c.threshold <= n.max(1);
+                    if c.client_set_max < MIN_CAPACITY
+                        || !threshold_ok
+                        || !self.exchange_keys_match(&c.relay_exchange_keys)
+                        || !self.aggregation_valid(&c.aggregation)
+                        || c.message_size == 0
+                        || c.message_size > u16::MAX as usize
+                        || c.vector_bytes == 0
+                    {
+                        return false;
+                    }
+                }
+                // The scheduler only ever proposes Noop / Adcnet / Panetiere / ScheduledPanetiere.
                 ProtocolConfig::ScheduledAdcnet(_) | ProtocolConfig::Nym(_) => return false,
             }
         }
@@ -908,6 +950,55 @@ impl SchedulerCore {
             .collect()
     }
 
+    /// Upgrades a `Panetiere` entry to `ScheduledPanetiere` on sustained traffic,
+    /// downgrades after `SCHED_DOWNGRADE_GRACE` low ticks. Any non-`Panetiere`
+    /// entry drops its state, so escalation always starts one-round.
+    fn apply_sched_mode(&mut self, protos: &mut [SchedulerProtocol]) {
+        let upgrade_bytes = 2 * self.params.message_size;
+        let downgrade_bytes = self.params.message_size / 2;
+        for (i, proto) in protos.iter_mut().enumerate() {
+            let id = i as SubnetId;
+            if *proto != SchedulerProtocol::Panetiere {
+                self.sched_mode.remove(&id);
+                continue;
+            }
+            let bytes = self
+                .observers
+                .get(&id)
+                .and_then(|o| o.decoded_bytes_recent(SCHED_WINDOW))
+                .unwrap_or(0);
+            let state = self.sched_mode.entry(id).or_default();
+            if !state.scheduled && bytes >= upgrade_bytes {
+                state.scheduled = true;
+                state.downgrade_streak = 0;
+            } else if state.scheduled && bytes <= downgrade_bytes {
+                state.downgrade_streak += 1;
+                if state.downgrade_streak >= SCHED_DOWNGRADE_GRACE {
+                    state.scheduled = false;
+                    state.downgrade_streak = 0;
+                }
+            } else {
+                state.downgrade_streak = 0;
+            }
+            if state.scheduled {
+                let min_vector = round_up_to(
+                    expected_active(self.capacity) as usize * self.params.message_size / 2,
+                    8192,
+                );
+                let desired = round_up_to(bytes.saturating_mul(3) / 2, 8192)
+                    .max(min_vector)
+                    .min(MAX_VECTOR_BYTES);
+                if state.vector_bytes == 0
+                    || desired.abs_diff(state.vector_bytes) as f64
+                        >= state.vector_bytes as f64 * SCHED_VECTOR_RESIZE_MARGIN
+                {
+                    state.vector_bytes = desired;
+                }
+                *proto = SchedulerProtocol::ScheduledPanetiere;
+            }
+        }
+    }
+
     fn build_body(&self, protos: &[SchedulerProtocol]) -> AnymoneRoundConfigurationBody {
         let mut relay_vec: Vec<Pubkey> = self.registered.iter().copied().collect();
         relay_vec.sort();
@@ -948,6 +1039,32 @@ impl SchedulerCore {
                         relay_exchange_keys: relay_xk.clone(),
                         aggregation: aggregation.clone(),
                     }),
+                    SchedulerProtocol::ScheduledPanetiere => {
+                        let vector_bytes = self
+                            .sched_mode
+                            .get(&(i as SubnetId))
+                            .map(|s| s.vector_bytes)
+                            .filter(|&v| v > 0)
+                            .unwrap_or_else(|| {
+                                round_up_to(
+                                    expected_active(self.capacity) as usize * self.params.message_size / 2,
+                                    8192,
+                                )
+                                .min(MAX_VECTOR_BYTES)
+                            });
+                        ProtocolConfig::ScheduledPanetiere(crate::config::ScheduledPanetiereConfig {
+                            round_duration_ms: dur_ms,
+                            message_size: self.params.message_size,
+                            vector_bytes,
+                            estimated_messages: self.capacity,
+                            client_set_min: 0,
+                            client_set_max: self.capacity,
+                            threshold: (n / 2 + 1).max(n.saturating_sub(2)),
+                            setup_seed: crate::keys::derive_seed(b"anymone/subnet-seed", &relay_vec),
+                            relay_exchange_keys: relay_xk.clone(),
+                            aggregation: aggregation.clone(),
+                        })
+                    }
                     // ADCNet for `Adcnet` (and the never-scheduled `Noop`).
                     _ => ProtocolConfig::Adcnet(AdcnetConfig {
                         round_duration_ms: dur_ms,
@@ -983,6 +1100,7 @@ impl SchedulerCore {
 /// appear in the config (they key-exchange directly with relays on the subnet).
 fn content_key(
     protos: &[SchedulerProtocol],
+    vector_bytes: &[usize],
     pin: Option<SchedulerProtocol>,
     relays: &HashSet<Pubkey>,
     services: &HashMap<ServiceTag, Pubkey>,
@@ -992,17 +1110,22 @@ fn content_key(
     let mut key = Vec::new();
     // Subnet count + each subnet's protocol, so one subnet escalating re-proposes.
     key.extend_from_slice(&(protos.len() as u32).to_le_bytes());
-    for p in protos {
+    for (i, p) in protos.iter().enumerate() {
         key.push(match p {
             SchedulerProtocol::Adcnet => 1,
             SchedulerProtocol::Panetiere => 2,
+            SchedulerProtocol::ScheduledPanetiere => 3,
         });
+        if *p == SchedulerProtocol::ScheduledPanetiere {
+            key.extend_from_slice(&(vector_bytes[i] as u32).to_le_bytes());
+        }
     }
     // Toggling the pin must re-propose even if it doesn't (yet) change `protos`.
     key.push(match pin {
         None => 0,
         Some(SchedulerProtocol::Adcnet) => 1,
         Some(SchedulerProtocol::Panetiere) => 2,
+        Some(SchedulerProtocol::ScheduledPanetiere) => 3,
     });
     key.extend_from_slice(&capacity.to_le_bytes());
     // Quantize so a change in the committee's cover target re-proposes a config.
@@ -1066,9 +1189,8 @@ fn proto_kind(p: &ProtocolConfig) -> Option<SchedulerProtocol> {
     match p {
         ProtocolConfig::Adcnet(_) => Some(SchedulerProtocol::Adcnet),
         ProtocolConfig::Panetiere(_) => Some(SchedulerProtocol::Panetiere),
-        ProtocolConfig::Noop(_) | ProtocolConfig::ScheduledAdcnet(_) | ProtocolConfig::Nym(_) => {
-            None
-        }
+        ProtocolConfig::ScheduledPanetiere(_) => Some(SchedulerProtocol::ScheduledPanetiere),
+        ProtocolConfig::Noop(_) | ProtocolConfig::ScheduledAdcnet(_) | ProtocolConfig::Nym(_) => None,
     }
 }
 
@@ -1116,6 +1238,15 @@ impl PublicObserver {
             PublicObserver::Panetiere(o) => o.share_frontier(),
         }
     }
+
+    /// Mean decoded bytes/round over `window` — the scheduled-mode upgrade
+    /// signal. `None` for ADCNet (not part of the Panetiere family).
+    fn decoded_bytes_recent(&self, window: u64) -> Option<usize> {
+        match self {
+            PublicObserver::Adcnet(_) => None,
+            PublicObserver::Panetiere(o) => Some(o.decoded_bytes_recent(window)),
+        }
+    }
 }
 
 fn build_observer(
@@ -1128,9 +1259,13 @@ fn build_observer(
         Some(SchedulerProtocol::Adcnet) => Some(PublicObserver::Adcnet(
             AdcnetObserverSession::new(roster, leader, fault_threshold),
         )),
-        Some(SchedulerProtocol::Panetiere) => Some(PublicObserver::Panetiere(
-            PanetiereObserverSession::new(roster, Some(leader), fault_threshold),
-        )),
+        Some(SchedulerProtocol::Panetiere) | Some(SchedulerProtocol::ScheduledPanetiere) => {
+            Some(PublicObserver::Panetiere(PanetiereObserverSession::new(
+                roster,
+                Some(leader),
+                fault_threshold,
+            )))
+        }
         _ => None,
     }
 }

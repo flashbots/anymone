@@ -131,17 +131,17 @@ fn run_aggregated(
         }
     }
 
-    // Aggregators emit mid-round, delivered to every relay before commit_round(0)
-    // — matching production's mid → commit → end cadence.
+    // Aggregators emit at checkpoint 1, delivered to every relay before
+    // checkpoint 2 — matching production's k=1 → k=2 → end cadence.
     let group_aggs: Vec<Vec<u8>> =
-        aggregators.iter_mut().flat_map(|a| a.mid_round(0, now)).collect();
+        aggregators.iter_mut().flat_map(|a| a.checkpoint(0, 1, now)).collect();
     for s in servers.iter_mut() {
         for m in &group_aggs {
             s.on_inbound(server_pks[0], m.clone());
         }
     }
-    let announce = servers[0].commit_round(0, now);
-    assert!(!announce.is_empty(), "leader announces the canonical set at commit");
+    let announce = servers[0].checkpoint(0, 2, now);
+    assert!(!announce.is_empty(), "leader announces the canonical set at checkpoint 2");
     for s in servers[1..].iter_mut() {
         for m in &announce {
             s.on_inbound(server_pks[0], m.clone());
@@ -191,7 +191,7 @@ fn aggregated_flow_survives_one_dead_replica_per_group() {
     assert_eq!(&got[..payload.len()], payload.as_slice());
 }
 
-/// A group's aggregate arriving after the leader's `commit_round` freeze must
+/// A group's aggregate arriving after the leader's checkpoint-2 freeze must
 /// not zero the round — the leader should decode the groups it did have, not
 /// stall forever waiting for a live union match against a growing set.
 #[test]
@@ -262,15 +262,15 @@ fn late_group_aggregate_does_not_zero_the_round() {
 
     // Both groups' aggregators produce their aggregate, but only group 0's
     // reaches the relays before the leader freezes.
-    let group0_agg = aggregators[0].mid_round(0, now);
-    let group1_agg = aggregators[1].mid_round(0, now);
+    let group0_agg = aggregators[0].checkpoint(0, 1, now);
+    let group1_agg = aggregators[1].checkpoint(0, 1, now);
     for s in servers.iter_mut() {
         for m in &group0_agg {
             s.on_inbound(server_pks[0], m.clone());
         }
     }
 
-    let announce = servers[0].commit_round(0, now);
+    let announce = servers[0].checkpoint(0, 2, now);
     assert!(!announce.is_empty(), "leader announces canonical = group 0's clients");
     for s in servers[1..].iter_mut() {
         for m in &announce {

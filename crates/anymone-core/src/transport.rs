@@ -88,6 +88,9 @@ pub trait Transport: Send + Sync + 'static {
 
     /// Adopt a roster-bound topic policy; default no-op for backends that don't enforce admission.
     fn set_topic_policy(&self, _policy: TopicPolicy) {}
+
+    /// Maintain connections to these peers; default no-op.
+    async fn ensure_peers(&self, _peers: Vec<Pubkey>) {}
 }
 
 /// In-memory broadcast network shared by multiple `Anymone` instances in a

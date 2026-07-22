@@ -86,6 +86,11 @@ pub enum ProtocolConfig {
     /// Trivial vector-append broadcast. No crypto. For bring-up and debugging.
     Noop(NoopConfig),
     Panetiere(PanetiereConfig),
+    /// Panetiere staggered flow: each round's ciphertext both reserves
+    /// message-vector slots for itself and carries the vector payloads for an
+    /// earlier round's reservations (fixed round gap, see
+    /// `panetiere_scheduled::RESERVATION_TO_MSG_GAP`).
+    ScheduledPanetiere(ScheduledPanetiereConfig),
     /// ADCNet 1-round flow: payload rides directly in the IBLT, no auction.
     Adcnet(AdcnetConfig),
     /// ADCNet 2-round flow: auction round allocates message-vector slots,
@@ -99,6 +104,7 @@ impl ProtocolConfig {
         match self {
             ProtocolConfig::Noop(c) => Duration::from_millis(c.round_duration_ms),
             ProtocolConfig::Panetiere(c) => Duration::from_millis(c.round_duration_ms),
+            ProtocolConfig::ScheduledPanetiere(c) => Duration::from_millis(c.round_duration_ms),
             ProtocolConfig::Adcnet(c) => Duration::from_millis(c.round_duration_ms),
             ProtocolConfig::ScheduledAdcnet(c) => Duration::from_millis(c.round_duration_ms),
             ProtocolConfig::Nym(c) => Duration::from_millis(c.round_duration_ms),
@@ -109,6 +115,7 @@ impl ProtocolConfig {
         match self {
             ProtocolConfig::Noop(c) => c.message_size,
             ProtocolConfig::Panetiere(c) => c.message_size,
+            ProtocolConfig::ScheduledPanetiere(c) => c.message_size,
             ProtocolConfig::Adcnet(c) => c.max_payload_bytes,
             ProtocolConfig::ScheduledAdcnet(c) => c.message_length,
             ProtocolConfig::Nym(c) => c.message_size,
@@ -119,6 +126,7 @@ impl ProtocolConfig {
         match self {
             ProtocolConfig::Noop(c) => c.client_set_min,
             ProtocolConfig::Panetiere(c) => c.client_set_min,
+            ProtocolConfig::ScheduledPanetiere(c) => c.client_set_min,
             ProtocolConfig::Adcnet(c) => c.client_set_min,
             ProtocolConfig::ScheduledAdcnet(c) => c.client_set_min,
             ProtocolConfig::Nym(c) => c.client_set_min,
@@ -129,6 +137,7 @@ impl ProtocolConfig {
         match self {
             ProtocolConfig::Noop(c) => c.client_set_max,
             ProtocolConfig::Panetiere(c) => c.client_set_max,
+            ProtocolConfig::ScheduledPanetiere(c) => c.client_set_max,
             ProtocolConfig::Adcnet(c) => c.client_set_max,
             ProtocolConfig::ScheduledAdcnet(c) => c.client_set_max,
             ProtocolConfig::Nym(c) => c.client_set_max,
@@ -138,6 +147,7 @@ impl ProtocolConfig {
     pub fn aggregation(&self) -> Option<&Aggregation> {
         match self {
             ProtocolConfig::Panetiere(c) => c.aggregation.as_ref(),
+            ProtocolConfig::ScheduledPanetiere(c) => c.aggregation.as_ref(),
             ProtocolConfig::Adcnet(c) => c.aggregation.as_ref(),
             _ => None,
         }
@@ -182,6 +192,30 @@ pub struct PanetiereConfig {
     pub relay_exchange_keys: Vec<(crate::identity::Pubkey, ExchangePublicKeyWire)>,
     /// Aggregation `None` = direct flow (every client posts its own ciphertext+commitment to
     /// ingress topic).
+    #[serde(default)]
+    pub aggregation: Option<Aggregation>,
+}
+
+/// Scheduled Panetiere subnet config. Each round's ciphertext carries a tiny
+/// MSE reserving `(rand, size)` slots in a `vector_bytes`-wide vector, plus
+/// that vector fulfilling an earlier round's reservations (fixed gap, see
+/// `panetiere_scheduled::RESERVATION_TO_MSG_GAP`).
+/// `setup_seed` plays the same deterministic-setup role as in `PanetiereConfig`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScheduledPanetiereConfig {
+    pub round_duration_ms: u64,
+    /// Largest single framed message; must fit in `u16` (reservation size).
+    pub message_size: usize,
+    /// Total width of the message-section vector carried each round.
+    pub vector_bytes: usize,
+    /// Expected reservations per round (ρ); sizes the reservation MSE.
+    pub estimated_messages: u32,
+    pub client_set_min: u32,
+    pub client_set_max: u32,
+    pub threshold: u32,
+    #[serde(with = "serde_bytes_array")]
+    pub setup_seed: [u8; 32],
+    pub relay_exchange_keys: Vec<(crate::identity::Pubkey, ExchangePublicKeyWire)>,
     #[serde(default)]
     pub aggregation: Option<Aggregation>,
 }

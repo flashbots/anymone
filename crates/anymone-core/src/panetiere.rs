@@ -112,7 +112,7 @@ pub(crate) fn max_wire_estimate(
 }
 
 /// `pk`'s position in the sorted relay list — the Panetiere `ServerId`.
-fn server_index(relays: &[Pubkey], pk: Pubkey) -> Option<u32> {
+pub(crate) fn server_index(relays: &[Pubkey], pk: Pubkey) -> Option<u32> {
     let mut sorted = relays.to_vec();
     sorted.sort();
     sorted.iter().position(|p| *p == pk).map(|i| i as u32)
@@ -120,13 +120,13 @@ fn server_index(relays: &[Pubkey], pk: Pubkey) -> Option<u32> {
 
 /// Deterministic `ClientId` from a pubkey's first 4 bytes; stable per node+pipe
 /// so the decoder merges a round's publics with its openings.
-fn client_id_from_pubkey(pk: Pubkey) -> ClientId {
+pub(crate) fn client_id_from_pubkey(pk: Pubkey) -> ClientId {
     ClientId(u32::from_be_bytes([pk.0[0], pk.0[1], pk.0[2], pk.0[3]]))
 }
 
 /// Panetiere `(ServerId, pke::PublicKey)` roster for sealing client openings —
 /// relays whose exchange key is missing or undecodable are skipped.
-fn seal_roster(cfg: &PanetiereConfig, subnet: &Subnet) -> Vec<(ServerId, pke::PublicKey)> {
+pub(crate) fn seal_roster(cfg: &PanetiereConfig, subnet: &Subnet) -> Vec<(ServerId, pke::PublicKey)> {
     crate::keys::roster_exchange_pubkeys(&subnet.relays, &cfg.relay_exchange_keys)
         .into_iter()
         .filter_map(|(i, xk)| {
@@ -305,7 +305,7 @@ pub(crate) async fn run_subnet(
                     .iter_mut()
                     .flat_map(|(key, s)| {
                         let key = *key;
-                        s.mid_round(round, Instant::now()).into_iter().map(move |out| (key, out))
+                        s.checkpoint(round, 1, Instant::now()).into_iter().map(move |out| (key, out))
                     })
                     .collect();
                 for (key, out) in outs {
@@ -321,7 +321,7 @@ pub(crate) async fn run_subnet(
                     .iter_mut()
                     .flat_map(|(key, s)| {
                         let key = *key;
-                        s.commit_round(round, Instant::now()).into_iter().map(move |out| (key, out))
+                        s.checkpoint(round, 2, Instant::now()).into_iter().map(move |out| (key, out))
                     })
                     .collect();
                 for (key, out) in outs {
@@ -433,7 +433,7 @@ pub(crate) async fn run_subnet(
 
 /// Tagged wire form for every Panetiere message published on a subnet topic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-enum PanetiereWire {
+pub(crate) enum PanetiereWire {
     ClientPublic {
         round: u64,
         client_id: u32,
@@ -485,11 +485,15 @@ enum PanetiereWire {
     /// Leader-announced canonical client set for `round` (public subnets). Relays
     /// share over exactly this set; one authoritative set per round.
     ClientSet { round: u64, clients: Vec<u32> },
+    /// Scheduled Panetiere only: `round`'s decoded reservation list
+    /// `(rand, size)`, leader-broadcast so clients derive `round+1`'s
+    /// message-vector allocation via `codec::beacon` + `codec::allocate`.
+    Reservations { round: u64, entries: Vec<(u16, u16)> },
 }
 
 /// Bytes a relay signs over its `ServerPublic` (and every consumer verifies
 /// against `roster[server_id]`).
-fn server_public_signing_bytes(
+pub(crate) fn server_public_signing_bytes(
     round: u64,
     server_id: u32,
     clients: &[u32],
@@ -552,6 +556,10 @@ pub(crate) fn describe(bytes: &[u8]) -> Option<String> {
             "Panetiere ClientSet round={round} clients={}",
             clients.len()
         )),
+        PanetiereWire::Reservations { round, entries } => Some(format!(
+            "Panetiere Reservations round={round} entries={}",
+            entries.len()
+        )),
     }
 }
 
@@ -593,14 +601,15 @@ fn server_public_consistent(agg_open: &[u8], agg_share: &[u8]) -> bool {
 
 /// The wire round embedded in a fault's evidence, when decodable as a
 /// `PanetiereWire` — distinct from the anymone tick that observed it.
-fn evidence_round(evidence: &[u8]) -> Option<Round> {
+pub(crate) fn evidence_round(evidence: &[u8]) -> Option<Round> {
     match bincode::deserialize::<PanetiereWire>(evidence).ok()? {
         PanetiereWire::ClientPublic { round, .. }
         | PanetiereWire::Opening { round, .. }
         | PanetiereWire::ServerPublic { round, .. }
         | PanetiereWire::Decoded { round, .. }
         | PanetiereWire::GroupAggregate { round, .. }
-        | PanetiereWire::ClientSet { round, .. } => Some(round),
+        | PanetiereWire::ClientSet { round, .. }
+        | PanetiereWire::Reservations { round, .. } => Some(round),
     }
 }
 
@@ -636,6 +645,9 @@ pub struct PanetiereObserverSession {
     max_round: Option<u64>,
     /// Canonical client set size per round — the per-round anonymity set.
     anon_set_by_round: std::collections::BTreeMap<u64, usize>,
+    /// Total decoded payload bytes per round — the scheduler's upgrade signal
+    /// for scheduled mode.
+    decoded_bytes_by_round: std::collections::BTreeMap<u64, usize>,
     /// Integrity culprits caught from inconsistent shares, deduped, emitted at `end_round`.
     integrity_pending: Vec<Fault>,
     integrity_seen: HashSet<(u64, u32)>,
@@ -651,6 +663,7 @@ impl PanetiereObserverSession {
             leader,
             max_round: None,
             anon_set_by_round: std::collections::BTreeMap::new(),
+            decoded_bytes_by_round: std::collections::BTreeMap::new(),
             integrity_pending: Vec::new(),
             integrity_seen: HashSet::new(),
         }
@@ -661,6 +674,14 @@ impl PanetiereObserverSession {
         while self.anon_set_by_round.len() > ANON_SET_HISTORY {
             let oldest = *self.anon_set_by_round.keys().next().unwrap();
             self.anon_set_by_round.remove(&oldest);
+        }
+    }
+
+    fn record_decoded_bytes(&mut self, round: u64, bytes: usize) {
+        self.decoded_bytes_by_round.insert(round, bytes);
+        while self.decoded_bytes_by_round.len() > ANON_SET_HISTORY {
+            let oldest = *self.decoded_bytes_by_round.keys().next().unwrap();
+            self.decoded_bytes_by_round.remove(&oldest);
         }
     }
 
@@ -699,6 +720,21 @@ impl PanetiereObserverSession {
     pub fn relays_shared_recent(&self, window: u64) -> Vec<usize> {
         self.tracker.relays_shared_recent(window)
     }
+
+    /// Mean decoded bytes/round over the last `window` rounds — the scheduler's
+    /// real-traffic signal for switching a subnet to scheduled mode. Anchored
+    /// on the share frontier, not the last `Decoded`, so a round without one
+    /// counts as zero and the mean decays instead of freezing when traffic stops.
+    pub fn decoded_bytes_recent(&self, window: u64) -> usize {
+        let decoded_last = self.decoded_bytes_by_round.keys().next_back().copied();
+        let frontier = match self.tracker.share_frontier().max(decoded_last) {
+            Some(r) => r,
+            None => return 0,
+        };
+        let cutoff = frontier.saturating_sub(window.saturating_sub(1));
+        let total: usize = self.decoded_bytes_by_round.range(cutoff..=frontier).map(|(_, &b)| b).sum();
+        total / (frontier - cutoff + 1).max(1) as usize
+    }
 }
 
 impl Session for PanetiereObserverSession {
@@ -714,7 +750,8 @@ impl Session for PanetiereObserverSession {
                 | PanetiereWire::ServerPublic { round, .. }
                 | PanetiereWire::Decoded { round, .. }
                 | PanetiereWire::GroupAggregate { round, .. }
-                | PanetiereWire::ClientSet { round, .. } => *round,
+                | PanetiereWire::ClientSet { round, .. }
+                | PanetiereWire::Reservations { round, .. } => *round,
             };
             self.max_round = Some(self.max_round.map_or(round, |m| m.max(round)));
             match &msg {
@@ -760,9 +797,18 @@ impl Session for PanetiereObserverSession {
                 PanetiereWire::ClientSet { round, clients } if self.leader == Some(from) => {
                     self.record_anon(*round, clients.len());
                 }
-                PanetiereWire::Decoded { round, .. }
+                PanetiereWire::Decoded { round, payloads }
                     if self.leader.map_or(true, |l| from == l) =>
                 {
+                    self.tracker.observe_output(*round);
+                    let bytes = payloads.iter().map(Vec::len).sum();
+                    self.record_decoded_bytes(*round, bytes);
+                }
+                // Scheduled-flow only: the leader emits this every decoded
+                // round (even when empty), so it's the output-liveness signal
+                // there — `Decoded` may legitimately be absent on payload-empty
+                // rounds.
+                PanetiereWire::Reservations { round, .. } if self.leader == Some(from) => {
                     self.tracker.observe_output(*round);
                 }
                 _ => {}
@@ -963,7 +1009,7 @@ pub struct PanetiereServerSession {
 /// Rounds kept after they go quiet. A bucket decodes at `end_round(r+1)`; one
 /// that never reaches `t` (a stalled round) is dropped this many rounds later so
 /// memory stays bounded.
-const PANETIERE_ROUND_RETENTION: Round = 4;
+pub(crate) const PANETIERE_ROUND_RETENTION: Round = 4;
 
 impl PanetiereServerSession {
     #[allow(clippy::too_many_arguments)]
@@ -994,8 +1040,8 @@ impl PanetiereServerSession {
     }
 
     /// Leader-only: announce the one canonical set per settled round, once.
-    /// Called from `end_round` (direct flow) or `commit_round` (aggregated).
-    fn announce_settled(&mut self, round: Round) -> Vec<Vec<u8>> {
+    /// Called from `end_round` (direct flow) or checkpoint 2 (aggregated).
+    pub(crate) fn announce_settled(&mut self, round: Round) -> Vec<Vec<u8>> {
         let aggregated = self.aggregation.is_some();
         let mut outbound = Vec::new();
         let mut announce: Vec<(Round, Vec<ClientId>)> = Vec::new();
@@ -1214,8 +1260,11 @@ impl Session for PanetiereServerSession {
         Vec::new()
     }
 
-    /// Freeze the canonical set for the aggregated flow, ahead of `end_round`.
-    fn commit_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
+    /// k=2: freeze the canonical set for the aggregated flow, ahead of `end_round`.
+    fn checkpoint(&mut self, round: Round, k: u8, _now: Instant) -> Vec<Vec<u8>> {
+        if k != 2 {
+            return Vec::new();
+        }
         let is_leader = self.mode == SetMode::Leader;
         let withholding = self.misbehavior == Some(Misbehavior::Withhold);
         if is_leader && !withholding && self.aggregation.is_some() {
@@ -1305,6 +1354,8 @@ impl Session for PanetiereServerSession {
             }
             // Servers decode themselves; `Decoded` is for watchers.
             PanetiereWire::Decoded { .. } => {}
+            // Scheduled-flow only; the one-round server has no use for it.
+            PanetiereWire::Reservations { .. } => {}
             PanetiereWire::ClientSet { round, clients } => {
                 if let SetMode::Follower { leader } = self.mode {
                     if from == leader {
@@ -1364,117 +1415,178 @@ impl Session for PanetiereServerSession {
     }
 
     fn end_round(&mut self, round: Round, _now: Instant) -> RoundOutcome {
-        let mut outbound: Vec<Vec<u8>> = Vec::new();
-        let mut decoded: Vec<Vec<u8>> = Vec::new();
+        let aggregated = self.aggregation.is_some();
+        let is_leader = self.mode == SetMode::Leader;
+        let withholding = self.misbehavior == Some(Misbehavior::Withhold);
 
-        // Phase 1: emit our ServerPublic for every settled round (`r <= round`)
-        // we've collected openings for and haven't emitted yet — not just the
-        // just-ended round. A relay whose round timer fires before that round's
-        // openings arrive (boundary skew) would otherwise strand them: Phase 1
-        // never revisits the bucket, so the round falls below `t` ServerPublics
-        // and never decodes — losing a client message that's sent only once.
-        // Withhold drops us from the threshold set entirely; the others still
-        // decode under t-of-n. CorruptShare instead emits a share that no longer
-        // matches its (valid) opening, so the decoding leader attributes it.
+        let mut outbound: Vec<Vec<u8>> = Vec::new();
+        // Aggregated flow announces at checkpoint 2 instead.
+        if is_leader && !withholding && !aggregated {
+            outbound.extend(self.announce_settled(round));
+        }
+        outbound.extend(self.emit_server_publics(round));
+
+        let mut decoded: Vec<Vec<u8>> = Vec::new();
+        for (r, plain) in self.decode_settled() {
+            // Peel every client's MSE element out of the summed plaintext —
+            // each is one message, so concurrent senders don't collide. A
+            // cover-only round peels to nothing; a peel stall yields nothing.
+            let n = MseEncoding::n_polys(&self.mse).min(plain.len());
+            let msgs: Vec<Vec<u8>> = MseEncoding::unpack(&self.mse, &plain[..n])
+                .decode()
+                .map(|elements| {
+                    elements
+                        .into_iter()
+                        .map(|symbols| symbols_to_bytes(&symbols))
+                        .filter(|b| b.iter().any(|x| *x != 0))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !msgs.is_empty() {
+                if is_leader {
+                    let wire = PanetiereWire::Decoded { round: r, payloads: msgs.clone() };
+                    outbound.push(bincode::serialize(&wire).expect("serialise decoded"));
+                }
+                decoded.extend(msgs);
+            }
+        }
+
+        self.gc(round);
+
+        RoundOutcome {
+            outbound,
+            decoded,
+            faults: Vec::new(),
+        }
+    }
+
+    fn set_misbehavior(&mut self, mode: Option<Misbehavior>) {
+        self.misbehavior = mode;
+    }
+}
+
+impl PanetiereServerSession {
+    /// Phase 1: emit our `ServerPublic` for every settled round (`r <= round`)
+    /// we've collected openings for and haven't emitted yet — not just the
+    /// just-ended round. A relay whose round timer fires before that round's
+    /// openings arrive (boundary skew) would otherwise strand them: this never
+    /// revisits the bucket, so the round falls below `t` ServerPublics and
+    /// never decodes — losing a client message that's sent only once.
+    /// Withhold drops us from the threshold set entirely; the others still
+    /// decode under t-of-n. CorruptShare instead emits a share that no longer
+    /// matches its (valid) opening, so the decoding leader attributes it.
+    pub(crate) fn emit_server_publics(&mut self, round: Round) -> Vec<Vec<u8>> {
         let withholding = self.misbehavior == Some(Misbehavior::Withhold);
         let corrupt_share = self.misbehavior == Some(Misbehavior::CorruptShare);
         let aggregated = self.aggregation.is_some();
-        let is_leader = self.mode == SetMode::Leader;
         let self_derived = self.mode == SetMode::SelfDerived;
 
-        // Aggregated flow announces at `commit_round` instead.
-        if is_leader && !withholding && !aggregated {
-            outbound.extend(self.announce_settled(round));
+        let mut outbound = Vec::new();
+        if withholding {
+            return outbound;
         }
 
         let cs = &self.pp.cs;
         let sid = self.server_id;
         let identity = self.identity.clone();
 
-        if !withholding {
-            for (&r, state) in self.rounds.iter_mut() {
-                if r > round || state.emitted_my_public || state.inbox_items.is_empty() {
-                    continue;
-                }
-                // Public subnets share over the leader's announced set; the
-                // leaderless committee derives its own (public + opening it holds,
-                // or openings alone in the aggregated flow).
-                let canonical: Vec<ClientId> = if self_derived {
-                    let mut c: Vec<ClientId> = if aggregated {
-                        state
-                            .group_aggregates
-                            .values()
-                            .flat_map(|g| g.clients.iter().copied())
-                            .collect()
-                    } else {
-                        state
-                            .inbox_items
-                            .iter()
-                            .filter_map(|(cid, _)| state.publics.get(cid).map(|_| *cid))
-                            .collect()
-                    };
-                    c.sort();
-                    c.dedup();
-                    c
+        for (&r, state) in self.rounds.iter_mut() {
+            if r > round || state.emitted_my_public || state.inbox_items.is_empty() {
+                continue;
+            }
+            // Public subnets share over the leader's announced set; the
+            // leaderless committee derives its own (public + opening it holds,
+            // or openings alone in the aggregated flow).
+            let canonical: Vec<ClientId> = if self_derived {
+                let mut c: Vec<ClientId> = if aggregated {
+                    state
+                        .group_aggregates
+                        .values()
+                        .flat_map(|g| g.clients.iter().copied())
+                        .collect()
                 } else {
-                    match self.client_set_by_round.get(&r) {
-                        Some(set) => set.clone(),
-                        None => continue,
-                    }
+                    state
+                        .inbox_items
+                        .iter()
+                        .filter_map(|(cid, _)| state.publics.get(cid).map(|_| *cid))
+                        .collect()
                 };
-                if canonical.is_empty() {
-                    continue;
-                }
-                // run_server_round is all-or-nothing: skip a round we can't fully
-                // cover rather than share over a different set than the leader's.
-                if !self_derived {
-                    let present: HashSet<ClientId> =
-                        state.inbox_items.iter().map(|(cid, _)| *cid).collect();
-                    if !canonical.iter().all(|c| present.contains(c)) {
+                c.sort();
+                c.dedup();
+                c
+            } else {
+                match self.client_set_by_round.get(&r) {
+                    Some(set) => set.clone(),
+                    None => {
+                        tracing::debug!(round = r, "panetiere server: no leader ClientSet yet; share deferred");
                         continue;
                     }
                 }
-                let inbox = ServerInbox {
-                    server_id: sid,
-                    items: std::mem::take(&mut state.inbox_items),
-                };
-                if let Ok(sp) = run_server_round(&inbox, &canonical) {
-                    let (r_b, s_b, t_b) =
-                        panetiere::cs::aggregated_opening_pack_bounds(cs, sp.clients.len() as u32);
-                    let packed = sp.agg_open.pack(r_b, s_b, t_b);
-                    let mut agg_share = panetiere::cs::pack_cs_shares(&sp.agg_share);
-                    if corrupt_share {
-                        if let Some(b) = agg_share.first_mut() {
-                            *b ^= 0x01;
-                        }
-                    }
-                    let clients: Vec<u32> = sp.clients.iter().map(|c| c.0).collect();
-                    let agg_open = packed.to_bytes();
-                    // Sign what we publish — a corrupted share stays attributable.
-                    let signature = identity.sign(&server_public_signing_bytes(
-                        r, sp.server_id.0, &clients, &agg_open, &agg_share,
-                    ));
-                    let wire = PanetiereWire::ServerPublic {
-                        round: r,
-                        server_id: sp.server_id.0,
-                        clients,
-                        agg_open,
-                        agg_share,
-                        signature,
-                    };
-                    // Cache our own honest public so try_decode sees it as a peer entry.
-                    state.peer_server_publics.insert(sp.server_id, sp);
-                    outbound.push(bincode::serialize(&wire).expect("serialise server public"));
-                    state.emitted_my_public = true;
+            };
+            if canonical.is_empty() {
+                continue;
+            }
+            // run_server_round is all-or-nothing: skip a round we can't fully
+            // cover rather than share over a different set than the leader's.
+            if !self_derived {
+                let present: HashSet<ClientId> =
+                    state.inbox_items.iter().map(|(cid, _)| *cid).collect();
+                let missing = canonical.iter().filter(|c| !present.contains(c)).count();
+                if missing > 0 {
+                    tracing::debug!(
+                        round = r,
+                        missing,
+                        canonical = canonical.len(),
+                        "panetiere server: openings incomplete for canonical set; share deferred"
+                    );
+                    continue;
                 }
             }
+            let inbox = ServerInbox {
+                server_id: sid,
+                items: std::mem::take(&mut state.inbox_items),
+            };
+            if let Ok(sp) = run_server_round(&inbox, &canonical) {
+                let (r_b, s_b, t_b) =
+                    panetiere::cs::aggregated_opening_pack_bounds(cs, sp.clients.len() as u32);
+                let packed = sp.agg_open.pack(r_b, s_b, t_b);
+                let mut agg_share = panetiere::cs::pack_cs_shares(&sp.agg_share);
+                if corrupt_share {
+                    if let Some(b) = agg_share.first_mut() {
+                        *b ^= 0x01;
+                    }
+                }
+                let clients: Vec<u32> = sp.clients.iter().map(|c| c.0).collect();
+                let agg_open = packed.to_bytes();
+                // Sign what we publish — a corrupted share stays attributable.
+                let signature = identity.sign(&server_public_signing_bytes(
+                    r, sp.server_id.0, &clients, &agg_open, &agg_share,
+                ));
+                let wire = PanetiereWire::ServerPublic {
+                    round: r,
+                    server_id: sp.server_id.0,
+                    clients,
+                    agg_open,
+                    agg_share,
+                    signature,
+                };
+                // Cache our own honest public so try_decode sees it as a peer entry.
+                state.peer_server_publics.insert(sp.server_id, sp);
+                outbound.push(bincode::serialize(&wire).expect("serialise server public"));
+                state.emitted_my_public = true;
+            }
         }
+        outbound
+    }
 
-        // Phase 2: decode every bucket that now has enough peer ServerPublics —
-        // earlier rounds first. A round's shares arrive during the next anymone
-        // round, so the round just ended usually isn't decodable yet; an earlier
-        // one is.
-        let faults: Vec<Fault> = Vec::new();
+    /// Phase 2: decode every bucket that now has enough peer `ServerPublic`s —
+    /// earlier rounds first. A round's shares arrive during the next anymone
+    /// round, so the round just ended usually isn't decodable yet; an earlier
+    /// one is. Returns raw plaintext (pre-MSE-peel) per decoded round; marks
+    /// buckets decoded and frees their crypto state.
+    pub(crate) fn decode_settled(&mut self) -> Vec<(Round, Vec<KahePoly>)> {
+        let self_derived = self.mode == SetMode::SelfDerived;
+        let mut out = Vec::new();
         for (r, state) in self.rounds.iter_mut() {
             if state.decoded {
                 continue;
@@ -1493,27 +1605,7 @@ impl Session for PanetiereServerSession {
                 None => try_decode_round(&self.pp, state, anchor.as_deref(), self.min_clients),
             };
             if let Some(plain) = decoded_round {
-                // Peel every client's MSE element out of the summed plaintext —
-                // each is one message, so concurrent senders don't collide. A
-                // cover-only round peels to nothing; a peel stall yields nothing.
-                let n = MseEncoding::n_polys(&self.mse).min(plain.len());
-                let msgs: Vec<Vec<u8>> = MseEncoding::unpack(&self.mse, &plain[..n])
-                    .decode()
-                    .map(|elements| {
-                        elements
-                            .into_iter()
-                            .map(|symbols| symbols_to_bytes(&symbols))
-                            .filter(|b| b.iter().any(|x| *x != 0))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if !msgs.is_empty() {
-                    if is_leader {
-                        let wire = PanetiereWire::Decoded { round: *r, payloads: msgs.clone() };
-                        outbound.push(bincode::serialize(&wire).expect("serialise decoded"));
-                    }
-                    decoded.extend(msgs);
-                }
+                out.push((*r, plain));
                 state.decoded = true;
                 // Free the heavy crypto state; keep the (now-empty) bucket
                 // marked `decoded` so a share that arrives a round late lands
@@ -1523,24 +1615,28 @@ impl Session for PanetiereServerSession {
                 state.peer_server_publics.clear();
             }
         }
+        out
+    }
 
-        // GC: age out buckets (decoded or stalled) past the retention window so
-        // memory stays bounded; the window keeps a round alive long enough for
-        // its shares (which arrive the next anymone round) to decode it.
+    /// Age out buckets (decoded or stalled) past the retention window so
+    /// memory stays bounded; the window keeps a round alive long enough for
+    /// its shares (which arrive the next anymone round) to decode it.
+    pub(crate) fn gc(&mut self, round: Round) {
         let cutoff = round.saturating_sub(PANETIERE_ROUND_RETENTION);
+        let t = self.pp.shamir.t;
+        for (r, state) in self.rounds.range(..cutoff) {
+            if !state.decoded && !state.peer_server_publics.is_empty() {
+                tracing::debug!(
+                    round = r,
+                    shares = state.peer_server_publics.len(),
+                    need = t,
+                    "panetiere server: round aged out undecoded"
+                );
+            }
+        }
         self.rounds.retain(|r, _| *r >= cutoff);
         self.client_set_by_round.retain(|r, _| *r >= cutoff);
         self.announced_rounds.retain(|r| *r >= cutoff);
-
-        RoundOutcome {
-            outbound,
-            decoded,
-            faults,
-        }
-    }
-
-    fn set_misbehavior(&mut self, mode: Option<Misbehavior>) {
-        self.misbehavior = mode;
     }
 }
 
@@ -1591,9 +1687,12 @@ impl Session for PanetiereAggregatorSession {
         Vec::new()
     }
 
-    /// Emit the group's batch mid-round, so the leader can announce the set and
-    /// decode within the round rather than a round late.
-    fn mid_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
+    /// k=1: emit the group's batch mid-round, so the leader can announce the
+    /// set and decode within the round rather than a round late.
+    fn checkpoint(&mut self, round: Round, k: u8, _now: Instant) -> Vec<Vec<u8>> {
+        if k != 1 {
+            return Vec::new();
+        }
         let mut outbound = Vec::new();
         if !self.emitted.contains(&round) {
             if let Some(entries) = self.rounds.get(&round).filter(|e| !e.is_empty()) {

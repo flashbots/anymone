@@ -92,9 +92,11 @@ pub struct PanetiereCommitteeConfig {
     pub min_capacity: u32,
     /// Cover rate (f32 bits) shared so a caller can retune it live.
     pub cover_rate: Arc<AtomicU32>,
-    /// Force every subnet onto one protocol ("adcnet" | "panetiere"), bypassing
-    /// the escalation ladder. `None` keeps the default ADCNet-unless-escalated
-    /// behavior.
+    /// Force every subnet onto one protocol ("adcnet" | "panetiere" |
+    /// "scheduled-panetiere"), bypassing the escalation ladder. "panetiere"
+    /// pins the family but leaves the traffic-driven scheduled-mode choice
+    /// live; "scheduled-panetiere" forces the scheduled mode outright. `None`
+    /// keeps the default ADCNet-unless-escalated behavior.
     pub protocol: Option<String>,
     /// Whether large Panetiere subnets may route through an aggregator layer.
     pub aggregation: bool,
@@ -141,8 +143,9 @@ pub struct CommitteeParams {
     pub sideline: bool,
     /// Hard floor / initial subnet capacity.
     pub min_capacity: u32,
-    /// Force every subnet onto one protocol ("adcnet" | "panetiere"); absent
-    /// or unrecognized keeps the default ADCNet-unless-escalated ladder.
+    /// Force every subnet onto one protocol ("adcnet" | "panetiere" |
+    /// "scheduled-panetiere"); absent or unrecognized keeps the default
+    /// ADCNet-unless-escalated ladder. See [`PanetiereCommitteeConfig::protocol`].
     pub protocol: Option<String>,
     /// Whether large Panetiere subnets may route through an aggregator layer.
     pub aggregation: bool,
@@ -260,6 +263,9 @@ pub async fn spawn_panetiere_committee_scheduler(
     let pin = match config.protocol.as_deref() {
         Some("adcnet") => Some(crate::scheduling::SchedulerProtocol::Adcnet),
         Some("panetiere") => Some(crate::scheduling::SchedulerProtocol::Panetiere),
+        Some("scheduled-panetiere") => {
+            Some(crate::scheduling::SchedulerProtocol::ScheduledPanetiere)
+        }
         Some(other) => {
             tracing::warn!(protocol = other, "unrecognized committee protocol pin, ignoring");
             None
