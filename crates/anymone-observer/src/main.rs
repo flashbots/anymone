@@ -149,6 +149,9 @@ const FAULT_THRESHOLD: u64 = 2;
 /// jitter without flagging a relay that's merely a round behind.
 const SHARE_LIVENESS_WINDOW: u64 = 3;
 
+/// Retry cadence for `spawn_config_loop`'s fetch_config fallback.
+const CONFIG_PULL_INTERVAL: Duration = Duration::from_secs(5);
+
 #[derive(Parser, Debug)]
 #[command(name = "anymone-observer", about = "Global network view for anymone.")]
 struct Cli {
@@ -385,14 +388,31 @@ fn spawn_config_loop(
         // session so the new roster (replacement relay) is tracked and the
         // dropped relay stops rendering "missing" forever.
         let mut watchers: HashMap<SubnetId, (String, tokio::task::JoinHandle<()>)> = HashMap::new();
-        while let Some(msg) = sub.recv().await {
-            let Ok(cfg) = bincode::deserialize::<AnymoneRoundConfiguration>(&msg.payload) else {
-                continue;
+        // TOPIC_CONFIG is a one-shot push per version; retry fetch_config (the
+        // relay/service bootstrap path) until gossip or a pull seeds us.
+        let mut seeded = false;
+        let mut pull_tick = tokio::time::interval(CONFIG_PULL_INTERVAL);
+        pull_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let cfg = tokio::select! {
+                biased;
+                Some(msg) = sub.recv() => {
+                    let Ok(cfg) = bincode::deserialize::<AnymoneRoundConfiguration>(&msg.payload) else {
+                        continue;
+                    };
+                    cfg
+                }
+                _ = pull_tick.tick(), if !seeded => {
+                    let Some(bytes) = transport.fetch_config().await else { continue; };
+                    let Ok(cfg) = bincode::deserialize::<AnymoneRoundConfiguration>(&bytes) else { continue; };
+                    cfg
+                }
             };
             if cfg.verify_multisig(&committee, threshold).is_err() {
                 continue;
             }
             let is_new = obs.lock().unwrap().on_config(cfg.clone());
+            seeded = true;
             if !is_new {
                 continue;
             }
