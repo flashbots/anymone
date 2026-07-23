@@ -20,8 +20,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use libp2p::futures::StreamExt;
 use libp2p::gossipsub::{
-    self, IdentTopic, MessageAcceptance, MessageAuthenticity, PeerScoreParams,
-    PeerScoreThresholds, TopicScoreParams,
+    self, IdentTopic, MessageAcceptance, MessageAuthenticity, PeerScoreParams, PeerScoreThresholds,
+    TopicScoreParams,
 };
 use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport};
@@ -159,7 +159,8 @@ impl Libp2pNetwork {
             Arc::new(Mutex::new(HashMap::new()));
         let peers: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
         let served_config: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
-        let policy: Arc<Mutex<crate::transport::TopicPolicy>> = Arc::new(Mutex::new(HashMap::new()));
+        let policy: Arc<Mutex<crate::transport::TopicPolicy>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         let task = tokio::spawn(swarm_loop(
             swarm,
@@ -245,7 +246,10 @@ impl Transport for Libp2pNetwork {
 
     async fn publish(&self, topic: &str, bytes: Vec<u8>) {
         crate::wire_debug::trace(topic, &self.local_pubkey, &bytes);
-        let _ = self.cmd_tx.send(Cmd::Publish(topic.to_string(), bytes)).await;
+        let _ = self
+            .cmd_tx
+            .send(Cmd::Publish(topic.to_string(), bytes))
+            .await;
     }
 
     fn serve_config(&self, bytes: Vec<u8>) {
@@ -255,7 +259,10 @@ impl Transport for Libp2pNetwork {
     async fn fetch_config(&self) -> Option<Vec<u8>> {
         let peer = self.peers.lock().unwrap().iter().next().copied()?;
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx.send(Cmd::FetchConfig { peer, reply: tx }).await.ok()?;
+        self.cmd_tx
+            .send(Cmd::FetchConfig { peer, reply: tx })
+            .await
+            .ok()?;
         match tokio::time::timeout(Duration::from_secs(3), rx).await {
             Ok(Ok(resp)) => resp,
             _ => None,
@@ -297,6 +304,21 @@ fn gossip_topic_score_params() -> TopicScoreParams {
     }
 }
 
+/// The default IP-colocation penalty (>10 peers sharing an address, an
+/// anti-sybil heuristic) treats every node in a single-host deployment as
+/// suspicious, since they all share one IP. `ANYMONE_IP_COLOCATION_THRESHOLD`
+/// raises the cliff for such deployments; production leaves it unset.
+fn peer_score_params() -> PeerScoreParams {
+    let mut params = PeerScoreParams::default();
+    if let Ok(v) = std::env::var("ANYMONE_IP_COLOCATION_THRESHOLD") {
+        match v.parse::<f64>() {
+            Ok(threshold) => params.ip_colocation_factor_threshold = threshold,
+            Err(e) => tracing::warn!(value = %v, error = %e, "invalid ANYMONE_IP_COLOCATION_THRESHOLD"),
+        }
+    }
+    params
+}
+
 fn build_behaviour(
     kp: &libp2p_id::Keypair,
 ) -> Result<Behaviour, Box<dyn std::error::Error + Send + Sync>> {
@@ -308,7 +330,7 @@ fn build_behaviour(
         .build()?;
     let mut gossipsub = gossipsub::Behaviour::new(MessageAuthenticity::Signed(kp.clone()), cfg)?;
     gossipsub
-        .with_peer_score(PeerScoreParams::default(), PeerScoreThresholds::default())
+        .with_peer_score(peer_score_params(), PeerScoreThresholds::default())
         .map_err(|e| format!("peer score params: {e}"))?;
 
     let peer_id = PeerId::from(kp.public());
@@ -327,7 +349,10 @@ fn build_behaviour(
     ));
 
     let config_rr = request_response::cbor::Behaviour::new(
-        [(StreamProtocol::new("/anymone/config/1"), ProtocolSupport::Full)],
+        [(
+            StreamProtocol::new("/anymone/config/1"),
+            ProtocolSupport::Full,
+        )],
         request_response::Config::default(),
     );
 
@@ -372,6 +397,9 @@ async fn swarm_loop(
             _ = redial.tick() => {
                 let connected = peers.lock().unwrap().clone();
                 for pid in wanted.difference(&connected) {
+                    // dial() only uses addresses kademlia already has cached;
+                    // query for the peer so a later redial has something to dial.
+                    swarm.behaviour_mut().kademlia.get_closest_peers(*pid);
                     let _ = swarm.dial(*pid);
                 }
             }
@@ -383,6 +411,7 @@ async fn swarm_loop(
                             swarm.behaviour_mut().gossipsub.add_explicit_peer(&pid);
                         }
                         if !connected.contains(&pid) {
+                            swarm.behaviour_mut().kademlia.get_closest_peers(pid);
                             let _ = swarm.dial(pid);
                         }
                     }
@@ -514,6 +543,23 @@ async fn swarm_loop(
                         swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
                     }
                 }
+                // GetClosestPeers results carry real addresses but aren't cached
+                // into the routing table automatically — without this, dialing a
+                // peer discovered only through this query still has nothing to dial.
+                SwarmEvent::Behaviour(BehaviourEvent::Kademlia(
+                    kad::Event::OutboundQueryProgressed {
+                        result: kad::QueryResult::GetClosestPeers(Ok(ok)), ..
+                    }
+                )) => {
+                    for peer in ok.peers {
+                        for addr in peer.addrs {
+                            swarm.behaviour_mut().kademlia.add_address(&peer.peer_id, addr);
+                        }
+                    }
+                }
+                SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), error, .. } => {
+                    tracing::debug!(peer = %peer_id, %error, "dial failed");
+                }
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                     peers.lock().unwrap().insert(peer_id);
                 }
@@ -572,4 +618,25 @@ fn peer_id_to_pubkey(peer_id: &PeerId) -> Option<Pubkey> {
     let pubkey = libp2p_id::PublicKey::try_decode_protobuf(mh.digest()).ok()?;
     let ed = pubkey.try_into_ed25519().ok()?;
     Some(Pubkey(ed.to_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pubkey_to_peer_id_matches_known_deployment_value() {
+        let mut bytes = [0u8; 32];
+        hex::decode_to_slice(
+            "327070c91dc166160fd2315631c6058fcae0febc25db4a6b3f734e2feda049f3",
+            &mut bytes,
+        )
+        .unwrap();
+        let pid = pubkey_to_peer_id(&Pubkey(bytes)).unwrap();
+        assert_eq!(
+            pid.to_string(),
+            "12D3KooWDDFzmBEys1wktvB5pumHWenBi3kx9dFKdoMqjjvuhLhQ"
+        );
+        assert_eq!(peer_id_to_pubkey(&pid).unwrap(), Pubkey(bytes));
+    }
 }

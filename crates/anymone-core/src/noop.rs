@@ -35,7 +35,7 @@ impl NoopClientSession {
     }
 
     /// Stage a payload to send out on the next `begin_round`. The Pipe layer
-    /// (M2) calls this; tests can call it directly.
+    /// calls this; tests can call it directly.
     pub fn stage(&mut self, payload: Vec<u8>) {
         self.pending = Some(payload);
     }

@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "adcnet"
 version = "0.1.0"
-source = "git+ssh://git@github.com/flashbots/adcnet-rs?branch=main#08988b193a4fa78d08f7ffed221ce28c7a1aeb6e"
+source = "git+ssh://git@github.com/flashbots/adcnet-rs?rev=08988b193a4fa78d08f7ffed221ce28c7a1aeb6e#08988b193a4fa78d08f7ffed221ce28c7a1aeb6e"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2556,7 +2556,7 @@ dependencies = [
 [[package]]
 name = "panetiere"
 version = "0.1.0"
-source = "git+ssh://git@github.com/flashbots/panetiere?branch=main#e55056428ae9f28234d86cc3096407c03fb25adb"
+source = "git+ssh://git@github.com/flashbots/panetiere?rev=e55056428ae9f28234d86cc3096407c03fb25adb#e55056428ae9f28234d86cc3096407c03fb25adb"
 dependencies = [
  "aes-gcm",
  "chipmunk_code",

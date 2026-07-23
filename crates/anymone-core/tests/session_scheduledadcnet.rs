@@ -14,9 +14,7 @@ use anymone_core::Identity;
 
 use adcnet::auction::iblt::IbltVector;
 use adcnet::crypto::{generate_keypair, ExchangePrivateKey, ExchangePublicKey, ServerId};
-use adcnet::protocol::{
-    AdcNetConfig, AggregationMode, RoundBroadcast,
-};
+use adcnet::protocol::{AdcNetConfig, AggregationMode, RoundBroadcast};
 
 #[test]
 fn scheduled_adcnet_session_happy_path() {
@@ -35,7 +33,9 @@ fn scheduled_adcnet_session_happy_path() {
 
     // Server identities.
     let server_signing: Vec<_> = (0..n_servers).map(|_| generate_keypair().1).collect();
-    let server_xks: Vec<_> = (0..n_servers).map(|_| ExchangePrivateKey::generate()).collect();
+    let server_xks: Vec<_> = (0..n_servers)
+        .map(|_| ExchangePrivateKey::generate())
+        .collect();
     let server_xpubs: Vec<ExchangePublicKey> = server_xks.iter().map(|k| k.public()).collect();
     let server_ids: Vec<ServerId> = (1..=n_servers as u32).map(ServerId).collect();
 
@@ -56,7 +56,13 @@ fn scheduled_adcnet_session_happy_path() {
     let peer_servers: Vec<_> = server_ids
         .iter()
         .zip(server_signing.iter())
-        .map(|(sid, sk)| (*sid, sk.public_key().expect("server signing key must yield a public key")))
+        .map(|(sid, sk)| {
+            (
+                *sid,
+                sk.public_key()
+                    .expect("server signing key must yield a public key"),
+            )
+        })
         .collect();
 
     // Empty initial broadcast for round 0 — clients/servers anchor on this.
@@ -161,7 +167,8 @@ fn scheduled_adcnet_session_happy_path() {
     // the vector is zero-padded).
     let vec = &any.decoded[0];
     let found = (0..vec.len()).any(|start| {
-        start + payload.len() <= vec.len() && &vec[start..start + payload.len()] == payload.as_slice()
+        start + payload.len() <= vec.len()
+            && &vec[start..start + payload.len()] == payload.as_slice()
     });
     assert!(
         found,

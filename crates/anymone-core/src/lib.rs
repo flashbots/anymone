@@ -30,6 +30,7 @@ pub mod wire_debug;
 pub mod test_util;
 
 pub use adcnet::AdcnetObserverSession;
+pub use bootstrap::{BootstrapConfig, NetworkConfig};
 pub use committee::{
     committee_roster, spawn_panetiere_committee_scheduler, CommitteeParams,
     PanetiereCommitteeConfig,
@@ -39,7 +40,7 @@ pub use config::{
     NoopConfig, NymConfig, PanetiereConfig, ProtocolConfig, Round, ScheduledAdcnetConfig,
     ServiceEntry, Signature, Subnet, SubnetId,
 };
-pub use bootstrap::{BootstrapConfig, NetworkConfig};
+pub use faults::{Attribution, Fault, FaultKind, OutputFaultTracker};
 pub use governance::{
     CommitteeMember, FaultReport, GovernanceBootstrap, GovernanceConfig, GovernanceError,
     TOPIC_CONFIG, TOPIC_FAULTS, TOPIC_REGISTRATION,
@@ -54,7 +55,6 @@ pub use scheduler_core::{SchedulerAction, SchedulerCore, SchedulerParams, Signed
 pub use scheduling::{
     announce_relay_registration, announce_service_registration, Registration, SchedulerProtocol,
 };
-pub use faults::{Attribution, Fault, FaultKind, OutputFaultTracker};
 pub use session::{LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
 pub use tee::{NoopProver, TeeProver, TeeVerifier};
 pub use transport::{InMemoryHandle, InMemoryNetwork, Inbound, Subscription, Transport};

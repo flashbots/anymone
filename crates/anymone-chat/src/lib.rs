@@ -9,15 +9,15 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anymone_core::{Anymone, ServiceTag};
 use anyhow::{Context, Result};
-use tokio::sync::mpsc;
+use anymone_core::{Anymone, ServiceTag};
 use axum::extract::State;
 use axum::http::header;
 use axum::response::Html;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 /// Label of the chat room's service tag.
 pub const CHAT_TAG_LABEL: &str = "anymone.chat";
@@ -48,13 +48,15 @@ struct ChatEntry {
 struct AppState {
     transcript: Arc<Mutex<VecDeque<ChatEntry>>>,
     outgoing: mpsc::UnboundedSender<Vec<u8>>,
+    /// `Access-Control-Allow-Origin` for `/chat/feed`; `*` if unset.
+    dashboard_origin: String,
 }
 
 pub(crate) const CHAT_HTML: &str = include_str!("../static/chat.html");
 
 /// Join the chat room as a participant and serve the chat app on `port`.
 /// Blocks forever; holds `anymone` alive.
-pub async fn serve(anymone: Anymone, port: u16) -> Result<()> {
+pub async fn serve(anymone: Anymone, port: u16, dashboard_origin: Option<String>) -> Result<()> {
     let transcript: Arc<Mutex<VecDeque<ChatEntry>>> = Arc::new(Mutex::new(VecDeque::new()));
     let (outgoing, mut outgoing_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
@@ -92,7 +94,11 @@ pub async fn serve(anymone: Anymone, port: u16) -> Result<()> {
         });
     }
 
-    let state = AppState { transcript, outgoing };
+    let state = AppState {
+        transcript,
+        outgoing,
+        dashboard_origin: dashboard_origin.unwrap_or_else(|| "*".to_string()),
+    };
     let app = Router::new()
         .route("/", get(|| async { Html(CHAT_HTML) }))
         .route("/chat/feed", get(feed))
@@ -105,7 +111,9 @@ pub async fn serve(anymone: Anymone, port: u16) -> Result<()> {
         .with_context(|| format!("bind chat app on {addr}"))?;
     tracing::info!(%addr, "chat app live");
 
-    axum::serve(listener, app).await.context("chat app server")?;
+    axum::serve(listener, app)
+        .await
+        .context("chat app server")?;
     Ok(())
 }
 
@@ -144,7 +152,9 @@ pub async fn run_bot(anymone: Anymone, handle: String, send_rate: f64) -> Result
         // tracks reconfig); one real-message decision per round.
         tokio::time::sleep(anymone.round_duration()).await;
         if rand::random::<f64>() < send_p {
-            let _ = pipe.send(bot_payload(&handle, rand::random::<usize>())).await;
+            let _ = pipe
+                .send(bot_payload(&handle, rand::random::<usize>()))
+                .await;
         }
     }
 }
@@ -152,17 +162,29 @@ pub async fn run_bot(anymone: Anymone, handle: String, send_rate: f64) -> Result
 async fn feed(State(state): State<AppState>) -> impl axum::response::IntoResponse {
     let entries: Vec<ChatEntry> = state.transcript.lock().unwrap().iter().cloned().collect();
     // CORS: the dashboard reads this from another port.
-    ([(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")], Json(entries))
+    (
+        [(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            state.dashboard_origin.clone(),
+        )],
+        Json(entries),
+    )
 }
 
-async fn send(State(state): State<AppState>, Json(msg): Json<ChatMessage>) -> Json<serde_json::Value> {
+async fn send(
+    State(state): State<AppState>,
+    Json(msg): Json<ChatMessage>,
+) -> Json<serde_json::Value> {
     let from = msg.from.trim();
     let text = msg.text.trim();
     if from.is_empty() || text.is_empty() {
         return Json(serde_json::json!({ "ok": false, "error": "empty from/text" }));
     }
-    let payload = serde_json::to_vec(&ChatMessage { from: from.to_string(), text: text.to_string() })
-        .expect("ChatMessage serializes");
+    let payload = serde_json::to_vec(&ChatMessage {
+        from: from.to_string(),
+        text: text.to_string(),
+    })
+    .expect("ChatMessage serializes");
     match state.outgoing.send(payload) {
         Ok(()) => Json(serde_json::json!({ "ok": true })),
         Err(_) => Json(serde_json::json!({ "ok": false, "error": "chat backend closed" })),

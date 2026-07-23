@@ -61,7 +61,14 @@ impl Pipe {
         inbound: mpsc::UnboundedReceiver<PipeIncoming>,
         self_tx: mpsc::UnboundedSender<PipeIncoming>,
     ) -> Self {
-        Pipe { anymone, peer_tag, return_tag, last_subnet: Mutex::new(initial_subnet), inbound, self_tx }
+        Pipe {
+            anymone,
+            peer_tag,
+            return_tag,
+            last_subnet: Mutex::new(initial_subnet),
+            inbound,
+            self_tx,
+        }
     }
 
     /// Our own delivery address.
@@ -77,14 +84,21 @@ impl Pipe {
 
     /// Send `payload` addressed to `dst` (a service tag, or a peer's return
     /// path). Service-side replies pass the request's `return_tag`.
-    pub async fn send_to(&self, dst: impl Into<RouteTag>, payload: Vec<u8>) -> Result<(), SendError> {
+    pub async fn send_to(
+        &self,
+        dst: impl Into<RouteTag>,
+        payload: Vec<u8>,
+    ) -> Result<(), SendError> {
         let dst = dst.into();
         // Resolve the subnet from the current config every send, so the pipe
         // re-homes as the committee adds/removes subnets.
         let anymone = self.anymone.upgrade().ok_or(SendError::Closed)?;
         let subnet = resolve_send_subnet(&anymone, self.peer_tag, self.return_tag, dst)
             .ok_or(SendError::SubnetGone)?;
-        let msg = PipeMessage { return_tag: self.return_tag, payload };
+        let msg = PipeMessage {
+            return_tag: self.return_tag,
+            payload,
+        };
         let data = bincode::serialize(&msg).map_err(|e| SendError::Encode(e.to_string()))?;
         // Reject payloads too big for one message rather than truncating/dropping them
         // downstream; fragmentation across rounds is a later batch.
@@ -131,9 +145,13 @@ impl Pipe {
 
 impl Drop for Pipe {
     fn drop(&mut self) {
-        let Some(inner) = self.anymone.upgrade() else { return };
+        let Some(inner) = self.anymone.upgrade() else {
+            return;
+        };
         let mut pipes = inner.pipes.lock().unwrap();
-        let still_owner = pipes.get(&self.return_tag).map_or(false, |tx| tx.same_channel(&self.self_tx));
+        let still_owner = pipes
+            .get(&self.return_tag)
+            .map_or(false, |tx| tx.same_channel(&self.self_tx));
         if still_owner {
             pipes.remove(&self.return_tag);
         }

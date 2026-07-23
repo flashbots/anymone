@@ -114,7 +114,10 @@ pub async fn announce_relay_registration(
     identity: &Identity,
     exchange_pubkey: ExchangePublicKeyWire,
 ) -> JoinHandle<()> {
-    spawn_reannounce(transport, Registration::relay(identity, exchange_pubkey).encode())
+    spawn_reannounce(
+        transport,
+        Registration::relay(identity, exchange_pubkey).encode(),
+    )
 }
 
 /// Re-broadcast a service registration for the node's lifetime (see
@@ -125,7 +128,10 @@ pub async fn announce_service_registration(
     tag: ServiceTag,
     exchange_pubkey: ExchangePublicKeyWire,
 ) -> JoinHandle<()> {
-    spawn_reannounce(transport, Registration::service(identity, tag, exchange_pubkey).encode())
+    spawn_reannounce(
+        transport,
+        Registration::service(identity, tag, exchange_pubkey).encode(),
+    )
 }
 
 fn spawn_reannounce(transport: Arc<dyn Transport>, reg: Vec<u8>) -> JoinHandle<()> {
@@ -156,4 +162,3 @@ pub enum SchedulerProtocol {
     /// ladder itself.
     ScheduledPanetiere,
 }
-

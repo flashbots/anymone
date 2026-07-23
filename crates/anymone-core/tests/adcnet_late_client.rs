@@ -15,8 +15,8 @@ use anymone_core::session::Session;
 use anymone_core::transport::Transport;
 use anymone_core::{
     committee_roster, spawn_panetiere_committee_scheduler, AdcnetObserverSession, Anymone,
-    AnymoneRoundConfiguration, PanetiereCommitteeConfig, GovernanceBootstrap, Identity,
-    InMemoryNetwork, Pubkey, ServiceTag, TOPIC_CONFIG,
+    AnymoneRoundConfiguration, GovernanceBootstrap, Identity, InMemoryNetwork,
+    PanetiereCommitteeConfig, Pubkey, ServiceTag, TOPIC_CONFIG,
 };
 
 fn xk(id: &Identity) -> ExchangePublicKeyWire {
@@ -38,7 +38,10 @@ async fn late_clients_join_and_grow_anon_set() {
     let committee: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
     let committee_pks: Vec<Pubkey> = committee.iter().map(|i| i.pubkey()).collect();
     let threshold = 2u32;
-    let gov = GovernanceBootstrap { committee: committee_pks.clone(), threshold };
+    let gov = GovernanceBootstrap {
+        committee: committee_pks.clone(),
+        threshold,
+    };
     let chat = ServiceTag::from_label("anymone.chat");
 
     let ccfg = PanetiereCommitteeConfig {
@@ -139,8 +142,12 @@ async fn late_clients_join_and_grow_anon_set() {
         let transport = h(cid.pubkey());
         let gov = gov.clone();
         tokio::spawn(async move {
-            let Ok(client) = Anymone::start(cid, transport, gov).await else { return };
-            let Ok(mut pipe) = client.open(chat).await else { return };
+            let Ok(client) = Anymone::start(cid, transport, gov).await else {
+                return;
+            };
+            let Ok(mut pipe) = client.open(chat).await else {
+                return;
+            };
             let _keep = client;
             // Send every round so a client session is built and contributes —
             // an idle pipe never spins one up (it only watches).

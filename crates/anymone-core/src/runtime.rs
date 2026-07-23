@@ -13,15 +13,13 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::adcnet::AdcnetWatchSession;
-use crate::config::{
-    AnymoneRoundConfiguration, ProtocolConfig, Round, Subnet, SubnetId,
-};
+use crate::config::{AnymoneRoundConfiguration, ProtocolConfig, Round, Subnet, SubnetId};
+use crate::faults::Fault;
 use crate::governance::{FaultReport, GovernanceBootstrap, GovernanceError, TOPIC_FAULTS};
 use crate::identity::{Identity, Pubkey};
 use crate::noop;
 use crate::panetiere::PanetiereWatchSession;
 use crate::pipe::{Pipe, PipeIncoming, PipeMessage};
-use crate::faults::Fault;
 use crate::session::{Misbehavior, Session};
 use crate::transport::{Inbound, Subscription, Transport};
 use crate::wire::{Frame, RouteTag, ServiceTag, SERVICE_TAG_LEN};
@@ -254,7 +252,11 @@ impl Anymone {
         let return_tag = RouteTag(return_bytes);
 
         let (in_tx, in_rx) = mpsc::unbounded_channel();
-        self.inner.pipes.lock().unwrap().insert(return_tag, in_tx.clone());
+        self.inner
+            .pipes
+            .lock()
+            .unwrap()
+            .insert(return_tag, in_tx.clone());
         self.inner.joined.lock().unwrap().insert(return_tag, tag);
 
         // Join the home subnet so the pipe contributes cover before any send.
@@ -298,9 +300,20 @@ impl Anymone {
         }
 
         let (in_tx, in_rx) = mpsc::unbounded_channel();
-        self.inner.pipes.lock().unwrap().insert(tag.into(), in_tx.clone());
+        self.inner
+            .pipes
+            .lock()
+            .unwrap()
+            .insert(tag.into(), in_tx.clone());
 
-        Ok(Pipe::new(Arc::downgrade(&self.inner), None, tag.into(), None, in_rx, in_tx))
+        Ok(Pipe::new(
+            Arc::downgrade(&self.inner),
+            None,
+            tag.into(),
+            None,
+            in_rx,
+            in_tx,
+        ))
     }
 
     /// Join a broadcast room on `tag`: receive every message addressed to `tag`
@@ -322,7 +335,11 @@ impl Anymone {
         }
 
         let (in_tx, in_rx) = mpsc::unbounded_channel();
-        self.inner.pipes.lock().unwrap().insert(tag.into(), in_tx.clone());
+        self.inner
+            .pipes
+            .lock()
+            .unwrap()
+            .insert(tag.into(), in_tx.clone());
         self.inner.joined.lock().unwrap().insert(tag.into(), tag);
 
         // Join one carrier for cover; receiving is route-by-tag on every subnet.
@@ -330,7 +347,9 @@ impl Anymone {
         if let Some(subnet) = subnet {
             let tx = self.inner.subnets.lock().unwrap().get(&subnet).cloned();
             if let Some(tx) = tx {
-                let _ = tx.send(StageMsg::Join { client_tag: tag.into() });
+                let _ = tx.send(StageMsg::Join {
+                    client_tag: tag.into(),
+                });
             }
         }
 
@@ -410,8 +429,12 @@ impl AnymonePrep {
                 match self.transport.fetch_config().await {
                     Some(b) => match bincode::deserialize::<AnymoneRoundConfiguration>(&b) {
                         Ok(c) if verify(&c) => break Ok(c),
-                        Ok(_) => tracing::debug!("anymone: fetched config failed multisig verification"),
-                        Err(e) => tracing::debug!(error = %e, "anymone: fetched config failed to deserialize"),
+                        Ok(_) => {
+                            tracing::debug!("anymone: fetched config failed multisig verification")
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, "anymone: fetched config failed to deserialize")
+                        }
                     },
                     None => {}
                 }
@@ -441,7 +464,6 @@ impl AnymonePrep {
         )
         .await)
     }
-
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -472,7 +494,7 @@ async fn apply_config(
     // Global round clock (genesis epoch), so every node agrees regardless of which
     // config version it holds. `config.body.round` is the version, not the clock.
     let base_round = 0;
-    let epoch_unix_ms = 0;
+    let epoch_unix_ms = config.body.epoch_unix_ms;
 
     // gossipsub meshes form only over existing connections, so dial the full
     // roster rather than relying on kademlia adjacency.
@@ -529,16 +551,38 @@ async fn apply_config(
         // subnet driver. Unsupported protocols were filtered by subnet_runnable above.
         let handle = match &subnet.protocol {
             ProtocolConfig::Adcnet(_) => tokio::spawn(crate::adcnet::run_subnet(
-                subnet, inner_for_task, stage_rx, subscriptions, base_round, epoch_unix_ms,
+                subnet,
+                inner_for_task,
+                stage_rx,
+                subscriptions,
+                base_round,
+                epoch_unix_ms,
             )),
             ProtocolConfig::Panetiere(_) => tokio::spawn(crate::panetiere::run_subnet(
-                subnet, inner_for_task, stage_rx, subscriptions, base_round, epoch_unix_ms,
+                subnet,
+                inner_for_task,
+                stage_rx,
+                subscriptions,
+                base_round,
+                epoch_unix_ms,
             )),
-            ProtocolConfig::ScheduledPanetiere(_) => tokio::spawn(crate::panetiere_scheduled::run_subnet(
-                subnet, inner_for_task, stage_rx, subscriptions, base_round, epoch_unix_ms,
-            )),
+            ProtocolConfig::ScheduledPanetiere(_) => {
+                tokio::spawn(crate::panetiere_scheduled::run_subnet(
+                    subnet,
+                    inner_for_task,
+                    stage_rx,
+                    subscriptions,
+                    base_round,
+                    epoch_unix_ms,
+                ))
+            }
             ProtocolConfig::Noop(_) => tokio::spawn(crate::noop::run_subnet(
-                subnet, inner_for_task, stage_rx, subscriptions, base_round, epoch_unix_ms,
+                subnet,
+                inner_for_task,
+                stage_rx,
+                subscriptions,
+                base_round,
+                epoch_unix_ms,
             )),
             ProtocolConfig::ScheduledAdcnet(_) | ProtocolConfig::Nym(_) => {
                 unreachable!("filtered by subnet_runnable")
@@ -552,8 +596,11 @@ async fn apply_config(
     {
         let mut workers = tasks.workers.lock().unwrap();
         let mut stage_map = inner.subnets.lock().unwrap();
-        let removed: Vec<SubnetId> =
-            workers.keys().copied().filter(|id| !present.contains(id)).collect();
+        let removed: Vec<SubnetId> = workers
+            .keys()
+            .copied()
+            .filter(|id| !present.contains(id))
+            .collect();
         for id in removed {
             if let Some(w) = workers.remove(&id) {
                 w.handle.abort();
@@ -562,13 +609,23 @@ async fn apply_config(
             }
         }
         for (id, sig, topics, stage_tx, handle) in built {
-            if let Some(old) = workers.insert(id, SubnetWorker { sig, topics, handle }) {
+            if let Some(old) = workers.insert(
+                id,
+                SubnetWorker {
+                    sig,
+                    topics,
+                    handle,
+                },
+            ) {
                 old.handle.abort();
                 stale.push(old);
             }
             stage_map.insert(id, stage_tx);
         }
-        live_topics = workers.values().flat_map(|w| w.topics.iter().cloned()).collect();
+        live_topics = workers
+            .values()
+            .flat_map(|w| w.topics.iter().cloned())
+            .collect();
     }
     // Leave topics no current worker uses. A respawned subnet reuses its topic
     // names, so only topics outside the live set may be unsubscribed — and only
@@ -738,11 +795,22 @@ pub(crate) async fn handle_inbound(
         .iter_mut()
         .flat_map(|(key, s)| {
             let key = *key;
-            s.on_inbound(from, payload.clone()).into_iter().map(move |out| (key, out))
+            s.on_inbound(from, payload.clone())
+                .into_iter()
+                .map(move |out| (key, out))
         })
         .collect();
     for (key, out) in outs {
-        publish_and_loop_back(sessions, fault_monitor, inner, egress, identity_pk, key, out).await;
+        publish_and_loop_back(
+            sessions,
+            fault_monitor,
+            inner,
+            egress,
+            identity_pk,
+            key,
+            out,
+        )
+        .await;
     }
 }
 
@@ -780,9 +848,11 @@ pub(crate) async fn gossip_faults(
             fault: fault.clone(),
         };
         inner.transport.publish(TOPIC_FAULTS, report.encode()).await;
-        let _ = inner
-            .events
-            .send(Event::Fault { round, subnet: subnet_id, fault });
+        let _ = inner.events.send(Event::Fault {
+            round,
+            subnet: subnet_id,
+            fault,
+        });
     }
 }
 
@@ -942,7 +1012,9 @@ pub fn subnet_shares_topic(id: SubnetId) -> String {
 pub fn subnet_uses_ingress(subnet: &Subnet) -> bool {
     matches!(
         subnet.protocol,
-        ProtocolConfig::Adcnet(_) | ProtocolConfig::Panetiere(_) | ProtocolConfig::ScheduledPanetiere(_)
+        ProtocolConfig::Adcnet(_)
+            | ProtocolConfig::Panetiere(_)
+            | ProtocolConfig::ScheduledPanetiere(_)
     )
 }
 
@@ -978,7 +1050,7 @@ pub(crate) fn route_to_pipe(inner: &AnymoneInner, bytes: &[u8]) {
     let outer_tag = frame.dst();
     let data = match frame {
         Frame::Raw { data, .. } => data,
-        Frame::Fragment { .. } => return, // reassembly is M6
+        Frame::Fragment { .. } => return, // reassembly not yet implemented
     };
     let pipe_msg: PipeMessage = match bincode::deserialize(data) {
         Ok(m) => m,
@@ -1070,11 +1142,7 @@ pub(crate) fn stage_outbound(
 
 /// Best-effort: drop this pipe's client session on `subnet` after a re-home. A
 /// subnet that's already gone needs no retirement.
-pub(crate) fn retire_outbound(
-    inner: &Weak<AnymoneInner>,
-    subnet: SubnetId,
-    client_tag: RouteTag,
-) {
+pub(crate) fn retire_outbound(inner: &Weak<AnymoneInner>, subnet: SubnetId, client_tag: RouteTag) {
     let Some(inner) = inner.upgrade() else { return };
     let tx = inner.subnets.lock().unwrap().get(&subnet).cloned();
     if let Some(tx) = tx {

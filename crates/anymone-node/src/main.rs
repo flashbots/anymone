@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::{anyhow, Context, Result};
 use anymone_core::config::ExchangePublicKeyWire;
 use anymone_core::p2p::{Libp2pConfig, Libp2pNetwork};
 use anymone_core::transport::Transport;
@@ -16,7 +17,6 @@ use anymone_core::{
     spawn_panetiere_committee_scheduler, Anymone, BootstrapConfig, GovernanceBootstrap, Identity,
     Misbehavior, ServiceTag,
 };
-use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use libp2p::{Multiaddr, PeerId};
 use tracing_subscriber::EnvFilter;
@@ -135,30 +135,36 @@ fn spawn_peers_endpoint(
         }
         app = app.route(
             "/state/misbehavior",
-            post(move |ConnectInfo(peer): ConnectInfo<SocketAddr>, Json(body): Json<MisbehaviorBody>| {
-                let slot = slot.clone();
-                async move {
-                    if !peer.ip().is_loopback() {
-                        return (StatusCode::FORBIDDEN, "loopback only");
-                    }
-                    let Some(anymone) = slot.read().unwrap().clone() else {
-                        return (StatusCode::SERVICE_UNAVAILABLE, "no config adopted yet");
-                    };
-                    let mode = match body.mode.as_str() {
-                        "honest" => Some(None),
-                        "withhold" => Some(Some(Misbehavior::Withhold)),
-                        "corrupt_share" => Some(Some(Misbehavior::CorruptShare)),
-                        _ => None,
-                    };
-                    match mode {
-                        Some(mode) => {
-                            anymone.set_misbehavior(mode);
-                            (StatusCode::OK, "ok")
+            post(
+                move |ConnectInfo(peer): ConnectInfo<SocketAddr>,
+                      Json(body): Json<MisbehaviorBody>| {
+                    let slot = slot.clone();
+                    async move {
+                        if !peer.ip().is_loopback() {
+                            return (StatusCode::FORBIDDEN, "loopback only");
                         }
-                        None => (StatusCode::BAD_REQUEST, "mode must be honest|withhold|corrupt_share"),
+                        let Some(anymone) = slot.read().unwrap().clone() else {
+                            return (StatusCode::SERVICE_UNAVAILABLE, "no config adopted yet");
+                        };
+                        let mode = match body.mode.as_str() {
+                            "honest" => Some(None),
+                            "withhold" => Some(Some(Misbehavior::Withhold)),
+                            "corrupt_share" => Some(Some(Misbehavior::CorruptShare)),
+                            _ => None,
+                        };
+                        match mode {
+                            Some(mode) => {
+                                anymone.set_misbehavior(mode);
+                                (StatusCode::OK, "ok")
+                            }
+                            None => (
+                                StatusCode::BAD_REQUEST,
+                                "mode must be honest|withhold|corrupt_share",
+                            ),
+                        }
                     }
-                }
-            }),
+                },
+            ),
         );
     }
     tokio::spawn(async move {
@@ -188,15 +194,23 @@ fn network_config(bootstrap: &BootstrapConfig) -> Result<Libp2pConfig> {
         .network
         .bootstrap_peers
         .iter()
-        .map(|s| s.parse::<Multiaddr>().with_context(|| format!("bad bootstrap multiaddr: {s}")))
+        .map(|s| {
+            s.parse::<Multiaddr>()
+                .with_context(|| format!("bad bootstrap multiaddr: {s}"))
+        })
         .collect::<Result<_>>()?;
-    Ok(Libp2pConfig { listen, bootstrap_peers })
+    Ok(Libp2pConfig {
+        listen,
+        bootstrap_peers,
+    })
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     match Cli::parse().cmd {
@@ -208,10 +222,15 @@ async fn main() -> Result<()> {
 
 fn keygen(args: KeygenArgs) -> Result<()> {
     if args.out.exists() {
-        return Err(anyhow!("{} already exists; refusing to overwrite", args.out.display()));
+        return Err(anyhow!(
+            "{} already exists; refusing to overwrite",
+            args.out.display()
+        ));
     }
     let identity = Identity::generate();
-    identity.save(&args.out).with_context(|| format!("writing identity to {}", args.out.display()))?;
+    identity
+        .save(&args.out)
+        .with_context(|| format!("writing identity to {}", args.out.display()))?;
     let peer_id = PeerId::from(identity.to_libp2p_keypair().public());
     let xpub = ExchangePublicKeyWire::from_key(&identity.exchange_pubkey());
     println!("identity_path  {}", args.out.display());
@@ -268,7 +287,12 @@ async fn run(args: RunArgs) -> Result<()> {
     let misbehavior_slot: Option<AnymoneSlot> =
         (args.role == Role::Relay).then(|| Arc::new(std::sync::RwLock::new(None)));
     if let Some(port) = args.peers_port {
-        spawn_peers_endpoint(net.clone(), args.role.as_str(), port, misbehavior_slot.clone());
+        spawn_peers_endpoint(
+            net.clone(),
+            args.role.as_str(),
+            port,
+            misbehavior_slot.clone(),
+        );
     }
 
     match args.role {

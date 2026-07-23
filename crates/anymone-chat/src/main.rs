@@ -20,7 +20,10 @@ use libp2p::Multiaddr;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-#[command(name = "anymone-chat", about = "Anonymous broadcast chat over anymone.")]
+#[command(
+    name = "anymone-chat",
+    about = "Anonymous broadcast chat over anymone."
+)]
 struct Args {
     /// Bootstrap TOML (identity, network, governance) — same shape as a node's.
     #[arg(long)]
@@ -39,12 +42,18 @@ struct Args {
     /// duration that paces sends is taken from the adopted config.
     #[arg(long, default_value = "0.5")]
     send_rate: f64,
+
+    /// Origin allowed to read `/chat/feed` via CORS. Defaults to `*`.
+    #[arg(long)]
+    dashboard_origin: Option<String>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let args = Args::parse();
@@ -53,17 +62,30 @@ async fn main() -> Result<()> {
     let identity = Identity::load_or_generate(&bootstrap.identity_path)
         .with_context(|| format!("identity at {}", bootstrap.identity_path.display()))?;
 
-    let listen: Multiaddr = bootstrap.network.listen.parse().context("bad listen multiaddr")?;
+    let listen: Multiaddr = bootstrap
+        .network
+        .listen
+        .parse()
+        .context("bad listen multiaddr")?;
     let bootstrap_peers: Vec<Multiaddr> = bootstrap
         .network
         .bootstrap_peers
         .iter()
-        .map(|s| s.parse::<Multiaddr>().with_context(|| format!("bad bootstrap multiaddr: {s}")))
+        .map(|s| {
+            s.parse::<Multiaddr>()
+                .with_context(|| format!("bad bootstrap multiaddr: {s}"))
+        })
         .collect::<Result<_>>()?;
 
-    let net = Libp2pNetwork::start(&identity, Libp2pConfig { listen, bootstrap_peers })
-        .await
-        .map_err(|e| anyhow!("libp2p start: {e}"))?;
+    let net = Libp2pNetwork::start(
+        &identity,
+        Libp2pConfig {
+            listen,
+            bootstrap_peers,
+        },
+    )
+    .await
+    .map_err(|e| anyhow!("libp2p start: {e}"))?;
     let transport: Arc<dyn Transport> = net.clone();
     let gov = GovernanceBootstrap::from_bootstrap_config(&bootstrap);
 
@@ -81,14 +103,19 @@ async fn main() -> Result<()> {
         // re-announced until placed).
         None => {
             let xk = ExchangePublicKeyWire::from_key(&identity.exchange_pubkey());
-            let _reannounce =
-                announce_service_registration(transport.clone(), &identity, anymone_chat::chat_tag(), xk).await;
+            let _reannounce = announce_service_registration(
+                transport.clone(),
+                &identity,
+                anymone_chat::chat_tag(),
+                xk,
+            )
+            .await;
             let anymone = Anymone::prepare(identity, transport, gov)
                 .await
                 .start()
                 .await
                 .map_err(|e| anyhow!("anymone start: {e}"))?;
-            anymone_chat::serve(anymone, args.port).await
+            anymone_chat::serve(anymone, args.port, args.dashboard_origin).await
         }
     }
 }

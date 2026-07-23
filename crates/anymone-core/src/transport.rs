@@ -36,7 +36,11 @@ impl Subscription {
     /// Construct a `Subscription` from an existing broadcast receiver. Used by
     /// the libp2p backend, where gossipsub already excludes the publisher.
     pub fn from_broadcast_receiver(rx: broadcast::Receiver<Inbound>, topic: String) -> Self {
-        Subscription { rx, owner: None, topic }
+        Subscription {
+            rx,
+            owner: None,
+            topic,
+        }
     }
 }
 

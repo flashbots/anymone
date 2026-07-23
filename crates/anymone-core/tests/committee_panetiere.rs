@@ -8,12 +8,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anymone_core::config::{ExchangePublicKeyWire, ProtocolConfig};
+use anymone_core::transport::Transport;
 use anymone_core::{
     committee_roster, spawn_panetiere_committee_scheduler, Anymone, AnymoneRoundConfiguration,
-    PanetiereCommitteeConfig, GovernanceBootstrap, Identity, InMemoryNetwork, Misbehavior,
+    GovernanceBootstrap, Identity, InMemoryNetwork, Misbehavior, PanetiereCommitteeConfig,
     Registration, ServiceTag, TOPIC_CONFIG, TOPIC_REGISTRATION,
 };
-use anymone_core::transport::Transport;
 
 fn xkw(id: &Identity) -> ExchangePublicKeyWire {
     ExchangePublicKeyWire::from_key(&id.exchange_pubkey())
@@ -116,10 +116,7 @@ async fn committee_panetiere_publishes_multisig_config() {
 
     // Configuration body sanity-check.
     assert_eq!(cfg.body.subnets.len(), 1);
-    assert!(cfg.body.subnets[0]
-        .relays
-        .iter()
-        .any(|p| *p == relay_pk));
+    assert!(cfg.body.subnets[0].relays.iter().any(|p| *p == relay_pk));
     assert!(cfg.body.services.iter().any(|s| s.pubkey == svc_pk));
 }
 
@@ -171,8 +168,12 @@ async fn committee_converges_despite_staggered_member_start() {
         let pub_transport = pub_transport.clone();
         async move {
             loop {
-                pub_transport.publish(TOPIC_REGISTRATION, relay_reg.clone()).await;
-                pub_transport.publish(TOPIC_REGISTRATION, svc_reg.clone()).await;
+                pub_transport
+                    .publish(TOPIC_REGISTRATION, relay_reg.clone())
+                    .await;
+                pub_transport
+                    .publish(TOPIC_REGISTRATION, svc_reg.clone())
+                    .await;
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
@@ -180,17 +181,29 @@ async fn committee_converges_despite_staggered_member_start() {
 
     let stagger = Duration::from_millis(1500);
     let _h0 = spawn_panetiere_committee_scheduler(
-        mk_handle(c0.pubkey()), c0.clone(), roster.clone(), threshold, cfg.clone(),
+        mk_handle(c0.pubkey()),
+        c0.clone(),
+        roster.clone(),
+        threshold,
+        cfg.clone(),
     )
     .await;
     tokio::time::sleep(stagger).await;
     let _h1 = spawn_panetiere_committee_scheduler(
-        mk_handle(c1.pubkey()), c1.clone(), roster.clone(), threshold, cfg.clone(),
+        mk_handle(c1.pubkey()),
+        c1.clone(),
+        roster.clone(),
+        threshold,
+        cfg.clone(),
     )
     .await;
     tokio::time::sleep(stagger).await;
     let _h2 = spawn_panetiere_committee_scheduler(
-        mk_handle(c2.pubkey()), c2.clone(), roster.clone(), threshold, cfg.clone(),
+        mk_handle(c2.pubkey()),
+        c2.clone(),
+        roster.clone(),
+        threshold,
+        cfg.clone(),
     )
     .await;
 
@@ -225,7 +238,10 @@ async fn committee_scales_to_second_subnet_under_load() {
     let committee_ids: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
     let committee_pks: Vec<_> = committee_ids.iter().map(|i| i.pubkey()).collect();
     let threshold = 2u32;
-    let gov = GovernanceBootstrap { committee: committee_pks.clone(), threshold };
+    let gov = GovernanceBootstrap {
+        committee: committee_pks.clone(),
+        threshold,
+    };
     let mk = |pk| -> Arc<dyn Transport> { Arc::new(net.handle(pk)) };
 
     let ccfg = PanetiereCommitteeConfig {
@@ -277,7 +293,11 @@ async fn committee_scales_to_second_subnet_under_load() {
     // Register relays + service so the committee proposes v0.
     let pubh = mk(Identity::generate().pubkey());
     for id in &relays {
-        pubh.publish(TOPIC_REGISTRATION, Registration::relay(id, xkw(id)).encode()).await;
+        pubh.publish(
+            TOPIC_REGISTRATION,
+            Registration::relay(id, xkw(id)).encode(),
+        )
+        .await;
     }
     pubh.publish(
         TOPIC_REGISTRATION,
@@ -331,7 +351,8 @@ async fn committee_scales_to_second_subnet_under_load() {
     .await
     .expect("committee never scheduled a second subnet under client load");
 
-    two.verify_multisig(&committee_pks, threshold).expect("multisig verifies");
+    two.verify_multisig(&committee_pks, threshold)
+        .expect("multisig verifies");
     assert!(two.body.subnets.len() >= 2);
     let _committee_tasks = committee_tasks;
     let _keep = keep;
@@ -355,7 +376,10 @@ async fn committee_escalates_to_panetiere_on_relay_fault() {
     let committee_ids: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
     let committee_pks: Vec<_> = committee_ids.iter().map(|i| i.pubkey()).collect();
     let threshold = 2u32;
-    let gov = GovernanceBootstrap { committee: committee_pks.clone(), threshold };
+    let gov = GovernanceBootstrap {
+        committee: committee_pks.clone(),
+        threshold,
+    };
     let mk = |pk| -> Arc<dyn Transport> { Arc::new(net.handle(pk)) };
 
     // `min_relays` = the full relay count, exactly as the demo configures it.
@@ -402,7 +426,11 @@ async fn committee_escalates_to_panetiere_on_relay_fault() {
 
     let pubh = mk(Identity::generate().pubkey());
     for id in &relays {
-        pubh.publish(TOPIC_REGISTRATION, Registration::relay(id, xkw(id)).encode()).await;
+        pubh.publish(
+            TOPIC_REGISTRATION,
+            Registration::relay(id, xkw(id)).encode(),
+        )
+        .await;
     }
     pubh.publish(
         TOPIC_REGISTRATION,
@@ -479,8 +507,13 @@ async fn committee_escalates_to_panetiere_on_relay_fault() {
     .await
     .expect("committee never escalated the faulted subnet to Panetiere");
 
-    escalated.verify_multisig(&committee_pks, threshold).expect("multisig verifies");
-    assert!(escalated.body.round > v0.body.round, "escalated config is a newer version");
+    escalated
+        .verify_multisig(&committee_pks, threshold)
+        .expect("multisig verifies");
+    assert!(
+        escalated.body.round > v0.body.round,
+        "escalated config is a newer version"
+    );
     let _committee_tasks = committee_tasks;
     let _relay_nodes = relay_nodes;
     let _svc = svc;

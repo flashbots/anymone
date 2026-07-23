@@ -11,7 +11,7 @@
 //!
 //! The v1 signature binds the version, service_tag, n_chunks, chunk_index,
 //! and the chunk's data — so reassembly can group chunks by signer.
-//! Reassembly itself lands in M6; for now we parse and re-emit v1 frames
+//! Reassembly itself isn't implemented yet; we parse and re-emit v1 frames
 //! but don't combine them.
 
 use std::fmt;
@@ -89,7 +89,9 @@ impl<'de> serde::Deserialize<'de> for ServiceTag {
 /// A 20-byte delivery address the transport routes to. A destination is either a
 /// service (reachable at its [`ServiceTag`]) or a client's per-pipe return path;
 /// on the wire both are just delivery addresses, distinct from service *identity*.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct RouteTag(pub [u8; SERVICE_TAG_LEN]);
 
 impl RouteTag {
@@ -113,7 +115,10 @@ impl fmt::Debug for RouteTag {
 /// A parsed message off the broadcast channel, borrowed from the underlying buffer.
 #[derive(Debug, Clone)]
 pub enum Frame<'a> {
-    Raw { dst: RouteTag, data: &'a [u8] },
+    Raw {
+        dst: RouteTag,
+        data: &'a [u8],
+    },
     Fragment {
         dst: RouteTag,
         n_chunks: u8,
@@ -141,7 +146,10 @@ impl<'a> Frame<'a> {
                 let (tag, data) = rest.split_at(SERVICE_TAG_LEN);
                 let mut tag_bytes = [0u8; SERVICE_TAG_LEN];
                 tag_bytes.copy_from_slice(tag);
-                Ok(Frame::Raw { dst: RouteTag(tag_bytes), data })
+                Ok(Frame::Raw {
+                    dst: RouteTag(tag_bytes),
+                    data,
+                })
             }
             VERSION_MULTI_FRAGMENT => {
                 let min_len = SERVICE_TAG_LEN + 1 + 1 + SIGNATURE_LEN;
@@ -156,7 +164,10 @@ impl<'a> Frame<'a> {
                     return Err(WireError::InvalidChunkCount);
                 }
                 if chunk_index >= n_chunks {
-                    return Err(WireError::InvalidChunkIndex { index: chunk_index, count: n_chunks });
+                    return Err(WireError::InvalidChunkIndex {
+                        index: chunk_index,
+                        count: n_chunks,
+                    });
                 }
                 let mut tag_bytes = [0u8; SERVICE_TAG_LEN];
                 tag_bytes.copy_from_slice(tag);
@@ -181,7 +192,13 @@ impl<'a> Frame<'a> {
                 out.extend_from_slice(&dst.0);
                 out.extend_from_slice(data);
             }
-            Frame::Fragment { dst, n_chunks, chunk_index, signature, data } => {
+            Frame::Fragment {
+                dst,
+                n_chunks,
+                chunk_index,
+                signature,
+                data,
+            } => {
                 out.push(VERSION_MULTI_FRAGMENT);
                 out.extend_from_slice(&dst.0);
                 out.push(*n_chunks);
@@ -238,7 +255,10 @@ mod tests {
 
     #[test]
     fn raw_roundtrip() {
-        let f = Frame::Raw { dst: tag(), data: b"hello" };
+        let f = Frame::Raw {
+            dst: tag(),
+            data: b"hello",
+        };
         let bytes = f.to_bytes();
         let parsed = Frame::decode(&bytes).unwrap();
         match parsed {
@@ -262,7 +282,13 @@ mod tests {
         let bytes = f.to_bytes();
         let parsed = Frame::decode(&bytes).unwrap();
         match parsed {
-            Frame::Fragment { dst, n_chunks, chunk_index, signature, data } => {
+            Frame::Fragment {
+                dst,
+                n_chunks,
+                chunk_index,
+                signature,
+                data,
+            } => {
                 assert_eq!(dst, tag());
                 assert_eq!(n_chunks, 3);
                 assert_eq!(chunk_index, 1);
@@ -276,7 +302,10 @@ mod tests {
     #[test]
     fn rejects_unknown_version() {
         let bytes = [0x99u8; 25];
-        assert_eq!(Frame::decode(&bytes).unwrap_err(), WireError::UnknownVersion(0x99));
+        assert_eq!(
+            Frame::decode(&bytes).unwrap_err(),
+            WireError::UnknownVersion(0x99)
+        );
     }
 
     #[test]
@@ -302,7 +331,10 @@ mod tests {
         };
         // We can encode invalid frames, but decode must reject.
         let bytes = f.to_bytes();
-        assert_eq!(Frame::decode(&bytes).unwrap_err(), WireError::InvalidChunkCount);
+        assert_eq!(
+            Frame::decode(&bytes).unwrap_err(),
+            WireError::InvalidChunkCount
+        );
     }
 
     #[test]

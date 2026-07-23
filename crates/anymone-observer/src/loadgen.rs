@@ -21,6 +21,9 @@ use crate::DemoControls;
 /// above the deployment's own ports (p2p 71xx, peers 72xx, chat 8080).
 const LISTEN_BASE: u16 = 7400;
 
+/// Hard ceiling on live bot processes, independent of the (uncapped) knob value.
+const MAX_LOAD_CLIENTS: usize = 512;
+
 /// Derive a per-client bootstrap config from the observer's own config text:
 /// same `[network] bootstrap_peers` + `[governance]`, but a unique identity and
 /// a distinct, dialable listen port.
@@ -62,7 +65,11 @@ pub fn spawn_supervisor(
             // Drop handles for clients that exited on their own; refilled below.
             children.retain_mut(|(_, c)| matches!(c.try_wait(), Ok(None)));
 
-            let want = controls.knob("clients").map(|k| k.get()).unwrap_or(0);
+            let want = controls
+                .knob("clients")
+                .map(|k| k.get())
+                .unwrap_or(0)
+                .min(MAX_LOAD_CLIENTS);
 
             while children.len() < want {
                 let used: HashSet<usize> = children.iter().map(|(s, _)| *s).collect();
@@ -71,7 +78,9 @@ pub fn spawn_supervisor(
                 let cfg_path = state_dir.join(format!("bot-{slot}.toml"));
                 let port = LISTEN_BASE + slot as u16;
                 let _ = std::fs::create_dir_all(&state_dir); // robust if the dir was removed
-                if let Err(e) = std::fs::write(&cfg_path, child_config(&config_text, &id_path, port)) {
+                if let Err(e) =
+                    std::fs::write(&cfg_path, child_config(&config_text, &id_path, port))
+                {
                     tracing::warn!("loadgen: write {}: {e}", cfg_path.display());
                     break;
                 }

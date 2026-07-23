@@ -79,7 +79,10 @@ async fn fault_for(mode: Misbehavior, panetiere: bool) -> Reported {
         0,
         protocol,
         relay_pks.clone(),
-        vec![ServiceEntry { tag: echo_tag(), pubkey: service.pubkey() }],
+        vec![ServiceEntry {
+            tag: echo_tag(),
+            pubkey: service.pubkey(),
+        }],
     )
     .sign_with(&[&committee]);
 
@@ -88,8 +91,9 @@ async fn fault_for(mode: Misbehavior, panetiere: bool) -> Reported {
 
     let mut relay_nodes: Vec<(Identity, Anymone)> = Vec::new();
     for id in relays.into_iter() {
-        let a = Anymone::start_with_config(id.clone(), Arc::new(net.handle(id.pubkey())), cfg.clone())
-            .await;
+        let a =
+            Anymone::start_with_config(id.clone(), Arc::new(net.handle(id.pubkey())), cfg.clone())
+                .await;
         relay_nodes.push((id, a));
     }
     let mut leader_events = relay_nodes
@@ -98,12 +102,18 @@ async fn fault_for(mode: Misbehavior, panetiere: bool) -> Reported {
         .map(|(_, a)| a.events())
         .expect("leader is among the relays");
 
-    let service_anymone =
-        Anymone::start_with_config(service.clone(), Arc::new(net.handle(service.pubkey())), cfg.clone())
-            .await;
-    let client_anymone =
-        Anymone::start_with_config(client.clone(), Arc::new(net.handle(client.pubkey())), cfg.clone())
-            .await;
+    let service_anymone = Anymone::start_with_config(
+        service.clone(),
+        Arc::new(net.handle(service.pubkey())),
+        cfg.clone(),
+    )
+    .await;
+    let client_anymone = Anymone::start_with_config(
+        client.clone(),
+        Arc::new(net.handle(client.pubkey())),
+        cfg.clone(),
+    )
+    .await;
 
     let mut svc_pipe = service_anymone.bind(echo_tag()).await.unwrap();
     tokio::spawn(async move {
@@ -123,7 +133,10 @@ async fn fault_for(mode: Misbehavior, panetiere: bool) -> Reported {
         }
     });
 
-    let mut faults_sub = net.handle(Identity::generate().pubkey()).subscribe(TOPIC_FAULTS).await;
+    let mut faults_sub = net
+        .handle(Identity::generate().pubkey())
+        .subscribe(TOPIC_FAULTS)
+        .await;
 
     // A few healthy rounds first, then the victim starts misbehaving in-band.
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -172,7 +185,13 @@ async fn fault_for(mode: Misbehavior, panetiere: bool) -> Reported {
     .await;
 
     drop(relay_nodes);
-    Reported { report, victim, leader_pk, saw_event, dup_count }
+    Reported {
+        report,
+        victim,
+        leader_pk,
+        saw_event,
+        dup_count,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -189,13 +208,19 @@ async fn misbehaving_relay_is_reported_as_a_liveness_fault() {
     let r = fault_for(Misbehavior::Withhold, false).await;
     assert_eq!(r.report.subnet, 0);
     assert_eq!(r.report.fault.kind, FaultKind::Liveness);
-    assert_eq!(r.report.reporter, r.leader_pk, "the leader is the subnet's fault reporter");
+    assert_eq!(
+        r.report.reporter, r.leader_pk,
+        "the leader is the subnet's fault reporter"
+    );
     assert_eq!(
         r.report.fault.attribution,
         Attribution::Peers(vec![r.victim]),
         "a withheld share is attributable to the silent relay"
     );
-    assert!(r.saw_event, "leader's events() never yielded the Liveness fault");
+    assert!(
+        r.saw_event,
+        "leader's events() never yielded the Liveness fault"
+    );
 
     // Corrupt-share under ADCNet: every relay's (validly signed) share is
     // present, but the leader can't combine — an unattributable fault.
@@ -223,7 +248,16 @@ async fn panetiere_corrupt_share_is_attributed_integrity() {
         Attribution::Peers(vec![r.victim]),
         "Panetiere attributes a bad share to its relay"
     );
-    assert!(!r.report.fault.evidence.is_empty(), "evidence is the offending ServerPublic bytes");
-    assert!(r.saw_event, "leader's events() never yielded the Integrity fault");
-    assert_eq!(r.dup_count, 0, "only one source should report the fault for a given round");
+    assert!(
+        !r.report.fault.evidence.is_empty(),
+        "evidence is the offending ServerPublic bytes"
+    );
+    assert!(
+        r.saw_event,
+        "leader's events() never yielded the Integrity fault"
+    );
+    assert_eq!(
+        r.dup_count, 0,
+        "only one source should report the fault for a given round"
+    );
 }

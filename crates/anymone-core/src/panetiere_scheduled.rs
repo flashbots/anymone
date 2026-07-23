@@ -31,7 +31,8 @@ use crate::config::{ProtocolConfig, Round, ScheduledPanetiereConfig, Subnet};
 use crate::identity::{Identity, Pubkey};
 use crate::panetiere::{
     client_id_from_pubkey, server_index, PanetiereAggregatorSession, PanetiereObserverSession,
-    PanetiereServerSession, PanetiereWatchSession, PanetiereWire, SetMode, PANETIERE_ROUND_RETENTION,
+    PanetiereServerSession, PanetiereWatchSession, PanetiereWire, SetMode,
+    PANETIERE_ROUND_RETENTION,
 };
 use crate::runtime::{
     aggregator_group_of, client_aggregator_topic, deadline_for, drain_inbound, egress_dest,
@@ -82,7 +83,9 @@ pub(crate) fn setup_joint_pp(
 ) -> Arc<ProtocolParams> {
     let mut rng = ChaCha20Rng::from_seed(setup_seed);
     let mu_kahe = MseEncoding::n_polys(sched_mse) + msg_polys(vector_bytes);
-    Arc::new(ProtocolParams::setup_with_kahe_dims(&mut rng, n_servers, mu_kahe, 1))
+    Arc::new(ProtocolParams::setup_with_kahe_dims(
+        &mut rng, n_servers, mu_kahe, 1,
+    ))
 }
 
 /// Conservative upper bound on the largest per-round wire message a scheduled
@@ -106,7 +109,10 @@ pub(crate) fn max_wire_estimate(
         pp.cs.aggregated_server_crypto_len(client_set_max) + client_set_max as usize * 4 + FRAMING;
     let decoded = vector_bytes + FRAMING;
     let reservations = 4 * estimated_messages as usize + FRAMING;
-    client_public.max(server_public).max(decoded).max(reservations)
+    client_public
+        .max(server_public)
+        .max(decoded)
+        .max(reservations)
 }
 
 /// Scheduled-Panetiere `(ServerId, pke::PublicKey)` roster for sealing client
@@ -251,10 +257,16 @@ impl Session for ScheduledPanetiereClientSession {
         // A reservation whose grant never arrived (leader silence, GC) goes
         // back to staged for a fresh attempt.
         let cutoff = round.saturating_sub(PANETIERE_ROUND_RETENTION);
-        let stale: Vec<Round> = self.reserved.keys().filter(|&&r| r < cutoff).copied().collect();
+        let stale: Vec<Round> = self
+            .reserved
+            .keys()
+            .filter(|&&r| r < cutoff)
+            .copied()
+            .collect();
         for r in stale {
             if let Some(entries) = self.reserved.remove(&r) {
-                self.deferred.extend(entries.into_iter().map(|(_, payload)| payload));
+                self.deferred
+                    .extend(entries.into_iter().map(|(_, payload)| payload));
             }
         }
         Vec::new()
@@ -334,10 +346,16 @@ impl Session for ScheduledPanetiereClientSession {
         let mut reservations = Vec::new();
         for data in std::mem::take(&mut self.staged) {
             let len = data.len();
-            debug_assert!(len <= u16::MAX as usize, "pipe gate should have bounded payload size");
+            debug_assert!(
+                len <= u16::MAX as usize,
+                "pipe gate should have bounded payload size"
+            );
             let rand: u16 = loop {
                 let candidate = self.rand_rng.gen();
-                if !reservations.iter().any(|(r, _): &(u16, Vec<u8>)| *r == candidate) {
+                if !reservations
+                    .iter()
+                    .any(|(r, _): &(u16, Vec<u8>)| *r == candidate)
+                {
                     break candidate;
                 }
             };
@@ -356,12 +374,17 @@ impl Session for ScheduledPanetiereClientSession {
 
         let mut plaintext = sched.pack();
         plaintext.extend(codec::encode_raw(&msg_buf));
-        debug_assert_eq!(plaintext.len(), message_polys(&self.pp), "joint pp must fit sched + msg exactly");
+        debug_assert_eq!(
+            plaintext.len(),
+            message_polys(&self.pp),
+            "joint pp must fit sched + msg exactly"
+        );
 
         let mut seed = self.rng_seed;
         seed[24..32].copy_from_slice(&round.to_le_bytes());
         let mut rng = ChaCha20Rng::from_seed(seed);
-        let round_out = run_client_round(&mut rng, &self.pp, self.client_id, plaintext, &self.servers);
+        let round_out =
+            run_client_round(&mut rng, &self.pp, self.client_id, plaintext, &self.servers);
 
         let mut out: Vec<Vec<u8>> = Vec::with_capacity(1 + self.servers.len());
         out.push(
@@ -494,24 +517,32 @@ impl Session for ScheduledPanetiereServerSession {
 
         for (rd, plain) in self.inner.decode_settled() {
             let n = self.sched_polys.min(plain.len());
-            let entries: Vec<(u16, u16)> = match MseEncoding::unpack(&self.sched_mse, &plain[..n]).decode() {
-                Ok(elements) => elements
-                    .into_iter()
-                    .filter_map(|symbols| match symbols.as_slice() {
-                        [rand, size] if *rand != 0 || *size != 0 => {
-                            Some((*rand as u16, *size as u16))
-                        }
-                        _ => None,
-                    })
-                    .collect(),
-                Err(e) => {
-                    // Peel stall loses the whole round's reservations (retried by clients).
-                    tracing::debug!(round = rd, ?e, "scheduled panetiere: reservation MSE peel failed");
-                    Vec::new()
-                }
-            };
+            let entries: Vec<(u16, u16)> =
+                match MseEncoding::unpack(&self.sched_mse, &plain[..n]).decode() {
+                    Ok(elements) => elements
+                        .into_iter()
+                        .filter_map(|symbols| match symbols.as_slice() {
+                            [rand, size] if *rand != 0 || *size != 0 => {
+                                Some((*rand as u16, *size as u16))
+                            }
+                            _ => None,
+                        })
+                        .collect(),
+                    Err(e) => {
+                        // Peel stall loses the whole round's reservations (retried by clients).
+                        tracing::debug!(
+                            round = rd,
+                            ?e,
+                            "scheduled panetiere: reservation MSE peel failed"
+                        );
+                        Vec::new()
+                    }
+                };
             if self.is_leader {
-                let wire = PanetiereWire::Reservations { round: rd, entries: entries.clone() };
+                let wire = PanetiereWire::Reservations {
+                    round: rd,
+                    entries: entries.clone(),
+                };
                 outbound.push(bincode::serialize(&wire).expect("serialise reservations"));
             }
             self.entries_by_round.insert(rd, entries);
@@ -545,13 +576,20 @@ impl Session for ScheduledPanetiereServerSession {
                     .filter(|b| b.iter().any(|x| *x != 0))
                     .collect::<Vec<_>>(),
                 Err(e) => {
-                    tracing::debug!(round = rd, ?e, "scheduled panetiere: message-vector decode failed");
+                    tracing::debug!(
+                        round = rd,
+                        ?e,
+                        "scheduled panetiere: message-vector decode failed"
+                    );
                     Vec::new()
                 }
             };
             if !msgs.is_empty() {
                 if self.is_leader {
-                    let wire = PanetiereWire::Decoded { round: rd, payloads: msgs.clone() };
+                    let wire = PanetiereWire::Decoded {
+                        round: rd,
+                        payloads: msgs.clone(),
+                    };
                     outbound.push(bincode::serialize(&wire).expect("serialise decoded"));
                 }
                 decoded.extend(msgs);
@@ -563,7 +601,11 @@ impl Session for ScheduledPanetiereServerSession {
         self.entries_by_round.retain(|r, _| *r >= cutoff);
         self.pending_msg.retain(|r, _| *r >= cutoff);
 
-        RoundOutcome { outbound, decoded, faults: Vec::new() }
+        RoundOutcome {
+            outbound,
+            decoded,
+            faults: Vec::new(),
+        }
     }
 
     fn set_misbehavior(&mut self, mode: Option<Misbehavior>) {
@@ -615,7 +657,12 @@ pub(crate) async fn run_subnet(
     };
     let identity_pk = inner.identity.pubkey();
     let sched_mse = sched_mse_params(cfg.estimated_messages, cfg.setup_seed);
-    let pp = setup_joint_pp(&sched_mse, cfg.vector_bytes, subnet.relays.len(), cfg.setup_seed);
+    let pp = setup_joint_pp(
+        &sched_mse,
+        cfg.vector_bytes,
+        subnet.relays.len(),
+        cfg.setup_seed,
+    );
     let leader_pk = subnet_leader_pk(&subnet);
     let client_agg_topic = client_aggregator_topic(&subnet, identity_pk);
 
@@ -626,23 +673,44 @@ pub(crate) async fn run_subnet(
     if subnet.relays.contains(&identity_pk) {
         sessions.insert(
             SessionKey::Server,
-            server_session(&pp, &sched_mse, cfg.vector_bytes, &cfg, &subnet, &inner.identity, leader_pk),
+            server_session(
+                &pp,
+                &sched_mse,
+                cfg.vector_bytes,
+                &cfg,
+                &subnet,
+                &inner.identity,
+                leader_pk,
+            ),
         );
     } else {
-        sessions.insert(SessionKey::Watch, Box::new(PanetiereWatchSession::new(leader_pk)));
+        sessions.insert(
+            SessionKey::Watch,
+            Box::new(PanetiereWatchSession::new(leader_pk)),
+        );
     }
     if let Some(a) = subnet_aggregation(&subnet) {
         if let Some(group) = aggregator_group_of(a, identity_pk) {
-            let mut agg_session =
-                PanetiereAggregatorSession::new(group, a.groups.len() as u32, inner.identity.clone());
+            let mut agg_session = PanetiereAggregatorSession::new(
+                group,
+                a.groups.len() as u32,
+                inner.identity.clone(),
+            );
             agg_session.set_client_set_max(cfg.client_set_max as usize);
-            sessions.insert(SessionKey::Aggregator, Box::new(ScheduledAggregatorSession(agg_session)));
+            sessions.insert(
+                SessionKey::Aggregator,
+                Box::new(ScheduledAggregatorSession(agg_session)),
+            );
         }
     }
     let mut fault_monitor: Option<Box<dyn Session>> = if leader_pk == identity_pk {
         let mut roster = subnet.relays.clone();
         roster.sort();
-        Some(Box::new(PanetiereObserverSession::new(roster, Some(leader_pk), FAULT_THRESHOLD)))
+        Some(Box::new(PanetiereObserverSession::new(
+            roster,
+            Some(leader_pk),
+            FAULT_THRESHOLD,
+        )))
     } else {
         None
     };
@@ -683,12 +751,22 @@ pub(crate) async fn run_subnet(
                 s.set_misbehavior(misbehavior);
             }
             let key = *key;
-            s.begin_round(round, Instant::now()).into_iter().map(move |out| (key, out))
+            s.begin_round(round, Instant::now())
+                .into_iter()
+                .map(move |out| (key, out))
         })
         .collect();
     for (key, out) in outs {
-        publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
-            .await;
+        publish_and_loop_back(
+            &mut sessions,
+            &mut fault_monitor,
+            &inner,
+            &egress,
+            identity_pk,
+            key,
+            out,
+        )
+        .await;
     }
 
     loop {
@@ -859,7 +937,12 @@ mod sizing_tests {
         let sched_mse = sched_mse_params(rho, [1u8; 32]);
         let pp = setup_joint_pp(&sched_mse, vector_bytes, n_relays, [1u8; 32]);
         let servers: Vec<(ServerId, pke::PublicKey)> = (0..n_relays as u32)
-            .map(|i| (ServerId(i), pke::PrivateKey::generate(&mut rand::rngs::OsRng).public()))
+            .map(|i| {
+                (
+                    ServerId(i),
+                    pke::PrivateKey::generate(&mut rand::rngs::OsRng).public(),
+                )
+            })
             .collect();
         let leader = Identity::generate().pubkey();
         let mut c = ScheduledPanetiereClientSession::new(
@@ -878,7 +961,10 @@ mod sizing_tests {
             .map(|m| m.len())
             .max()
             .unwrap();
-        assert!(est >= client_public, "estimate {est} < real ClientPublic {client_public}");
+        assert!(
+            est >= client_public,
+            "estimate {est} < real ClientPublic {client_public}"
+        );
         assert!(
             est >= pp.cs.aggregated_server_crypto_len(cset),
             "estimate omits the ServerPublic crypto term"

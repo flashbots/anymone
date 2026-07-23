@@ -18,8 +18,8 @@ use anymone_core::config::ExchangePublicKeyWire;
 use anymone_core::scheduling::{announce_relay_registration, announce_service_registration};
 use anymone_core::transport::Transport;
 use anymone_core::{
-    committee_roster, spawn_panetiere_committee_scheduler, Anymone, PanetiereCommitteeConfig,
-    GovernanceBootstrap, Identity, InMemoryNetwork, Misbehavior, ServiceTag,
+    committee_roster, spawn_panetiere_committee_scheduler, Anymone, GovernanceBootstrap, Identity,
+    InMemoryNetwork, Misbehavior, PanetiereCommitteeConfig, ServiceTag,
 };
 
 use anyhow::{anyhow, Result};
@@ -91,9 +91,14 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
     // --- committee ---------------------------------------------------------
     let committee_ids: Vec<Identity> = (0..COMMITTEE_SIZE).map(|_| Identity::generate()).collect();
     let committee_pks: Vec<_> = committee_ids.iter().map(|i| i.pubkey()).collect();
-    let gov = GovernanceBootstrap { committee: committee_pks.clone(), threshold: COMMITTEE_THRESHOLD };
+    let gov = GovernanceBootstrap {
+        committee: committee_pks.clone(),
+        threshold: COMMITTEE_THRESHOLD,
+    };
 
-    let cover_target = Arc::new(AtomicU32::new((args.cover_rate.clamp(0.0, 1.0) as f32).to_bits()));
+    let cover_target = Arc::new(AtomicU32::new(
+        (args.cover_rate.clamp(0.0, 1.0) as f32).to_bits(),
+    ));
     let ccfg = PanetiereCommitteeConfig {
         committee_round_duration: Duration::from_millis(args.committee_round_ms),
         public_round_duration: Duration::from_millis(args.public_round_ms),
@@ -127,7 +132,9 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
     //     any registration is published, so nobody misses the first config ---
     let relay_ids: Vec<Identity> = (0..args.relays).map(|_| Identity::generate()).collect();
     let svc_id = Identity::generate();
-    let client_ids: Vec<Identity> = (0..args.clients.max(1)).map(|_| Identity::generate()).collect();
+    let client_ids: Vec<Identity> = (0..args.clients.max(1))
+        .map(|_| Identity::generate())
+        .collect();
     let chat_tag = ServiceTag::from_label(CHAT_TAG_LABEL);
 
     let mut relay_preps = Vec::new();
@@ -156,7 +163,11 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
         COMMITTEE_THRESHOLD,
     );
     crate::spawn_registration_loop(obs_transport.clone(), observatory.clone());
-    crate::spawn_committee_loop(obs_transport.clone(), observatory.clone(), committee_pks.clone());
+    crate::spawn_committee_loop(
+        obs_transport.clone(),
+        observatory.clone(),
+        committee_pks.clone(),
+    );
     crate::spawn_fault_loop(obs_transport.clone(), observatory.clone());
 
     // --- publish registrations; committee now has quorum and emits a config -
@@ -169,7 +180,11 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
     // The `fault` knob drives one relay's misbehavior. It must be a non-leader
     // (subnet 0's leader is sorted(relays)[0] and is the fault reporter), so we
     // target the max-pubkey relay — guaranteed non-leader on the single subnet.
-    let fault_target = relay_ids.iter().map(|i| i.pubkey()).max().expect("relays non-empty");
+    let fault_target = relay_ids
+        .iter()
+        .map(|i| i.pubkey())
+        .max()
+        .expect("relays non-empty");
 
     // Relays: hold the Anymone alive inside a parked task (dropping it would
     // tear down its subnet workers). Start the fault target on the main path so
@@ -177,7 +192,10 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
     let mut fault_relay: Option<Anymone> = None;
     for (id, prep) in relay_ids.iter().zip(relay_preps) {
         if id.pubkey() == fault_target {
-            let a = prep.start().await.map_err(|e| anyhow!("fault-relay start: {e}"))?;
+            let a = prep
+                .start()
+                .await
+                .map_err(|e| anyhow!("fault-relay start: {e}"))?;
             fault_relay = Some(a.clone());
             tokio::spawn(async move {
                 let _keep = a;
@@ -199,10 +217,15 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
 
     // Chat backend: a real participant serving the chat app; the dashboard
     // reads its transcript rather than decoding the channel itself.
-    let svc = svc_prep.start().await.map_err(|e| anyhow!("chat backend start: {e}"))?;
+    let svc = svc_prep
+        .start()
+        .await
+        .map_err(|e| anyhow!("chat backend start: {e}"))?;
     let chat_port = args.chat_port;
     tokio::spawn(async move {
-        if let Err(e) = anymone_chat::serve(svc, chat_port).await {
+        // Open CORS: the dashboard may be viewed from any host, and the feed is
+        // the public broadcast transcript.
+        if let Err(e) = anymone_chat::serve(svc, chat_port, None).await {
             tracing::warn!("chat backend: {e}");
         }
     });
@@ -221,8 +244,14 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
     let cover_pct = (args.cover_rate.clamp(0.0, 1.0) * 100.0).round() as usize;
     let controls = Arc::new(
         crate::DemoControls::new()
-            .with("clients", crate::Knob::new("clients · anonymity set", n_clients, 1))
-            .with("cover", crate::Knob::new("cover · % of idle clients sending zero msg", cover_pct, 0))
+            .with(
+                "clients",
+                crate::Knob::new("clients · anonymity set", n_clients, 1),
+            )
+            .with(
+                "cover",
+                crate::Knob::new("cover · % of idle clients sending zero msg", cover_pct, 0),
+            )
             .with(
                 "fault",
                 crate::Knob::enumerated(
@@ -247,7 +276,10 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
                     _ => None,
                 };
                 fault_relay.set_misbehavior(mode);
-                observatory.lock().unwrap().set_fault_target(mode.map(|_| fault_target));
+                observatory
+                    .lock()
+                    .unwrap()
+                    .set_fault_target(mode.map(|_| fault_target));
                 tokio::time::sleep(round).await;
             }
         });
@@ -318,7 +350,9 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
     crate::serve(observatory, args.dashboard_port, Some(controls)).await
 }
 
-const HANDLES: &[&str] = &["lark", "moss", "vega", "puck", "wren", "flux", "iris", "nyx"];
+const HANDLES: &[&str] = &[
+    "lark", "moss", "vega", "puck", "wren", "flux", "iris", "nyx",
+];
 const LINES: &[&str] = &[
     "anyone else here?",
     "the broadcast actually works",
@@ -332,7 +366,11 @@ const LINES: &[&str] = &[
 
 fn handle_for(index: usize) -> String {
     let base = HANDLES[index % HANDLES.len()];
-    if index < HANDLES.len() { base.to_string() } else { format!("{base}{index}") }
+    if index < HANDLES.len() {
+        base.to_string()
+    } else {
+        format!("{base}{index}")
+    }
 }
 
 /// One demo chat participant: join, subscribe to the room, and send a random
@@ -363,8 +401,11 @@ async fn client_loop(
     };
     let handle = handle_for(index);
     let say = |text: &str| {
-        serde_json::to_vec(&anymone_chat::ChatMessage { from: handle.clone(), text: text.to_string() })
-            .expect("ChatMessage serializes")
+        serde_json::to_vec(&anymone_chat::ChatMessage {
+            from: handle.clone(),
+            text: text.to_string(),
+        })
+        .expect("ChatMessage serializes")
     };
     if index == 0 {
         let _ = pipe.send(say("hello from the anonymity set")).await;

@@ -1,9 +1,8 @@
 //! Helpers for spawning full `Anymone` instances inside one process for
 //! tests. Feature-gated behind `test-util`; production builds drop it.
 //!
-//! Currently rides on the in-memory transport (M2). Once libp2p lands the
-//! `Node` builder will gain a `start_libp2p` variant that brings up a real
-//! swarm on loopback.
+//! Currently rides on the in-memory transport. A future `Node` builder could
+//! gain a `start_libp2p` variant that brings up a real swarm on loopback.
 
 use std::sync::Arc;
 

@@ -31,11 +31,7 @@ struct NodeWithNet {
     net: Arc<Libp2pNetwork>,
 }
 
-async fn start_node(
-    identity: Identity,
-    port: u16,
-    bootstrap_addrs: Vec<Multiaddr>,
-) -> NodeWithNet {
+async fn start_node(identity: Identity, port: u16, bootstrap_addrs: Vec<Multiaddr>) -> NodeWithNet {
     let listen: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
     let net = Libp2pNetwork::start(
         &identity,
@@ -88,7 +84,10 @@ async fn e2e_echo_via_libp2p() {
     // others dial. Registration → committee → config is covered by the
     // committee-scheduler tests below.
     let relay_pks = vec![r1_id.pubkey(), r2_id.pubkey(), r3_id.pubkey()];
-    let services = vec![ServiceEntry { tag: ECHO_TAG, pubkey: svc_id.pubkey() }];
+    let services = vec![ServiceEntry {
+        tag: ECHO_TAG,
+        pubkey: svc_id.pubkey(),
+    }];
     let protocol = ProtocolConfig::Noop(NoopConfig {
         round_duration_ms: 30,
         message_size: 1024,
@@ -98,7 +97,8 @@ async fn e2e_echo_via_libp2p() {
     let config = AnymoneRoundConfiguration::singleton_subnet(0, protocol, relay_pks, services);
 
     let _committee_anymone =
-        Anymone::start_with_config(committee_id.clone(), committee.net.clone(), config.clone()).await;
+        Anymone::start_with_config(committee_id.clone(), committee.net.clone(), config.clone())
+            .await;
     let _r1 = Anymone::start_with_config(r1_id.clone(), r1.net.clone(), config.clone()).await;
     let _r2 = Anymone::start_with_config(r2_id.clone(), r2.net.clone(), config.clone()).await;
     let _r3 = Anymone::start_with_config(r3_id.clone(), r3.net.clone(), config.clone()).await;
@@ -297,9 +297,7 @@ async fn deployment_echo_full_nodes_via_bootnode() {
         let gov = gov.clone();
         let net: Arc<dyn Transport> = svc_node.net.clone();
         announce_service_registration(net.clone(), &svc_id, ECHO_TAG, xk(&svc_id)).await;
-        tokio::spawn(async move {
-            Anymone::prepare(svc_id, net, gov).await.start().await
-        })
+        tokio::spawn(async move { Anymone::prepare(svc_id, net, gov).await.start().await })
     };
 
     let cli_id = Identity::generate();
@@ -318,8 +316,14 @@ async fn deployment_echo_full_nodes_via_bootnode() {
     for id in &committee_ids {
         let node = start_node(id.clone(), pick(), dial.clone()).await;
         handles.push(
-            spawn_panetiere_committee_scheduler(node.net.clone(), id.clone(), roster.clone(), 2, ccfg.clone())
-                .await,
+            spawn_panetiere_committee_scheduler(
+                node.net.clone(),
+                id.clone(),
+                roster.clone(),
+                2,
+                ccfg.clone(),
+            )
+            .await,
         );
         keep.push(node.net);
     }

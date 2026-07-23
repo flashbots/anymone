@@ -1,4 +1,4 @@
-//! M5 end-to-end demo: the full stack on the in-memory transport.
+//! End-to-end demo: the full stack on the in-memory transport.
 //!
 //! Nodes are brought up from a static signed config (`singleton_subnet` +
 //! `start_with_config`) rather than a scheduler: three relays + an echo service
@@ -30,7 +30,10 @@ async fn e2e_echo_over_static_subnet() {
     let client = Node::fresh(&net);
 
     let relay_pks = relays.iter().map(|n| n.pubkey()).collect();
-    let services = vec![ServiceEntry { tag: ECHO_TAG, pubkey: service.pubkey() }];
+    let services = vec![ServiceEntry {
+        tag: ECHO_TAG,
+        pubkey: service.pubkey(),
+    }];
     let protocol = ProtocolConfig::Noop(NoopConfig {
         round_duration_ms: 30,
         message_size: 1024,

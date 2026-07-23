@@ -183,8 +183,8 @@ pub struct ExchangeIdentity {
 
 impl ExchangeIdentity {
     fn from_adcnet_key(key: adcnet::crypto::ExchangePrivateKey) -> Self {
-        let pke = panetiere::pke::PrivateKey::from_bytes(&key.to_bytes())
-            .expect("same P-256 scalar");
+        let pke =
+            panetiere::pke::PrivateKey::from_bytes(&key.to_bytes()).expect("same P-256 scalar");
         ExchangeIdentity { key, pke }
     }
 

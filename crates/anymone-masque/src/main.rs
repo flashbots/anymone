@@ -1,3 +1,3 @@
 fn main() {
-    eprintln!("anymone-masque: stub. Lands in M6.");
+    eprintln!("anymone-masque: not yet implemented.");
 }

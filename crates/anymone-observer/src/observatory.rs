@@ -118,7 +118,12 @@ pub struct Observatory {
 }
 
 impl Observatory {
-    pub fn new(committee: Vec<Pubkey>, threshold: u32, vantage: String, committee_round_ms: u64) -> Self {
+    pub fn new(
+        committee: Vec<Pubkey>,
+        threshold: u32,
+        vantage: String,
+        committee_round_ms: u64,
+    ) -> Self {
         Observatory {
             committee,
             threshold,
@@ -157,7 +162,10 @@ impl Observatory {
     /// caller should (re)spawn per-subnet watchers).
     pub fn on_config(&mut self, cfg: AnymoneRoundConfiguration) -> bool {
         let version = cfg.body.round;
-        let is_new = self.config.as_ref().map_or(true, |c| c.body.round != version);
+        let is_new = self
+            .config
+            .as_ref()
+            .map_or(true, |c| c.body.round != version);
         if !is_new {
             return false;
         }
@@ -165,7 +173,12 @@ impl Observatory {
         // Record protocol escalations (e.g. ADCNet→Panetiere) per subnet.
         if let Some(prev) = &self.config {
             for s in &cfg.body.subnets {
-                let was = prev.body.subnets.iter().find(|p| p.id == s.id).map(|p| proto_name(&p.protocol));
+                let was = prev
+                    .body
+                    .subnets
+                    .iter()
+                    .find(|p| p.id == s.id)
+                    .map(|p| proto_name(&p.protocol));
                 if let Some(w) = was {
                     if w != proto_name(&s.protocol) {
                         // Record the real wire round of the escalation if one's been
@@ -188,7 +201,12 @@ impl Observatory {
         // This config version is the result of (or supersedes) any in-flight
         // renegotiation, so the committee is no longer deliberating.
         self.renegotiating = false;
-        self.placed_relays = cfg.body.subnets.iter().flat_map(|s| s.relays.iter().copied()).collect();
+        self.placed_relays = cfg
+            .body
+            .subnets
+            .iter()
+            .flat_map(|s| s.relays.iter().copied())
+            .collect();
         // A relay that reappears in a config has healed.
         for pk in &self.placed_relays {
             self.faulted.remove(pk);
@@ -212,8 +230,18 @@ impl Observatory {
             return format!("genesis · {}", protos.join(", "));
         };
         let mut parts = Vec::new();
-        let prev_relays: HashSet<Pubkey> = prev.body.subnets.iter().flat_map(|s| s.relays.iter().copied()).collect();
-        let next_relays: HashSet<Pubkey> = next.body.subnets.iter().flat_map(|s| s.relays.iter().copied()).collect();
+        let prev_relays: HashSet<Pubkey> = prev
+            .body
+            .subnets
+            .iter()
+            .flat_map(|s| s.relays.iter().copied())
+            .collect();
+        let next_relays: HashSet<Pubkey> = next
+            .body
+            .subnets
+            .iter()
+            .flat_map(|s| s.relays.iter().copied())
+            .collect();
         for pk in prev_relays.difference(&next_relays) {
             parts.push(format!("−{}", short(pk)));
         }
@@ -266,7 +294,11 @@ impl Observatory {
                     last.msgs = msgs;
                 }
                 _ => {
-                    ring.push_back(RoundStat { round: r, anon_set: live.anon_set, msgs });
+                    ring.push_back(RoundStat {
+                        round: r,
+                        anon_set: live.anon_set,
+                        msgs,
+                    });
                     while ring.len() > 5 {
                         ring.pop_front();
                     }
@@ -279,7 +311,11 @@ impl Observatory {
     /// Record an observer-detected fault (deduped by round+subnet+kind).
     pub fn record_fault(&mut self, round: u64, subnet: SubnetId, fault: &Fault) {
         let kind = format!("{:?}", fault.kind);
-        if self.faults.iter().any(|f| f.round == round && f.subnet == subnet && f.kind == kind) {
+        if self
+            .faults
+            .iter()
+            .any(|f| f.round == round && f.subnet == subnet && f.kind == kind)
+        {
             return;
         }
         let attribution = match &fault.attribution {
@@ -289,7 +325,13 @@ impl Observatory {
         if let Some(pk) = attribution {
             self.faulted.insert(pk);
         }
-        self.faults.push(FaultEntry { round, subnet, kind, attribution, action: None });
+        self.faults.push(FaultEntry {
+            round,
+            subnet,
+            kind,
+            attribution,
+            action: None,
+        });
         // Bound the feed: a long-running demo would otherwise grow it without
         // limit. Keep the most recent entries.
         let overflow = self.faults.len().saturating_sub(FEED_CAP);
@@ -304,8 +346,10 @@ impl Observatory {
     /// A member signed a body that isn't the current config ⇒ a deliberation is
     /// in progress, whatever triggered it (fault, capacity, subnet growth).
     pub fn on_committee_sig(&mut self, body_bytes: &[u8]) {
-        let is_current =
-            self.config.as_ref().is_some_and(|c| c.body.canonical_bytes() == body_bytes);
+        let is_current = self
+            .config
+            .as_ref()
+            .is_some_and(|c| c.body.canonical_bytes() == body_bytes);
         if !is_current {
             self.renegotiating = true;
         }
@@ -423,8 +467,10 @@ impl Observatory {
             .map(|h| json!({ "version": h.version, "diff": h.diff }))
             .collect();
 
-        let candidate_pool: Vec<&Pubkey> =
-            self.candidate_relays.difference(&self.placed_relays).collect();
+        let candidate_pool: Vec<&Pubkey> = self
+            .candidate_relays
+            .difference(&self.placed_relays)
+            .collect();
 
         let committee = if self.committee.is_empty() {
             Value::Null
@@ -487,7 +533,9 @@ impl Observatory {
                 r.iter()
                     .rev()
                     .take(3)
-                    .map(|st| json!({ "round": st.round, "anon_set": st.anon_set, "msgs": st.msgs }))
+                    .map(
+                        |st| json!({ "round": st.round, "anon_set": st.anon_set, "msgs": st.msgs }),
+                    )
                     .collect()
             })
             .unwrap_or_default();
@@ -618,12 +666,26 @@ mod tests {
         let mut o = obs();
         let mut reported = Vec::new();
         for d in [5u64, 10, 15] {
-            o.update_live(0, SubnetLive { decoded: d, round: Some(d), ..Default::default() });
+            o.update_live(
+                0,
+                SubnetLive {
+                    decoded: d,
+                    round: Some(d),
+                    ..Default::default()
+                },
+            );
             reported.push(o.live.get(&0).unwrap().decoded);
         }
         // A watcher restart (e.g. protocol flip) resets the raw counter to 0.
         for d in [3u64, 6, 9] {
-            o.update_live(0, SubnetLive { decoded: d, round: Some(100 + d), ..Default::default() });
+            o.update_live(
+                0,
+                SubnetLive {
+                    decoded: d,
+                    round: Some(100 + d),
+                    ..Default::default()
+                },
+            );
             reported.push(o.live.get(&0).unwrap().decoded);
         }
         for w in reported.windows(2) {
@@ -639,12 +701,22 @@ mod tests {
     fn renegotiating_flag_tracks_fault_then_config() {
         let mut o = obs();
         assert!(!o.renegotiating);
-        let fault = Fault { kind: FaultKind::Liveness, attribution: Attribution::None, evidence: Vec::new() };
+        let fault = Fault {
+            kind: FaultKind::Liveness,
+            attribution: Attribution::None,
+            evidence: Vec::new(),
+        };
         o.record_fault(1, 0, &fault);
-        assert!(o.renegotiating, "a fault starts the committee renegotiating");
+        assert!(
+            o.renegotiating,
+            "a fault starts the committee renegotiating"
+        );
         assert!(o.faults[0].action.is_none(), "no action observed yet");
         assert!(o.on_config(cfg(1)), "first config is a new version");
-        assert!(!o.renegotiating, "the resulting config ends the renegotiation");
+        assert!(
+            !o.renegotiating,
+            "the resulting config ends the renegotiation"
+        );
         assert!(
             o.faults[0].action.as_deref().unwrap().starts_with("cfg v1"),
             "the config that followed becomes the fault's action"
@@ -657,7 +729,10 @@ mod tests {
         o.on_config(cfg(1));
         let current = o.config.as_ref().unwrap().body.canonical_bytes();
         o.on_committee_sig(&current);
-        assert!(!o.renegotiating, "sig over the current config is not a deliberation");
+        assert!(
+            !o.renegotiating,
+            "sig over the current config is not a deliberation"
+        );
         o.on_committee_sig(&cfg(2).body.canonical_bytes());
         assert!(o.renegotiating);
         o.on_config(cfg(2));

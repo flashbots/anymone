@@ -267,7 +267,10 @@ pub async fn spawn_panetiere_committee_scheduler(
             Some(crate::scheduling::SchedulerProtocol::ScheduledPanetiere)
         }
         Some(other) => {
-            tracing::warn!(protocol = other, "unrecognized committee protocol pin, ignoring");
+            tracing::warn!(
+                protocol = other,
+                "unrecognized committee protocol pin, ignoring"
+            );
             None
         }
         None => None,
@@ -356,8 +359,13 @@ pub async fn spawn_panetiere_committee_scheduler(
                             debug!("committee: publishing config");
                             // Serve it so a joining node can pull rather than await a push.
                             transport.serve_config(bytes.clone());
-                            if let Ok(cfg) = bincode::deserialize::<crate::config::AnymoneRoundConfiguration>(&bytes) {
-                                transport.set_topic_policy(crate::governance::topic_policy(&cfg.body, &committee));
+                            if let Ok(cfg) = bincode::deserialize::<
+                                crate::config::AnymoneRoundConfiguration,
+                            >(&bytes)
+                            {
+                                transport.set_topic_policy(crate::governance::topic_policy(
+                                    &cfg.body, &committee,
+                                ));
                             }
                         }
                         transport.publish(&topic, bytes).await;
@@ -367,7 +375,15 @@ pub async fn spawn_panetiere_committee_scheduler(
         }
 
         let init = server_session.begin_round(anymone_round, Instant::now());
-        emit(&transport, &topic, our_pk, &mut server_session, &mut client_session, init).await;
+        emit(
+            &transport,
+            &topic,
+            our_pk,
+            &mut server_session,
+            &mut client_session,
+            init,
+        )
+        .await;
 
         loop {
             tokio::select! {

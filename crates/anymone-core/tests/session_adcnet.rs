@@ -19,7 +19,10 @@ use adcnet::protocol::session::one_round::{IbltMsgParamsOwned, OneRoundConfig};
 
 fn test_config() -> OneRoundConfig {
     OneRoundConfig {
-        iblt: IbltMsgParamsOwned { estimated_messages: 8, max_payload_bytes: 256 },
+        iblt: IbltMsgParamsOwned {
+            estimated_messages: 8,
+            max_payload_bytes: 256,
+        },
     }
 }
 
@@ -35,7 +38,10 @@ fn adcnet_session_happy_path() {
 
     let mut client_shared: HashMap<ServerId, SharedKey> = HashMap::new();
     for (i, sid) in server_ids.iter().enumerate() {
-        client_shared.insert(*sid, client_id.exchange().ecdh(&servers_id[i].exchange_pubkey()));
+        client_shared.insert(
+            *sid,
+            client_id.exchange().ecdh(&servers_id[i].exchange_pubkey()),
+        );
     }
 
     let client_anymone = client_id.pubkey();
@@ -56,6 +62,7 @@ fn adcnet_session_happy_path() {
                 n_servers,
                 servers_id.iter().map(|s| s.pubkey()).collect::<Vec<_>>(),
                 0,
+                usize::MAX,
                 i == 0,
                 leader_pk,
                 None,
@@ -69,33 +76,50 @@ fn adcnet_session_happy_path() {
     let now = Instant::now();
 
     let mut bus: Vec<(Pubkey, Vec<u8>)> = Vec::new();
-    let deliver = |bus: &mut Vec<(Pubkey, Vec<u8>)>, servers: &mut [AdcnetServerSession], watch: &mut AdcnetWatchSession| {
+    let deliver = |bus: &mut Vec<(Pubkey, Vec<u8>)>,
+                   servers: &mut [AdcnetServerSession],
+                   watch: &mut AdcnetWatchSession| {
         for (from, msg) in bus.drain(..) {
-            for s in servers.iter_mut() { s.on_inbound(from, msg.clone()); }
+            for s in servers.iter_mut() {
+                s.on_inbound(from, msg.clone());
+            }
             watch.on_inbound(from, msg.clone());
         }
     };
 
     let mut decoded_all: Vec<Vec<u8>> = Vec::new();
     for r in 0..8u64 {
-        for m in client.begin_round(r, now) { bus.push((client_anymone, m)); }
+        // Delivered twice: a replayed contribution must be deduped by signer,
+        // or the leader double-sums it and the combine corrupts.
+        for m in client.begin_round(r, now) {
+            bus.push((client_anymone, m.clone()));
+            bus.push((client_anymone, m));
+        }
         deliver(&mut bus, &mut servers, &mut watch);
         for (i, s) in servers.iter_mut().enumerate() {
             let out = s.end_round(r, now);
             decoded_all.extend(out.decoded);
-            for m in out.outbound { bus.push((servers_id[i].pubkey(), m)); }
+            for m in out.outbound {
+                bus.push((servers_id[i].pubkey(), m));
+            }
         }
         decoded_all.extend(watch.end_round(r, now).decoded);
         deliver(&mut bus, &mut servers, &mut watch);
     }
 
-    assert!(decoded_all.contains(&payload), "payload never decoded; got {decoded_all:?}");
+    assert!(
+        decoded_all.contains(&payload),
+        "payload never decoded; got {decoded_all:?}"
+    );
 
     // Idle client: covers at rate 1.0, silent at 0.0; a staged payload always sends.
     let mk = |rate: f32| {
         let mut shared: HashMap<ServerId, SharedKey> = HashMap::new();
         for (i, sid) in server_ids.iter().enumerate() {
-            shared.insert(*sid, client_id.exchange().ecdh(&servers_id[i].exchange_pubkey()));
+            shared.insert(
+                *sid,
+                client_id.exchange().ecdh(&servers_id[i].exchange_pubkey()),
+            );
         }
         let mut c = AdcnetClientSession::new(
             cfg.clone(),
@@ -107,11 +131,66 @@ fn adcnet_session_happy_path() {
         c.set_cover_rate(rate);
         c
     };
-    assert!(mk(0.0).begin_round(0, now).is_empty(), "rate 0 idle stays silent");
-    assert!(!mk(1.0).begin_round(0, now).is_empty(), "rate 1 idle covers");
+    assert!(
+        mk(0.0).begin_round(0, now).is_empty(),
+        "rate 0 idle stays silent"
+    );
+    assert!(
+        !mk(1.0).begin_round(0, now).is_empty(),
+        "rate 1 idle covers"
+    );
     let mut staged = mk(0.0);
     staged.stage_message(b"x".to_vec());
-    assert!(!staged.begin_round(0, now).is_empty(), "staged payload always sends");
+    assert!(
+        !staged.begin_round(0, now).is_empty(),
+        "staged payload always sends"
+    );
+
+    // client_set_max caps the accepted round set at ingest.
+    let cap_relay = Identity::generate();
+    let cap_relay_pk = cap_relay.pubkey();
+    let mut cap_leader = AdcnetServerSession::new(
+        cfg.clone(),
+        ServerId(0),
+        cap_relay.to_adcnet_signing_key(),
+        cap_relay.exchange().clone(),
+        1,
+        vec![cap_relay_pk],
+        0,
+        1,
+        true,
+        cap_relay_pk,
+        None,
+    );
+    for cid in (0..2).map(|_| Identity::generate()) {
+        let shared: HashMap<ServerId, SharedKey> = HashMap::from([(
+            ServerId(0),
+            cid.exchange().ecdh(&cap_relay.exchange_pubkey()),
+        )]);
+        let mut c = AdcnetClientSession::new(
+            cfg.clone(),
+            cid.to_adcnet_signing_key(),
+            shared,
+            cid.exchange_pubkey(),
+            [3u8; 32],
+        );
+        c.stage_message(b"x".to_vec());
+        for m in c.begin_round(0, now) {
+            cap_leader.on_inbound(cid.pubkey(), m);
+        }
+    }
+    let out = cap_leader.end_round(0, now);
+    let mut cap_observer = AdcnetObserverSession::new(vec![cap_relay_pk], cap_relay_pk, 2);
+    cap_observer.begin_round(0, now);
+    for m in &out.outbound {
+        cap_observer.on_inbound(cap_relay_pk, m.clone());
+    }
+    cap_observer.end_round(0, now);
+    assert_eq!(
+        cap_observer.anonymity_set_for(0),
+        Some(1),
+        "client_set_max=1 must cap the announced set to 1, not 2"
+    );
 }
 
 /// A live 1-round ADCNet subnet (one client + N relays, relay 0 the leader)
@@ -138,7 +217,10 @@ impl Subnet {
 
         let mut client_shared: HashMap<ServerId, SharedKey> = HashMap::new();
         for (i, rid) in relay_ids.iter().enumerate() {
-            client_shared.insert(ServerId(i as u32), client_id.exchange().ecdh(&rid.exchange_pubkey()));
+            client_shared.insert(
+                ServerId(i as u32),
+                client_id.exchange().ecdh(&rid.exchange_pubkey()),
+            );
         }
 
         let client = AdcnetClientSession::new(
@@ -158,6 +240,7 @@ impl Subnet {
                     n_servers,
                     relay_pks.clone(),
                     0,
+                    usize::MAX,
                     i == 0,
                     leader_pk,
                     None,
@@ -179,7 +262,9 @@ impl Subnet {
 
     fn deliver(&mut self) {
         for (from, msg) in self.bus.drain(..) {
-            for relay in self.relays.iter_mut() { relay.on_inbound(from, msg.clone()); }
+            for relay in self.relays.iter_mut() {
+                relay.on_inbound(from, msg.clone());
+            }
             self.observer.on_inbound(from, msg.clone());
         }
     }
@@ -188,15 +273,23 @@ impl Subnet {
     /// faults the observer emitted.
     fn round(&mut self, r: u64, alive: &[usize]) -> Vec<anymone_core::Fault> {
         // Every relay's clock advances regardless of participation, as in the real runtime.
-        for relay in self.relays.iter_mut() { relay.begin_round(r, self.now); }
+        for relay in self.relays.iter_mut() {
+            relay.begin_round(r, self.now);
+        }
         self.observer.begin_round(r, self.now);
-        for m in self.client.begin_round(r, self.now) { self.bus.push((self.client_pk, m)); }
+        for m in self.client.begin_round(r, self.now) {
+            self.bus.push((self.client_pk, m));
+        }
         self.deliver();
         for i in 0..self.relays.len() {
-            if !alive.contains(&i) { continue; }
+            if !alive.contains(&i) {
+                continue;
+            }
             let out = self.relays[i].end_round(r, self.now);
             let pk = self.relay_pks[i];
-            for m in out.outbound { self.bus.push((pk, m)); }
+            for m in out.outbound {
+                self.bus.push((pk, m));
+            }
         }
         let faults = self.observer.end_round(r, self.now).faults;
         self.deliver();
@@ -211,7 +304,10 @@ fn observer_silent_on_healthy_subnet() {
     for r in 0..16u64 {
         all_faults.extend(net.round(r, &[0, 1, 2]));
     }
-    assert!(all_faults.is_empty(), "healthy subnet must not fault; got {all_faults:?}");
+    assert!(
+        all_faults.is_empty(),
+        "healthy subnet must not fault; got {all_faults:?}"
+    );
 }
 
 #[test]
@@ -221,7 +317,10 @@ fn observer_attributes_non_leader_silence() {
     let victim_pk = net.relay_pks[victim];
 
     for r in 0..8u64 {
-        assert!(net.round(r, &[0, 1, 2]).is_empty(), "no fault while healthy (round {r})");
+        assert!(
+            net.round(r, &[0, 1, 2]).is_empty(),
+            "no fault while healthy (round {r})"
+        );
     }
 
     let mut faults = Vec::new();

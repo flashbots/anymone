@@ -20,16 +20,20 @@ tokio.workspace = true
 async-trait.workspace = true
 futures-util.workspace = true
 tracing.workspace = true
-panetiere = { git = "ssh://git@github.com/flashbots/panetiere", branch = "main" }
+panetiere = { git = "ssh://git@github.com/flashbots/panetiere", rev = "e55056428ae9f28234d86cc3096407c03fb25adb" }
+# panetiere also depends on this unpinned; rev-pinning ours conflicts (cargo can't unify).
 chipmunk_code = { git = "https://github.com/Ruteri/Chipmunk", branch = "main", default-features = false, features = ["fast-ntt"] }
-adcnet = { git = "ssh://git@github.com/flashbots/adcnet-rs", branch = "main" }
+adcnet = { git = "ssh://git@github.com/flashbots/adcnet-rs", rev = "08988b193a4fa78d08f7ffed221ce28c7a1aeb6e" }
 num-bigint = { version = "0.4", features = ["serde"] }
 libp2p.workspace = true
 
 [features]
 default = []
-# Spawning full Anymone instances on loopback libp2p for tests. Lands in M3.
+# Spawning full Anymone instances on loopback libp2p for tests.
 test-util = []
+# Decoded-plaintext wire tracing (ANYMONE_TRACE=1). Off by default so a release
+# build can't dump decoded traffic even if the env var is set; opt in per binary.
+wire-debug = []
 
 [dev-dependencies]
 serial_test = "3"

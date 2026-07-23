@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use anymone_core::test_util::Node;
 use anymone_core::{
-    AnymoneRoundConfiguration, GovernanceBootstrap, InMemoryNetwork, NoopConfig,
-    ProtocolConfig, ServiceEntry, ServiceTag, Subnet, Transport, TOPIC_CONFIG,
+    AnymoneRoundConfiguration, GovernanceBootstrap, InMemoryNetwork, NoopConfig, ProtocolConfig,
+    ServiceEntry, ServiceTag, Subnet, Transport, TOPIC_CONFIG,
 };
 
 fn echo_tag() -> ServiceTag {
@@ -49,7 +49,10 @@ async fn echo_via_governance_topic() {
             client_set_max: 256,
         }),
         relays.iter().map(|r| r.pubkey()).collect(),
-        vec![ServiceEntry { tag: echo_tag(), pubkey: service.pubkey() }],
+        vec![ServiceEntry {
+            tag: echo_tag(),
+            pubkey: service.pubkey(),
+        }],
     );
     // A malformed (empty-relay) subnet in the signed config must be skipped, not
     // panic the runtime — the echo below still round-trips on subnet 0.
@@ -78,7 +81,9 @@ async fn echo_via_governance_topic() {
     // Phase 2: committee publishes the signed config once. All subscribers
     // above are already in place so the message reaches them.
     let committee_transport: Arc<dyn Transport> = Arc::new(net.handle(committee_pk));
-    committee_transport.publish(TOPIC_CONFIG, signed_bytes).await;
+    committee_transport
+        .publish(TOPIC_CONFIG, signed_bytes)
+        .await;
 
     // Phase 3: each prep awaits the config it just received and starts its
     // subnet runtime. Run all starts concurrently.

@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::config::{AnymoneRoundConfigurationBody, ExchangePublicKeyWire, Round, SubnetId};
-use crate::identity::Pubkey;
 use crate::faults::Fault;
+use crate::identity::Pubkey;
 use crate::transport::TopicPolicy;
 
 /// The committee + threshold a deployment configures (the `[governance]` section
@@ -101,7 +101,11 @@ pub fn topic_policy(body: &AnymoneRoundConfigurationBody, committee: &[Pubkey]) 
     for subnet in &body.subnets {
         let mut shares: HashSet<Pubkey> = subnet.relays.iter().copied().collect();
         if let Some(agg) = crate::runtime::subnet_aggregation(subnet) {
-            shares.extend(agg.groups.iter().flat_map(|g| g.aggregators.iter().copied()));
+            shares.extend(
+                agg.groups
+                    .iter()
+                    .flat_map(|g| g.aggregators.iter().copied()),
+            );
         }
         policy.insert(crate::runtime::subnet_shares_topic(subnet.id), shares);
         if !matches!(subnet.protocol, crate::config::ProtocolConfig::Noop(_)) {
@@ -113,6 +117,9 @@ pub fn topic_policy(body: &AnymoneRoundConfigurationBody, committee: &[Pubkey]) 
         all_relays.extend(subnet.relays.iter().copied());
     }
     policy.insert(TOPIC_FAULTS.to_string(), all_relays);
-    policy.insert(TOPIC_CONFIG.to_string(), committee.iter().copied().collect());
+    policy.insert(
+        TOPIC_CONFIG.to_string(),
+        committee.iter().copied().collect(),
+    );
     policy
 }

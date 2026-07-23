@@ -7,14 +7,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anymone_core::config::{
-    now_unix_ms, AdcnetConfig, AnymoneRoundConfigurationBody, ExchangePublicKeyWire, ProtocolConfig,
-    Subnet,
-};
-use anymone_core::panetiere::{
-    client_id_from_pubkey, PanetiereClientSession, PanetiereObserverSession, PanetiereServerSession,
-    SetMode,
+    now_unix_ms, AdcnetConfig, AnymoneRoundConfigurationBody, ExchangePublicKeyWire,
+    ProtocolConfig, Subnet,
 };
 use anymone_core::faults::{Attribution, FaultKind};
+use anymone_core::panetiere::{
+    client_id_from_pubkey, PanetiereClientSession, PanetiereObserverSession,
+    PanetiereServerSession, SetMode,
+};
 use anymone_core::session::{Misbehavior, Session};
 use anymone_core::{Identity, Pubkey, ServiceEntry, ServiceTag};
 
@@ -40,7 +40,11 @@ fn server_env(n: usize) -> (Vec<Identity>, Vec<Pubkey>, Vec<(ServerId, pke::Publ
 }
 
 fn server_pubkeys(server_pks: &[Pubkey]) -> HashMap<ServerId, Pubkey> {
-    server_pks.iter().enumerate().map(|(i, pk)| (ServerId(i as u32), *pk)).collect()
+    server_pks
+        .iter()
+        .enumerate()
+        .map(|(i, pk)| (ServerId(i as u32), *pk))
+        .collect()
 }
 
 /// MSE channel params (γ=4, δ≈3 buckets/insert, ξ for `msg_bytes`) plus a KAHE
@@ -59,7 +63,9 @@ fn channel(
     rng.fill_bytes(&mut prf_key);
     let mse = MseParams::new(4, delta, xi, prf_key);
     let n_polys = MseEncoding::n_polys(&mse);
-    let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(rng, n_servers, n_polys, 1));
+    let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(
+        rng, n_servers, n_polys, 1,
+    ));
     (mse, pp)
 }
 
@@ -72,12 +78,21 @@ fn panetiere_session_happy_path() {
     let client_pk = Identity::generate().pubkey();
     let client_id = client_id_from_pubkey(client_pk);
     let (ids, server_pks, xpubs) = server_env(n_servers);
-    let mut client = PanetiereClientSession::new(
-        pp.clone(), mse.clone(), client_id, xpubs, [42u8; 32]);
+    let mut client =
+        PanetiereClientSession::new(pp.clone(), mse.clone(), client_id, xpubs, [42u8; 32]);
     let mut servers: Vec<PanetiereServerSession> = server_ids
         .iter()
         .map(|sid| {
-            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, ids[sid.0 as usize].clone(), SetMode::SelfDerived, 0, server_pubkeys(&server_pks), None)
+            PanetiereServerSession::new(
+                pp.clone(),
+                mse.clone(),
+                *sid,
+                ids[sid.0 as usize].clone(),
+                SetMode::SelfDerived,
+                0,
+                server_pubkeys(&server_pks),
+                None,
+            )
         })
         .collect();
 
@@ -86,11 +101,18 @@ fn panetiere_session_happy_path() {
 
     let now = Instant::now();
     let client_out = client.begin_round(0, now);
-    assert_eq!(client_out.len(), 1 + n_servers, "expected 1 ClientPublic + {n_servers} Openings");
+    assert_eq!(
+        client_out.len(),
+        1 + n_servers,
+        "expected 1 ClientPublic + {n_servers} Openings"
+    );
 
     for s in servers.iter_mut() {
         for m in &client_out {
-            assert!(s.on_inbound(client_pk, m.clone()).is_empty(), "server should not respond synchronously");
+            assert!(
+                s.on_inbound(client_pk, m.clone()).is_empty(),
+                "server should not respond synchronously"
+            );
         }
     }
 
@@ -103,7 +125,9 @@ fn panetiere_session_happy_path() {
 
     for i in 0..servers.len() {
         for (j, o) in mid.iter().enumerate() {
-            if i == j { continue; }
+            if i == j {
+                continue;
+            }
             for m in &o.outbound {
                 servers[i].on_inbound(server_pks[j], m.clone());
             }
@@ -132,11 +156,25 @@ fn committee_panetiere_roundtrip(payload: &[u8]) -> Vec<u8> {
     let client_pk = Identity::generate().pubkey();
     let (ids, server_pks, xpubs) = server_env(n_servers);
     let mut client = PanetiereClientSession::new(
-        pp.clone(), mse.clone(), client_id_from_pubkey(client_pk), xpubs, [42u8; 32]);
+        pp.clone(),
+        mse.clone(),
+        client_id_from_pubkey(client_pk),
+        xpubs,
+        [42u8; 32],
+    );
     let mut servers: Vec<PanetiereServerSession> = server_ids
         .iter()
         .map(|sid| {
-            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, ids[sid.0 as usize].clone(), SetMode::SelfDerived, 0, server_pubkeys(&server_pks), None)
+            PanetiereServerSession::new(
+                pp.clone(),
+                mse.clone(),
+                *sid,
+                ids[sid.0 as usize].clone(),
+                SetMode::SelfDerived,
+                0,
+                server_pubkeys(&server_pks),
+                None,
+            )
         })
         .collect();
 
@@ -151,7 +189,9 @@ fn committee_panetiere_roundtrip(payload: &[u8]) -> Vec<u8> {
     let mid: Vec<_> = servers.iter_mut().map(|s| s.end_round(0, now)).collect();
     for i in 0..servers.len() {
         for (j, o) in mid.iter().enumerate() {
-            if i == j { continue; }
+            if i == j {
+                continue;
+            }
             for m in &o.outbound {
                 servers[i].on_inbound(server_pks[j], m.clone());
             }
@@ -181,11 +221,25 @@ fn panetiere_back_to_back_rounds_lose_nothing() {
     let client_pk = Identity::generate().pubkey();
     let (ids, server_pks, xpubs) = server_env(n_servers);
     let mut client = PanetiereClientSession::new(
-        pp.clone(), mse.clone(), client_id_from_pubkey(client_pk), xpubs, [42u8; 32]);
+        pp.clone(),
+        mse.clone(),
+        client_id_from_pubkey(client_pk),
+        xpubs,
+        [42u8; 32],
+    );
     let mut servers: Vec<PanetiereServerSession> = server_ids
         .iter()
         .map(|sid| {
-            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, ids[sid.0 as usize].clone(), SetMode::SelfDerived, 0, server_pubkeys(&server_pks), None)
+            PanetiereServerSession::new(
+                pp.clone(),
+                mse.clone(),
+                *sid,
+                ids[sid.0 as usize].clone(),
+                SetMode::SelfDerived,
+                0,
+                server_pubkeys(&server_pks),
+                None,
+            )
         })
         .collect();
 
@@ -249,7 +303,12 @@ fn panetiere_corrupt_share_attributes_integrity() {
     let (ids, server_pks, xpubs) = server_env(n_servers);
 
     let mut client = PanetiereClientSession::new(
-        pp.clone(), mse.clone(), client_id_from_pubkey(client_pk), xpubs, [42u8; 32]);
+        pp.clone(),
+        mse.clone(),
+        client_id_from_pubkey(client_pk),
+        xpubs,
+        [42u8; 32],
+    );
     // Server 0 is the decoding leader; server 2 corrupts its share.
     let mut servers: Vec<PanetiereServerSession> = server_ids
         .iter()
@@ -259,7 +318,11 @@ fn panetiere_corrupt_share_attributes_integrity() {
                 mse.clone(),
                 *sid,
                 ids[sid.0 as usize].clone(),
-                if sid.0 == 0 { SetMode::Leader } else { SetMode::SelfDerived },
+                if sid.0 == 0 {
+                    SetMode::Leader
+                } else {
+                    SetMode::SelfDerived
+                },
                 0,
                 server_pubkeys(&server_pks),
                 None,
@@ -281,7 +344,9 @@ fn panetiere_corrupt_share_attributes_integrity() {
     let mid: Vec<_> = servers.iter_mut().map(|s| s.end_round(0, now)).collect();
     for i in 0..servers.len() {
         for (j, o) in mid.iter().enumerate() {
-            if i == j { continue; }
+            if i == j {
+                continue;
+            }
             for m in &o.outbound {
                 servers[i].on_inbound(server_pks[j], m.clone());
             }
@@ -307,7 +372,10 @@ fn panetiere_corrupt_share_attributes_integrity() {
     let fault = &faults[0];
     assert_eq!(fault.kind, FaultKind::Integrity);
     assert_eq!(fault.attribution, Attribution::Peers(vec![server_pks[2]]));
-    assert!(!fault.evidence.is_empty(), "evidence is the offending ServerPublic bytes");
+    assert!(
+        !fault.evidence.is_empty(),
+        "evidence is the offending ServerPublic bytes"
+    );
 }
 
 /// Several clients sending DISTINCT real messages in the SAME round, plus cover
@@ -339,13 +407,27 @@ fn panetiere_concurrent_clients_all_decode() {
     let mut servers: Vec<PanetiereServerSession> = server_ids
         .iter()
         .map(|sid| {
-            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, ids[sid.0 as usize].clone(), if sid.0 == 0 { SetMode::Leader } else { SetMode::SelfDerived }, 0, server_pubkeys(&server_pks), None)
+            PanetiereServerSession::new(
+                pp.clone(),
+                mse.clone(),
+                *sid,
+                ids[sid.0 as usize].clone(),
+                if sid.0 == 0 {
+                    SetMode::Leader
+                } else {
+                    SetMode::SelfDerived
+                },
+                0,
+                server_pubkeys(&server_pks),
+                None,
+            )
         })
         .collect();
 
     // First `active` clients send real messages; the rest stay idle → cover.
-    let payloads: Vec<Vec<u8>> =
-        (0..active).map(|i| format!("client-{i}-says-hi").into_bytes()).collect();
+    let payloads: Vec<Vec<u8>> = (0..active)
+        .map(|i| format!("client-{i}-says-hi").into_bytes())
+        .collect();
     for (i, p) in payloads.iter().enumerate() {
         clients[i].stage(p.clone());
     }
@@ -361,7 +443,9 @@ fn panetiere_concurrent_clients_all_decode() {
     let mid: Vec<_> = servers.iter_mut().map(|s| s.end_round(0, now)).collect();
     for i in 0..servers.len() {
         for (j, o) in mid.iter().enumerate() {
-            if i == j { continue; }
+            if i == j {
+                continue;
+            }
             for m in &o.outbound {
                 servers[i].on_inbound(server_pks[j], m.clone());
             }
@@ -371,7 +455,9 @@ fn panetiere_concurrent_clients_all_decode() {
     let decoded: Vec<Vec<u8>> = finals.iter().flat_map(|o| o.decoded.clone()).collect();
     for p in &payloads {
         assert!(
-            decoded.iter().any(|d| d.windows(p.len()).any(|w| w == p.as_slice())),
+            decoded
+                .iter()
+                .any(|d| d.windows(p.len()).any(|w| w == p.as_slice())),
             "message {:?} not recovered; all concurrent messages must decode, got {} buffers",
             String::from_utf8_lossy(p),
             decoded.len(),
@@ -382,7 +468,12 @@ fn panetiere_concurrent_clients_all_decode() {
         .iter()
         .map(|d| d.iter().take_while(|b| **b != 0).copied().collect())
         .collect();
-    assert_eq!(distinct.len(), active, "cover must not add messages; got {}", distinct.len());
+    assert_eq!(
+        distinct.len(),
+        active,
+        "cover must not add messages; got {}",
+        distinct.len()
+    );
 }
 
 /// Followers must share over the *leader's* announced set (not a self-derived
@@ -395,15 +486,20 @@ fn panetiere_followers_use_leader_set_with_min_floor() {
         let n_servers = 3;
         let (mse, pp) = channel(&mut setup_rng, n_servers, n_clients, 64);
         let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
-        let client_pks: Vec<Pubkey> = (0..n_clients).map(|_| Identity::generate().pubkey()).collect();
+        let client_pks: Vec<Pubkey> = (0..n_clients)
+            .map(|_| Identity::generate().pubkey())
+            .collect();
         let (ids, server_pks, xpubs) = server_env(n_servers);
         let leader_pk = server_pks[0];
 
         let mut clients: Vec<PanetiereClientSession> = (0..n_clients)
             .map(|i| {
                 PanetiereClientSession::new(
-                    pp.clone(), mse.clone(), client_id_from_pubkey(client_pks[i]),
-                    xpubs.clone(), [50 + i as u8; 32],
+                    pp.clone(),
+                    mse.clone(),
+                    client_id_from_pubkey(client_pks[i]),
+                    xpubs.clone(),
+                    [50 + i as u8; 32],
                 )
             })
             .collect();
@@ -419,8 +515,14 @@ fn panetiere_followers_use_leader_set_with_min_floor() {
                     SetMode::Follower { leader: leader_pk }
                 };
                 PanetiereServerSession::new(
-                    pp.clone(), mse.clone(), *sid, ids[sid.0 as usize].clone(),
-                    mode, min_clients, server_pubkeys(&server_pks), None,
+                    pp.clone(),
+                    mse.clone(),
+                    *sid,
+                    ids[sid.0 as usize].clone(),
+                    mode,
+                    min_clients,
+                    server_pubkeys(&server_pks),
+                    None,
                 )
             })
             .collect();
@@ -452,7 +554,10 @@ fn panetiere_followers_use_leader_set_with_min_floor() {
         }
         decoded_total
     }
-    assert!(run(2, 2) >= 1, "followers adopt the leader's set and decode at the floor");
+    assert!(
+        run(2, 2) >= 1,
+        "followers adopt the leader's set and decode at the floor"
+    );
     assert_eq!(run(3, 2), 0, "decode is refused below the min client set");
 }
 
@@ -462,7 +567,12 @@ fn adcnet_config_body(n_subnets: usize) -> AnymoneRoundConfigurationBody {
     relay_pks.sort();
     let mut relay_xk: Vec<_> = relays
         .iter()
-        .map(|i| (i.pubkey(), ExchangePublicKeyWire::from_key(&i.exchange_pubkey())))
+        .map(|i| {
+            (
+                i.pubkey(),
+                ExchangePublicKeyWire::from_key(&i.exchange_pubkey()),
+            )
+        })
         .collect();
     relay_xk.sort_by_key(|(p, _)| *p);
     let svc = Identity::generate();
@@ -486,7 +596,10 @@ fn adcnet_config_body(n_subnets: usize) -> AnymoneRoundConfigurationBody {
     AnymoneRoundConfigurationBody {
         round: 1,
         epoch_unix_ms: now_unix_ms(),
-        services: vec![ServiceEntry { tag: ServiceTag::from_label("anymone.chat"), pubkey: svc.pubkey() }],
+        services: vec![ServiceEntry {
+            tag: ServiceTag::from_label("anymone.chat"),
+            pubkey: svc.pubkey(),
+        }],
         subnets,
     }
 }
@@ -503,7 +616,10 @@ fn committee_panetiere_carries_multi_subnet_config() {
         let got: AnymoneRoundConfigurationBody = bincode::deserialize(&decoded).unwrap_or_else(|e| {
             panic!("{n}-subnet config body ({} bytes) did not survive the committee Panetiere: {e}", bytes.len())
         });
-        assert_eq!(got, body, "config body must round-trip byte-exact through the committee Panetiere");
+        assert_eq!(
+            got, body,
+            "config body must round-trip byte-exact through the committee Panetiere"
+        );
     }
 }
 
@@ -520,11 +636,25 @@ fn panetiere_fixed_seed_multiround_no_stall() {
     let client_pk = Identity::generate().pubkey();
     let (ids, server_pks, xpubs) = server_env(n_servers);
     let mut client = PanetiereClientSession::new(
-        pp.clone(), mse.clone(), client_id_from_pubkey(client_pk), xpubs, [42u8; 32]);
+        pp.clone(),
+        mse.clone(),
+        client_id_from_pubkey(client_pk),
+        xpubs,
+        [42u8; 32],
+    );
     let mut servers: Vec<PanetiereServerSession> = server_ids
         .iter()
         .map(|sid| {
-            PanetiereServerSession::new(pp.clone(), mse.clone(), *sid, ids[sid.0 as usize].clone(), SetMode::SelfDerived, 0, server_pubkeys(&server_pks), None)
+            PanetiereServerSession::new(
+                pp.clone(),
+                mse.clone(),
+                *sid,
+                ids[sid.0 as usize].clone(),
+                SetMode::SelfDerived,
+                0,
+                server_pubkeys(&server_pks),
+                None,
+            )
         })
         .collect();
 
@@ -535,7 +665,9 @@ fn panetiere_fixed_seed_multiround_no_stall() {
 
     for r in 0..(N_MSGS as u64 * 2 + 8) {
         for (from, m) in bus.drain(..) {
-            for s in servers.iter_mut() { s.on_inbound(from, m.clone()); }
+            for s in servers.iter_mut() {
+                s.on_inbound(from, m.clone());
+            }
         }
         if r % 2 == 0 && staged < N_MSGS {
             client.stage(format!("committee-proposal-{staged:02}").into_bytes());
@@ -545,20 +677,30 @@ fn panetiere_fixed_seed_multiround_no_stall() {
             bus.push((client_pk, m));
         }
         for (from, m) in bus.drain(..) {
-            for s in servers.iter_mut() { s.on_inbound(from, m.clone()); }
+            for s in servers.iter_mut() {
+                s.on_inbound(from, m.clone());
+            }
         }
         for (i, s) in servers.iter_mut().enumerate() {
             let out = s.end_round(r, now);
-            for m in out.outbound { bus.push((server_pks[i], m)); }
+            for m in out.outbound {
+                bus.push((server_pks[i], m));
+            }
             for d in out.decoded {
                 let trimmed: Vec<u8> = d.iter().take_while(|b| **b != 0).copied().collect();
-                if !trimmed.is_empty() { decoded.insert(trimmed); }
+                if !trimmed.is_empty() {
+                    decoded.insert(trimmed);
+                }
             }
         }
     }
 
     for i in 0..N_MSGS {
         let want = format!("committee-proposal-{i:02}").into_bytes();
-        assert!(decoded.contains(&want), "message {i} never decoded; got {} distinct", decoded.len());
+        assert!(
+            decoded.contains(&want),
+            "message {i} never decoded; got {} distinct",
+            decoded.len()
+        );
     }
 }

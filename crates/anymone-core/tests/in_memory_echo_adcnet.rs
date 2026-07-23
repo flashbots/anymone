@@ -42,10 +42,7 @@ fn build_config(
     // echo service, which replies as a client) announce their own exchange
     // keys on the subnet via signed `ClientKey` messages — no config entry.
     let _ = (service, client);
-    let mut relay_xk: Vec<_> = relays
-        .iter()
-        .map(|i| (i.pubkey(), xkw(i)))
-        .collect();
+    let mut relay_xk: Vec<_> = relays.iter().map(|i| (i.pubkey(), xkw(i))).collect();
     relay_xk.sort_by_key(|(p, _)| *p);
 
     AnymoneRoundConfiguration::singleton_subnet(
@@ -60,7 +57,10 @@ fn build_config(
             aggregation: None,
         }),
         relay_pks,
-        vec![ServiceEntry { tag: echo_tag(), pubkey: service.pubkey() }],
+        vec![ServiceEntry {
+            tag: echo_tag(),
+            pubkey: service.pubkey(),
+        }],
     )
     .sign_with(&[committee])
 }
@@ -96,9 +96,12 @@ async fn adcnet_echo_roundtrip_in_memory() {
     let client_handle = net.handle(client.pubkey());
     let client_anymone =
         Anymone::start_with_config(client, Arc::new(client_handle), cfg.clone()).await;
-    let idle_anymone =
-        Anymone::start_with_config(idle.clone(), Arc::new(net.handle(idle.pubkey())), cfg.clone())
-            .await;
+    let idle_anymone = Anymone::start_with_config(
+        idle.clone(),
+        Arc::new(net.handle(idle.pubkey())),
+        cfg.clone(),
+    )
+    .await;
 
     let mut svc_pipe = service_anymone.bind(echo_tag()).await.unwrap();
     tokio::spawn(async move {
@@ -111,8 +114,10 @@ async fn adcnet_echo_roundtrip_in_memory() {
     let leader = anymone_core::runtime::subnet_leader_pk(&cfg.body.subnets[0]);
     let anon = Arc::new(std::sync::atomic::AtomicU64::new(0));
     {
-        let mut sub =
-            net.handle(Identity::generate().pubkey()).subscribe(&subnet_broadcast_topic(0)).await;
+        let mut sub = net
+            .handle(Identity::generate().pubkey())
+            .subscribe(&subnet_broadcast_topic(0))
+            .await;
         let anon = anon.clone();
         tokio::spawn(async move {
             let mut o = AdcnetObserverSession::new(roster, leader, 2);
@@ -147,7 +152,10 @@ async fn adcnet_echo_roundtrip_in_memory() {
         }
     })
     .await;
-    assert!(reached.is_ok(), "idle open pipe never appeared in the anon set (no cover)");
+    assert!(
+        reached.is_ok(),
+        "idle open pipe never appeared in the anon set (no cover)"
+    );
 
     drop(anymones);
 }
@@ -196,7 +204,10 @@ async fn adcnet_aggregated_echo_roundtrip_when_leader_is_aggregator() {
             }),
         }),
         relay_pks.clone(),
-        vec![ServiceEntry { tag: echo_tag(), pubkey: service.pubkey() }],
+        vec![ServiceEntry {
+            tag: echo_tag(),
+            pubkey: service.pubkey(),
+        }],
     )
     .sign_with(&[&committee]);
     assert_eq!(
@@ -225,10 +236,14 @@ async fn adcnet_aggregated_echo_roundtrip_when_leader_is_aggregator() {
     });
 
     let mut pipe = client_anymone.open(echo_tag()).await.unwrap();
-    pipe.send(b"hello aggregated adcnet".to_vec()).await.unwrap();
+    pipe.send(b"hello aggregated adcnet".to_vec())
+        .await
+        .unwrap();
     let reply = tokio::time::timeout(Duration::from_secs(15), pipe.recv())
         .await
-        .expect("recv timed out — the leader's own aggregator output never reached its Server session")
+        .expect(
+            "recv timed out — the leader's own aggregator output never reached its Server session",
+        )
         .expect("pipe closed");
     let reply_str = &reply.payload[..reply.payload.len().min(24)];
     assert_eq!(reply_str, b"hello aggregated adcnet");
@@ -270,16 +285,16 @@ async fn broadcast_room_participant_sees_own_message_via_channel() {
                 .await,
         );
     }
-    let owner_anymone =
-        Anymone::start_with_config(owner.clone(), Arc::new(net.handle(owner.pubkey())), cfg.clone())
-            .await;
+    let owner_anymone = Anymone::start_with_config(
+        owner.clone(),
+        Arc::new(net.handle(owner.pubkey())),
+        cfg.clone(),
+    )
+    .await;
     for id in &others {
-        let a = Anymone::start_with_config(
-            id.clone(),
-            Arc::new(net.handle(id.pubkey())),
-            cfg.clone(),
-        )
-        .await;
+        let a =
+            Anymone::start_with_config(id.clone(), Arc::new(net.handle(id.pubkey())), cfg.clone())
+                .await;
         let pipe = a.subscribe(echo_tag()).await.unwrap();
         keep.push(a);
         tokio::spawn(async move {
@@ -334,7 +349,10 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
 
     let net = InMemoryNetwork::new();
     let committee = Identity::generate();
-    let gov = GovernanceBootstrap { committee: vec![committee.pubkey()], threshold: 1 };
+    let gov = GovernanceBootstrap {
+        committee: vec![committee.pubkey()],
+        threshold: 1,
+    };
     let relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
     let service = Identity::generate();
     let n_clients = 8usize;
@@ -356,7 +374,10 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
             aggregation: None,
         })
     };
-    let services = vec![ServiceEntry { tag: echo_tag(), pubkey: service.pubkey() }];
+    let services = vec![ServiceEntry {
+        tag: echo_tag(),
+        pubkey: service.pubkey(),
+    }];
 
     let v0 = AnymoneRoundConfiguration::new(AnymoneRoundConfigurationBody {
         round: 0,
@@ -381,10 +402,17 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
     // Observer on subnet 0's broadcast topic → tracks its live anonymity set.
     let anon0 = Arc::new(AtomicU64::new(0));
     {
-        let mut sub0 = net.handle(Identity::generate().pubkey()).subscribe(&subnet_broadcast_topic(0)).await;
+        let mut sub0 = net
+            .handle(Identity::generate().pubkey())
+            .subscribe(&subnet_broadcast_topic(0))
+            .await;
         let anon0 = anon0.clone();
         let roster = relay_pks.clone();
-        let leader = { let mut r = relay_pks.clone(); r.sort(); r[0] };
+        let leader = {
+            let mut r = relay_pks.clone();
+            r.sort();
+            r[0]
+        };
         tokio::spawn(async move {
             let mut o = AdcnetObserverSession::new(roster, leader, 2);
             while let Some(m) = sub0.recv().await {
@@ -397,15 +425,26 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
     // Prepare everyone before publishing v0.
     let mut relay_preps = Vec::new();
     for id in &relays {
-        relay_preps.push(Anymone::prepare(id.clone(), Arc::new(net.handle(id.pubkey())), gov.clone()).await);
+        relay_preps.push(
+            Anymone::prepare(id.clone(), Arc::new(net.handle(id.pubkey())), gov.clone()).await,
+        );
     }
-    let svc_prep = Anymone::prepare(service.clone(), Arc::new(net.handle(service.pubkey())), gov.clone()).await;
+    let svc_prep = Anymone::prepare(
+        service.clone(),
+        Arc::new(net.handle(service.pubkey())),
+        gov.clone(),
+    )
+    .await;
     let mut client_preps = Vec::new();
     for id in &clients {
-        client_preps.push(Anymone::prepare(id.clone(), Arc::new(net.handle(id.pubkey())), gov.clone()).await);
+        client_preps.push(
+            Anymone::prepare(id.clone(), Arc::new(net.handle(id.pubkey())), gov.clone()).await,
+        );
     }
 
-    net.handle(committee.pubkey()).publish(TOPIC_CONFIG, bincode::serialize(&v0).unwrap()).await;
+    net.handle(committee.pubkey())
+        .publish(TOPIC_CONFIG, bincode::serialize(&v0).unwrap())
+        .await;
 
     let mut keep: Vec<Anymone> = Vec::new();
     for p in relay_preps {
@@ -423,7 +462,9 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
     for prep in client_preps {
         tokio::spawn(async move {
             let Ok(a) = prep.start().await else { return };
-            let Ok(pipe) = a.open(echo_tag()).await else { return };
+            let Ok(pipe) = a.open(echo_tag()).await else {
+                return;
+            };
             let _keep = a;
             loop {
                 let _ = pipe.send(b"x".to_vec()).await;
@@ -446,7 +487,9 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
     .expect("subnet 0 never gathered all clients");
 
     // Add subnet 1; clients re-home and must leave subnet 0.
-    net.handle(committee.pubkey()).publish(TOPIC_CONFIG, bincode::serialize(&v1).unwrap()).await;
+    net.handle(committee.pubkey())
+        .publish(TOPIC_CONFIG, bincode::serialize(&v1).unwrap())
+        .await;
 
     // Give re-homing several rounds, then subnet 0 must have shed clients.
     let shed = tokio::time::timeout(Duration::from_secs(60), async {
@@ -459,16 +502,25 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
     })
     .await
     .expect("subnet 0 kept all clients after the split — double-counted across subnets");
-    assert!(shed < n_clients, "subnet 0 must shed re-homed clients, still has {shed}/{n_clients}");
+    assert!(
+        shed < n_clients,
+        "subnet 0 must shed re-homed clients, still has {shed}/{n_clients}"
+    );
 
     // Subnet 1's leader is sorted_relays[1 % 3] = relay_pks[1], NOT the
     // sorted-first relay — so a non-zero-index leader must be the one announcing
     // the canonical set and broadcasting output on subnet 1.
     let subnet1_leader = relay_pks[1 % relay_pks.len()];
-    let mut bcast1 = net.handle(Identity::generate().pubkey()).subscribe(&subnet_broadcast_topic(1)).await;
+    let mut bcast1 = net
+        .handle(Identity::generate().pubkey())
+        .subscribe(&subnet_broadcast_topic(1))
+        .await;
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            let m = bcast1.recv().await.expect("subnet 1 broadcast topic closed");
+            let m = bcast1
+                .recv()
+                .await
+                .expect("subnet 1 broadcast topic closed");
             if m.from == subnet1_leader {
                 return;
             }
@@ -481,7 +533,10 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
     // an outsider's publish there must not reach anyone (real relay share
     // traffic keeps flowing, so filter for the forged payload specifically).
     let outsider = Identity::generate();
-    let mut shares1 = net.handle(Identity::generate().pubkey()).subscribe(&subnet_shares_topic(1)).await;
+    let mut shares1 = net
+        .handle(Identity::generate().pubkey())
+        .subscribe(&subnet_shares_topic(1))
+        .await;
     net.handle(outsider.pubkey())
         .publish(&subnet_shares_topic(1), b"forged share".to_vec())
         .await;
@@ -495,7 +550,10 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
     })
     .await
     .is_ok();
-    assert!(!saw_forged, "publish from outside subnet 1's relay roster must be rejected");
+    assert!(
+        !saw_forged,
+        "publish from outside subnet 1's relay roster must be rejected"
+    );
 
     drop(keep);
 }
@@ -506,7 +564,10 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
 async fn pipe_drop_retires_client_without_further_sends() {
     let net = InMemoryNetwork::new();
     let committee = Identity::generate();
-    let gov = GovernanceBootstrap { committee: vec![committee.pubkey()], threshold: 1 };
+    let gov = GovernanceBootstrap {
+        committee: vec![committee.pubkey()],
+        threshold: 1,
+    };
     let relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
     let service = Identity::generate();
     let client = Identity::generate();
@@ -520,7 +581,10 @@ async fn pipe_drop_retires_client_without_further_sends() {
     // as this count freezing, not as it reaching zero.
     let anon_broadcasts = Arc::new(AtomicU64::new(0));
     {
-        let mut sub0 = net.handle(Identity::generate().pubkey()).subscribe(&subnet_broadcast_topic(0)).await;
+        let mut sub0 = net
+            .handle(Identity::generate().pubkey())
+            .subscribe(&subnet_broadcast_topic(0))
+            .await;
         let anon_broadcasts = anon_broadcasts.clone();
         let roster = relay_pks.clone();
         tokio::spawn(async move {
@@ -540,11 +604,20 @@ async fn pipe_drop_retires_client_without_further_sends() {
 
     let mut relay_preps = Vec::new();
     for id in &relays {
-        relay_preps.push(Anymone::prepare(id.clone(), Arc::new(net.handle(id.pubkey())), gov.clone()).await);
+        relay_preps.push(
+            Anymone::prepare(id.clone(), Arc::new(net.handle(id.pubkey())), gov.clone()).await,
+        );
     }
-    let client_prep = Anymone::prepare(client.clone(), Arc::new(net.handle(client.pubkey())), gov.clone()).await;
+    let client_prep = Anymone::prepare(
+        client.clone(),
+        Arc::new(net.handle(client.pubkey())),
+        gov.clone(),
+    )
+    .await;
 
-    net.handle(committee.pubkey()).publish(TOPIC_CONFIG, bincode::serialize(&cfg).unwrap()).await;
+    net.handle(committee.pubkey())
+        .publish(TOPIC_CONFIG, bincode::serialize(&cfg).unwrap())
+        .await;
 
     let mut relays_running = Vec::new();
     for p in relay_preps {

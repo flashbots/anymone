@@ -26,16 +26,16 @@ async fn two_peers_can_gossip() {
 
     let net_a = Libp2pNetwork::start(
         &id_a,
-        Libp2pConfig { listen: listen_a.clone(), bootstrap_peers: vec![] },
+        Libp2pConfig {
+            listen: listen_a.clone(),
+            bootstrap_peers: vec![],
+        },
     )
     .await
     .unwrap();
-    let a_addr: Multiaddr = format!(
-        "/ip4/127.0.0.1/tcp/{port_a}/p2p/{}",
-        net_a.local_peer_id()
-    )
-    .parse()
-    .unwrap();
+    let a_addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port_a}/p2p/{}", net_a.local_peer_id())
+        .parse()
+        .unwrap();
 
     let net_b = Libp2pNetwork::start(
         &id_b,
@@ -67,16 +67,27 @@ async fn two_peers_can_gossip() {
 /// not bootnode relaying.
 #[tokio::test(flavor = "multi_thread")]
 async fn bootnode_only_peers_discover_each_other() {
-    async fn node(port: u16, bootstrap: Vec<Multiaddr>) -> (Identity, std::sync::Arc<Libp2pNetwork>) {
+    async fn node(
+        port: u16,
+        bootstrap: Vec<Multiaddr>,
+    ) -> (Identity, std::sync::Arc<Libp2pNetwork>) {
         let id = Identity::generate();
         let listen: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
-        let net = Libp2pNetwork::start(&id, Libp2pConfig { listen, bootstrap_peers: bootstrap })
-            .await
-            .unwrap();
+        let net = Libp2pNetwork::start(
+            &id,
+            Libp2pConfig {
+                listen,
+                bootstrap_peers: bootstrap,
+            },
+        )
+        .await
+        .unwrap();
         (id, net)
     }
     fn addr_of(port: u16, net: &Libp2pNetwork) -> Multiaddr {
-        format!("/ip4/127.0.0.1/tcp/{port}/p2p/{}", net.local_peer_id()).parse().unwrap()
+        format!("/ip4/127.0.0.1/tcp/{port}/p2p/{}", net.local_peer_id())
+            .parse()
+            .unwrap()
     }
 
     let port_boot = portpicker::pick_unused_port().expect("free port");
@@ -96,12 +107,19 @@ async fn bootnode_only_peers_discover_each_other() {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let msg = loop {
         net_a.publish("test/discovery", payload.clone()).await;
-        if let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(500), sub_b.recv()).await {
+        if let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(500), sub_b.recv()).await
+        {
             break msg;
         }
-        assert!(std::time::Instant::now() < deadline, "B never received — discovery failed");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "B never received — discovery failed"
+        );
     };
     assert_eq!(msg.from, id_a.pubkey());
     assert_eq!(msg.payload, payload);
-    assert!(net_a.peer_snapshot().contains(&id_b.pubkey()), "A not directly connected to B");
+    assert!(
+        net_a.peer_snapshot().contains(&id_b.pubkey()),
+        "A not directly connected to B"
+    );
 }

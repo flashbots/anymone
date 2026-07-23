@@ -395,7 +395,7 @@ impl AnymoneRoundConfiguration {
         Ok(())
     }
 
-    /// Helper for tests and the M3 static publisher: one subnet with the
+    /// Helper for tests and static publishing: one subnet with the
     /// given protocol, relays, and services. SubnetId = 0.
     pub fn singleton_subnet(
         round: Round,

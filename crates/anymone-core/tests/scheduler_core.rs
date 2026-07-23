@@ -13,13 +13,13 @@ use anymone_core::config::{
     AdcnetConfig, AnymoneRoundConfiguration, AnymoneRoundConfigurationBody, ExchangePublicKeyWire,
     NoopConfig, ProtocolConfig,
 };
-use anymone_core::scheduler_core::{
-    CommitteeSig, SchedulerAction, SchedulerCore, SchedulerParams, SignedProposal,
-};
 use anymone_core::faults::{Attribution, Fault, FaultKind};
 use anymone_core::panetiere::{
-    client_id_from_pubkey, PanetiereClientSession, PanetiereObserverSession, PanetiereServerSession,
-    SetMode,
+    client_id_from_pubkey, PanetiereClientSession, PanetiereObserverSession,
+    PanetiereServerSession, SetMode,
+};
+use anymone_core::scheduler_core::{
+    CommitteeSig, SchedulerAction, SchedulerCore, SchedulerParams, SignedProposal,
 };
 use anymone_core::session::{Misbehavior, Session};
 use anymone_core::{FaultReport, Identity, Pubkey, Registration, ServiceTag, TOPIC_CONFIG};
@@ -62,7 +62,9 @@ fn enact(core: &mut SchedulerCore, committee: &[Identity], proposal: SignedPropo
         signature: peer.sign(&approve_bytes),
     });
     assert!(
-        actions.iter().any(|a| matches!(a, SchedulerAction::Publish { topic, .. } if topic == TOPIC_CONFIG)),
+        actions
+            .iter()
+            .any(|a| matches!(a, SchedulerAction::Publish { topic, .. } if topic == TOPIC_CONFIG)),
         "enact: proposal must publish a config at threshold"
     );
 }
@@ -109,7 +111,11 @@ fn lead_core(committee: &[Identity], threshold: u32) -> SchedulerCore {
 /// `escalation_grace` is generous so an unrelated honest-traffic de-escalation
 /// (the original fault healing) doesn't interfere with a mode-selection test
 /// running many rounds of otherwise-clean traffic.
-fn lead_core_msg_size(committee: &[Identity], threshold: u32, message_size: usize) -> SchedulerCore {
+fn lead_core_msg_size(
+    committee: &[Identity],
+    threshold: u32,
+    message_size: usize,
+) -> SchedulerCore {
     let mut sorted: Vec<_> = committee.to_vec();
     sorted.sort_by_key(|i| i.pubkey());
     let pks: Vec<_> = committee.iter().map(|i| i.pubkey()).collect();
@@ -173,11 +179,15 @@ fn renegotiates_adcnet_panetiere_adcnet() {
 
     // Liveness fault attributed to relay #1 (partial shares seen, #1's missing).
     let victim = relays[1].pubkey();
-    core.apply_observed_faults(0, vec![Fault {
-        kind: FaultKind::Liveness,
-        attribution: Attribution::Peers(vec![victim]),
-        evidence: Vec::new(),
-    }], 0);
+    core.apply_observed_faults(
+        0,
+        vec![Fault {
+            kind: FaultKind::Liveness,
+            attribution: Attribution::Peers(vec![victim]),
+            evidence: Vec::new(),
+        }],
+        0,
+    );
 
     // Escalate to Panetiere with the victim dropped.
     let body = staged_body(&core.tick(3, 0)).expect("escalation proposal staged");
@@ -227,17 +237,32 @@ fn renegotiates_adcnet_panetiere_adcnet() {
     let pinned_service = Identity::generate();
     register_relays_and_service(&mut pinned, &pinned_relays, &pinned_service);
     let body = staged_body(&pinned.tick(0, 0)).expect("pinned core stages on round 0");
-    assert_eq!(proto_name(&body), "panetiere", "pin must hold with zero faults");
+    assert_eq!(
+        proto_name(&body),
+        "panetiere",
+        "pin must hold with zero faults"
+    );
 
     let pinned_victim = pinned_relays[1].pubkey();
-    pinned.apply_observed_faults(0, vec![Fault {
-        kind: FaultKind::Liveness,
-        attribution: Attribution::Peers(vec![pinned_victim]),
-        evidence: Vec::new(),
-    }], 0);
+    pinned.apply_observed_faults(
+        0,
+        vec![Fault {
+            kind: FaultKind::Liveness,
+            attribution: Attribution::Peers(vec![pinned_victim]),
+            evidence: Vec::new(),
+        }],
+        0,
+    );
     let body = staged_body(&pinned.tick(1, 0)).expect("pinned core re-proposes after fault");
-    assert_eq!(proto_name(&body), "panetiere", "pin must hold across a fault");
-    assert!(!body.subnets[0].relays.contains(&pinned_victim), "sidelining still runs under the pin");
+    assert_eq!(
+        proto_name(&body),
+        "panetiere",
+        "pin must hold across a fault"
+    );
+    assert!(
+        !body.subnets[0].relays.contains(&pinned_victim),
+        "sidelining still runs under the pin"
+    );
 
     // sideline: false — the same attributed fault is recorded but the roster
     // stays intact; the staged body keeps all 3 relays.
@@ -262,13 +287,21 @@ fn renegotiates_adcnet_panetiere_adcnet() {
     );
     register_relays_and_service(&mut reporting, &pinned_relays, &pinned_service);
     let _ = reporting.tick(0, 0);
-    reporting.apply_observed_faults(0, vec![Fault {
-        kind: FaultKind::Integrity,
-        attribution: Attribution::Peers(vec![pinned_victim]),
-        evidence: Vec::new(),
-    }], 0);
+    reporting.apply_observed_faults(
+        0,
+        vec![Fault {
+            kind: FaultKind::Integrity,
+            attribution: Attribution::Peers(vec![pinned_victim]),
+            evidence: Vec::new(),
+        }],
+        0,
+    );
     let body = staged_body(&reporting.tick(1, 0)).expect("re-stage until published");
-    assert_eq!(body.subnets[0].relays.len(), 3, "sideline: false must not drop the culprit");
+    assert_eq!(
+        body.subnets[0].relays.len(),
+        3,
+        "sideline: false must not drop the culprit"
+    );
 }
 
 #[test]
@@ -285,11 +318,15 @@ fn unattributable_fault_escalates_without_dropping() {
     assert_eq!(body.subnets[0].relays.len(), 3);
 
     // General subnetwork fault (no output, all/none shares) — unattributable.
-    core.apply_observed_faults(0, vec![Fault {
-        kind: FaultKind::Liveness,
-        attribution: Attribution::None,
-        evidence: Vec::new(),
-    }], 0);
+    core.apply_observed_faults(
+        0,
+        vec![Fault {
+            kind: FaultKind::Liveness,
+            attribution: Attribution::None,
+            evidence: Vec::new(),
+        }],
+        0,
+    );
 
     // Escalate to Panetiere but keep all 3 relays (nobody specific to drop).
     let esc = staged_proposal(&core.tick(1, 0)).expect("escalation proposal");
@@ -306,7 +343,10 @@ fn unattributable_fault_escalates_without_dropping() {
     // Ticking well past the grace with the subnet fully silent must not heal
     // it — silence produces no fault either, but it isn't a clean round.
     for r in 3..10 {
-        assert!(staged_body(&core.tick(r, 0)).is_none(), "silence must not heal the subnet");
+        assert!(
+            staged_body(&core.tick(r, 0)).is_none(),
+            "silence must not heal the subnet"
+        );
     }
 
     // Real signed Panetiere traffic for the grace period does heal it.
@@ -340,11 +380,15 @@ fn integrity_offender_barred_until_backoff() {
     enact(&mut core, &committee, first);
 
     let victim = relays[1].pubkey();
-    core.apply_observed_faults(0, vec![Fault {
-        kind: FaultKind::Integrity,
-        attribution: Attribution::Peers(vec![victim]),
-        evidence: Vec::new(),
-    }], 0);
+    core.apply_observed_faults(
+        0,
+        vec![Fault {
+            kind: FaultKind::Integrity,
+            attribution: Attribution::Peers(vec![victim]),
+            evidence: Vec::new(),
+        }],
+        0,
+    );
 
     let esc = staged_proposal(&core.tick(1, 0)).expect("escalation proposal");
     assert_eq!(proto_name(&esc.body), "panetiere");
@@ -354,7 +398,10 @@ fn integrity_offender_barred_until_backoff() {
     // Re-registration within the backoff is refused — the offender stays out, so
     // the content is unchanged and (already enacted) nothing is re-staged.
     core.on_registration(Registration::relay(&relays[1], xkw(&relays[1])));
-    assert!(staged_body(&core.tick(2, 60_000)).is_none(), "still sidelined within backoff");
+    assert!(
+        staged_body(&core.tick(2, 60_000)).is_none(),
+        "still sidelined within backoff"
+    );
 
     // After the backoff, the offender entry expires and re-registration heals.
     let after = 6 * 60 * 1000 + 1;
@@ -409,14 +456,18 @@ fn multisig_assembles_via_committee_sig() {
 
     // A proposal signature must not double as a valid approval.
     assert!(
-        !lead.pubkey().verify(&body.approve_bytes(), &proposal.signature),
+        !lead
+            .pubkey()
+            .verify(&body.approve_bytes(), &proposal.signature),
         "a proposal signature must not verify as a valid approval"
     );
 
     // The committee Panetiere decodes the body back to the lead → 1 sig, no config.
     let actions = core.on_decoded_body(proposal);
     assert!(
-        !actions.iter().any(|a| matches!(a, SchedulerAction::Publish { topic, .. } if topic == TOPIC_CONFIG)),
+        !actions
+            .iter()
+            .any(|a| matches!(a, SchedulerAction::Publish { topic, .. } if topic == TOPIC_CONFIG)),
         "must not assemble with a single signature"
     );
 
@@ -431,19 +482,25 @@ fn multisig_assembles_via_committee_sig() {
     let cfg_bytes = actions
         .iter()
         .find_map(|a| match a {
-            SchedulerAction::Publish { topic, bytes } if topic == TOPIC_CONFIG => Some(bytes.clone()),
+            SchedulerAction::Publish { topic, bytes } if topic == TOPIC_CONFIG => {
+                Some(bytes.clone())
+            }
             _ => None,
         })
         .expect("config must be published once threshold signatures are in");
     let cfg: AnymoneRoundConfiguration = bincode::deserialize(&cfg_bytes).unwrap();
-    cfg.verify_multisig(&pks, 2).expect("assembled config verifies at threshold");
+    cfg.verify_multisig(&pks, 2)
+        .expect("assembled config verifies at threshold");
 
     // A restarted (fresh) core seeded from the published config resumes above
     // the network's round; an unverifiable config must not seed.
     let mut forged = cfg.clone();
     forged.signatures.clear();
     let mut fresh = SchedulerCore::new(lead.clone(), pks.clone(), 2, params.clone());
-    assert!(!fresh.on_published_config(&forged), "unverifiable config must not seed");
+    assert!(
+        !fresh.on_published_config(&forged),
+        "unverifiable config must not seed"
+    );
 
     // A multisig-valid but empty-relay body must be rejected, not panic in leader_of.
     let empty_relay_cfg = AnymoneRoundConfiguration::new(AnymoneRoundConfigurationBody {
@@ -483,7 +540,11 @@ fn multisig_assembles_via_committee_sig() {
     let mut stale_body = cfg.body.clone();
     stale_body.round -= 1;
     let signature = lead.sign(&stale_body.propose_bytes());
-    let stale = SignedProposal { body: stale_body, proposer: lead.pubkey(), signature };
+    let stale = SignedProposal {
+        body: stale_body,
+        proposer: lead.pubkey(),
+        signature,
+    };
     assert!(
         member.on_decoded_body(stale).is_empty(),
         "rollback below the seeded round must be rejected"
@@ -532,15 +593,23 @@ fn cover_rate_stamped_and_reproposed() {
     // Default rate stamped onto every subnet.
     let first = staged_proposal(&core.tick(0, 0)).expect("first proposal staged");
     assert!(first.body.subnets.iter().all(|s| s.cover_rate == 1.0));
-    enact(&mut core, &committee, first);
+    assert_ne!(
+        first.body.epoch_unix_ms, 0,
+        "epoch must be a real wall-clock stamp, not 0"
+    );
+    enact(&mut core, &committee, first.clone());
 
     // Unchanged content → no re-propose.
     assert!(staged_body(&core.tick(1, 0)).is_none());
 
-    // A cover change re-proposes with the new rate.
+    // Epoch must carry forward unchanged across re-proposals.
     core.set_cover_rate(0.25);
     let reproposed = staged_proposal(&core.tick(2, 0)).expect("cover change re-proposes");
     assert!(reproposed.body.subnets.iter().all(|s| s.cover_rate == 0.25));
+    assert_eq!(
+        reproposed.body.epoch_unix_ms, first.body.epoch_unix_ms,
+        "epoch must stay fixed across re-proposals of the same network"
+    );
 }
 
 /// A live ADCNet subnet (clients + relays, relay 0 the leader) over a
@@ -601,13 +670,21 @@ impl Subnet {
                     sorted.len(),
                     relay_pks.clone(),
                     0,
+                    usize::MAX,
                     i == 0,
                     leader_pk,
                     None,
                 )
             })
             .collect();
-        Subnet { clients, client_pks, relays, relay_pks, bus: Vec::new(), now: Instant::now() }
+        Subnet {
+            clients,
+            client_pks,
+            relays,
+            relay_pks,
+            bus: Vec::new(),
+            now: Instant::now(),
+        }
     }
 
     /// Run one round; return all wire messages produced. `alive` lists
@@ -622,10 +699,14 @@ impl Subnet {
             }
         }
         for (from, msg) in self.bus.drain(..).collect::<Vec<_>>() {
-            for relay in self.relays.iter_mut() { relay.on_inbound(from, msg.clone()); }
+            for relay in self.relays.iter_mut() {
+                relay.on_inbound(from, msg.clone());
+            }
         }
         for i in 0..self.relays.len() {
-            if !alive.contains(&i) { continue; }
+            if !alive.contains(&i) {
+                continue;
+            }
             let out = self.relays[i].end_round(r, self.now);
             let pk = self.relay_pks[i];
             for m in out.outbound {
@@ -634,7 +715,9 @@ impl Subnet {
             }
         }
         for (from, msg) in self.bus.drain(..).collect::<Vec<_>>() {
-            for relay in self.relays.iter_mut() { relay.on_inbound(from, msg.clone()); }
+            for relay in self.relays.iter_mut() {
+                relay.on_inbound(from, msg.clone());
+            }
         }
         produced
     }
@@ -717,7 +800,8 @@ fn committee_schedules_second_subnet_when_one_nears_capacity() {
     assert_eq!(body.subnets.len(), 1, "v0 starts with a single subnet");
     let cfg = adcnet_cfg_of(&body);
     core.on_decoded_body(proposal);
-    let proposal_no_agg = staged_proposal(&core_no_agg.tick(0, 0)).expect("first proposal (no-agg)");
+    let proposal_no_agg =
+        staged_proposal(&core_no_agg.tick(0, 0)).expect("first proposal (no-agg)");
     core_no_agg.on_decoded_body(proposal_no_agg);
 
     let clients: Vec<Identity> = (0..32).map(|_| Identity::generate()).collect();
@@ -742,27 +826,55 @@ fn committee_schedules_second_subnet_when_one_nears_capacity() {
     }
 
     let body = grown.expect("committee must schedule a second subnet once a subnet nears capacity");
-    assert_eq!(proto_name(&body), "adcnet", "scaling stays on ADCNet (not a fault escalation)");
-    assert!(body.subnets.len() >= 2, "expected ≥2 subnets, got {}", body.subnets.len());
+    assert_eq!(
+        proto_name(&body),
+        "adcnet",
+        "scaling stays on ADCNet (not a fault escalation)"
+    );
+    assert!(
+        body.subnets.len() >= 2,
+        "expected ≥2 subnets, got {}",
+        body.subnets.len()
+    );
     let grown_no_agg = grown_no_agg.expect("no-agg core must also schedule a second subnet");
     assert!(
-        grown_no_agg.subnets.iter().all(|s| s.protocol.aggregation().is_none()),
+        grown_no_agg
+            .subnets
+            .iter()
+            .all(|s| s.protocol.aggregation().is_none()),
         "aggregation: false must suppress the layer even above the capacity threshold"
     );
 
     // Per-subnet escalation (#19/#21): an unattributable fault on subnet 1
     // escalates only subnet 1 to Panetiere; subnet 0 stays optimistic ADCNet.
     let count = body.subnets.len();
-    core.apply_observed_faults(1, vec![Fault {
-        kind: FaultKind::Liveness,
-        attribution: Attribution::None,
-        evidence: Vec::new(),
-    }], 0);
+    core.apply_observed_faults(
+        1,
+        vec![Fault {
+            kind: FaultKind::Liveness,
+            attribution: Attribution::None,
+            evidence: Vec::new(),
+        }],
+        0,
+    );
     let mixed = staged_body(&core.tick(9, 0)).expect("re-propose after per-subnet fault");
-    assert_eq!(mixed.subnets.len(), count, "a fault must not change the subnet count");
-    assert!(matches!(mixed.subnets[0].protocol, ProtocolConfig::Adcnet(_)), "unfaulted subnet 0 stays ADCNet");
-    assert!(matches!(mixed.subnets[1].protocol, ProtocolConfig::Panetiere(_)), "faulted subnet 1 escalates to Panetiere");
-    assert!(mixed.subnets[1].protocol.aggregation().is_some(), "capacity above threshold should aggregate by default");
+    assert_eq!(
+        mixed.subnets.len(),
+        count,
+        "a fault must not change the subnet count"
+    );
+    assert!(
+        matches!(mixed.subnets[0].protocol, ProtocolConfig::Adcnet(_)),
+        "unfaulted subnet 0 stays ADCNet"
+    );
+    assert!(
+        matches!(mixed.subnets[1].protocol, ProtocolConfig::Panetiere(_)),
+        "faulted subnet 1 escalates to Panetiere"
+    );
+    assert!(
+        mixed.subnets[1].protocol.aggregation().is_some(),
+        "capacity above threshold should aggregate by default"
+    );
 }
 
 /// Reproduces the demo's subnet *flapping*: after growing to two subnets and
@@ -804,17 +916,28 @@ fn committee_holds_new_subnet_through_rehome_transient() {
     // First ticks under the transient must NOT shrink.
     for r in 6..8u64 {
         if let Some(b) = staged_body(&core.tick(r, 0)) {
-            assert!(b.subnets.len() >= 2, "subnet dropped during the re-home transient (round {r})");
+            assert!(
+                b.subnets.len() >= 2,
+                "subnet dropped during the re-home transient (round {r})"
+            );
         }
     }
     // Once the low load has held for the full grace window, one subnet is removed.
     let shrunk = staged_body(&core.tick(8, 0)).expect("shrink proposal after the grace window");
-    assert_eq!(shrunk.subnets.len(), 1, "removes a subnet only after the grace window");
+    assert_eq!(
+        shrunk.subnets.len(),
+        1,
+        "removes a subnet only after the grace window"
+    );
 
     // Convergent: the same low load must not oscillate back up after shrinking.
     for r in 9..12u64 {
         if let Some(b) = staged_body(&core.tick(r, 0)) {
-            assert_eq!(b.subnets.len(), 1, "must not re-grow after shrinking (round {r})");
+            assert_eq!(
+                b.subnets.len(),
+                1,
+                "must not re-grow after shrinking (round {r})"
+            );
         }
     }
 }
@@ -857,11 +980,17 @@ fn adcnet_capacity_resizes_to_observed_load() {
     let grown = drive(&mut core, 30);
     assert_eq!(grown.subnets.len(), 1);
     let grown_cap = adcnet_cfg_of(&grown).client_set_max;
-    assert!(grown_cap > floor, "capacity grew from {floor} to {grown_cap}");
+    assert!(
+        grown_cap > floor,
+        "capacity grew from {floor} to {grown_cap}"
+    );
 
     // Load collapses → capacity resizes back down.
     let shrunk_cap = adcnet_cfg_of(&drive(&mut core, 1)).client_set_max;
-    assert!(shrunk_cap < grown_cap, "capacity shrank from {grown_cap} to {shrunk_cap}");
+    assert!(
+        shrunk_cap < grown_cap,
+        "capacity shrank from {grown_cap} to {shrunk_cap}"
+    );
 }
 
 /// `sorted(committee)[0]` — the only member whose proposals are signable.
@@ -873,7 +1002,11 @@ fn lead_of(committee: &[Identity]) -> Identity {
 
 fn sign_proposal(id: &Identity, body: AnymoneRoundConfigurationBody) -> SignedProposal {
     let signature = id.sign(&body.propose_bytes());
-    SignedProposal { body, proposer: id.pubkey(), signature }
+    SignedProposal {
+        body,
+        proposer: id.pubkey(),
+        signature,
+    }
 }
 
 /// A body decoded from the committee Panetiere that wasn't signed by the lead —
@@ -893,13 +1026,21 @@ fn outsider_proposal_is_rejected() {
     // An outside peer re-signs the same body with its own (non-committee) key.
     let outsider = Identity::generate();
     assert!(
-        core.on_decoded_body(sign_proposal(&outsider, body.clone())).is_empty(),
+        core.on_decoded_body(sign_proposal(&outsider, body.clone()))
+            .is_empty(),
         "a proposal from a non-lead key must be ignored"
     );
 
     // A garbage signature carrying the lead's pubkey must also be rejected.
-    let bad = SignedProposal { body: body.clone(), proposer: genuine.proposer, signature: vec![0u8; 64] };
-    assert!(core.on_decoded_body(bad).is_empty(), "a bad lead signature must be ignored");
+    let bad = SignedProposal {
+        body: body.clone(),
+        proposer: genuine.proposer,
+        signature: vec![0u8; 64],
+    };
+    assert!(
+        core.on_decoded_body(bad).is_empty(),
+        "a bad lead signature must be ignored"
+    );
 
     // The genuine lead proposal is accepted (the member signs + gossips).
     assert!(
@@ -922,7 +1063,9 @@ fn malicious_lead_cannot_insert_unregistered_relay() {
     let mut proposal = staged_proposal(&core.tick(0, 0)).expect("staged");
     // The lead splices in a relay nobody registered, then re-signs as the lead.
     let attacker_relay = Identity::generate();
-    proposal.body.subnets[0].relays.push(attacker_relay.pubkey());
+    proposal.body.subnets[0]
+        .relays
+        .push(attacker_relay.pubkey());
     let forged = sign_proposal(&lead_of(&committee), proposal.body);
 
     assert!(
@@ -947,7 +1090,9 @@ fn stale_proposal_replay_is_rejected() {
     let mut newer = template.clone();
     newer.round = 5;
     assert!(
-        !core.on_decoded_body(sign_proposal(&lead_of(&committee), newer)).is_empty(),
+        !core
+            .on_decoded_body(sign_proposal(&lead_of(&committee), newer))
+            .is_empty(),
         "the newer proposal is accepted"
     );
 
@@ -956,7 +1101,8 @@ fn stale_proposal_replay_is_rejected() {
     let mut stale = template.clone();
     stale.round = 4;
     assert!(
-        core.on_decoded_body(sign_proposal(&lead_of(&committee), stale)).is_empty(),
+        core.on_decoded_body(sign_proposal(&lead_of(&committee), stale))
+            .is_empty(),
         "a strictly older round must be rejected"
     );
 }
@@ -999,7 +1145,12 @@ impl PanetiereSubnet {
         // elsewhere); MSE sized to that.
         let mse = MseParams::new(4, 1, 32, [0xAA; 32]);
         let n_polys = MseEncoding::n_polys(&mse);
-        let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(&mut setup_rng, n, n_polys, 1));
+        let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(
+            &mut setup_rng,
+            n,
+            n_polys,
+            1,
+        ));
         let server_ids: Vec<PanServerId> = (0..n as u32).map(PanServerId).collect();
 
         let mut sorted = relay_ids.to_vec();
@@ -1019,7 +1170,12 @@ impl PanetiereSubnet {
 
         let client_id = Identity::generate();
         let client = PanetiereClientSession::new(
-            pp.clone(), mse.clone(), client_id_from_pubkey(client_id.pubkey()), xpubs, [42u8; 32]);
+            pp.clone(),
+            mse.clone(),
+            client_id_from_pubkey(client_id.pubkey()),
+            xpubs,
+            [42u8; 32],
+        );
         let mut servers: Vec<PanetiereServerSession> = server_ids
             .iter()
             .map(|sid| {
@@ -1028,7 +1184,11 @@ impl PanetiereSubnet {
                     mse.clone(),
                     *sid,
                     sorted[sid.0 as usize].clone(),
-                    if sid.0 == 0 { SetMode::Leader } else { SetMode::SelfDerived },
+                    if sid.0 == 0 {
+                        SetMode::Leader
+                    } else {
+                        SetMode::SelfDerived
+                    },
                     0,
                     server_pubkeys.clone(),
                     None,
@@ -1062,7 +1222,8 @@ impl PanetiereSubnet {
             }
         }
         // A distinct real payload every round so the leader emits a `Decoded`.
-        self.client.stage(format!("payload-{:02}", self.seq).into_bytes());
+        self.client
+            .stage(format!("payload-{:02}", self.seq).into_bytes());
         self.seq += 1;
         let client_out = self.client.begin_round(r, self.now);
         for s in self.servers.iter_mut() {
@@ -1116,11 +1277,15 @@ fn corrupt_panetiere_keeps_escalation() {
 
     // An ADCNet corrupt share fails decode without attribution → unattributable
     // fault → escalate to Panetiere keeping all 3 relays (the corrupt one rides in).
-    core.apply_observed_faults(0, vec![Fault {
-        kind: FaultKind::Liveness,
-        attribution: Attribution::None,
-        evidence: Vec::new(),
-    }], 0);
+    core.apply_observed_faults(
+        0,
+        vec![Fault {
+            kind: FaultKind::Liveness,
+            attribution: Attribution::None,
+            evidence: Vec::new(),
+        }],
+        0,
+    );
     let esc = staged_proposal(&core.tick(1, 0)).expect("escalation proposal");
     assert_eq!(proto_name(&esc.body), "panetiere");
     assert_eq!(esc.body.subnets[0].relays.len(), 3);
@@ -1145,8 +1310,7 @@ fn corrupt_panetiere_keeps_escalation() {
         }
         total_output += decoded;
         if faults.iter().any(|f| {
-            f.kind == FaultKind::Integrity
-                && f.attribution == Attribution::Peers(vec![corrupt_pk])
+            f.kind == FaultKind::Integrity && f.attribution == Attribution::Peers(vec![corrupt_pk])
         }) {
             saw_integrity = true;
         }
@@ -1159,8 +1323,14 @@ fn corrupt_panetiere_keeps_escalation() {
 
     // Preconditions — not a stall: the subnet kept producing output AND the
     // leader raised the integrity fault.
-    assert!(total_output > 0, "subnet must keep producing output (liveness met)");
-    assert!(saw_integrity, "leader must attribute an integrity fault to the corrupt relay");
+    assert!(
+        total_output > 0,
+        "subnet must keep producing output (liveness met)"
+    );
+    assert!(
+        saw_integrity,
+        "leader must attribute an integrity fault to the corrupt relay"
+    );
 
     // The ongoing integrity fault must keep the subnet escalated; it must NOT
     // fall back to ADCNet with the offender re-included.
@@ -1182,11 +1352,15 @@ fn escalated_panetiere_core(
     register_relays_and_service(&mut core, relays, service);
     let first = staged_proposal(&core.tick(0, 0)).expect("first proposal");
     enact(&mut core, committee, first);
-    core.apply_observed_faults(0, vec![Fault {
-        kind: FaultKind::Liveness,
-        attribution: Attribution::None,
-        evidence: Vec::new(),
-    }], 0);
+    core.apply_observed_faults(
+        0,
+        vec![Fault {
+            kind: FaultKind::Liveness,
+            attribution: Attribution::None,
+            evidence: Vec::new(),
+        }],
+        0,
+    );
     let esc = staged_proposal(&core.tick(1, 0)).expect("escalation");
     assert_eq!(proto_name(&esc.body), "panetiere");
     enact(&mut core, committee, esc);
@@ -1218,10 +1392,16 @@ fn committee_acts_on_verified_leader_integrity_report() {
     for r in 0..4u64 {
         let (wire, faults, _) = net.round(r);
         if honest_sp.is_none() {
-            honest_sp = wire.iter().find(|(from, _)| *from == honest_pk).map(|(_, b)| b.clone());
+            honest_sp = wire
+                .iter()
+                .find(|(from, _)| *from == honest_pk)
+                .map(|(_, b)| b.clone());
         }
         if corrupt_sp.is_none() {
-            corrupt_sp = wire.iter().find(|(from, _)| *from == corrupt_pk).map(|(_, b)| b.clone());
+            corrupt_sp = wire
+                .iter()
+                .find(|(from, _)| *from == corrupt_pk)
+                .map(|(_, b)| b.clone());
         }
         if integrity.is_none() {
             integrity = faults.into_iter().find(|f| f.kind == FaultKind::Integrity);
@@ -1239,18 +1419,48 @@ fn committee_acts_on_verified_leader_integrity_report() {
     let mut core = escalated_panetiere_core(&committee, &relays, &service);
     core.on_fault_report(
         leader_pk,
-        FaultReport { round: 5, subnet: 0, reporter: leader_pk, fault: fault.clone() },
+        FaultReport {
+            round: 5,
+            subnet: 0,
+            reporter: leader_pk,
+            fault: fault.clone(),
+        },
         0,
     );
     let body = staged_body(&core.tick(2, 0)).expect("re-propose after integrity report");
     assert_eq!(proto_name(&body), "panetiere");
     assert!(!body.subnets[0].relays.contains(&corrupt_pk));
 
+    // A replayed report must not refresh the offender's backoff timer.
+    core.on_fault_report(
+        leader_pk,
+        FaultReport {
+            round: 5,
+            subnet: 0,
+            reporter: leader_pk,
+            fault: fault.clone(),
+        },
+        6 * 60 * 1000 - 1,
+    );
+    core.tick(3, 6 * 60 * 1000 + 1);
+    core.on_registration(Registration::relay(&sorted[2], xkw(&sorted[2])));
+    core.set_cover_rate(0.9);
+    let body = staged_body(&core.tick(4, 6 * 60 * 1000 + 1)).expect("heal proposal after backoff");
+    assert!(
+        body.subnets[0].relays.contains(&corrupt_pk),
+        "a replayed fault report must not refresh the offender's backoff timer"
+    );
+
     // A report from a non-leader is ignored (forced re-propose keeps all 3 relays).
     let mut core = escalated_panetiere_core(&committee, &relays, &service);
     core.on_fault_report(
         honest_pk,
-        FaultReport { round: 5, subnet: 0, reporter: honest_pk, fault: fault.clone() },
+        FaultReport {
+            round: 5,
+            subnet: 0,
+            reporter: honest_pk,
+            fault: fault.clone(),
+        },
         0,
     );
     core.set_cover_rate(0.5);
@@ -1297,7 +1507,10 @@ fn committee_acts_on_verified_leader_integrity_report() {
     core.set_cover_rate(0.9);
     let body = staged_body(&core.tick(2, 0)).expect("cover change re-proposes");
     assert!(body.subnets[0].relays.contains(&honest_pk));
-    assert!(body.subnets[0].relays.contains(&corrupt_pk), "mis-attributed report must be ignored entirely");
+    assert!(
+        body.subnets[0].relays.contains(&corrupt_pk),
+        "mis-attributed report must be ignored entirely"
+    );
 }
 
 /// A fresh escalation always starts one-round Panetiere; sustained real
@@ -1317,13 +1530,21 @@ fn sustained_traffic_upgrades_to_scheduled_panetiere() {
     assert_eq!(proto_name(&first.body), "adcnet");
     enact(&mut core, &committee, first);
 
-    core.apply_observed_faults(0, vec![Fault {
-        kind: FaultKind::Liveness,
-        attribution: Attribution::None,
-        evidence: Vec::new(),
-    }], 0);
+    core.apply_observed_faults(
+        0,
+        vec![Fault {
+            kind: FaultKind::Liveness,
+            attribution: Attribution::None,
+            evidence: Vec::new(),
+        }],
+        0,
+    );
     let esc = staged_proposal(&core.tick(1, 0)).expect("escalation proposal");
-    assert_eq!(proto_name(&esc.body), "panetiere", "a fresh escalation always starts one-round");
+    assert_eq!(
+        proto_name(&esc.body),
+        "panetiere",
+        "a fresh escalation always starts one-round"
+    );
     enact(&mut core, &committee, esc);
 
     let mut net = PanetiereSubnet::new(&relays, None);
@@ -1337,7 +1558,11 @@ fn sustained_traffic_upgrades_to_scheduled_panetiere() {
             if proto_name(&body) == "scheduled-panetiere" {
                 upgraded_body = Some(body.clone());
             }
-            enact(&mut core, &committee, sign_proposal(&lead_of(&committee), body));
+            enact(
+                &mut core,
+                &committee,
+                sign_proposal(&lead_of(&committee), body),
+            );
             if upgraded_body.is_some() {
                 break;
             }
@@ -1347,7 +1572,10 @@ fn sustained_traffic_upgrades_to_scheduled_panetiere() {
     let ProtocolConfig::ScheduledPanetiere(cfg) = &upgraded.subnets[0].protocol else {
         panic!("expected ScheduledPanetiere");
     };
-    assert!(cfg.vector_bytes > 0, "scheduled subnet must get a sized message vector");
+    assert!(
+        cfg.vector_bytes > 0,
+        "scheduled subnet must get a sized message vector"
+    );
 
     // Steady traffic afterwards must not keep re-proposing (content key stable).
     let mut restaged = false;
@@ -1360,7 +1588,10 @@ fn sustained_traffic_upgrades_to_scheduled_panetiere() {
             restaged = true;
         }
     }
-    assert!(!restaged, "steady scheduled-mode traffic must not keep re-proposing");
+    assert!(
+        !restaged,
+        "steady scheduled-mode traffic must not keep re-proposing"
+    );
 
     // Pinned deployment shapes: "scheduled-panetiere" forces the mode from the
     // first proposal, no traffic needed.
@@ -1387,9 +1618,16 @@ fn sustained_traffic_upgrades_to_scheduled_panetiere() {
     );
     register_relays_and_service(&mut pinned, &relays, &service);
     let body = staged_body(&pinned.tick(0, 0)).expect("pinned core proposes");
-    assert_eq!(proto_name(&body), "scheduled-panetiere", "pin forces scheduled mode outright");
+    assert_eq!(
+        proto_name(&body),
+        "scheduled-panetiere",
+        "pin forces scheduled mode outright"
+    );
     let ProtocolConfig::ScheduledPanetiere(cfg) = &body.subnets[0].protocol else {
         panic!("expected ScheduledPanetiere");
     };
-    assert!(cfg.vector_bytes > 0, "pinned scheduled subnet gets the default vector sizing");
+    assert!(
+        cfg.vector_bytes > 0,
+        "pinned scheduled subnet gets the default vector sizing"
+    );
 }

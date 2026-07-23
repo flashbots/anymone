@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anymone_core::{
-    Anymone, AnymoneRoundConfiguration, PanetiereConfig, Identity, InMemoryNetwork, NoopConfig,
+    Anymone, AnymoneRoundConfiguration, Identity, InMemoryNetwork, NoopConfig, PanetiereConfig,
     ProtocolConfig, Pubkey, ServiceEntry, ServiceTag,
 };
 
@@ -16,7 +16,11 @@ fn echo_tag() -> ServiceTag {
     ServiceTag::from_label("anymone.echo")
 }
 
-fn noop_config(committee: &Identity, relays: &[Identity], service_pk: Pubkey) -> AnymoneRoundConfiguration {
+fn noop_config(
+    committee: &Identity,
+    relays: &[Identity],
+    service_pk: Pubkey,
+) -> AnymoneRoundConfiguration {
     AnymoneRoundConfiguration::singleton_subnet(
         0,
         ProtocolConfig::Noop(NoopConfig {
@@ -26,18 +30,28 @@ fn noop_config(committee: &Identity, relays: &[Identity], service_pk: Pubkey) ->
             client_set_max: 256,
         }),
         relays.iter().map(|i| i.pubkey()).collect(),
-        vec![ServiceEntry { tag: echo_tag(), pubkey: service_pk }],
+        vec![ServiceEntry {
+            tag: echo_tag(),
+            pubkey: service_pk,
+        }],
     )
     .sign_with(&[committee])
 }
 
-fn panetiere_config(committee: &Identity, relays: &[Identity], service_pk: Pubkey) -> AnymoneRoundConfiguration {
+fn panetiere_config(
+    committee: &Identity,
+    relays: &[Identity],
+    service_pk: Pubkey,
+) -> AnymoneRoundConfiguration {
     let mut relay_pks: Vec<_> = relays.iter().map(|i| i.pubkey()).collect();
     relay_pks.sort();
     let relay_xk = relays
         .iter()
         .map(|i| {
-            (i.pubkey(), anymone_core::config::ExchangePublicKeyWire::from_key(&i.exchange_pubkey()))
+            (
+                i.pubkey(),
+                anymone_core::config::ExchangePublicKeyWire::from_key(&i.exchange_pubkey()),
+            )
         })
         .collect();
     AnymoneRoundConfiguration::singleton_subnet(
@@ -54,23 +68,44 @@ fn panetiere_config(committee: &Identity, relays: &[Identity], service_pk: Pubke
             aggregation: None,
         }),
         relay_pks,
-        vec![ServiceEntry { tag: echo_tag(), pubkey: service_pk }],
+        vec![ServiceEntry {
+            tag: echo_tag(),
+            pubkey: service_pk,
+        }],
     )
     .sign_with(&[committee])
 }
 
 /// Stand up 3 relays + service + client under `cfg`, run the echo service, send
 /// `msg`, and return the reply payload.
-async fn echo_roundtrip(cfg: AnymoneRoundConfiguration, relays: Vec<Identity>, service: Identity, client: Identity, msg: &[u8], timeout: Duration) -> Vec<u8> {
+async fn echo_roundtrip(
+    cfg: AnymoneRoundConfiguration,
+    relays: Vec<Identity>,
+    service: Identity,
+    client: Identity,
+    msg: &[u8],
+    timeout: Duration,
+) -> Vec<u8> {
     let net = InMemoryNetwork::new();
     let mut anymones: Vec<Anymone> = Vec::new();
     for id in relays {
-        anymones.push(Anymone::start_with_config(id.clone(), Arc::new(net.handle(id.pubkey())), cfg.clone()).await);
+        anymones.push(
+            Anymone::start_with_config(id.clone(), Arc::new(net.handle(id.pubkey())), cfg.clone())
+                .await,
+        );
     }
-    let service_anymone =
-        Anymone::start_with_config(service.clone(), Arc::new(net.handle(service.pubkey())), cfg.clone()).await;
-    let client_anymone =
-        Anymone::start_with_config(client.clone(), Arc::new(net.handle(client.pubkey())), cfg.clone()).await;
+    let service_anymone = Anymone::start_with_config(
+        service.clone(),
+        Arc::new(net.handle(service.pubkey())),
+        cfg.clone(),
+    )
+    .await;
+    let client_anymone = Anymone::start_with_config(
+        client.clone(),
+        Arc::new(net.handle(client.pubkey())),
+        cfg.clone(),
+    )
+    .await;
 
     let mut svc_pipe = service_anymone.bind(echo_tag()).await.unwrap();
     tokio::spawn(async move {
@@ -96,7 +131,15 @@ async fn noop_echo_roundtrip() {
     let service = Identity::generate();
     let client = Identity::generate();
     let cfg = noop_config(&committee, &relays, service.pubkey());
-    let reply = echo_roundtrip(cfg, relays, service, client, b"hello", Duration::from_secs(2)).await;
+    let reply = echo_roundtrip(
+        cfg,
+        relays,
+        service,
+        client,
+        b"hello",
+        Duration::from_secs(2),
+    )
+    .await;
     assert_eq!(reply, b"hello");
 }
 
@@ -107,7 +150,15 @@ async fn panetiere_echo_roundtrip() {
     let service = Identity::generate();
     let client = Identity::generate();
     let cfg = panetiere_config(&committee, &relays, service.pubkey());
-    let reply = echo_roundtrip(cfg, relays, service, client, b"hello panetiere", Duration::from_secs(15)).await;
+    let reply = echo_roundtrip(
+        cfg,
+        relays,
+        service,
+        client,
+        b"hello panetiere",
+        Duration::from_secs(15),
+    )
+    .await;
     assert_eq!(&reply[..15], b"hello panetiere");
 }
 
@@ -128,13 +179,17 @@ async fn oversized_send_is_rejected() {
             client_set_max: 256,
         }),
         relays.iter().map(|i| i.pubkey()).collect(),
-        vec![ServiceEntry { tag: echo_tag(), pubkey: service.pubkey() }],
+        vec![ServiceEntry {
+            tag: echo_tag(),
+            pubkey: service.pubkey(),
+        }],
     )
     .sign_with(&[&committee]);
 
     let net = InMemoryNetwork::new();
     let client_anymone =
-        Anymone::start_with_config(client.clone(), Arc::new(net.handle(client.pubkey())), cfg).await;
+        Anymone::start_with_config(client.clone(), Arc::new(net.handle(client.pubkey())), cfg)
+            .await;
     let pipe = client_anymone.open(echo_tag()).await.unwrap();
     let err = pipe.send(vec![0u8; 500]).await.unwrap_err();
     assert!(
@@ -158,13 +213,19 @@ async fn subscribe_delivers_broadcast_to_participants() {
     let mut anymones: Vec<Anymone> = Vec::new();
     for id in &relays {
         anymones.push(
-            Anymone::start_with_config(id.clone(), Arc::new(net.handle(id.pubkey())), cfg.clone()).await,
+            Anymone::start_with_config(id.clone(), Arc::new(net.handle(id.pubkey())), cfg.clone())
+                .await,
         );
     }
-    let alice_anymone =
-        Anymone::start_with_config(alice.clone(), Arc::new(net.handle(alice.pubkey())), cfg.clone()).await;
+    let alice_anymone = Anymone::start_with_config(
+        alice.clone(),
+        Arc::new(net.handle(alice.pubkey())),
+        cfg.clone(),
+    )
+    .await;
     let bob_anymone =
-        Anymone::start_with_config(bob.clone(), Arc::new(net.handle(bob.pubkey())), cfg.clone()).await;
+        Anymone::start_with_config(bob.clone(), Arc::new(net.handle(bob.pubkey())), cfg.clone())
+            .await;
 
     let alice_pipe = alice_anymone.subscribe(echo_tag()).await.unwrap();
     let mut bob_pipe = bob_anymone.subscribe(echo_tag()).await.unwrap();

@@ -25,7 +25,7 @@ use anymone_core::scheduling::Registration;
 use anymone_core::session::Session;
 use anymone_core::transport::Transport;
 use anymone_core::{
-    AdcnetObserverSession, BootstrapConfig, PanetiereObserverSession, Identity, Pubkey,
+    AdcnetObserverSession, BootstrapConfig, Identity, PanetiereObserverSession, Pubkey,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -58,7 +58,12 @@ pub(crate) struct Knob {
 
 impl Knob {
     pub fn new(label: impl Into<String>, initial: usize, min: usize) -> Self {
-        Self { label: label.into(), min, value: AtomicUsize::new(initial.max(min)), options: None }
+        Self {
+            label: label.into(),
+            min,
+            value: AtomicUsize::new(initial.max(min)),
+            options: None,
+        }
     }
     /// A discrete knob whose value selects one of `options` by index.
     pub fn enumerated(label: impl Into<String>, options: Vec<String>, initial: usize) -> Self {
@@ -81,7 +86,8 @@ impl Knob {
         self.value.store(n, Ordering::Relaxed);
     }
     fn to_json(&self) -> serde_json::Value {
-        let mut v = serde_json::json!({ "label": self.label, "value": self.get(), "min": self.min });
+        let mut v =
+            serde_json::json!({ "label": self.label, "value": self.get(), "min": self.min });
         if let Some(opts) = &self.options {
             v["options"] = serde_json::json!(opts);
         }
@@ -99,7 +105,9 @@ pub(crate) struct DemoControls {
 
 impl DemoControls {
     pub fn new() -> Self {
-        Self { knobs: std::collections::BTreeMap::new() }
+        Self {
+            knobs: std::collections::BTreeMap::new(),
+        }
     }
     pub fn with(mut self, name: impl Into<String>, knob: Knob) -> Self {
         self.knobs.insert(name.into(), knob);
@@ -118,7 +126,12 @@ impl DemoControls {
         }
     }
     fn to_json(&self) -> serde_json::Value {
-        serde_json::Value::Object(self.knobs.iter().map(|(k, v)| (k.clone(), v.to_json())).collect())
+        serde_json::Value::Object(
+            self.knobs
+                .iter()
+                .map(|(k, v)| (k.clone(), v.to_json()))
+                .collect(),
+        )
     }
 }
 
@@ -203,7 +216,9 @@ struct PeersResp {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     match Cli::parse().cmd {
@@ -214,7 +229,11 @@ async fn main() -> Result<()> {
 
 /// Serve the dashboard page at `/` and the reconstructed state at `/state`.
 /// Blocks forever. Shared by `run` and the demo.
-pub(crate) async fn serve(obs: Shared, port: u16, controls: Option<Arc<DemoControls>>) -> Result<()> {
+pub(crate) async fn serve(
+    obs: Shared,
+    port: u16,
+    controls: Option<Arc<DemoControls>>,
+) -> Result<()> {
     let mut app = Router::new()
         .route("/", get(|| async { Html(DASHBOARD) }))
         .route(
@@ -238,13 +257,16 @@ pub(crate) async fn serve(obs: Shared, port: u16, controls: Option<Arc<DemoContr
     if let Some(ctrl) = controls {
         app = app.route(
             "/admin/knob/:name",
-            post(move |axum::extract::Path(name): axum::extract::Path<String>, Json(req): Json<KnobReq>| {
-                let ctrl = ctrl.clone();
-                async move {
-                    let ok = ctrl.set(&name, req.count);
-                    Json(serde_json::json!({ "ok": ok, "control": ctrl.to_json() }))
-                }
-            }),
+            post(
+                move |axum::extract::Path(name): axum::extract::Path<String>,
+                      Json(req): Json<KnobReq>| {
+                    let ctrl = ctrl.clone();
+                    async move {
+                        let ok = ctrl.set(&name, req.count);
+                        Json(serde_json::json!({ "ok": ok, "control": ctrl.to_json() }))
+                    }
+                },
+            ),
         );
     }
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
@@ -252,7 +274,9 @@ pub(crate) async fn serve(obs: Shared, port: u16, controls: Option<Arc<DemoContr
         .await
         .with_context(|| format!("bind dashboard on {addr}"))?;
     tracing::info!(%addr, "observer dashboard live");
-    axum::serve(listener, app).await.context("dashboard server")?;
+    axum::serve(listener, app)
+        .await
+        .context("dashboard server")?;
     Ok(())
 }
 
@@ -262,21 +286,38 @@ async fn run(args: RunArgs) -> Result<()> {
     let identity = Identity::load_or_generate(&bootstrap.identity_path)
         .with_context(|| format!("identity at {}", bootstrap.identity_path.display()))?;
 
-    let listen: Multiaddr = bootstrap.network.listen.parse().context("bad listen multiaddr")?;
+    let listen: Multiaddr = bootstrap
+        .network
+        .listen
+        .parse()
+        .context("bad listen multiaddr")?;
     let bootstrap_peers: Vec<Multiaddr> = bootstrap
         .network
         .bootstrap_peers
         .iter()
-        .map(|s| s.parse::<Multiaddr>().with_context(|| format!("bad bootstrap multiaddr: {s}")))
+        .map(|s| {
+            s.parse::<Multiaddr>()
+                .with_context(|| format!("bad bootstrap multiaddr: {s}"))
+        })
         .collect::<Result<_>>()?;
 
-    let net = Libp2pNetwork::start(&identity, Libp2pConfig { listen, bootstrap_peers })
-        .await
-        .map_err(|e| anyhow!("libp2p start: {e}"))?;
+    let net = Libp2pNetwork::start(
+        &identity,
+        Libp2pConfig {
+            listen,
+            bootstrap_peers,
+        },
+    )
+    .await
+    .map_err(|e| anyhow!("libp2p start: {e}"))?;
     let transport: Arc<dyn Transport> = net.clone();
 
-    let committee: Vec<Pubkey> =
-        bootstrap.governance.committee.iter().map(|m| m.pubkey).collect();
+    let committee: Vec<Pubkey> = bootstrap
+        .governance
+        .committee
+        .iter()
+        .map(|m| m.pubkey)
+        .collect();
     let threshold = bootstrap.governance.threshold;
     // `run` attaches to an existing network, so the committee's round cadence
     // isn't known here — use the `PanetiereCommitteeConfig` default (1s) for the
@@ -310,9 +351,10 @@ async fn run(args: RunArgs) -> Result<()> {
     let controls = if args.enable_load {
         let config_text = std::fs::read_to_string(&args.config)
             .with_context(|| format!("reading {} for loadgen", args.config.display()))?;
-        let controls = Arc::new(
-            DemoControls::new().with("clients", Knob::new("clients · anonymity set", args.clients, 0)),
-        );
+        let controls = Arc::new(DemoControls::new().with(
+            "clients",
+            Knob::new("clients · anonymity set", args.clients, 0),
+        ));
         loadgen::spawn_supervisor(
             controls.clone(),
             config_text,
@@ -329,7 +371,12 @@ async fn run(args: RunArgs) -> Result<()> {
 
 /// Track config changes; (re)spawn a watcher per subnet whose protocol/version
 /// changed, and drop watchers for subnets that disappeared.
-fn spawn_config_loop(transport: Arc<dyn Transport>, obs: Shared, committee: Vec<Pubkey>, threshold: u32) {
+fn spawn_config_loop(
+    transport: Arc<dyn Transport>,
+    obs: Shared,
+    committee: Vec<Pubkey>,
+    threshold: u32,
+) {
     tokio::spawn(async move {
         let mut sub = transport.subscribe(TOPIC_CONFIG).await;
         // Per subnet: a signature of its wiring (protocol + sorted roster) and
@@ -349,8 +396,12 @@ fn spawn_config_loop(transport: Arc<dyn Transport>, obs: Shared, committee: Vec<
             if !is_new {
                 continue;
             }
-            let mut roster: Vec<anymone_core::Pubkey> =
-                cfg.body.subnets.iter().flat_map(|s| s.relays.iter().copied()).collect();
+            let mut roster: Vec<anymone_core::Pubkey> = cfg
+                .body
+                .subnets
+                .iter()
+                .flat_map(|s| s.relays.iter().copied())
+                .collect();
             roster.sort();
             roster.dedup();
             transport.ensure_peers(roster).await;
@@ -375,11 +426,8 @@ fn spawn_config_loop(transport: Arc<dyn Transport>, obs: Shared, committee: Vec<
                     if let Some((_, h)) = watchers.remove(&subnet.id) {
                         h.abort();
                     }
-                    let h = tokio::spawn(watch_subnet(
-                        subnet.clone(),
-                        transport.clone(),
-                        obs.clone(),
-                    ));
+                    let h =
+                        tokio::spawn(watch_subnet(subnet.clone(), transport.clone(), obs.clone()));
                     watchers.insert(subnet.id, (sig, h));
                 }
             }
@@ -400,7 +448,11 @@ async fn watch_subnet(subnet: Subnet, transport: Arc<dyn Transport>, obs: Shared
     // the shares topic. It does NOT subscribe to the high-volume ingress
     // (client contributions).
     let mut shares = if anymone_core::runtime::subnet_uses_ingress(&subnet) {
-        Some(transport.subscribe(&anymone_core::runtime::subnet_shares_topic(subnet.id)).await)
+        Some(
+            transport
+                .subscribe(&anymone_core::runtime::subnet_shares_topic(subnet.id))
+                .await,
+        )
     } else {
         None
     };
@@ -409,15 +461,15 @@ async fn watch_subnet(subnet: Subnet, transport: Arc<dyn Transport>, obs: Shared
     roster.sort();
     let leader = anymone_core::subnet_leader_pk(&subnet);
     let mut adcnet_obs = match subnet.protocol {
-        ProtocolConfig::Adcnet(_) | ProtocolConfig::ScheduledAdcnet(_) => {
-            Some(AdcnetObserverSession::new(roster.clone(), leader, FAULT_THRESHOLD))
-        }
+        ProtocolConfig::Adcnet(_) | ProtocolConfig::ScheduledAdcnet(_) => Some(
+            AdcnetObserverSession::new(roster.clone(), leader, FAULT_THRESHOLD),
+        ),
         _ => None,
     };
     let mut panetiere_obs = match subnet.protocol {
-        ProtocolConfig::Panetiere(_) | ProtocolConfig::ScheduledPanetiere(_) => {
-            Some(PanetiereObserverSession::new(roster.clone(), Some(leader), FAULT_THRESHOLD))
-        }
+        ProtocolConfig::Panetiere(_) | ProtocolConfig::ScheduledPanetiere(_) => Some(
+            PanetiereObserverSession::new(roster.clone(), Some(leader), FAULT_THRESHOLD),
+        ),
         _ => None,
     };
 
@@ -574,7 +626,9 @@ fn spawn_registration_loop(transport: Arc<dyn Transport>, obs: Shared) {
 fn spawn_committee_loop(transport: Arc<dyn Transport>, obs: Shared, committee: Vec<Pubkey>) {
     tokio::spawn(async move {
         let mut sub = transport.subscribe(TOPIC_COMMITTEE_PANETIERE).await;
-        let mut sigs = transport.subscribe(anymone_core::committee::TOPIC_COMMITTEE_SIGS).await;
+        let mut sigs = transport
+            .subscribe(anymone_core::committee::TOPIC_COMMITTEE_SIGS)
+            .await;
         // Read the committee's round off its genuine Panetiere messages (each
         // carries the round) rather than guessing from a clock or message count.
         // Members stamp their sorted-committee index, so the roster must be sorted.
@@ -620,7 +674,9 @@ fn spawn_fault_loop(transport: Arc<dyn Transport>, obs: Shared) {
         let mut sub = transport.subscribe(TOPIC_FAULTS).await;
         while let Some(msg) = sub.recv().await {
             if let Some(report) = anymone_core::FaultReport::decode(&msg.payload) {
-                obs.lock().unwrap().record_fault(report.round, report.subnet, &report.fault);
+                obs.lock()
+                    .unwrap()
+                    .record_fault(report.round, report.subnet, &report.fault);
             }
         }
     });
@@ -632,7 +688,12 @@ fn spawn_scrape_loop(urls: Vec<String>, obs: Shared) {
         loop {
             for base in &urls {
                 let url = format!("{}/state/peers", base.trim_end_matches('/'));
-                match client.get(&url).timeout(Duration::from_millis(800)).send().await {
+                match client
+                    .get(&url)
+                    .timeout(Duration::from_millis(800))
+                    .send()
+                    .await
+                {
                     Ok(resp) => {
                         if let Ok(p) = resp.json::<PeersResp>().await {
                             obs.lock().unwrap().apply_scrape(p.pubkey, p.role, p.peers);

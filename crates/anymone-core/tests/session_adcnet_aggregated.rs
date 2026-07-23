@@ -16,7 +16,10 @@ use adcnet::protocol::session::one_round::{IbltMsgParamsOwned, OneRoundConfig};
 
 fn test_config() -> OneRoundConfig {
     OneRoundConfig {
-        iblt: IbltMsgParamsOwned { estimated_messages: 8, max_payload_bytes: 256 },
+        iblt: IbltMsgParamsOwned {
+            estimated_messages: 8,
+            max_payload_bytes: 256,
+        },
     }
 }
 
@@ -58,7 +61,13 @@ fn run_adcnet_aggregated(
             }
             let mut seed = [0u8; 32];
             seed[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            AdcnetClientSession::new(cfg.clone(), cid.to_adcnet_signing_key(), shared, cid.exchange_pubkey(), seed)
+            AdcnetClientSession::new(
+                cfg.clone(),
+                cid.to_adcnet_signing_key(),
+                shared,
+                cid.exchange_pubkey(),
+                seed,
+            )
         })
         .collect();
     clients[0].stage_message(payload.to_vec());
@@ -73,9 +82,16 @@ fn run_adcnet_aggregated(
                 n_servers,
                 relay_pks.clone(),
                 0,
+                usize::MAX,
                 i == 0,
                 leader_pk,
-                if i == 0 { Some(LeaderAggregation { roster: roster.clone() }) } else { None },
+                if i == 0 {
+                    Some(LeaderAggregation {
+                        roster: roster.clone(),
+                    })
+                } else {
+                    None
+                },
             )
         })
         .collect();
@@ -86,24 +102,30 @@ fn run_adcnet_aggregated(
         .flat_map(|(g, ids)| {
             ids.iter()
                 .take(live_replicas as usize)
-                .map(move |id| (id.pubkey(), AdcnetAggregatorSession::new(g as u32, group_count, id.clone())))
+                .map(move |id| {
+                    (
+                        id.pubkey(),
+                        AdcnetAggregatorSession::new(g as u32, group_count, id.clone()),
+                    )
+                })
                 .collect::<Vec<_>>()
         })
         .collect();
 
     let now = Instant::now();
     let mut bus: Vec<(Pubkey, Vec<u8>)> = Vec::new();
-    let deliver =
-        |bus: &mut Vec<(Pubkey, Vec<u8>)>, servers: &mut [AdcnetServerSession], aggs: &mut [(Pubkey, AdcnetAggregatorSession)]| {
-            for (from, msg) in bus.drain(..) {
-                for s in servers.iter_mut() {
-                    s.on_inbound(from, msg.clone());
-                }
-                for (_, a) in aggs.iter_mut() {
-                    a.on_inbound(from, msg.clone());
-                }
+    let deliver = |bus: &mut Vec<(Pubkey, Vec<u8>)>,
+                   servers: &mut [AdcnetServerSession],
+                   aggs: &mut [(Pubkey, AdcnetAggregatorSession)]| {
+        for (from, msg) in bus.drain(..) {
+            for s in servers.iter_mut() {
+                s.on_inbound(from, msg.clone());
             }
-        };
+            for (_, a) in aggs.iter_mut() {
+                a.on_inbound(from, msg.clone());
+            }
+        }
+    };
 
     let mut decoded: Vec<Vec<u8>> = Vec::new();
     for r in 0..14u64 {
@@ -151,8 +173,11 @@ fn run_realtime(aggregated: bool, payload: &[u8]) -> Vec<u64> {
     let leader_pk = relay_pks[0];
 
     let agg_ids: Vec<Identity> = (0..group_count).map(|_| Identity::generate()).collect();
-    let roster: HashMap<u32, Vec<Pubkey>> =
-        agg_ids.iter().enumerate().map(|(g, id)| (g as u32, vec![id.pubkey()])).collect();
+    let roster: HashMap<u32, Vec<Pubkey>> = agg_ids
+        .iter()
+        .enumerate()
+        .map(|(g, id)| (g as u32, vec![id.pubkey()]))
+        .collect();
 
     let client_ids: Vec<Identity> = (0..6).map(|_| Identity::generate()).collect();
     let client_pks: Vec<Pubkey> = client_ids.iter().map(|i| i.pubkey()).collect();
@@ -166,7 +191,13 @@ fn run_realtime(aggregated: bool, payload: &[u8]) -> Vec<u64> {
             }
             let mut seed = [0u8; 32];
             seed[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            AdcnetClientSession::new(cfg.clone(), cid.to_adcnet_signing_key(), shared, cid.exchange_pubkey(), seed)
+            AdcnetClientSession::new(
+                cfg.clone(),
+                cid.to_adcnet_signing_key(),
+                shared,
+                cid.exchange_pubkey(),
+                seed,
+            )
         })
         .collect();
     clients[0].stage_message(payload.to_vec());
@@ -181,14 +212,30 @@ fn run_realtime(aggregated: bool, payload: &[u8]) -> Vec<u64> {
                 n_servers,
                 relay_pks.clone(),
                 0,
+                usize::MAX,
                 i == 0,
                 leader_pk,
-                if i == 0 && aggregated { Some(LeaderAggregation { roster: roster.clone() }) } else { None },
+                if i == 0 && aggregated {
+                    Some(LeaderAggregation {
+                        roster: roster.clone(),
+                    })
+                } else {
+                    None
+                },
             )
         })
         .collect();
     let mut aggregators: Vec<(Pubkey, AdcnetAggregatorSession)> = if aggregated {
-        agg_ids.iter().enumerate().map(|(g, id)| (id.pubkey(), AdcnetAggregatorSession::new(g as u32, group_count, id.clone()))).collect()
+        agg_ids
+            .iter()
+            .enumerate()
+            .map(|(g, id)| {
+                (
+                    id.pubkey(),
+                    AdcnetAggregatorSession::new(g as u32, group_count, id.clone()),
+                )
+            })
+            .collect()
     } else {
         Vec::new()
     };
@@ -233,7 +280,10 @@ fn run_realtime(aggregated: bool, payload: &[u8]) -> Vec<u64> {
                 decoded_at.push(r);
             }
             let delay = if i == 0 { 1 } else { 1 + SUBNET_LAG };
-            queue.entry(r + delay).or_default().extend(out.outbound.into_iter().map(|m| (relay_pks[i], m)));
+            queue
+                .entry(r + delay)
+                .or_default()
+                .extend(out.outbound.into_iter().map(|m| (relay_pks[i], m)));
         }
     }
     decoded_at
@@ -245,20 +295,32 @@ fn run_realtime(aggregated: bool, payload: &[u8]) -> Vec<u64> {
 #[test]
 fn aggregated_decodes_within_subnet_lag_window() {
     let payload = b"aggregated round-0 payload".to_vec();
-    assert!(!run_realtime(false, &payload).is_empty(), "direct decodes with one round of subnet lag");
-    assert!(!run_realtime(true, &payload).is_empty(), "aggregated must also decode within the window");
+    assert!(
+        !run_realtime(false, &payload).is_empty(),
+        "direct decodes with one round of subnet lag"
+    );
+    assert!(
+        !run_realtime(true, &payload).is_empty(),
+        "aggregated must also decode within the window"
+    );
 }
 
 #[test]
 fn adcnet_aggregated_decodes_through_groups() {
     let payload = b"aggregated adcnet across groups".to_vec();
     let decoded = run_adcnet_aggregated(3, 6, 2, 2, 2, &payload);
-    assert!(decoded.contains(&payload), "payload never decoded; got {decoded:?}");
+    assert!(
+        decoded.contains(&payload),
+        "payload never decoded; got {decoded:?}"
+    );
 }
 
 #[test]
 fn adcnet_aggregated_survives_one_dead_replica_per_group() {
     let payload = b"one live adcnet aggregator suffices".to_vec();
     let decoded = run_adcnet_aggregated(3, 6, 2, 2, 1, &payload);
-    assert!(decoded.contains(&payload), "payload never decoded; got {decoded:?}");
+    assert!(
+        decoded.contains(&payload),
+        "payload never decoded; got {decoded:?}"
+    );
 }

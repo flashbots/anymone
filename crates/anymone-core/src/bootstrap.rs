@@ -107,7 +107,9 @@ mod tests {
 
     #[test]
     fn bootstrap_parses_valid_toml() {
-        let members: String = (0..3).map(|_| member_table(&Identity::generate())).collect();
+        let members: String = (0..3)
+            .map(|_| member_table(&Identity::generate()))
+            .collect();
         let toml = format!(
             r#"
 identity_path = "/tmp/identity"
@@ -135,7 +137,11 @@ aggregation = false"#
         assert_eq!(cfg.committee.protocol.as_deref(), Some("panetiere"));
         assert!(!cfg.committee.aggregation);
         // A config with no `[committee]` section at all uses all defaults.
-        let no_committee = BootstrapConfig::from_toml_str(&toml.replace("[committee]\npublic_round_ms = 2000\nprotocol = \"panetiere\"\naggregation = false", "")).unwrap();
+        let no_committee = BootstrapConfig::from_toml_str(&toml.replace(
+            "[committee]\npublic_round_ms = 2000\nprotocol = \"panetiere\"\naggregation = false",
+            "",
+        ))
+        .unwrap();
         assert_eq!(no_committee.committee.public_round_ms, 4000);
         assert_eq!(no_committee.committee.protocol, None);
         assert!(no_committee.committee.aggregation);

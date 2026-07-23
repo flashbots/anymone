@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anymone_core::panetiere::{
-    client_id_from_pubkey, PanetiereAggregatorSession, PanetiereClientSession, PanetiereServerSession,
-    SetMode,
+    client_id_from_pubkey, PanetiereAggregatorSession, PanetiereClientSession,
+    PanetiereServerSession, SetMode,
 };
 use anymone_core::session::{LeaderAggregation, Session};
 use anymone_core::{Identity, Pubkey};
@@ -41,7 +41,11 @@ fn server_env(n: usize) -> (Vec<Identity>, Vec<Pubkey>, Vec<(ServerId, pke::Publ
 }
 
 fn server_pubkeys(server_pks: &[Pubkey]) -> HashMap<ServerId, Pubkey> {
-    server_pks.iter().enumerate().map(|(i, pk)| (ServerId(i as u32), *pk)).collect()
+    server_pks
+        .iter()
+        .enumerate()
+        .map(|(i, pk)| (ServerId(i as u32), *pk))
+        .collect()
 }
 
 /// Run the aggregated two-round flow. `live_replicas` aggregators per group
@@ -59,7 +63,12 @@ fn run_aggregated(
     // Only client 0 is active; the IBLT is sized to the active count.
     let mse = MseParams::new(4, 1, 32, prf_key(&mut setup_rng));
     let n_polys = MseEncoding::n_polys(&mse);
-    let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(&mut setup_rng, n_servers, n_polys, 1));
+    let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(
+        &mut setup_rng,
+        n_servers,
+        n_polys,
+        1,
+    ));
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let (ids, server_pks, xpubs) = server_env(n_servers);
 
@@ -72,16 +81,24 @@ fn run_aggregated(
         .enumerate()
         .map(|(g, ids)| (g as u32, ids.iter().map(|i| i.pubkey()).collect()))
         .collect();
-    let leader_agg = || LeaderAggregation { roster: roster.clone() };
+    let leader_agg = || LeaderAggregation {
+        roster: roster.clone(),
+    };
 
     // Clients: client 0 carries `payload`, the rest send cover (zero) traffic.
-    let client_pks: Vec<Pubkey> = (0..n_clients).map(|_| Identity::generate().pubkey()).collect();
+    let client_pks: Vec<Pubkey> = (0..n_clients)
+        .map(|_| Identity::generate().pubkey())
+        .collect();
     let mut clients: Vec<PanetiereClientSession> = (0..n_clients as usize)
         .map(|i| {
             let mut seed = [0u8; 32];
             seed[..4].copy_from_slice(&(i as u32).to_le_bytes());
             PanetiereClientSession::new(
-                pp.clone(), mse.clone(), client_id_from_pubkey(client_pks[i]), xpubs.clone(), seed,
+                pp.clone(),
+                mse.clone(),
+                client_id_from_pubkey(client_pks[i]),
+                xpubs.clone(),
+                seed,
             )
         })
         .collect();
@@ -99,7 +116,9 @@ fn run_aggregated(
                 if sid.0 == 0 {
                     SetMode::Leader
                 } else {
-                    SetMode::Follower { leader: server_pks[0] }
+                    SetMode::Follower {
+                        leader: server_pks[0],
+                    }
                 },
                 0,
                 server_pubkeys(&server_pks),
@@ -137,15 +156,20 @@ fn run_aggregated(
 
     // Aggregators emit at checkpoint 1, delivered to every relay before
     // checkpoint 2 — matching production's k=1 → k=2 → end cadence.
-    let group_aggs: Vec<Vec<u8>> =
-        aggregators.iter_mut().flat_map(|a| a.checkpoint(0, 1, now)).collect();
+    let group_aggs: Vec<Vec<u8>> = aggregators
+        .iter_mut()
+        .flat_map(|a| a.checkpoint(0, 1, now))
+        .collect();
     for s in servers.iter_mut() {
         for m in &group_aggs {
             s.on_inbound(server_pks[0], m.clone());
         }
     }
     let announce = servers[0].checkpoint(0, 2, now);
-    assert!(!announce.is_empty(), "leader announces the canonical set at checkpoint 2");
+    assert!(
+        !announce.is_empty(),
+        "leader announces the canonical set at checkpoint 2"
+    );
     for s in servers[1..].iter_mut() {
         for m in &announce {
             s.on_inbound(server_pks[0], m.clone());
@@ -154,7 +178,12 @@ fn run_aggregated(
     let server_publics: Vec<(usize, Vec<u8>)> = servers
         .iter_mut()
         .enumerate()
-        .flat_map(|(i, s)| s.end_round(0, now).outbound.into_iter().map(move |m| (i, m)))
+        .flat_map(|(i, s)| {
+            s.end_round(0, now)
+                .outbound
+                .into_iter()
+                .map(move |m| (i, m))
+        })
         .collect();
 
     // Round 1: peer ServerPublics cross-delivered.
@@ -171,7 +200,11 @@ fn run_aggregated(
         .enumerate()
         .flat_map(|(i, s)| {
             let outcome = s.end_round(1, now);
-            if i == 0 { outcome.decoded } else { Vec::new() }
+            if i == 0 {
+                outcome.decoded
+            } else {
+                Vec::new()
+            }
         })
         .collect()
 }
@@ -181,7 +214,9 @@ fn aggregated_flow_decodes_through_groups() {
     let payload = b"aggregated panetiere across two groups".to_vec();
     // 20 clients (> 16 threshold), 2 groups of ~10, 1-of-2 committees all live.
     let decoded = run_aggregated(3, 20, 2, 2, 2, &payload);
-    let got = decoded.first().expect("leader decodes the aggregated round");
+    let got = decoded
+        .first()
+        .expect("leader decodes the aggregated round");
     assert!(got.len() >= payload.len());
     assert_eq!(&got[..payload.len()], payload.as_slice());
 }
@@ -191,7 +226,9 @@ fn aggregated_flow_survives_one_dead_replica_per_group() {
     let payload = b"one live aggregator per group is enough".to_vec();
     // Only 1 of the 2 replicas per group emits — 1-of-n liveness.
     let decoded = run_aggregated(3, 20, 2, 2, 1, &payload);
-    let got = decoded.first().expect("leader decodes with one live replica per group");
+    let got = decoded
+        .first()
+        .expect("leader decodes with one live replica per group");
     assert_eq!(&got[..payload.len()], payload.as_slice());
 }
 
@@ -204,15 +241,25 @@ fn late_group_aggregate_does_not_zero_the_round() {
     let n_servers = 3;
     let mse = MseParams::new(4, 2, 32, prf_key(&mut setup_rng));
     let n_polys = MseEncoding::n_polys(&mse);
-    let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(&mut setup_rng, n_servers, n_polys, 1));
+    let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(
+        &mut setup_rng,
+        n_servers,
+        n_polys,
+        1,
+    ));
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let (ids, server_pks, xpubs) = server_env(n_servers);
 
     let group_count = 2u32;
     let agg_ids: Vec<Identity> = (0..group_count).map(|_| Identity::generate()).collect();
-    let roster: HashMap<u32, Vec<Pubkey>> =
-        agg_ids.iter().enumerate().map(|(g, id)| (g as u32, vec![id.pubkey()])).collect();
-    let leader_agg = || LeaderAggregation { roster: roster.clone() };
+    let roster: HashMap<u32, Vec<Pubkey>> = agg_ids
+        .iter()
+        .enumerate()
+        .map(|(g, id)| (g as u32, vec![id.pubkey()]))
+        .collect();
+    let leader_agg = || LeaderAggregation {
+        roster: roster.clone(),
+    };
 
     let payload_a = b"group zero's message survives".to_vec();
     let payload_b = b"group one arrives too late this round".to_vec();
@@ -230,10 +277,20 @@ fn late_group_aggregate_does_not_zero_the_round() {
             break (b, a);
         }
     };
-    let mut client0 =
-        PanetiereClientSession::new(pp.clone(), mse.clone(), client_id_from_pubkey(pk_a), xpubs.clone(), [10u8; 32]);
-    let mut client1 =
-        PanetiereClientSession::new(pp.clone(), mse.clone(), client_id_from_pubkey(pk_b), xpubs.clone(), [11u8; 32]);
+    let mut client0 = PanetiereClientSession::new(
+        pp.clone(),
+        mse.clone(),
+        client_id_from_pubkey(pk_a),
+        xpubs.clone(),
+        [10u8; 32],
+    );
+    let mut client1 = PanetiereClientSession::new(
+        pp.clone(),
+        mse.clone(),
+        client_id_from_pubkey(pk_b),
+        xpubs.clone(),
+        [11u8; 32],
+    );
     client0.stage(payload_a.clone());
     client1.stage(payload_b.clone());
 
@@ -248,7 +305,9 @@ fn late_group_aggregate_does_not_zero_the_round() {
                 if sid.0 == 0 {
                     SetMode::Leader
                 } else {
-                    SetMode::Follower { leader: server_pks[0] }
+                    SetMode::Follower {
+                        leader: server_pks[0],
+                    }
                 },
                 0,
                 server_pubkeys(&server_pks),
@@ -289,7 +348,10 @@ fn late_group_aggregate_does_not_zero_the_round() {
     }
 
     let announce = servers[0].checkpoint(0, 2, now);
-    assert!(!announce.is_empty(), "leader announces canonical = group 0's clients");
+    assert!(
+        !announce.is_empty(),
+        "leader announces canonical = group 0's clients"
+    );
     for s in servers[1..].iter_mut() {
         for m in &announce {
             s.on_inbound(server_pks[0], m.clone());
@@ -299,7 +361,12 @@ fn late_group_aggregate_does_not_zero_the_round() {
     let server_publics: Vec<(usize, Vec<u8>)> = servers
         .iter_mut()
         .enumerate()
-        .flat_map(|(i, s)| s.end_round(0, now).outbound.into_iter().map(move |m| (i, m)))
+        .flat_map(|(i, s)| {
+            s.end_round(0, now)
+                .outbound
+                .into_iter()
+                .map(move |m| (i, m))
+        })
         .collect();
     for i in 0..servers.len() {
         for (j, m) in &server_publics {
@@ -317,7 +384,11 @@ fn late_group_aggregate_does_not_zero_the_round() {
     }
 
     let decoded = servers[0].end_round(1, now).decoded;
-    assert_eq!(decoded.len(), 1, "round 0 decodes group 0's message, not zero");
+    assert_eq!(
+        decoded.len(),
+        1,
+        "round 0 decodes group 0's message, not zero"
+    );
     let got = &decoded[0];
     assert_eq!(&got[..payload_a.len()], payload_a.as_slice());
 }

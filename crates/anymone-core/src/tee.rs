@@ -3,7 +3,7 @@
 //! Each protocol's session module wires integrity proofs internally — the
 //! runtime doesn't see them. The traits here are the lowest common
 //! denominator: attest some bytes, verify some bytes. The real TDX-based
-//! prover lands in M6; for now `NoopProver` is enough to compile sessions
+//! prover isn't implemented yet; `NoopProver` is enough to compile sessions
 //! that take `Option<&dyn TeeProver>`.
 
 pub trait TeeProver: Send + Sync {
