@@ -1,0 +1,35 @@
+[package]
+name = "anymone-eth-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "anymone_eth_bridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "anymone-eth-bridge"
+path = "src/main.rs"
+
+[dependencies]
+anymone-core = { path = "../anymone-core" }
+anymone-txbus = { path = "../anymone-txbus" }
+alloy-primitives = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+hex.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

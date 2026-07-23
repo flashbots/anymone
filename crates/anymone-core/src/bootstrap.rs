@@ -12,6 +12,7 @@ use thiserror::Error;
 use crate::committee::CommitteeParams;
 use crate::governance::GovernanceConfig;
 use crate::identity::Pubkey;
+use crate::p2p::Libp2pConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapConfig {
@@ -52,6 +53,31 @@ impl BootstrapConfig {
         Ok(())
     }
 
+    /// Build the libp2p listen/bootstrap-peer config every binary that stands
+    /// up a `Libp2pNetwork` from a `BootstrapConfig` needs (`anymone-node`,
+    /// the tx-bus gateway, the reth bridge) — one parse of `network`, not one
+    /// per binary.
+    pub fn libp2p_config(&self) -> Result<Libp2pConfig, BootstrapError> {
+        let listen = self
+            .network
+            .listen
+            .parse()
+            .map_err(|_| BootstrapError::BadMultiaddr(self.network.listen.clone()))?;
+        let bootstrap_peers = self
+            .network
+            .bootstrap_peers
+            .iter()
+            .map(|s| {
+                s.parse()
+                    .map_err(|_| BootstrapError::BadMultiaddr(s.clone()))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Libp2pConfig {
+            listen,
+            bootstrap_peers,
+        })
+    }
+
     fn validate(&self) -> Result<(), BootstrapError> {
         if self.governance.committee.is_empty() {
             return Err(BootstrapError::EmptyCommittee);
@@ -88,6 +114,8 @@ pub enum BootstrapError {
     BadThreshold { threshold: u32, committee: u32 },
     #[error("duplicate committee member: {0}")]
     DuplicateCommitteeMember(Pubkey),
+    #[error("bad multiaddr: {0}")]
+    BadMultiaddr(String),
 }
 
 #[cfg(test)]
@@ -110,13 +138,14 @@ mod tests {
         let members: String = (0..3)
             .map(|_| member_table(&Identity::generate()))
             .collect();
+        let seed_peer_id = libp2p_identity::PeerId::from(Identity::generate().to_libp2p_keypair().public());
         let toml = format!(
             r#"
 identity_path = "/tmp/identity"
 
 [network]
 listen = "/ip4/0.0.0.0/tcp/7100"
-bootstrap_peers = ["/dns4/seed/tcp/7100/p2p/12D3KooW..."]
+bootstrap_peers = ["/dns4/seed/tcp/7100/p2p/{seed_peer_id}"]
 
 [governance]
 threshold = 2
@@ -131,6 +160,11 @@ aggregation = false"#
         assert_eq!(cfg.governance.threshold, 2);
         assert_eq!(cfg.network.bootstrap_peers.len(), 1);
         assert!(cfg.governance.committee[0].exchange_pubkey.to_key().is_ok());
+        // libp2p_config parses the same listen/bootstrap_peers strings every
+        // binary that stands up a Libp2pNetwork from this config relies on.
+        let net_cfg = cfg.libp2p_config().unwrap();
+        assert_eq!(net_cfg.listen.to_string(), "/ip4/0.0.0.0/tcp/7100");
+        assert_eq!(net_cfg.bootstrap_peers.len(), 1);
         // Present fields parse; omitted committee fields fall back to defaults.
         assert_eq!(cfg.committee.public_round_ms, 2000);
         assert_eq!(cfg.committee.committee_round_ms, 10_000);

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anymone_core::config::ExchangePublicKeyWire;
-use anymone_core::p2p::{Libp2pConfig, Libp2pNetwork};
+use anymone_core::p2p::Libp2pNetwork;
 use anymone_core::transport::Transport;
 use anymone_core::{
     announce_service_registration, Anymone, BootstrapConfig, GovernanceBootstrap, Identity,
@@ -16,7 +16,6 @@ use anymone_core::{
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use libp2p::Multiaddr;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -62,30 +61,9 @@ async fn main() -> Result<()> {
     let identity = Identity::load_or_generate(&bootstrap.identity_path)
         .with_context(|| format!("identity at {}", bootstrap.identity_path.display()))?;
 
-    let listen: Multiaddr = bootstrap
-        .network
-        .listen
-        .parse()
-        .context("bad listen multiaddr")?;
-    let bootstrap_peers: Vec<Multiaddr> = bootstrap
-        .network
-        .bootstrap_peers
-        .iter()
-        .map(|s| {
-            s.parse::<Multiaddr>()
-                .with_context(|| format!("bad bootstrap multiaddr: {s}"))
-        })
-        .collect::<Result<_>>()?;
-
-    let net = Libp2pNetwork::start(
-        &identity,
-        Libp2pConfig {
-            listen,
-            bootstrap_peers,
-        },
-    )
-    .await
-    .map_err(|e| anyhow!("libp2p start: {e}"))?;
+    let net = Libp2pNetwork::start(&identity, bootstrap.libp2p_config()?)
+        .await
+        .map_err(|e| anyhow!("libp2p start: {e}"))?;
     let transport: Arc<dyn Transport> = net.clone();
     let gov = GovernanceBootstrap::from_bootstrap_config(&bootstrap);
 

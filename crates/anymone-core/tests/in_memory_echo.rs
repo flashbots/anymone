@@ -196,6 +196,16 @@ async fn oversized_send_is_rejected() {
         matches!(err, anymone_core::SendError::PayloadTooLarge { .. }),
         "expected PayloadTooLarge, got {err:?}"
     );
+
+    // max_message_payload's boundary matches the real send-time check exactly:
+    // one byte over is rejected, right at the limit succeeds.
+    let max = anymone_core::max_message_payload(64);
+    pipe.send(vec![0u8; max]).await.expect("payload at the limit must fit");
+    let err = pipe.send(vec![0u8; max + 1]).await.unwrap_err();
+    assert!(
+        matches!(err, anymone_core::SendError::PayloadTooLarge { .. }),
+        "expected PayloadTooLarge, got {err:?}"
+    );
 }
 
 /// `subscribe` registers a tag receiver without owning it: a message to the tag
@@ -237,5 +247,26 @@ async fn subscribe_delivers_broadcast_to_participants() {
         .expect("bob recv timed out")
         .expect("pipe closed");
     assert_eq!(got.payload, b"hi room");
+    assert_eq!(got.return_tag, alice_pipe.return_tag());
+
+    // send_unlinkable: two sends from the same pipe carry different, random
+    // return tags, neither equal to the pipe's own — bus traffic can't be
+    // linked back to the sender or to each other via the return path.
+    alice_pipe.send_unlinkable(b"anon 1".to_vec()).await.unwrap();
+    let anon1 = tokio::time::timeout(Duration::from_secs(2), bob_pipe.recv())
+        .await
+        .expect("bob recv timed out")
+        .expect("pipe closed");
+    alice_pipe.send_unlinkable(b"anon 2".to_vec()).await.unwrap();
+    let anon2 = tokio::time::timeout(Duration::from_secs(2), bob_pipe.recv())
+        .await
+        .expect("bob recv timed out")
+        .expect("pipe closed");
+    assert_eq!(anon1.payload, b"anon 1");
+    assert_eq!(anon2.payload, b"anon 2");
+    assert_ne!(anon1.return_tag, alice_pipe.return_tag());
+    assert_ne!(anon2.return_tag, alice_pipe.return_tag());
+    assert_ne!(anon1.return_tag, anon2.return_tag);
+
     drop(anymones);
 }

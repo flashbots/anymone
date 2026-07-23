@@ -614,9 +614,18 @@ impl AdcnetObserverSession {
     }
 }
 
+impl AdcnetObserverSession {
+    // The observer has no scheduler tick of its own — `begin_round` is never
+    // fed a real round, so the window clock instead tracks the highest
+    // accepted wire round seen so far.
+    fn advance_cur_round(&mut self, round: u64) {
+        let round = round as u32;
+        self.cur_round = Some(self.cur_round.map_or(round, |cur| cur.max(round)));
+    }
+}
+
 impl Session for AdcnetObserverSession {
-    fn begin_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
-        self.cur_round = Some(round as u32);
+    fn begin_round(&mut self, _round: Round, _now: Instant) -> Vec<Vec<u8>> {
         Vec::new()
     }
 
@@ -636,6 +645,7 @@ impl Session for AdcnetObserverSession {
                 {
                     return Vec::new();
                 }
+                self.advance_cur_round(round);
                 // Credit the signer's own roster slot — a relay can't vouch for another.
                 if let Some(idx) = self
                     .roster
@@ -651,12 +661,14 @@ impl Session for AdcnetObserverSession {
                 if future(round) {
                     return Vec::new();
                 }
+                self.advance_cur_round(round);
                 self.tracker.observe_output(round);
             }
             AdcnetObserved::ClientSet { size, round } if from == self.leader => {
                 if future(round) {
                     return Vec::new();
                 }
+                self.advance_cur_round(round);
                 self.anon_set_by_round.insert(round, size);
                 while self.anon_set_by_round.len() > ANON_SET_HISTORY {
                     let oldest = *self.anon_set_by_round.keys().next().unwrap();

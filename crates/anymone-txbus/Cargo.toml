@@ -1,0 +1,17 @@
+[package]
+name = "anymone-txbus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "anymone_txbus"
+path = "src/lib.rs"
+
+[dependencies]
+anymone-core = { path = "../anymone-core" }
+# "kzg" for the EIP-4844 blob sidecar variant EthereumTxEnvelope needs below.
+alloy-consensus = { workspace = true, features = ["kzg"] }
+alloy-eips = { workspace = true, features = ["kzg"] }
+alloy-primitives.workspace = true
+thiserror.workspace = true

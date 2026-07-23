@@ -5,6 +5,7 @@
 
 use std::sync::{Mutex, Weak};
 
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -30,6 +31,22 @@ pub(crate) struct PipeMessage {
 pub struct PipeIncoming {
     pub return_tag: RouteTag,
     pub payload: Vec<u8>,
+}
+
+/// The largest `send`/`send_to`/`send_unlinkable` payload that fits in one
+/// message on a subnet whose carrier reports `message_size`, computed from
+/// the real `Frame::Raw` + `PipeMessage` encoding (not an estimate), so a
+/// caller can reject an oversized payload before attempting a send.
+pub fn max_message_payload(message_size: usize) -> usize {
+    let probe = PipeMessage {
+        return_tag: RouteTag([0u8; SERVICE_TAG_LEN]),
+        payload: Vec::new(),
+    };
+    let empty_encoded = bincode::serialize(&probe)
+        .expect("PipeMessage serialises")
+        .len();
+    let frame_header = 1 + SERVICE_TAG_LEN; // Frame::Raw discriminant + dst
+    message_size.saturating_sub(frame_header + empty_encoded)
 }
 
 pub struct Pipe {
@@ -89,14 +106,35 @@ impl Pipe {
         dst: impl Into<RouteTag>,
         payload: Vec<u8>,
     ) -> Result<(), SendError> {
-        let dst = dst.into();
+        self.send_inner(dst.into(), self.return_tag, payload).await
+    }
+
+    /// Send to the bound service with a one-off random return path instead of
+    /// this pipe's own: the recipient cannot link this message to any other
+    /// send from this pipe (or reply to it). For reply-less broadcast traffic
+    /// where reusing `return_tag` across sends would deanonymize the sender
+    /// as "the same submitter" even though individual messages stay unlinked
+    /// from the pipe's identity otherwise.
+    pub async fn send_unlinkable(&self, payload: Vec<u8>) -> Result<(), SendError> {
+        let dst = self.peer_tag.ok_or(SendError::NoPeerTag)?;
+        let mut bytes = [0u8; SERVICE_TAG_LEN];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        self.send_inner(dst.into(), RouteTag(bytes), payload).await
+    }
+
+    async fn send_inner(
+        &self,
+        dst: RouteTag,
+        return_tag: RouteTag,
+        payload: Vec<u8>,
+    ) -> Result<(), SendError> {
         // Resolve the subnet from the current config every send, so the pipe
         // re-homes as the committee adds/removes subnets.
         let anymone = self.anymone.upgrade().ok_or(SendError::Closed)?;
         let subnet = resolve_send_subnet(&anymone, self.peer_tag, self.return_tag, dst)
             .ok_or(SendError::SubnetGone)?;
         let msg = PipeMessage {
-            return_tag: self.return_tag,
+            return_tag,
             payload,
         };
         let data = bincode::serialize(&msg).map_err(|e| SendError::Encode(e.to_string()))?;
@@ -140,6 +178,12 @@ impl Pipe {
     /// Receive the next inbound message, or `None` once the pipe is closed.
     pub async fn recv(&mut self) -> Option<PipeIncoming> {
         self.inbound.recv().await
+    }
+
+    /// Non-blocking receive: `Some` if a message is already queued, `None` if
+    /// the inbox is currently empty (whether or not the pipe is closed).
+    pub fn try_recv(&mut self) -> Option<PipeIncoming> {
+        self.inbound.try_recv().ok()
     }
 }
 

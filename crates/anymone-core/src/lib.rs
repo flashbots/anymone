@@ -49,7 +49,7 @@ pub use identity::{Identity, Pubkey};
 pub use panetiere::{
     PanetiereClientSession, PanetiereObserverSession, PanetiereServerSession, PanetiereWatchSession,
 };
-pub use pipe::{Pipe, PipeIncoming, SendError};
+pub use pipe::{max_message_payload, Pipe, PipeIncoming, SendError};
 pub use runtime::{leader_of, subnet_leader_pk, Anymone, AnymonePrep, Event, OpenError};
 pub use scheduler_core::{SchedulerAction, SchedulerCore, SchedulerParams, SignedProposal};
 pub use scheduling::{

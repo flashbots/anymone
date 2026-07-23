@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use anymone_core::config::ExchangePublicKeyWire;
-use anymone_core::p2p::{Libp2pConfig, Libp2pNetwork};
+use anymone_core::p2p::Libp2pNetwork;
 use anymone_core::transport::Transport;
 use anymone_core::{
     announce_relay_registration, announce_service_registration,
@@ -18,7 +18,7 @@ use anymone_core::{
     Misbehavior, ServiceTag,
 };
 use clap::{Parser, Subcommand, ValueEnum};
-use libp2p::{Multiaddr, PeerId};
+use libp2p::PeerId;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -183,28 +183,6 @@ fn spawn_peers_endpoint(
     });
 }
 
-/// Parse `network.listen` + `network.bootstrap_peers` from a loaded config.
-fn network_config(bootstrap: &BootstrapConfig) -> Result<Libp2pConfig> {
-    let listen: Multiaddr = bootstrap
-        .network
-        .listen
-        .parse()
-        .with_context(|| format!("bad listen multiaddr: {}", bootstrap.network.listen))?;
-    let bootstrap_peers: Vec<Multiaddr> = bootstrap
-        .network
-        .bootstrap_peers
-        .iter()
-        .map(|s| {
-            s.parse::<Multiaddr>()
-                .with_context(|| format!("bad bootstrap multiaddr: {s}"))
-        })
-        .collect::<Result<_>>()?;
-    Ok(Libp2pConfig {
-        listen,
-        bootstrap_peers,
-    })
-}
-
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -248,7 +226,7 @@ async fn bootnode(args: BootnodeArgs) -> Result<()> {
     let peer_id = PeerId::from(identity.to_libp2p_keypair().public());
     tracing::info!(%peer_id, listen = %bootstrap.network.listen, "starting bootnode");
 
-    let net = Libp2pNetwork::start(&identity, network_config(&bootstrap)?)
+    let net = Libp2pNetwork::start(&identity, bootstrap.libp2p_config()?)
         .await
         .map_err(|e| anyhow!("libp2p start: {e}"))?;
     // Join the governance topics so the bootnode is in those meshes; held for
@@ -275,7 +253,7 @@ async fn run(args: RunArgs) -> Result<()> {
         .with_context(|| format!("identity at {}", bootstrap.identity_path.display()))?;
     tracing::info!(role = ?args.role, pubkey = %identity.pubkey(), "starting node");
 
-    let net = Libp2pNetwork::start(&identity, network_config(&bootstrap)?)
+    let net = Libp2pNetwork::start(&identity, bootstrap.libp2p_config()?)
         .await
         .map_err(|e| anyhow!("libp2p start: {e}"))?;
     let transport: Arc<dyn Transport> = net.clone();
