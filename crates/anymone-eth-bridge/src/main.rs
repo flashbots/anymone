@@ -92,7 +92,9 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     if args.serve.is_none() && args.forward_to.is_none() {
-        return Err(anyhow!("at least one of --serve or --forward-to is required"));
+        return Err(anyhow!(
+            "at least one of --serve or --forward-to is required"
+        ));
     }
 
     let bootstrap = BootstrapConfig::load(&args.config)
@@ -147,7 +149,9 @@ async fn main() -> Result<()> {
             let listener = tokio::net::TcpListener::bind(&listen)
                 .await
                 .with_context(|| format!("binding {listen}"))?;
-            axum::serve(listener, router(state)).await.context("serving")
+            axum::serve(listener, router(state))
+                .await
+                .context("serving")
         }));
     }
 

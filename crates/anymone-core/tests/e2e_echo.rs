@@ -40,7 +40,8 @@ async fn e2e_echo_over_static_subnet() {
         client_set_min: 0,
         client_set_max: 256,
     });
-    let config = AnymoneRoundConfiguration::singleton_subnet(0, protocol, relay_pks, services);
+    let config =
+        AnymoneRoundConfiguration::singleton_subnet(0, protocol, relay_pks, vec![], services);
 
     // Start everyone (subscribes synchronously); service before client so the
     // service's subnet subscription is in place before the first send.

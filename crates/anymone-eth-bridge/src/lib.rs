@@ -43,7 +43,9 @@ pub trait BusRecv: Send {
 #[async_trait::async_trait]
 impl BusRecv for anymone_core::Pipe {
     async fn recv(&mut self) -> Option<Vec<u8>> {
-        anymone_core::Pipe::recv(self).await.map(|incoming| incoming.payload)
+        anymone_core::Pipe::recv(self)
+            .await
+            .map(|incoming| incoming.payload)
     }
 }
 
@@ -415,7 +417,11 @@ mod tests {
         let raw_invalid = anymone_txbus::encode_tx(&signed_tx(999, 0, 1_000_000_000, 21_000));
         let raw_b = anymone_txbus::encode_tx(&signed_tx(1, 0, 2_000_000_000, 21_000));
 
-        let pipe = StubBusRecv([raw_a.clone(), raw_invalid, raw_b.clone()].into_iter().collect());
+        let pipe = StubBusRecv(
+            [raw_a.clone(), raw_invalid, raw_b.clone()]
+                .into_iter()
+                .collect(),
+        );
         let calls = Arc::new(Mutex::new(Vec::new()));
         // `fail: true` on every call — the loop must still drain all three
         // messages rather than stopping at the first RPC error.

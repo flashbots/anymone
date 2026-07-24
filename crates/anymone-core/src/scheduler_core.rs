@@ -226,6 +226,52 @@ mod sizing_tests {
                 "reference message {worst} at {n_relays} relays exceeds budget"
             );
         }
+
+        // The worst-case proposal (MAX_SUBNETS, largest protocol config, max
+        // aggregator groups) must fit the committee channel, or the committee
+        // wedges: it stages the config every round and never decodes it back.
+        let id = Identity::generate();
+        let mut core = SchedulerCore::new(
+            id.clone(),
+            vec![id.pubkey()],
+            1,
+            SchedulerParams {
+                public_round_duration: Duration::from_secs(8),
+                min_relays: 4,
+                min_services: 1,
+                fault_threshold: 2,
+                escalation_grace: ESCALATION_GRACE,
+                grow_at: SUBNET_GROW_AT,
+                message_size: 1024,
+                integrity_backoff_ms: 6 * 60 * 1000,
+                sideline: false,
+                min_capacity: 8,
+                pin: None,
+                aggregation: true,
+            },
+        );
+        for _ in 0..8 {
+            let rid = Identity::generate();
+            core.registered.insert(rid.pubkey());
+            core.relay_xpubs.insert(
+                rid.pubkey(),
+                ExchangePublicKeyWire::from_key(&rid.exchange_pubkey()),
+            );
+        }
+        core.services
+            .insert(ServiceTag([1u8; 20]), Identity::generate().pubkey());
+        core.capacity = MAX_SUBNET_CLIENTS;
+        let body = core.build_body(&vec![SchedulerProtocol::ScheduledPanetiere; MAX_SUBNETS]);
+        let proposal = SignedProposal {
+            body,
+            proposer: id.pubkey(),
+            signature: vec![0u8; 64],
+        };
+        let len = bincode::serialize(&proposal).unwrap().len();
+        assert!(
+            len <= crate::panetiere::COMMITTEE_MSG_BYTES,
+            "{MAX_SUBNETS}-subnet proposal ({len} bytes) exceeds COMMITTEE_MSG_BYTES"
+        );
     }
 
     #[test]
@@ -237,7 +283,6 @@ mod sizing_tests {
                 estimated_messages: expected_active(50_000),
                 client_set_min: 0,
                 client_set_max: 50_000,
-                relay_exchange_keys: vec![],
                 aggregation: None,
             }),
             5,
@@ -270,6 +315,7 @@ mod sizing_tests {
             round: 0,
             epoch_unix_ms: 0,
             services: vec![],
+            relay_exchange_keys: vec![],
             subnets: vec![Subnet {
                 id: 0,
                 relays: vec![],
@@ -951,14 +997,30 @@ impl SchedulerCore {
             })
             .collect();
         if sig != self.current_subnets_sig {
-            self.observers = sig
+            // Diff per subnet id — growing/shrinking the subnet count changes
+            // the overall `sig`, but must not reset every other subnet's
+            // observer (anonymity set, fault streak) along with it.
+            let prev: HashMap<SubnetId, (Vec<Pubkey>, Option<SchedulerProtocol>)> = self
+                .current_subnets_sig
                 .iter()
-                .filter_map(|(id, roster, proto)| {
-                    let leader = crate::runtime::leader_of(roster, *id);
-                    build_observer(*proto, roster.clone(), leader, self.params.fault_threshold)
-                        .map(|o| (*id, o))
-                })
+                .map(|(id, roster, proto)| (*id, (roster.clone(), *proto)))
                 .collect();
+            let mut observers = std::collections::BTreeMap::new();
+            for (id, roster, proto) in &sig {
+                if prev.get(id) == Some(&(roster.clone(), *proto)) {
+                    if let Some(o) = self.observers.remove(id) {
+                        observers.insert(*id, o);
+                        continue;
+                    }
+                }
+                let leader = crate::runtime::leader_of(roster, *id);
+                if let Some(o) =
+                    build_observer(*proto, roster.clone(), leader, self.params.fault_threshold)
+                {
+                    observers.insert(*id, o);
+                }
+            }
+            self.observers = observers;
             self.current_subnets_sig = sig;
         }
     }
@@ -1016,24 +1078,18 @@ impl SchedulerCore {
         {
             return false;
         }
+        if !self.exchange_keys_match(&body.relay_exchange_keys) {
+            return false;
+        }
         for s in &body.subnets {
             if !s.relays.iter().all(|pk| self.registered.contains(pk)) {
                 return false;
             }
             let keys_ok = match &s.protocol {
                 ProtocolConfig::Noop(_) => true,
-                ProtocolConfig::Adcnet(c) => {
-                    self.exchange_keys_match(&c.relay_exchange_keys)
-                        && self.aggregation_valid(&c.aggregation)
-                }
-                ProtocolConfig::Panetiere(c) => {
-                    self.exchange_keys_match(&c.relay_exchange_keys)
-                        && self.aggregation_valid(&c.aggregation)
-                }
-                ProtocolConfig::ScheduledPanetiere(c) => {
-                    self.exchange_keys_match(&c.relay_exchange_keys)
-                        && self.aggregation_valid(&c.aggregation)
-                }
+                ProtocolConfig::Adcnet(c) => self.aggregation_valid(&c.aggregation),
+                ProtocolConfig::Panetiere(c) => self.aggregation_valid(&c.aggregation),
+                ProtocolConfig::ScheduledPanetiere(c) => self.aggregation_valid(&c.aggregation),
                 // Rejected by validate_structure already.
                 ProtocolConfig::ScheduledAdcnet(_) | ProtocolConfig::Nym(_) => false,
             };
@@ -1044,24 +1100,23 @@ impl SchedulerCore {
         true
     }
 
-    /// Every `(relay, exchange_key)` pair in a proposed protocol config must
-    /// match what that relay actually registered.
+    /// Every `(relay, exchange_key)` pair in a proposed config must match what
+    /// that relay actually registered.
     fn exchange_keys_match(&self, keys: &[(Pubkey, ExchangePublicKeyWire)]) -> bool {
         keys.iter()
             .all(|(pk, xk)| self.relay_xpubs.get(pk) == Some(xk))
     }
 
     /// Each aggregator group must be a `replication`-sized committee of
-    /// registered relays whose exchange keys match registration.
+    /// registered relays.
     fn aggregation_valid(&self, agg: &Option<Aggregation>) -> bool {
         if !aggregation_structural_ok(agg) {
             return false;
         }
         let Some(a) = agg else { return true };
-        a.groups.iter().all(|g| {
-            g.aggregators.iter().all(|pk| self.registered.contains(pk))
-                && self.exchange_keys_match(&g.aggregator_exchange_keys)
-        })
+        a.groups
+            .iter()
+            .all(|g| g.aggregators.iter().all(|pk| self.registered.contains(pk)))
     }
 
     fn subnet_escalated(&self, id: SubnetId) -> bool {
@@ -1162,7 +1217,7 @@ impl SchedulerCore {
         let aggregation = self
             .params
             .aggregation
-            .then(|| build_subnet_aggregation(self.capacity, &relay_vec, &relay_xk))
+            .then(|| build_subnet_aggregation(self.capacity, &relay_vec))
             .flatten();
         let n = relay_vec.len() as u32;
         let subnets = protos
@@ -1178,7 +1233,6 @@ impl SchedulerCore {
                         client_set_max: self.capacity,
                         threshold: (n / 2 + 1).max(n.saturating_sub(2)),
                         setup_seed: crate::keys::derive_seed(b"anymone/subnet-seed", &relay_vec),
-                        relay_exchange_keys: relay_xk.clone(),
                         aggregation: aggregation.clone(),
                     }),
                     SchedulerProtocol::ScheduledPanetiere => {
@@ -1209,7 +1263,6 @@ impl SchedulerCore {
                                     b"anymone/subnet-seed",
                                     &relay_vec,
                                 ),
-                                relay_exchange_keys: relay_xk.clone(),
                                 aggregation: aggregation.clone(),
                             },
                         )
@@ -1221,7 +1274,6 @@ impl SchedulerCore {
                         estimated_messages: expected_active(self.capacity),
                         client_set_min: 0,
                         client_set_max: self.capacity,
-                        relay_exchange_keys: relay_xk.clone(),
                         aggregation: aggregation.clone(),
                     }),
                 };
@@ -1239,6 +1291,7 @@ impl SchedulerCore {
                 .epoch_unix_ms
                 .unwrap_or_else(crate::config::now_unix_ms),
             services: service_vec,
+            relay_exchange_keys: relay_xk,
             subnets,
         }
     }
@@ -1298,11 +1351,7 @@ fn content_key(
 /// below the threshold. Group count is `min(1 + capacity/16, √capacity/2)`,
 /// clamped to at least one and at most one distinct `replication`-sized committee
 /// per group (a node runs one aggregator session, so a relay can't staff two).
-fn build_subnet_aggregation(
-    capacity: u32,
-    relay_vec: &[Pubkey],
-    relay_xk: &[(Pubkey, ExchangePublicKeyWire)],
-) -> Option<Aggregation> {
+fn build_subnet_aggregation(capacity: u32, relay_vec: &[Pubkey]) -> Option<Aggregation> {
     let replication = AGGREGATOR_REPLICATION.min(relay_vec.len() as u32);
     if capacity <= AGGREGATION_THRESHOLD || replication == 0 {
         return None;
@@ -1313,20 +1362,12 @@ fn build_subnet_aggregation(
         .floor() as u32)
         .min(max_groups)
         .max(1);
-    let xk: HashMap<Pubkey, ExchangePublicKeyWire> = relay_xk.iter().cloned().collect();
     let groups = (0..group_count)
         .map(|g| {
             let aggregators: Vec<Pubkey> = (0..replication)
                 .map(|r| relay_vec[((g * replication + r) as usize) % relay_vec.len()])
                 .collect();
-            let aggregator_exchange_keys = aggregators
-                .iter()
-                .filter_map(|pk| xk.get(pk).map(|x| (*pk, x.clone())))
-                .collect();
-            AggregatorGroup {
-                aggregators,
-                aggregator_exchange_keys,
-            }
+            AggregatorGroup { aggregators }
         })
         .collect();
     Some(Aggregation {

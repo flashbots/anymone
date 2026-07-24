@@ -49,6 +49,7 @@ async fn echo_via_governance_topic() {
             client_set_max: 256,
         }),
         relays.iter().map(|r| r.pubkey()).collect(),
+        vec![],
         vec![ServiceEntry {
             tag: echo_tag(),
             pubkey: service.pubkey(),

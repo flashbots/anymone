@@ -61,7 +61,6 @@ async fn fault_for(mode: Misbehavior, panetiere: bool) -> Reported {
             client_set_max: 8,
             threshold: 2,
             setup_seed: [7u8; 32],
-            relay_exchange_keys: relay_xk,
             aggregation: None,
         })
     } else {
@@ -71,7 +70,6 @@ async fn fault_for(mode: Misbehavior, panetiere: bool) -> Reported {
             estimated_messages: 8,
             client_set_min: 0,
             client_set_max: 8,
-            relay_exchange_keys: relay_xk,
             aggregation: None,
         })
     };
@@ -79,6 +77,7 @@ async fn fault_for(mode: Misbehavior, panetiere: bool) -> Reported {
         0,
         protocol,
         relay_pks.clone(),
+        relay_xk,
         vec![ServiceEntry {
             tag: echo_tag(),
             pubkey: service.pubkey(),

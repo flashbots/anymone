@@ -507,6 +507,7 @@ fn multisig_assembles_via_committee_sig() {
         round: cfg.body.round,
         epoch_unix_ms: cfg.body.epoch_unix_ms,
         services: vec![],
+        relay_exchange_keys: vec![],
         subnets: vec![anymone_core::config::Subnet::new(
             0,
             vec![],
@@ -637,15 +638,13 @@ impl Subnet {
         let relay_pks: Vec<Pubkey> = sorted.iter().map(|i| i.pubkey()).collect();
         let leader_pk = relay_pks[0];
 
-        let xk_by_pk: HashMap<Pubkey, ExchangePublicKeyWire> =
-            cfg.relay_exchange_keys.iter().cloned().collect();
         let clients: Vec<AdcnetClientSession> = client_ids
             .iter()
             .enumerate()
             .map(|(ci, client_id)| {
                 let mut client_shared: HashMap<ServerId, SharedKey> = HashMap::new();
-                for (i, pk) in relay_pks.iter().enumerate() {
-                    let xk = xk_by_pk.get(pk).unwrap().to_key().unwrap();
+                for (i, relay) in sorted.iter().enumerate() {
+                    let xk = relay.exchange_pubkey();
                     client_shared.insert(ServerId(i as u32), client_id.exchange().ecdh(&xk));
                 }
                 let mut seed = [3u8; 32];

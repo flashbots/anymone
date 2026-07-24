@@ -552,6 +552,7 @@ async fn apply_config(
         let handle = match &subnet.protocol {
             ProtocolConfig::Adcnet(_) => tokio::spawn(crate::adcnet::run_subnet(
                 subnet,
+                config.body.relay_exchange_keys.clone(),
                 inner_for_task,
                 stage_rx,
                 subscriptions,
@@ -560,6 +561,7 @@ async fn apply_config(
             )),
             ProtocolConfig::Panetiere(_) => tokio::spawn(crate::panetiere::run_subnet(
                 subnet,
+                config.body.relay_exchange_keys.clone(),
                 inner_for_task,
                 stage_rx,
                 subscriptions,
@@ -569,6 +571,7 @@ async fn apply_config(
             ProtocolConfig::ScheduledPanetiere(_) => {
                 tokio::spawn(crate::panetiere_scheduled::run_subnet(
                     subnet,
+                    config.body.relay_exchange_keys.clone(),
                     inner_for_task,
                     stage_rx,
                     subscriptions,

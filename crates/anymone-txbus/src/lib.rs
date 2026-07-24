@@ -12,7 +12,8 @@ use anymone_core::ServiceTag;
 /// The pooled/network transaction representation carried on the bus — the
 /// standard post-EIP-4844 Ethereum tx envelope, same type every mainstream
 /// execution client (reth, geth, etc.) accepts via `eth_sendRawTransaction`.
-pub type PooledTx = EthereumTxEnvelope<alloy_consensus::TxEip4844WithSidecar<BlobTransactionSidecarVariant>>;
+pub type PooledTx =
+    EthereumTxEnvelope<alloy_consensus::TxEip4844WithSidecar<BlobTransactionSidecarVariant>>;
 
 pub fn tx_bus_tag(chain_id: u64) -> ServiceTag {
     ServiceTag::from_label(&format!("anymone.eth.tx.{chain_id}"))
@@ -50,7 +51,11 @@ pub struct StatelessLimits {
     pub min_gas_price: u128,
 }
 
-pub fn check_stateless(encoded_len: usize, tx: &PooledTx, limits: &StatelessLimits) -> Result<(), TxReject> {
+pub fn check_stateless(
+    encoded_len: usize,
+    tx: &PooledTx,
+    limits: &StatelessLimits,
+) -> Result<(), TxReject> {
     if tx.is_eip4844() {
         return Err(TxReject::BlobTx);
     }

@@ -138,7 +138,8 @@ mod tests {
         let members: String = (0..3)
             .map(|_| member_table(&Identity::generate()))
             .collect();
-        let seed_peer_id = libp2p_identity::PeerId::from(Identity::generate().to_libp2p_keypair().public());
+        let seed_peer_id =
+            libp2p_identity::PeerId::from(Identity::generate().to_libp2p_keypair().public());
         let toml = format!(
             r#"
 identity_path = "/tmp/identity"

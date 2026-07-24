@@ -38,6 +38,9 @@ pub struct AnymoneRoundConfigurationBody {
     /// Every service is carried on every subnet, so services are a single
     /// global list rather than per-subnet.
     pub services: Vec<ServiceEntry>,
+    /// Exchange pubkey per relay, once for the whole config; subnets look
+    /// their relays up here (per-subnet copies blew the committee channel).
+    pub relay_exchange_keys: Vec<(crate::identity::Pubkey, ExchangePublicKeyWire)>,
     pub subnets: Vec<Subnet>,
 }
 
@@ -187,9 +190,6 @@ pub struct PanetiereConfig {
     pub threshold: u32,
     #[serde(with = "serde_bytes_array")]
     pub setup_seed: [u8; 32],
-    /// Each relay's exchange pubkey; clients seal per-server openings to
-    /// these. Same distribution as `AdcnetConfig::relay_exchange_keys`.
-    pub relay_exchange_keys: Vec<(crate::identity::Pubkey, ExchangePublicKeyWire)>,
     /// Aggregation `None` = direct flow (every client posts its own ciphertext+commitment to
     /// ingress topic).
     #[serde(default)]
@@ -215,7 +215,6 @@ pub struct ScheduledPanetiereConfig {
     pub threshold: u32,
     #[serde(with = "serde_bytes_array")]
     pub setup_seed: [u8; 32],
-    pub relay_exchange_keys: Vec<(crate::identity::Pubkey, ExchangePublicKeyWire)>,
     #[serde(default)]
     pub aggregation: Option<Aggregation>,
 }
@@ -232,7 +231,6 @@ pub struct Aggregation {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AggregatorGroup {
     pub aggregators: Vec<crate::identity::Pubkey>,
-    pub aggregator_exchange_keys: Vec<(crate::identity::Pubkey, ExchangePublicKeyWire)>,
 }
 
 mod serde_bytes_array {
@@ -268,7 +266,6 @@ pub struct AdcnetConfig {
     pub estimated_messages: u32,
     pub client_set_min: u32,
     pub client_set_max: u32,
-    pub relay_exchange_keys: Vec<(crate::identity::Pubkey, ExchangePublicKeyWire)>,
     /// `None` = direct flow (every client sends its contribution to the leader).
     #[serde(default)]
     pub aggregation: Option<Aggregation>,
@@ -401,12 +398,14 @@ impl AnymoneRoundConfiguration {
         round: Round,
         protocol: ProtocolConfig,
         relays: Vec<Pubkey>,
+        relay_exchange_keys: Vec<(Pubkey, ExchangePublicKeyWire)>,
         services: Vec<ServiceEntry>,
     ) -> Self {
         let body = AnymoneRoundConfigurationBody {
             round,
             epoch_unix_ms: now_unix_ms(),
             services,
+            relay_exchange_keys,
             subnets: vec![Subnet::new(0, relays, protocol)],
         };
         AnymoneRoundConfiguration::new(body)
@@ -433,6 +432,7 @@ mod tests {
                 tag: ServiceTag::from_label("anymone.echo"),
                 pubkey: Identity::generate().pubkey(),
             }],
+            relay_exchange_keys: vec![],
             subnets: vec![Subnet::new(
                 0,
                 (0..3).map(|_| Identity::generate().pubkey()).collect(),

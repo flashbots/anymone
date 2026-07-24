@@ -313,7 +313,9 @@ fn peer_score_params() -> PeerScoreParams {
     if let Ok(v) = std::env::var("ANYMONE_IP_COLOCATION_THRESHOLD") {
         match v.parse::<f64>() {
             Ok(threshold) => params.ip_colocation_factor_threshold = threshold,
-            Err(e) => tracing::warn!(value = %v, error = %e, "invalid ANYMONE_IP_COLOCATION_THRESHOLD"),
+            Err(e) => {
+                tracing::warn!(value = %v, error = %e, "invalid ANYMONE_IP_COLOCATION_THRESHOLD")
+            }
         }
     }
     params

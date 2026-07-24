@@ -53,10 +53,10 @@ fn build_config(
             estimated_messages: 8,
             client_set_min: 0,
             client_set_max: 8,
-            relay_exchange_keys: relay_xk,
             aggregation: None,
         }),
         relay_pks,
+        relay_xk,
         vec![ServiceEntry {
             tag: echo_tag(),
             pubkey: service.pubkey(),
@@ -194,16 +194,15 @@ async fn adcnet_aggregated_echo_roundtrip_when_leader_is_aggregator() {
             estimated_messages: 8,
             client_set_min: 0,
             client_set_max: 8,
-            relay_exchange_keys: relay_xk,
             aggregation: Some(Aggregation {
                 replication: 1,
                 groups: vec![AggregatorGroup {
                     aggregators: vec![relay_pks[0]],
-                    aggregator_exchange_keys: vec![(relay_pks[0], xkw(&relays[0]))],
                 }],
             }),
         }),
         relay_pks.clone(),
+        relay_xk,
         vec![ServiceEntry {
             tag: echo_tag(),
             pubkey: service.pubkey(),
@@ -370,7 +369,6 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
             estimated_messages: 64,
             client_set_min: 0,
             client_set_max: 64,
-            relay_exchange_keys: relay_xk.clone(),
             aggregation: None,
         })
     };
@@ -383,6 +381,7 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
         round: 0,
         epoch_unix_ms: now_unix_ms(),
         services: services.clone(),
+        relay_exchange_keys: relay_xk.clone(),
         subnets: vec![Subnet::new(0, relay_pks.clone(), proto())],
     })
     .sign_with(&[&committee]);
@@ -392,6 +391,7 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
         round: 1,
         epoch_unix_ms: now_unix_ms(),
         services,
+        relay_exchange_keys: relay_xk,
         subnets: vec![
             Subnet::new(0, relay_pks.clone(), proto()),
             Subnet::new(1, relay_pks.clone(), proto()),

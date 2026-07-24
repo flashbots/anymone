@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anymone_core::config::{
-    now_unix_ms, AdcnetConfig, AnymoneRoundConfigurationBody, ExchangePublicKeyWire,
-    ProtocolConfig, Subnet,
+    now_unix_ms, AdcnetConfig, Aggregation, AggregatorGroup, AnymoneRoundConfigurationBody,
+    ExchangePublicKeyWire, ProtocolConfig, Subnet,
 };
 use anymone_core::faults::{Attribution, FaultKind};
 use anymone_core::panetiere::{
@@ -151,7 +151,7 @@ fn committee_panetiere_roundtrip(payload: &[u8]) -> Vec<u8> {
     let mut setup_rng = ChaCha20Rng::from_seed([7u8; 32]);
     let n_servers = 3;
     // ρ=3, message bound matching the committee's COMMITTEE_MSG_BYTES.
-    let (mse, pp) = channel(&mut setup_rng, n_servers, 3, 4096);
+    let (mse, pp) = channel(&mut setup_rng, n_servers, 3, 12288);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_pk = Identity::generate().pubkey();
     let (ids, server_pks, xpubs) = server_env(n_servers);
@@ -562,7 +562,7 @@ fn panetiere_followers_use_leader_set_with_min_floor() {
 }
 
 fn adcnet_config_body(n_subnets: usize) -> AnymoneRoundConfigurationBody {
-    let relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
+    let relays: Vec<Identity> = (0..8).map(|_| Identity::generate()).collect();
     let mut relay_pks: Vec<_> = relays.iter().map(|i| i.pubkey()).collect();
     relay_pks.sort();
     let mut relay_xk: Vec<_> = relays
@@ -587,8 +587,14 @@ fn adcnet_config_body(n_subnets: usize) -> AnymoneRoundConfigurationBody {
                     estimated_messages: 32,
                     client_set_min: 0,
                     client_set_max: 32,
-                    relay_exchange_keys: relay_xk.clone(),
-                    aggregation: None,
+                    aggregation: Some(Aggregation {
+                        replication: 1,
+                        groups: (0..8)
+                            .map(|g| AggregatorGroup {
+                                aggregators: vec![relay_pks[g]],
+                            })
+                            .collect(),
+                    }),
                 }),
             )
         })
@@ -600,6 +606,7 @@ fn adcnet_config_body(n_subnets: usize) -> AnymoneRoundConfigurationBody {
             tag: ServiceTag::from_label("anymone.chat"),
             pubkey: svc.pubkey(),
         }],
+        relay_exchange_keys: relay_xk,
         subnets,
     }
 }
@@ -607,9 +614,10 @@ fn adcnet_config_body(n_subnets: usize) -> AnymoneRoundConfigurationBody {
 /// Reproduces the demo's "stuck at one subnet" bug at the committee layer: a
 /// grown (multi-subnet) config body must survive the committee's own Panetiere
 /// codec, or it never deserializes back and the grown config never publishes.
+/// Sized to the worst case: MAX_SUBNETS, 8 relays, max aggregator groups.
 #[test]
 fn committee_panetiere_carries_multi_subnet_config() {
-    for n in [1usize, 2, 3] {
+    for n in [1usize, 3, anymone_core::scheduler_core::MAX_SUBNETS] {
         let body = adcnet_config_body(n);
         let bytes = bincode::serialize(&body).expect("serialise body");
         let decoded = committee_panetiere_roundtrip(&bytes);

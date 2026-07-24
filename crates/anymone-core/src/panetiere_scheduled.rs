@@ -27,7 +27,9 @@ use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use tokio::sync::mpsc;
 
-use crate::config::{ProtocolConfig, Round, ScheduledPanetiereConfig, Subnet};
+use crate::config::{
+    ExchangePublicKeyWire, ProtocolConfig, Round, ScheduledPanetiereConfig, Subnet,
+};
 use crate::identity::{Identity, Pubkey};
 use crate::panetiere::{
     client_id_from_pubkey, server_index, PanetiereAggregatorSession, PanetiereObserverSession,
@@ -117,8 +119,11 @@ pub(crate) fn max_wire_estimate(
 
 /// Scheduled-Panetiere `(ServerId, pke::PublicKey)` roster for sealing client
 /// openings — relays whose exchange key is missing or undecodable are skipped.
-fn seal_roster(cfg: &ScheduledPanetiereConfig, subnet: &Subnet) -> Vec<(ServerId, pke::PublicKey)> {
-    crate::keys::roster_exchange_pubkeys(&subnet.relays, &cfg.relay_exchange_keys)
+fn seal_roster(
+    relay_xk: &[(Pubkey, ExchangePublicKeyWire)],
+    subnet: &Subnet,
+) -> Vec<(ServerId, pke::PublicKey)> {
+    crate::keys::roster_exchange_pubkeys(&subnet.relays, relay_xk)
         .into_iter()
         .filter_map(|(i, xk)| {
             let pk = pke::PublicKey::from_sec1_bytes(&xk.to_sec1_bytes()).ok()?;
@@ -131,12 +136,12 @@ fn client_session(
     pp: &Arc<ProtocolParams>,
     sched_mse: &MseParams,
     vector_bytes: usize,
-    cfg: &ScheduledPanetiereConfig,
+    relay_xk: &[(Pubkey, ExchangePublicKeyWire)],
     subnet: &Subnet,
     identity: &Identity,
     leader_pk: Pubkey,
 ) -> Box<dyn Session> {
-    let servers = seal_roster(cfg, subnet);
+    let servers = seal_roster(relay_xk, subnet);
     if servers.len() != subnet.relays.len() {
         tracing::warn!(
             have = servers.len(),
@@ -645,6 +650,7 @@ impl Session for ScheduledAggregatorSession {
 /// announce, end_round shares + decode + broadcast.
 pub(crate) async fn run_subnet(
     subnet: Subnet,
+    relay_xk: Vec<(Pubkey, ExchangePublicKeyWire)>,
     inner: Arc<AnymoneInner>,
     mut stage_rx: mpsc::UnboundedReceiver<StageMsg>,
     mut subscriptions: Vec<Subscription>,
@@ -895,14 +901,14 @@ pub(crate) async fn run_subnet(
                         client_homes.insert(client_tag);
                         sessions
                             .entry(SessionKey::Client)
-                            .or_insert_with(|| client_session(&pp, &sched_mse, cfg.vector_bytes, &cfg, &subnet, &inner.identity, leader_pk))
+                            .or_insert_with(|| client_session(&pp, &sched_mse, cfg.vector_bytes, &relay_xk, &subnet, &inner.identity, leader_pk))
                             .set_cover_rate(cover_rate);
                     }
                     StageMsg::Stage { client_tag, payload } => {
                         client_homes.insert(client_tag);
                         let sess = sessions
                             .entry(SessionKey::Client)
-                            .or_insert_with(|| client_session(&pp, &sched_mse, cfg.vector_bytes, &cfg, &subnet, &inner.identity, leader_pk));
+                            .or_insert_with(|| client_session(&pp, &sched_mse, cfg.vector_bytes, &relay_xk, &subnet, &inner.identity, leader_pk));
                         sess.set_cover_rate(cover_rate);
                         sess.stage(payload);
                     }

@@ -25,7 +25,7 @@ use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::config::{PanetiereConfig, ProtocolConfig, Round, Subnet};
+use crate::config::{ExchangePublicKeyWire, PanetiereConfig, ProtocolConfig, Round, Subnet};
 use crate::faults::{Attribution, Fault, FaultKind, OutputFaultTracker};
 use crate::identity::{Identity, Pubkey};
 use crate::runtime::{
@@ -59,9 +59,10 @@ pub(crate) fn channel_mse_params(
     MseParams::new(GAMMA, delta, xi, prf_key)
 }
 
-/// Message-byte bound for the committee's config-anonymising channel (a
-/// serialized `SignedProposal` fits well within this).
-pub(crate) const COMMITTEE_MSG_BYTES: usize = 4096;
+/// Message-byte bound for the committee's config-anonymising channel. Must fit
+/// a serialized `SignedProposal` at `MAX_SUBNETS` — asserted against the real
+/// `build_body` packing in `scheduler_core::sizing_tests`.
+pub(crate) const COMMITTEE_MSG_BYTES: usize = 12288;
 
 /// Per-subnet Panetiere parameters, with the KAHE message width sized to exactly
 /// hold one MSE pack (`mu_kahe = n_polys`, `l = 1`).
@@ -145,10 +146,10 @@ pub fn client_id_from_pubkey(pk: Pubkey) -> ClientId {
 /// Panetiere `(ServerId, pke::PublicKey)` roster for sealing client openings —
 /// relays whose exchange key is missing or undecodable are skipped.
 pub(crate) fn seal_roster(
-    cfg: &PanetiereConfig,
+    relay_xk: &[(Pubkey, ExchangePublicKeyWire)],
     subnet: &Subnet,
 ) -> Vec<(ServerId, pke::PublicKey)> {
-    crate::keys::roster_exchange_pubkeys(&subnet.relays, &cfg.relay_exchange_keys)
+    crate::keys::roster_exchange_pubkeys(&subnet.relays, relay_xk)
         .into_iter()
         .filter_map(|(i, xk)| {
             let pk = pke::PublicKey::from_sec1_bytes(&xk.to_sec1_bytes()).ok()?;
@@ -160,11 +161,11 @@ pub(crate) fn seal_roster(
 fn client_session(
     pp: &Arc<ProtocolParams>,
     mse: &MseParams,
-    cfg: &PanetiereConfig,
+    relay_xk: &[(Pubkey, ExchangePublicKeyWire)],
     subnet: &Subnet,
     identity: &Identity,
 ) -> Box<dyn Session> {
-    let servers = seal_roster(cfg, subnet);
+    let servers = seal_roster(relay_xk, subnet);
     if servers.len() != subnet.relays.len() {
         tracing::warn!(
             have = servers.len(),
@@ -229,6 +230,7 @@ fn server_session(
 /// the round loop. The runtime dispatches here for Panetiere subnets.
 pub(crate) async fn run_subnet(
     subnet: Subnet,
+    relay_xk: Vec<(Pubkey, ExchangePublicKeyWire)>,
     inner: Arc<AnymoneInner>,
     mut stage_rx: mpsc::UnboundedReceiver<StageMsg>,
     mut subscriptions: Vec<Subscription>,
@@ -450,14 +452,14 @@ pub(crate) async fn run_subnet(
                         client_homes.insert(client_tag);
                         sessions
                             .entry(SessionKey::Client)
-                            .or_insert_with(|| client_session(&pp, &mse, &cfg, &subnet, &inner.identity))
+                            .or_insert_with(|| client_session(&pp, &mse, &relay_xk, &subnet, &inner.identity))
                             .set_cover_rate(cover_rate);
                     }
                     StageMsg::Stage { client_tag, payload } => {
                         client_homes.insert(client_tag);
                         let sess = sessions
                             .entry(SessionKey::Client)
-                            .or_insert_with(|| client_session(&pp, &mse, &cfg, &subnet, &inner.identity));
+                            .or_insert_with(|| client_session(&pp, &mse, &relay_xk, &subnet, &inner.identity));
                         sess.set_cover_rate(cover_rate);
                         sess.stage(payload);
                     }
@@ -1024,6 +1026,17 @@ impl Session for PanetiereClientSession {
     }
 
     fn stage(&mut self, payload: Vec<u8>) {
+        // Callers outside the pipe send gate (committee StageProposal) reach
+        // here unchecked; truncating would corrupt the payload silently.
+        let cap = self.mse.payload_symbols * BYTES_PER_SYMBOL;
+        if payload.len() > cap {
+            tracing::error!(
+                len = payload.len(),
+                cap,
+                "panetiere client: staged payload exceeds channel capacity, dropped"
+            );
+            return;
+        }
         // One MSE insert per message: the leader peels every active client's
         // element out of the summed plaintext, so concurrent senders don't collide.
         let symbols = bytes_to_symbols(&payload, self.mse.payload_symbols);

@@ -29,7 +29,7 @@ use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use crate::config::{AdcnetConfig, ProtocolConfig, Round, Subnet};
+use crate::config::{AdcnetConfig, ExchangePublicKeyWire, ProtocolConfig, Round, Subnet};
 use crate::faults::Fault;
 use crate::identity::Pubkey;
 use crate::runtime::{
@@ -84,11 +84,11 @@ fn relay_index(subnet: &Subnet, pk: Pubkey) -> Option<u32> {
 /// ECDH the node's exchange privkey against each relay's exchange pubkey,
 /// keyed by 0-based `ServerId`.
 fn client_shared_secrets(
-    cfg: &AdcnetConfig,
+    relay_xk: &[(Pubkey, ExchangePublicKeyWire)],
     identity: &Identity,
     subnet: &Subnet,
 ) -> HashMap<ServerId, SharedKey> {
-    crate::keys::roster_exchange_pubkeys(&subnet.relays, &cfg.relay_exchange_keys)
+    crate::keys::roster_exchange_pubkeys(&subnet.relays, relay_xk)
         .into_iter()
         .map(|(i, xk)| (ServerId(i as u32), identity.exchange().ecdh(&xk)))
         .collect()
@@ -96,11 +96,11 @@ fn client_shared_secrets(
 
 fn client_session(
     one_round: &OneRoundConfig,
-    cfg: &AdcnetConfig,
+    relay_xk: &[(Pubkey, ExchangePublicKeyWire)],
     subnet: &Subnet,
     identity: &Identity,
 ) -> Box<dyn Session> {
-    let shared_secrets = client_shared_secrets(cfg, identity, subnet);
+    let shared_secrets = client_shared_secrets(relay_xk, identity, subnet);
     let mut seed = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut seed);
     Box::new(AdcnetClientSession::new(
@@ -149,6 +149,7 @@ fn server_session(
 /// the round loop. The runtime dispatches here for ADCNet subnets.
 pub(crate) async fn run_subnet(
     subnet: Subnet,
+    relay_xk: Vec<(Pubkey, ExchangePublicKeyWire)>,
     inner: Arc<AnymoneInner>,
     mut stage_rx: mpsc::UnboundedReceiver<StageMsg>,
     mut subscriptions: Vec<Subscription>,
@@ -342,14 +343,14 @@ pub(crate) async fn run_subnet(
                         client_homes.insert(client_tag);
                         sessions
                             .entry(SessionKey::Client)
-                            .or_insert_with(|| client_session(&one_round, &cfg, &subnet, &inner.identity))
+                            .or_insert_with(|| client_session(&one_round, &relay_xk, &subnet, &inner.identity))
                             .set_cover_rate(cover_rate);
                     }
                     StageMsg::Stage { client_tag, payload } => {
                         client_homes.insert(client_tag);
                         let sess = sessions
                             .entry(SessionKey::Client)
-                            .or_insert_with(|| client_session(&one_round, &cfg, &subnet, &inner.identity));
+                            .or_insert_with(|| client_session(&one_round, &relay_xk, &subnet, &inner.identity));
                         sess.set_cover_rate(cover_rate);
                         sess.stage(payload);
                     }

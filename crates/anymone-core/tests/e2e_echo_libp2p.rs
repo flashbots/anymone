@@ -94,7 +94,8 @@ async fn e2e_echo_via_libp2p() {
         client_set_min: 0,
         client_set_max: 256,
     });
-    let config = AnymoneRoundConfiguration::singleton_subnet(0, protocol, relay_pks, services);
+    let config =
+        AnymoneRoundConfiguration::singleton_subnet(0, protocol, relay_pks, vec![], services);
 
     let _committee_anymone =
         Anymone::start_with_config(committee_id.clone(), committee.net.clone(), config.clone())

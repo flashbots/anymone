@@ -30,6 +30,7 @@ fn noop_config(
             client_set_max: 256,
         }),
         relays.iter().map(|i| i.pubkey()).collect(),
+        vec![],
         vec![ServiceEntry {
             tag: echo_tag(),
             pubkey: service_pk,
@@ -64,10 +65,10 @@ fn panetiere_config(
             client_set_max: 8,
             threshold: 2,
             setup_seed: [7u8; 32],
-            relay_exchange_keys: relay_xk,
             aggregation: None,
         }),
         relay_pks,
+        relay_xk,
         vec![ServiceEntry {
             tag: echo_tag(),
             pubkey: service_pk,
@@ -179,6 +180,7 @@ async fn oversized_send_is_rejected() {
             client_set_max: 256,
         }),
         relays.iter().map(|i| i.pubkey()).collect(),
+        vec![],
         vec![ServiceEntry {
             tag: echo_tag(),
             pubkey: service.pubkey(),
@@ -200,7 +202,9 @@ async fn oversized_send_is_rejected() {
     // max_message_payload's boundary matches the real send-time check exactly:
     // one byte over is rejected, right at the limit succeeds.
     let max = anymone_core::max_message_payload(64);
-    pipe.send(vec![0u8; max]).await.expect("payload at the limit must fit");
+    pipe.send(vec![0u8; max])
+        .await
+        .expect("payload at the limit must fit");
     let err = pipe.send(vec![0u8; max + 1]).await.unwrap_err();
     assert!(
         matches!(err, anymone_core::SendError::PayloadTooLarge { .. }),
@@ -252,12 +256,18 @@ async fn subscribe_delivers_broadcast_to_participants() {
     // send_unlinkable: two sends from the same pipe carry different, random
     // return tags, neither equal to the pipe's own — bus traffic can't be
     // linked back to the sender or to each other via the return path.
-    alice_pipe.send_unlinkable(b"anon 1".to_vec()).await.unwrap();
+    alice_pipe
+        .send_unlinkable(b"anon 1".to_vec())
+        .await
+        .unwrap();
     let anon1 = tokio::time::timeout(Duration::from_secs(2), bob_pipe.recv())
         .await
         .expect("bob recv timed out")
         .expect("pipe closed");
-    alice_pipe.send_unlinkable(b"anon 2".to_vec()).await.unwrap();
+    alice_pipe
+        .send_unlinkable(b"anon 2".to_vec())
+        .await
+        .unwrap();
     let anon2 = tokio::time::timeout(Duration::from_secs(2), bob_pipe.recv())
         .await
         .expect("bob recv timed out")
