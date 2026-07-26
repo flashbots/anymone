@@ -531,9 +531,8 @@ fn panetiere_followers_use_leader_set_with_min_floor() {
 
         let now = Instant::now();
         // Each server sees the clients in a different arrival order (as on a
-        // real network): once submitters exceed `client_set_max`, servers admit
-        // different subsets and the round must fail loudly (no decode, rejects
-        // logged) — capacity is governance, overflow means it was sized wrong.
+        // real network) — admission must not make servers keep different
+        // subsets once submitters exceed `client_set_max`.
         let msgs: Vec<Vec<Vec<u8>>> = clients.iter_mut().map(|c| c.begin_round(0, now)).collect();
         for (j, s) in servers.iter_mut().enumerate() {
             for k in 0..n_clients {
@@ -571,10 +570,9 @@ fn panetiere_followers_use_leader_set_with_min_floor() {
         0,
         "decode is refused below the min client set"
     );
-    assert_eq!(
-        run(2, 6, 4),
-        0,
-        "submitters beyond client_set_max diverge admission; the round is refused, not truncated"
+    assert!(
+        run(2, 6, 4) >= 1,
+        "more submitters than client_set_max must still decode a capped set"
     );
 }
 

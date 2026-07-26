@@ -12,7 +12,7 @@
 //! `PanetiereWatchSession`) — only the plaintext layout and checkpoint
 //! cadence differ.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -56,7 +56,7 @@ const BYTES_PER_POLY: usize = N * 4;
 /// round each client used, so every participant needs to land on the same
 /// round independently. `R+3` because `Reservations{R}` broadcasts as
 /// `begin_round(R+2)` fires elsewhere, and delivery lands sometime during `R+2`.
-const RESERVATION_TO_MSG_GAP: Round = 3;
+pub(crate) const RESERVATION_TO_MSG_GAP: Round = 3;
 
 /// Must outlive `RESERVATION_TO_MSG_GAP` plus the inner session's own retention.
 const SCHED_ENTRIES_RETENTION: Round = PANETIERE_ROUND_RETENTION + RESERVATION_TO_MSG_GAP;
@@ -131,7 +131,6 @@ fn seal_roster(
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn client_session(
     pp: &Arc<ProtocolParams>,
     sched_mse: &MseParams,
@@ -140,7 +139,6 @@ fn client_session(
     subnet: &Subnet,
     identity: &Identity,
     leader_pk: Pubkey,
-    delivery_rounds: Arc<std::sync::Mutex<BTreeSet<Round>>>,
 ) -> Box<dyn Session> {
     let servers = seal_roster(relay_xk, subnet);
     if servers.len() != subnet.relays.len() {
@@ -152,7 +150,7 @@ fn client_session(
     }
     let mut seed = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut seed);
-    let mut s = ScheduledPanetiereClientSession::new(
+    Box::new(ScheduledPanetiereClientSession::new(
         pp.clone(),
         sched_mse.clone(),
         vector_bytes,
@@ -160,9 +158,7 @@ fn client_session(
         servers,
         leader_pk,
         seed,
-    );
-    s.set_delivery_rounds(delivery_rounds);
-    Box::new(s)
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -225,9 +221,6 @@ pub struct ScheduledPanetiereClientSession {
     cover_rate: f32,
     cover_rng: ChaCha20Rng,
     rand_rng: ChaCha20Rng,
-    /// Node-shared grant calendar; a due delivery is the node's one write that
-    /// round, so the runtime skips the participation draw.
-    delivery_rounds: Option<Arc<std::sync::Mutex<BTreeSet<Round>>>>,
 }
 
 impl ScheduledPanetiereClientSession {
@@ -259,12 +252,7 @@ impl ScheduledPanetiereClientSession {
             cover_rate: 1.0,
             cover_rng: ChaCha20Rng::from_seed(cover_seed),
             rand_rng: ChaCha20Rng::from_seed(rand_seed),
-            delivery_rounds: None,
         }
-    }
-
-    pub fn set_delivery_rounds(&mut self, due: Arc<std::sync::Mutex<BTreeSet<Round>>>) {
-        self.delivery_rounds = Some(due);
     }
 }
 
@@ -281,8 +269,12 @@ impl Session for ScheduledPanetiereClientSession {
             .collect();
         for r in stale {
             if let Some(entries) = self.reserved.remove(&r) {
-                self.deferred
-                    .extend(entries.into_iter().map(|(_, payload)| payload));
+                self.deferred.extend(
+                    entries
+                        .into_iter()
+                        .map(|(_, payload)| payload)
+                        .filter(|p| !p.is_empty()),
+                );
             }
         }
         Vec::new()
@@ -310,15 +302,17 @@ impl Session for ScheduledPanetiereClientSession {
             let idx = entries
                 .iter()
                 .position(|&(r, s)| r == rand && s as usize == data.len());
+            // Zero-length (cover) grants are fulfilled too: a message at R
+            // hides among clients present at BOTH R-GAP and R on this subnet,
+            // so cover must return exactly like a real sender or the
+            // intersection collapses to the real senders.
             match idx.and_then(|i| offs[i]) {
-                Some(offset) => {
-                    if let Some(due) = &self.delivery_rounds {
-                        due.lock().unwrap().insert(target);
-                    }
-                    self.granted.push((target, offset, data));
-                }
-                // Dropped: rand tie, vector overflow, or no match — retry with a fresh rand.
-                None => self.deferred.push(data),
+                Some(offset) => self.granted.push((target, offset, data)),
+                // Dropped: rand tie, vector overflow, or no match — real
+                // payloads retry with a fresh rand; a dropped cover
+                // reservation just ends that chain.
+                None if !data.is_empty() => self.deferred.push(data),
+                None => {}
             }
         }
         Vec::new()
@@ -363,11 +357,10 @@ impl Session for ScheduledPanetiereClientSession {
             }
         }
 
-        // Cover enacts the full scheduled flow — a zero-length reservation now,
-        // its zero message at the granted round — indistinguishable from a real
-        // sender. Reserved EVERY round (pipelined, ≤ GAP+1 outstanding): gating
-        // on being idle would keep clients off the wire between reservation and
-        // grant, halving each round's canonical set.
+        // Cover enacts the full scheduled flow: a fresh zero-length
+        // reservation every round on the drawn subnet, and its zero-delivery
+        // at r+GAP back on this subnet (via the grant, like a real message) —
+        // presence in both rounds is what hides a real sender.
         if self.staged.is_empty() && self.cover_rng.gen::<f32>() < self.cover_rate {
             self.staged.push(Vec::new());
         }
@@ -799,7 +792,6 @@ pub(crate) async fn run_subnet(
             &subnet,
             &inner.identity,
             leader_pk,
-            inner.delivery_rounds.clone(),
         )
     });
     let misbehavior = inner.misbehavior();
@@ -941,7 +933,6 @@ pub(crate) async fn run_subnet(
                         &subnet,
                         &inner.identity,
                         leader_pk,
-                        inner.delivery_rounds.clone(),
                     )
                 });
                 let misbehavior = inner.misbehavior();

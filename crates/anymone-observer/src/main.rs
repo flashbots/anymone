@@ -580,15 +580,29 @@ async fn watch_subnet(subnet: Subnet, transport: Arc<dyn Transport>, obs: Shared
                 // would replay the set of that long-dead round (possibly from a
                 // different client-population era) indefinitely — show nothing
                 // instead once the frontier lags the wire.
+                // Scheduled flow: a message hides among clients present in both
+                // its reservation and delivery rounds, so the honest anon
+                // number is the returning set, not one round's membership.
+                let scheduled = matches!(
+                    subnet.protocol,
+                    anymone_core::ProtocolConfig::ScheduledPanetiere(_)
+                );
                 let anon_set = output_frontier
                     .filter(|of| {
                         wire_round.is_none_or(|w| w.saturating_sub(*of) <= ANON_SET_STALL_ROUNDS)
                     })
                     .and_then(|r| {
+                        let pan = panetiere_obs.as_ref();
                         adcnet_obs
                             .as_ref()
                             .and_then(|o| o.anonymity_set_for(r))
-                            .or_else(|| panetiere_obs.as_ref().and_then(|o| o.anonymity_set_for(r)))
+                            .or_else(|| {
+                                if scheduled {
+                                    pan.and_then(|o| o.returning_set())
+                                } else {
+                                    pan.and_then(|o| o.anonymity_set_for(r))
+                                }
+                            })
                     })
                     .unwrap_or(0) as u64;
                 {

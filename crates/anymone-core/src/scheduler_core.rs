@@ -255,6 +255,7 @@ mod sizing_tests {
                 sideline: false,
                 renegotiate_on_fault: true,
                 min_capacity: 8,
+                vector_bytes: 0,
                 pin: None,
                 aggregation: true,
             },
@@ -317,6 +318,7 @@ mod sizing_tests {
                 sideline: true,
                 renegotiate_on_fault: true,
                 min_capacity: 8,
+                vector_bytes: 0,
                 pin: None,
                 aggregation: true,
             },
@@ -412,9 +414,11 @@ pub struct SchedulerParams {
     /// a fault-triggered reconfiguration is itself a round-losing cutover, so a
     /// stabilizing deployment turns the reaction off rather than tuning graces.
     pub renegotiate_on_fault: bool,
-    /// Force every subnet onto one protocol, bypassing the escalation ladder.
-    /// `Panetiere` still traffic-upgrades to `ScheduledPanetiere`; pinning
-    /// `ScheduledPanetiere` fixes it outright.
+    /// Fixed scheduled-Panetiere message-vector width; `0` derives it from
+    /// capacity and observed traffic.
+    pub vector_bytes: usize,
+    /// Freeze every subnet onto one protocol, bypassing both the escalation
+    /// ladder and the traffic-driven scheduled upgrade.
     pub pin: Option<SchedulerProtocol>,
     /// Whether the committee may route large Panetiere subnets through an
     /// aggregator layer above [`AGGREGATION_THRESHOLD`].
@@ -1239,15 +1243,17 @@ impl SchedulerCore {
 
     /// Upgrades a `Panetiere` entry to `ScheduledPanetiere` on sustained traffic,
     /// downgrades after `SCHED_DOWNGRADE_GRACE` low ticks. An `Adcnet` entry
-    /// drops its state, so escalation always starts one-round. A `pin` of
-    /// `ScheduledPanetiere` forces `scheduled` permanently but still runs the
-    /// sizing below, so vector_bytes tracks real traffic even when pinned.
+    /// drops its state, so escalation always starts one-round. A pin freezes
+    /// the protocol outright: `ScheduledPanetiere` forces `scheduled` (sizing
+    /// below still tracks traffic), `Panetiere` disables the upgrade entirely.
     fn apply_sched_mode(&mut self, protos: &mut [SchedulerProtocol]) {
         let upgrade_bytes = 2 * self.params.message_size;
         let downgrade_bytes = self.params.message_size / 2;
         for (i, proto) in protos.iter_mut().enumerate() {
             let id = i as SubnetId;
-            if *proto == SchedulerProtocol::Adcnet {
+            if *proto == SchedulerProtocol::Adcnet
+                || self.params.pin == Some(SchedulerProtocol::Panetiere)
+            {
                 self.sched_mode.remove(&id);
                 continue;
             }
@@ -1277,9 +1283,13 @@ impl SchedulerCore {
                     expected_active(self.capacity) as usize * self.params.message_size / 2,
                     8192,
                 );
-                let desired = round_up_to(bytes.saturating_mul(3) / 2, 8192)
-                    .max(min_vector)
-                    .min(MAX_VECTOR_BYTES);
+                let desired = if self.params.vector_bytes > 0 {
+                    self.params.vector_bytes
+                } else {
+                    round_up_to(bytes.saturating_mul(3) / 2, 8192)
+                        .max(min_vector)
+                        .min(MAX_VECTOR_BYTES)
+                };
                 if state.vector_bytes == 0
                     || desired.abs_diff(state.vector_bytes) as f64
                         >= state.vector_bytes as f64 * SCHED_VECTOR_RESIZE_MARGIN
@@ -1331,11 +1341,14 @@ impl SchedulerCore {
                         aggregation: aggregation.clone(),
                     }),
                     SchedulerProtocol::ScheduledPanetiere => {
-                        let vector_bytes = self
-                            .sched_mode
-                            .get(&(i as SubnetId))
-                            .map(|s| s.vector_bytes)
+                        let vector_bytes = Some(self.params.vector_bytes)
                             .filter(|&v| v > 0)
+                            .or_else(|| {
+                                self.sched_mode
+                                    .get(&(i as SubnetId))
+                                    .map(|s| s.vector_bytes)
+                                    .filter(|&v| v > 0)
+                            })
                             .unwrap_or_else(|| {
                                 round_up_to(
                                     expected_active(self.capacity) as usize

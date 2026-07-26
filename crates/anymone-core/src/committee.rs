@@ -93,13 +93,15 @@ pub struct PanetiereCommitteeConfig {
     /// Hard floor / initial subnet capacity; set above expected load to hold
     /// capacity constant and avoid resize-driven worker respawns.
     pub min_capacity: u32,
+    /// Fixed scheduled-Panetiere message-vector width; `0` derives it from
+    /// capacity and observed traffic.
+    pub vector_bytes: usize,
     /// Cover rate (f32 bits) shared so a caller can retune it live.
     pub cover_rate: Arc<AtomicU32>,
-    /// Force every subnet onto one protocol ("adcnet" | "panetiere" |
-    /// "scheduled-panetiere"), bypassing the escalation ladder. "panetiere"
-    /// pins the family but leaves the traffic-driven scheduled-mode choice
-    /// live; "scheduled-panetiere" forces the scheduled mode outright. `None`
-    /// keeps the default ADCNet-unless-escalated behavior.
+    /// Freeze every subnet onto one protocol ("adcnet" | "panetiere" |
+    /// "scheduled-panetiere"), bypassing the escalation ladder and the
+    /// traffic-driven scheduled upgrade. `None` keeps the default
+    /// ADCNet-unless-escalated behavior with the upgrade live.
     pub protocol: Option<String>,
     /// Whether large Panetiere subnets may route through an aggregator layer.
     pub aggregation: bool,
@@ -127,6 +129,7 @@ impl Default for PanetiereCommitteeConfig {
             protocol: None,
             aggregation: true,
             committee_msg_bytes: COMMITTEE_MSG_BYTES,
+            vector_bytes: 0,
         }
     }
 }
@@ -162,6 +165,8 @@ pub struct CommitteeParams {
     pub aggregation: bool,
     /// See [`PanetiereCommitteeConfig::committee_msg_bytes`].
     pub committee_msg_bytes: usize,
+    /// See [`PanetiereCommitteeConfig::vector_bytes`].
+    pub vector_bytes: usize,
 }
 
 impl Default for CommitteeParams {
@@ -182,6 +187,7 @@ impl Default for CommitteeParams {
             protocol: None,
             aggregation: true,
             committee_msg_bytes: COMMITTEE_MSG_BYTES,
+            vector_bytes: 0,
         }
     }
 }
@@ -205,6 +211,7 @@ impl CommitteeParams {
             protocol: self.protocol,
             aggregation: self.aggregation,
             committee_msg_bytes: self.committee_msg_bytes,
+            vector_bytes: self.vector_bytes,
         }
     }
 }
@@ -307,6 +314,7 @@ pub async fn spawn_panetiere_committee_scheduler(
         min_capacity: config.min_capacity,
         pin,
         aggregation: config.aggregation,
+        vector_bytes: config.vector_bytes,
     };
 
     tokio::spawn(async move {

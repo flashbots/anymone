@@ -657,6 +657,7 @@ mod tests {
             round,
             epoch_unix_ms: 0,
             services: vec![],
+            relay_exchange_keys: vec![],
             subnets: vec![],
         })
     }

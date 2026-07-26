@@ -101,6 +101,7 @@ fn lead_core(committee: &[Identity], threshold: u32) -> SchedulerCore {
             renegotiate_on_fault: true,
             min_capacity: 8,
             pin: None,
+            vector_bytes: 0,
             aggregation: true,
         },
     )
@@ -137,6 +138,7 @@ fn lead_core_msg_size(
             renegotiate_on_fault: true,
             min_capacity: 8,
             pin: None,
+            vector_bytes: 0,
             aggregation: true,
         },
     )
@@ -233,6 +235,7 @@ fn renegotiates_adcnet_panetiere_adcnet() {
             renegotiate_on_fault: true,
             min_capacity: 8,
             pin: Some(anymone_core::SchedulerProtocol::Panetiere),
+            vector_bytes: 0,
             aggregation: true,
         },
     );
@@ -286,6 +289,7 @@ fn renegotiates_adcnet_panetiere_adcnet() {
             renegotiate_on_fault: true,
             min_capacity: 8,
             pin: Some(anymone_core::SchedulerProtocol::Panetiere),
+            vector_bytes: 0,
             aggregation: true,
         },
     );
@@ -440,6 +444,7 @@ fn multisig_assembles_via_committee_sig() {
         renegotiate_on_fault: true,
         min_capacity: 8,
         pin: None,
+        vector_bytes: 0,
         aggregation: true,
     };
     let mut core = SchedulerCore::new(lead.clone(), pks.clone(), 2, params.clone());
@@ -580,6 +585,7 @@ fn non_lead_core_never_stages() {
             renegotiate_on_fault: true,
             min_capacity: 8,
             pin: None,
+            vector_bytes: 0,
             aggregation: true,
         },
     );
@@ -749,6 +755,7 @@ fn live_core(committee: &[Identity]) -> SchedulerCore {
             renegotiate_on_fault: true,
             min_capacity: 8,
             pin: None,
+            vector_bytes: 0,
             aggregation: true,
         },
     )
@@ -792,6 +799,7 @@ fn committee_schedules_second_subnet_when_one_nears_capacity() {
                 renegotiate_on_fault: true,
                 min_capacity: 8,
                 pin: None,
+                vector_bytes: 0,
                 aggregation: false,
             },
         )
@@ -1634,6 +1642,7 @@ fn sustained_traffic_upgrades_to_scheduled_panetiere() {
             renegotiate_on_fault: true,
             min_capacity: 8,
             pin: Some(anymone_core::scheduling::SchedulerProtocol::ScheduledPanetiere),
+            vector_bytes: 0,
             aggregation: true,
         },
     );

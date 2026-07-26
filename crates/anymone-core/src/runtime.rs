@@ -115,9 +115,6 @@ pub(crate) struct AnymoneInner {
     /// Private seed for the per-round subnet draw: deterministic across this
     /// node's workers (exactly one claims each round), unpredictable outside it.
     participation_seed: [u8; 32],
-    /// Rounds with a scheduled-flow delivery due somewhere on this node; that
-    /// delivery is the round's one write, so the draw must not add another.
-    pub(crate) delivery_rounds: Arc<Mutex<std::collections::BTreeSet<Round>>>,
     /// Set only under governance; `None` for `start_with_config` (fixed-config
     /// tests). Drives topic admission on every adopted config.
     pub(crate) committee: Option<Vec<Pubkey>>,
@@ -218,7 +215,6 @@ impl Anymone {
             subnets: Mutex::new(HashMap::new()),
             outbox: Mutex::new(VecDeque::new()),
             participation_seed,
-            delivery_rounds: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             committee,
             events: broadcast::channel(EVENTS_CAPACITY).0,
             misbehavior: AtomicU8::new(0),
@@ -1171,17 +1167,14 @@ pub(crate) fn sync_client_round(
         sessions.remove(&SessionKey::Client);
         return;
     }
-    let busy = {
-        let mut due = inner.delivery_rounds.lock().unwrap();
-        *due = due.split_off(&round);
-        due.contains(&round)
-    };
-    let participating = !busy && participation_subnet(inner, round) == Some(subnet);
-    let submit = participating && rand::thread_rng().gen::<f32>() < messaging_rate;
-    if !submit {
+    let drawn = participation_subnet(inner, round) == Some(subnet);
+    let submit = drawn && rand::thread_rng().gen::<f32>() < messaging_rate;
+    // Not being drawn is the normal case on every other subnet; only a coin
+    // skip (messaging_rate < 1) is worth a line.
+    if drawn && !submit {
         debug!(
             subnet,
-            round, participating, messaging_rate, "sync: client not submitting this round"
+            round, messaging_rate, "sync: drawn but not submitting"
         );
     }
     let sess = sessions.entry(SessionKey::Client).or_insert_with(make);
@@ -1242,7 +1235,6 @@ mod participation_tests {
             subnets: Mutex::new(HashMap::new()),
             outbox: Mutex::new(VecDeque::new()),
             participation_seed: [42u8; 32],
-            delivery_rounds: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             committee: None,
             events: broadcast::channel(1).0,
             misbehavior: AtomicU8::new(0),

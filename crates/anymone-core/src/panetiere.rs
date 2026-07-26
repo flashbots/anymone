@@ -841,6 +841,28 @@ impl PanetiereObserverSession {
             .map(|(r, c)| (*r, c.as_slice()))
     }
 
+    /// Clients in ≥2 of the last GAP+1 canonical sets — the set a scheduled
+    /// message actually hides in (its reservation and delivery rounds).
+    pub fn returning_set(&self) -> Option<usize> {
+        let window = crate::panetiere_scheduled::RESERVATION_TO_MSG_GAP as usize + 1;
+        let recent: Vec<&Vec<u32>> = self
+            .clients_by_round
+            .values()
+            .rev()
+            .take(window)
+            .collect();
+        if recent.len() < 2 {
+            return None;
+        }
+        let mut seen: HashMap<u32, u32> = HashMap::new();
+        for set in &recent {
+            for c in set.iter() {
+                *seen.entry(*c).or_default() += 1;
+            }
+        }
+        Some(seen.values().filter(|&&n| n >= 2).count())
+    }
+
     /// Canonical client set size for `round`, falling back to the most recent
     /// earlier round when that exact round hasn't been observed yet.
     pub fn anonymity_set_for(&self, round: u64) -> Option<usize> {
@@ -1318,10 +1340,13 @@ impl PanetiereServerSession {
                     .flat_map(|g| g.clients.iter().copied())
                     .collect()
             } else {
+                // Safe to truncate: every relay admits 2× the cap in openings,
+                // so any cap-sized subset the leader picks is servable.
                 state
                     .inbox_items
                     .iter()
                     .filter_map(|(cid, _)| state.publics.get(cid).map(|_| *cid))
+                    .take(self.client_set_max)
                     .collect()
             };
             canonical.sort();
@@ -1636,7 +1661,10 @@ impl Session for PanetiereServerSession {
                 }
                 if target_server == self.server_id.0 {
                     let cid = ClientId(client_id);
-                    let max = self.client_set_max;
+                    // Admission is arrival-ordered and differs per relay, while
+                    // the canonical set is frozen elsewhere; 2× headroom keeps
+                    // every canonical member's opening servable.
+                    let max = self.client_set_max.saturating_mul(2);
                     let bucket = self.rounds.entry(round).or_default();
                     match admit_client(&mut bucket.owners, cid, from, max) {
                         Admit::Admitted => {}
@@ -2050,6 +2078,9 @@ pub struct PanetiereAggregatorSession {
     emitted: HashSet<Round>,
     /// Own round clock, from `begin_round`; bounds accepted wire rounds.
     cur_round: Option<Round>,
+    /// First round this session ticked; earlier rounds were only partially
+    /// observed and must never be emitted.
+    first_round: Option<Round>,
     /// Upper bound on distinct clients admitted per round; unbounded until
     /// [`Self::set_client_set_max`] is called.
     client_set_max: usize,
@@ -2068,6 +2099,7 @@ impl PanetiereAggregatorSession {
             owners: std::collections::BTreeMap::new(),
             emitted: HashSet::new(),
             cur_round: None,
+            first_round: None,
             client_set_max: usize::MAX,
             entry_len: usize::MAX,
         }
@@ -2087,6 +2119,9 @@ impl PanetiereAggregatorSession {
 
 impl Session for PanetiereAggregatorSession {
     fn begin_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
+        if self.first_round.is_none() {
+            self.first_round = Some(round);
+        }
         self.cur_round = Some(round);
         Vec::new()
     }
@@ -2151,7 +2186,11 @@ impl Session for PanetiereAggregatorSession {
             .rounds
             .keys()
             .copied()
-            .filter(|r| *r <= round && !self.emitted.contains(r))
+            .filter(|r| {
+                *r <= round
+                    && !self.emitted.contains(r)
+                    && !self.first_round.is_some_and(|f| *r < f)
+            })
             .collect();
         for r in due {
             let Some(entries) = self.rounds.get(&r).filter(|e| !e.is_empty()) else {
