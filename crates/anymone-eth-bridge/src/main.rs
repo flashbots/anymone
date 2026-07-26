@@ -14,11 +14,12 @@ use anymone_core::transport::Transport;
 use anymone_core::{
     announce_service_registration, Anymone, BootstrapConfig, GovernanceBootstrap, Identity,
 };
-use anymone_eth_bridge::{forward_loop, router, AppState, HttpRpcSink};
+use anymone_eth_bridge::{bus_loop, router, AppState, HttpRpcSink, TxFeed};
 use anymone_txbus::StatelessLimits;
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
+use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -130,19 +131,27 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow!("anymone start: {e}"))?;
 
+    // One standing pipe for the process lifetime, serving both directions.
+    // `subscribe` (rather than `open`) receives the bus as well as sending to
+    // it, which is what lets the page show what the bus carried and confirm a
+    // submission came back off it; it joins the bus's home subnet just the
+    // same, so the process contributes cover every round it is up (design §6).
+    // Exactly one subscription per process: the runtime keys pipes by tag, so a
+    // second one would silently leave the first deaf.
+    let pipe = anymone
+        .subscribe(anymone_txbus::tx_bus_tag(args.chain_id))
+        .await
+        .map_err(|e| anyhow!("subscribing to the tx bus: {e}"))?;
+    let feed = Arc::new(TxFeed::new());
+    let (staging, staging_rx) = mpsc::unbounded_channel();
+
     let mut tasks = Vec::new();
 
     if let Some(listen) = args.serve.clone() {
-        // One standing pipe for the process lifetime: joins the bus's home
-        // subnet at open() so it contributes cover every round it's up,
-        // independent of how often it actually sends (design §6).
-        let pipe = anymone
-            .open(anymone_txbus::tx_bus_tag(args.chain_id))
-            .await
-            .map_err(|e| anyhow!("opening the tx bus: {e}"))?;
         let state = Arc::new(AppState {
-            pipe,
+            pipe: staging,
             limits: limits(&args),
+            feed: feed.clone(),
         });
         tracing::info!(listen = %listen, chain_id = args.chain_id, "anymone-eth-bridge serving ingress");
         tasks.push(tokio::spawn(async move {
@@ -155,19 +164,15 @@ async fn main() -> Result<()> {
         }));
     }
 
-    if let Some(rpc_url) = args.forward_to.clone() {
-        let pipe = anymone
-            .subscribe(anymone_txbus::tx_bus_tag(args.chain_id))
-            .await
-            .map_err(|e| anyhow!("subscribing to the tx bus: {e}"))?;
-        let sink = HttpRpcSink::new(rpc_url.clone());
-        let bus_limits = limits(&args);
+    let sink = args.forward_to.clone().map(|rpc_url| {
         tracing::info!(rpc_url = %rpc_url, chain_id = args.chain_id, "anymone-eth-bridge forwarding egress");
-        tasks.push(tokio::spawn(async move {
-            forward_loop(pipe, sink, bus_limits).await;
-            Ok::<(), anyhow::Error>(())
-        }));
-    }
+        HttpRpcSink::new(rpc_url)
+    });
+    let bus_limits = limits(&args);
+    tasks.push(tokio::spawn(async move {
+        bus_loop(pipe, sink, bus_limits, feed, staging_rx).await;
+        Ok::<(), anyhow::Error>(())
+    }));
 
     for task in tasks {
         task.await??;

@@ -16,6 +16,9 @@ path = "src/main.rs"
 anymone-core = { path = "../anymone-core" }
 anymone-txbus = { path = "../anymone-txbus" }
 alloy-primitives = { workspace = true, features = ["std"] }
+# `k256` for ecrecover: the feed shows each bus tx's signer, which is public
+# data carried in the signature — unlike who submitted it.
+alloy-consensus = { workspace = true, features = ["k256"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "signal"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -29,7 +32,6 @@ async-trait.workspace = true
 reqwest.workspace = true
 
 [dev-dependencies]
-alloy-consensus.workspace = true
 alloy-eips.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

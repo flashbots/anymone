@@ -23,9 +23,11 @@ if [[ -e "$OUT" && "${FORCE:-0}" != "1" ]]; then
     echo "error: $OUT exists; set FORCE=1 to regenerate" >&2
     exit 1
 fi
-rm -rf "$OUT"
 ID="$OUT/identities"
 CFG="$OUT/configs"
+# Only the generated trees; $OUT also holds hand-written launchers (run-local.sh,
+# run-local-txbus.sh) that must survive regeneration.
+rm -rf "$ID" "$CFG"
 mkdir -p "$ID" "$CFG"
 
 echo "building anymone-node…" >&2
@@ -50,10 +52,10 @@ for i in $(seq 0 $((COMMITTEE - 1))); do
     COMMITTEE_BLOCK+=$'\n[[governance.committee]]\n'"pubkey = \"$PK\""$'\n'"exchange_pubkey = \"$XP\""$'\n'
 done
 
-# write_cfg <name> <listen-port> <bootstrap-peers-toml-array>
+# write_cfg <name> <listen-port> <bootstrap-peers-toml-array> [extra-committee-toml] [identity-name]
 write_cfg() {
     cat >"$CFG/$1.toml" <<EOF
-identity_path = "$ID/$1"
+identity_path = "$ID/${5:-$1}"
 
 [network]
 listen = "/ip4/0.0.0.0/tcp/$2"
@@ -65,6 +67,7 @@ $COMMITTEE_BLOCK
 [committee]
 committee_round_ms = 10000
 public_round_ms = 4000
+${4:-}
 EOF
 }
 
@@ -74,7 +77,23 @@ for i in $(seq 0 $((COMMITTEE - 1))); do write_cfg "committee-$i" $((7110 + i)) 
 for i in $(seq 0 $((RELAYS - 1)));    do write_cfg "relay-$i"     $((7120 + i)) "$SEED"; done
 write_cfg chat     7130 "$SEED"
 write_cfg client   7131 "$SEED"
-write_cfg observer 7140 "$SEED"
+write_cfg observer 7150 "$SEED"
+
+# Tx-bus demo (run-local-txbus.sh): the RPC gateway plus two forwarding bridges,
+# and a committee pinned to scheduled Panetiere with 16 KiB messages so
+# transactions that size ride the bus. Separate committee configs reusing the
+# same identities, so run-local.sh keeps its ADCNet→Panetiere escalation ladder.
+TXBUS_COMMITTEE='protocol = "scheduled-panetiere"
+message_size = 16384
+vector_bytes = 65536
+min_capacity = 40'
+for i in $(seq 0 $((COMMITTEE - 1))); do
+    write_cfg "committee-txbus-$i" $((7110 + i)) "$SEED" "$TXBUS_COMMITTEE" "committee-$i"
+done
+for name in gateway bridge-a bridge-b; do gen "$name" >/dev/null; done
+write_cfg gateway  7140 "$SEED"
+write_cfg bridge-a 7141 "$SEED"
+write_cfg bridge-b 7142 "$SEED"
 
 # run.sh: launch everything. Relays/committee expose /state/peers for the
 # observer to scrape; chat + dashboard serve on 8080 / 7000.
@@ -106,6 +125,6 @@ write_cfg observer 7140 "$SEED"
 } >"$OUT/run.sh"
 chmod +x "$OUT/run.sh"
 
-echo "wrote $((COMMITTEE + RELAYS + 4)) configs to $CFG" >&2
+echo "wrote $((2 * COMMITTEE + RELAYS + 7)) configs to $CFG" >&2
 echo "bootnode: $BOOT_ADDR" >&2
 echo "launch:   $OUT/run.sh" >&2
