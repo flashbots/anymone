@@ -16,7 +16,8 @@ use alloy_consensus::Transaction;
 use alloy_primitives::TxHash;
 use anymone_txbus::{PooledTx, StatelessLimits, TxReject};
 use axum::extract::State;
-use axum::response::Html;
+use axum::http::header;
+use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -322,8 +323,12 @@ async fn page() -> Html<&'static str> {
     Html(TX_HTML)
 }
 
-async fn tx_feed<B: BusSend>(State(st): State<Arc<AppState<B>>>) -> Json<Value> {
-    Json(st.feed.to_json(&st.limits))
+async fn tx_feed<B: BusSend>(State(st): State<Arc<AppState<B>>>) -> impl IntoResponse {
+    // CORS: the observer dashboard reads this from another port.
+    (
+        [(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")],
+        Json(st.feed.to_json(&st.limits)),
+    )
 }
 
 #[derive(Debug, Deserialize)]

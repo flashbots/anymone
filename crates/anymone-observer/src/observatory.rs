@@ -118,6 +118,7 @@ pub struct Observatory {
     /// dashboard can mark which chip is under attack. `None` when off.
     fault_target: Option<Pubkey>,
     chat_endpoint: Option<String>,
+    tx_endpoint: Option<String>,
 }
 
 impl Observatory {
@@ -149,6 +150,7 @@ impl Observatory {
             committee_anon_set: 0,
             fault_target: None,
             chat_endpoint: None,
+            tx_endpoint: None,
         }
     }
 
@@ -159,6 +161,11 @@ impl Observatory {
 
     pub fn set_chat_endpoint(&mut self, url: Option<String>) {
         self.chat_endpoint = url;
+    }
+
+    /// Tx-bus gateway whose `/tx/feed` the dashboard reads for the bus feed.
+    pub fn set_tx_endpoint(&mut self, url: Option<String>) {
+        self.tx_endpoint = url;
     }
 
     /// Ingest a verified config. Returns `true` if it's a new version (so the
@@ -525,6 +532,7 @@ impl Observatory {
             "config": { "version": version, "history": history },
             "fault_target": self.fault_target,
             "chat_endpoint": self.chat_endpoint,
+            "tx_endpoint": self.tx_endpoint,
         })
     }
 

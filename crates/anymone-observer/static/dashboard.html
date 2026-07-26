@@ -93,6 +93,11 @@
   .chat-feed { display: flex; flex-direction: column; gap: 6px; max-height: 320px; overflow-y: auto; }
   .chat-msg { font-size: 12px; word-break: break-word; }
   .chat-msg .from { color: var(--accent); font-weight: 700; margin-right: 6px; }
+  /* tx bus */
+  .tx-row { font-size: 12px; display: flex; gap: 6px; align-items: baseline; }
+  .tx-row .hash { color: var(--accent); }
+  .tx-row .who { color: var(--fg); }
+  .tx-row .amt { color: var(--dim); margin-left: auto; white-space: nowrap; }
 
   /* cards */
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 14px; }
@@ -211,6 +216,8 @@
     <div class="rail">
       <div class="section-title">chat</div>
       <div class="panel"><div class="chat-feed" id="chat"><div class="empty">—</div></div></div>
+      <div class="section-title" id="tx-title">tx bus</div>
+      <div class="panel" id="tx-panel"><div class="chat-feed" id="tx"><div class="empty">—</div></div></div>
       <div class="section-title">faults</div>
       <div class="panel"><div class="faults" id="faults"><div class="empty">no faults observed</div></div></div>
       <div class="section-title">config history</div>
@@ -249,6 +256,8 @@
  *    config: { version: number, history: Array<{ version: number, diff: string }> },
  *    fault_target?: string | null,     // relay pk the demo `fault` knob poisons
  *    chat_endpoint?: string | null,    // chat participant web app the feed reads from
+ *    tx_endpoint?: string | null,      // anymone-eth-bridge gateway; its /tx/feed backs the
+ *                                      // tx-bus panel (hidden when absent)
  *    control?: { [name: string]: { label: string, value: number, min: number,
  *                                  options?: Array<string> } },
  *                                       // live demo knobs (demo mode only; absent
@@ -354,6 +363,7 @@ function render(state, isMock) {
   faultTarget = state.fault_target || null;
   renderParticipants(state.participants || []);
   renderChat(state.chat_endpoint);
+  renderTxBus(state.tx_endpoint);
 
   const cards = [];
   if (state.committee) cards.push(committeeAsCard(state.committee));
@@ -646,6 +656,40 @@ async function renderChat(endpoint) {
     ).join("");
     box.scrollTop = box.scrollHeight;
   } catch (e) { /* backend not reachable from the browser; leave as-is */ }
+}
+
+/* ---- tx bus feed: read from an anymone-eth-bridge gateway ------------------ */
+let txLastSeq = -1;
+async function renderTxBus(endpoint) {
+  const title = document.getElementById("tx-title"), panel = document.getElementById("tx-panel");
+  const shown = !!endpoint;
+  title.style.display = panel.style.display = shown ? "" : "none";
+  if (!shown) return;
+  const box = document.getElementById("tx");
+  // Gateway shares this dashboard's host; keep only its port.
+  let feedUrl;
+  try {
+    const u = new URL(endpoint, window.location.href);
+    u.protocol = window.location.protocol;
+    u.hostname = window.location.hostname;
+    feedUrl = u.origin + "/tx/feed";
+  } catch (e) { feedUrl = endpoint.replace(/\/$/, "") + "/tx/feed"; }
+  try {
+    const r = await fetch(feedUrl, { cache: "no-store" });
+    const feed = await r.json();
+    const txs = feed.bus || [];
+    if (!txs.length) { box.innerHTML = '<div class="empty">no transactions yet</div>'; return; }
+    if (txs[0].seq === txLastSeq) return;
+    txLastSeq = txs[0].seq;
+    const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+    const short = h => h ? h.slice(0, 8) + "…" + h.slice(-4) : "—";
+    const eth = w => (Number(BigInt(w) / 10n ** 12n) / 1e6).toFixed(6).replace(/\.?0+$/, "");
+    box.innerHTML = txs.slice(0, 40).map(t =>
+      `<div class="tx-row"><span class="hash">${esc(short(t.hash))}</span>`
+      + `<span class="who">${esc(short(t.signer))} → ${esc(short(t.to))}</span>`
+      + `<span class="amt">${eth(t.value)} ETH · ${t.size}B</span></div>`
+    ).join("");
+  } catch (e) { /* gateway not reachable from the browser; leave as-is */ }
 }
 
 function animate() {

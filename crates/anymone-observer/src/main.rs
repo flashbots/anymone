@@ -194,6 +194,11 @@ struct RunArgs {
     #[arg(long)]
     chat_endpoint: Option<String>,
 
+    /// URL of an anymone-eth-bridge gateway; the dashboard reads its `/tx/feed`
+    /// for the tx-bus feed.
+    #[arg(long)]
+    tx_endpoint: Option<String>,
+
     /// Enable the live load-control panel: the dashboard's `clients` knob spawns
     /// artificial chat clients (one `anymone-chat --bot` process each) against
     /// this same network, reconciled to the knob.
@@ -344,6 +349,9 @@ async fn run(args: RunArgs) -> Result<()> {
     )));
     if let Some(url) = args.chat_endpoint {
         obs.lock().unwrap().set_chat_endpoint(Some(url));
+    }
+    if let Some(url) = args.tx_endpoint {
+        obs.lock().unwrap().set_tx_endpoint(Some(url));
     }
 
     spawn_config_loop(transport.clone(), obs.clone(), committee.clone(), threshold);
