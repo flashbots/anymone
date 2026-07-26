@@ -3,17 +3,14 @@
 //! The Pipe layer hides round structure, subnet selection, and the inner
 //! routing format. From the caller's point of view: bytes in, bytes out.
 
-use std::sync::{Mutex, Weak};
+use std::sync::Weak;
 
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::runtime::{
-    resolve_send_subnet, retire_outbound, retire_outbound_everywhere, stage_outbound, AnymoneInner,
-};
+use crate::runtime::{queue_outbound, subnet_runnable, AnymoneInner};
 use crate::wire::{Frame, RouteTag, ServiceTag, SERVICE_TAG_LEN};
-use crate::SubnetId;
 
 /// What gets put on the wire between Pipes: the inner `PipeMessage` is
 /// bincode-encoded, then wrapped in a v0 raw `Frame` whose `dst` is the
@@ -57,11 +54,6 @@ pub struct Pipe {
     /// Our own delivery address — for client pipes a random per-pipe return
     /// path, for service pipes the service tag as a delivery address.
     return_tag: RouteTag,
-    /// Subnet this pipe last staged on, or joined at construction. When a send
-    /// resolves a different subnet (the committee re-homed us across a
-    /// reconfig), or when the pipe is dropped, we retire the client session on
-    /// this subnet so we stop contributing there.
-    last_subnet: Mutex<Option<SubnetId>>,
     inbound: mpsc::UnboundedReceiver<PipeIncoming>,
     /// Clone of the sender registered under `return_tag` in `AnymoneInner.pipes`,
     /// so `Drop` only removes that entry if a later `bind`/`subscribe` on the
@@ -74,7 +66,6 @@ impl Pipe {
         anymone: Weak<AnymoneInner>,
         peer_tag: Option<ServiceTag>,
         return_tag: RouteTag,
-        initial_subnet: Option<SubnetId>,
         inbound: mpsc::UnboundedReceiver<PipeIncoming>,
         self_tx: mpsc::UnboundedSender<PipeIncoming>,
     ) -> Self {
@@ -82,7 +73,6 @@ impl Pipe {
             anymone,
             peer_tag,
             return_tag,
-            last_subnet: Mutex::new(initial_subnet),
             inbound,
             self_tx,
         }
@@ -128,51 +118,34 @@ impl Pipe {
         return_tag: RouteTag,
         payload: Vec<u8>,
     ) -> Result<(), SendError> {
-        // Resolve the subnet from the current config every send, so the pipe
-        // re-homes as the committee adds/removes subnets.
         let anymone = self.anymone.upgrade().ok_or(SendError::Closed)?;
-        let subnet = resolve_send_subnet(&anymone, self.peer_tag, self.return_tag, dst)
-            .ok_or(SendError::SubnetGone)?;
         let msg = PipeMessage {
             return_tag,
             payload,
         };
         let data = bincode::serialize(&msg).map_err(|e| SendError::Encode(e.to_string()))?;
-        // Reject payloads too big for one message rather than truncating/dropping them
-        // downstream; fragmentation across rounds is a later batch.
+        // Reject payloads too big for one message rather than truncating/dropping
+        // them downstream; fragmentation across rounds is a later batch. The
+        // per-round draw can land the frame on any runnable subnet, so it must
+        // fit the smallest.
         let framed = 1 + SERVICE_TAG_LEN + data.len();
-        let max_payload = anymone
+        let max = anymone
             .config
             .read()
             .unwrap()
             .body
             .subnets
             .iter()
-            .find(|s| s.id == subnet)
-            .map(|s| s.protocol.message_size());
-        if let Some(max) = max_payload {
-            if framed > max {
-                return Err(SendError::PayloadTooLarge { size: framed, max });
-            }
-        }
-        // On re-home (client pipes), retire the client session on the subnet we
-        // left so we stop contributing there — otherwise the old subnet keeps
-        // counting us and the population is double-counted across subnets.
-        // Service replies (no peer tag) are one-off, so they don't track a home.
-        if self.peer_tag.is_some() {
-            let prev = {
-                let mut last = self.last_subnet.lock().unwrap();
-                last.replace(subnet)
-            };
-            if let Some(prev) = prev {
-                if prev != subnet {
-                    retire_outbound(&self.anymone, prev, self.return_tag);
-                }
-            }
+            .filter(|s| subnet_runnable(s))
+            .map(|s| s.protocol.message_size())
+            .min()
+            .ok_or(SendError::SubnetGone)?;
+        if framed > max {
+            return Err(SendError::PayloadTooLarge { size: framed, max });
         }
         let mut bytes = Vec::with_capacity(framed);
         Frame::Raw { dst, data: &data }.encode(&mut bytes);
-        stage_outbound(&self.anymone, subnet, self.return_tag, bytes)
+        queue_outbound(&self.anymone, bytes)
     }
 
     /// Receive the next inbound message, or `None` once the pipe is closed.
@@ -201,9 +174,7 @@ impl Drop for Pipe {
         }
         drop(pipes);
         if still_owner && self.peer_tag.is_some() {
-            let mut joined = inner.joined.lock().unwrap();
-            joined.remove(&self.return_tag);
-            retire_outbound_everywhere(&self.anymone, self.return_tag);
+            inner.joined.lock().unwrap().remove(&self.return_tag);
         }
     }
 }
@@ -214,7 +185,7 @@ pub enum SendError {
     NoPeerTag,
     #[error("anymone instance shut down")]
     Closed,
-    #[error("subnet is no longer active")]
+    #[error("no runnable subnet in the current configuration")]
     SubnetGone,
     #[error("encode: {0}")]
     Encode(String),

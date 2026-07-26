@@ -98,6 +98,7 @@ fn lead_core(committee: &[Identity], threshold: u32) -> SchedulerCore {
             message_size: 16,
             integrity_backoff_ms: 6 * 60 * 1000,
             sideline: true,
+            renegotiate_on_fault: true,
             min_capacity: 8,
             pin: None,
             aggregation: true,
@@ -133,6 +134,7 @@ fn lead_core_msg_size(
             message_size,
             integrity_backoff_ms: 6 * 60 * 1000,
             sideline: true,
+            renegotiate_on_fault: true,
             min_capacity: 8,
             pin: None,
             aggregation: true,
@@ -228,6 +230,7 @@ fn renegotiates_adcnet_panetiere_adcnet() {
             message_size: 16,
             integrity_backoff_ms: 6 * 60 * 1000,
             sideline: true,
+            renegotiate_on_fault: true,
             min_capacity: 8,
             pin: Some(anymone_core::SchedulerProtocol::Panetiere),
             aggregation: true,
@@ -280,6 +283,7 @@ fn renegotiates_adcnet_panetiere_adcnet() {
             message_size: 16,
             integrity_backoff_ms: 6 * 60 * 1000,
             sideline: false,
+            renegotiate_on_fault: true,
             min_capacity: 8,
             pin: Some(anymone_core::SchedulerProtocol::Panetiere),
             aggregation: true,
@@ -433,6 +437,7 @@ fn multisig_assembles_via_committee_sig() {
         message_size: 16,
         integrity_backoff_ms: 6 * 60 * 1000,
         sideline: true,
+        renegotiate_on_fault: true,
         min_capacity: 8,
         pin: None,
         aggregation: true,
@@ -572,6 +577,7 @@ fn non_lead_core_never_stages() {
             message_size: 16,
             integrity_backoff_ms: 6 * 60 * 1000,
             sideline: true,
+            renegotiate_on_fault: true,
             min_capacity: 8,
             pin: None,
             aggregation: true,
@@ -740,6 +746,7 @@ fn live_core(committee: &[Identity]) -> SchedulerCore {
             message_size: 16,
             integrity_backoff_ms: 6 * 60 * 1000,
             sideline: true,
+            renegotiate_on_fault: true,
             min_capacity: 8,
             pin: None,
             aggregation: true,
@@ -750,7 +757,7 @@ fn live_core(committee: &[Identity]) -> SchedulerCore {
 fn adcnet_cfg_of(body: &AnymoneRoundConfigurationBody) -> AdcnetConfig {
     match &body.subnets[0].protocol {
         ProtocolConfig::Adcnet(c) => c.clone(),
-        _ => unreachable!(),
+        other => panic!("expected ADCNet subnet 0, got {other:?}"),
     }
 }
 
@@ -782,6 +789,7 @@ fn committee_schedules_second_subnet_when_one_nears_capacity() {
                 message_size: 16,
                 integrity_backoff_ms: 6 * 60 * 1000,
                 sideline: true,
+                renegotiate_on_fault: true,
                 min_capacity: 8,
                 pin: None,
                 aggregation: false,
@@ -806,9 +814,11 @@ fn committee_schedules_second_subnet_when_one_nears_capacity() {
     let clients: Vec<Identity> = (0..32).map(|_| Identity::generate()).collect();
     let mut net = Subnet::new(&cfg, &relays, &clients);
 
+    // Resizes are damped (`CAPACITY_RESIZE_GRACE` ticks): drive through the
+    // window and keep the last staged body, which carries the settled capacity.
     let mut grown: Option<AnymoneRoundConfigurationBody> = None;
     let mut grown_no_agg: Option<AnymoneRoundConfigurationBody> = None;
-    for round in 0..8u64 {
+    for round in 0..12u64 {
         for (from, msg) in net.round(round, &[0, 1, 2]) {
             core.on_subnet_message(0, from, msg.clone());
             core_no_agg.on_subnet_message(0, from, msg);
@@ -818,9 +828,6 @@ fn committee_schedules_second_subnet_when_one_nears_capacity() {
         }
         if let Some(b) = staged_body(&core_no_agg.tick(round, 0)) {
             grown_no_agg = Some(b);
-        }
-        if grown.is_some() && grown_no_agg.is_some() {
-            break;
         }
     }
 
@@ -957,22 +964,24 @@ fn adcnet_capacity_resizes_to_observed_load() {
     core.on_decoded_body(v0);
 
     let mut round = 1u64;
+    // Resizes are damped (`CAPACITY_RESIZE_GRACE` ticks), so drive through the
+    // window and keep the last staged body.
     let mut drive = |core: &mut SchedulerCore, n: usize| -> AnymoneRoundConfigurationBody {
         let clients: Vec<Identity> = (0..n).map(|_| Identity::generate()).collect();
         let mut net = Subnet::new(&cfg, &relays, &clients);
-        for _ in 0..8 {
+        let mut last = None;
+        for _ in 0..12 {
             for (from, msg) in net.round(round, &[0, 1, 2]) {
                 core.on_subnet_message(0, from, msg);
             }
             let staged = staged_proposal(&core.tick(round, 0));
             round += 1;
             if let Some(p) = staged {
-                let body = p.body.clone();
+                last = Some(p.body.clone());
                 core.on_decoded_body(p);
-                return body;
             }
         }
-        panic!("capacity never resized");
+        last.expect("capacity never resized")
     };
 
     // 30 clients (below the grow mark) → one subnet, capacity grows to fit.
@@ -984,12 +993,24 @@ fn adcnet_capacity_resizes_to_observed_load() {
         "capacity grew from {floor} to {grown_cap}"
     );
 
-    // Load collapses → capacity resizes back down.
-    let shrunk_cap = adcnet_cfg_of(&drive(&mut core, 1)).client_set_max;
+    // Load collapses → capacity resizes back down. Sparse traffic over the
+    // (longer, damped) drive can trip a low-load escalation to Panetiere; this
+    // test is about capacity, so read it regardless of the ladder state.
+    let shrunk_cap = subnet_capacity(&drive(&mut core, 1).subnets[0].protocol);
     assert!(
         shrunk_cap < grown_cap,
         "capacity shrank from {grown_cap} to {shrunk_cap}"
     );
+}
+
+fn subnet_capacity(p: &ProtocolConfig) -> u32 {
+    match p {
+        ProtocolConfig::Adcnet(c) => c.client_set_max,
+        ProtocolConfig::Panetiere(c) => c.client_set_max,
+        ProtocolConfig::ScheduledPanetiere(c) => c.client_set_max,
+        ProtocolConfig::Noop(c) => c.client_set_max,
+        _ => unreachable!("scheduler emits only adcnet/panetiere/noop"),
+    }
 }
 
 /// `sorted(committee)[0]` — the only member whose proposals are signable.
@@ -1610,6 +1631,7 @@ fn sustained_traffic_upgrades_to_scheduled_panetiere() {
             message_size: 4,
             integrity_backoff_ms: 6 * 60 * 1000,
             sideline: true,
+            renegotiate_on_fault: true,
             min_capacity: 8,
             pin: Some(anymone_core::scheduling::SchedulerProtocol::ScheduledPanetiere),
             aggregation: true,

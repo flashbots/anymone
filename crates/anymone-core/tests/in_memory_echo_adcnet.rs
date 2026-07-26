@@ -329,13 +329,11 @@ async fn broadcast_room_participant_sees_own_message_via_channel() {
     drop(keep);
 }
 
-/// When the committee adds a subnet, clients that re-home must **leave** the
-/// subnet they came from — not keep padding its anonymity set with cover
-/// traffic. Without retiring the old client session, the population is
-/// double-counted (old subnet keeps all N while the new one also fills up).
-/// Here all clients start on subnet 0, a reconfig adds subnet 1 (the tag is on
-/// both), and an observer watching subnet 0 must see its set shrink below N as
-/// roughly half the clients move to subnet 1.
+/// When the committee adds a subnet, the population must split across the two,
+/// never double-count (each node participates in exactly one drawn subnet per
+/// round). With one subnet, subnet 0's set gathers all N; after the split an
+/// observer watching subnet 0 must see its per-round set fall below N as the
+/// draw spreads clients across both.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn rehome_sheds_clients_from_the_old_subnet() {
@@ -387,26 +385,37 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
     .sign_with(&[&committee]);
     // Every subnet carries every service, so growing to two subnets lets
     // ~half the clients re-home to subnet 1 and the rest stay on subnet 0.
+    // Subnet 0's config also changes (capacity resize), so v1 exercises the
+    // same-id graceful respawn, not just the added subnet.
+    let resized = || {
+        let ProtocolConfig::Adcnet(mut c) = proto() else {
+            unreachable!()
+        };
+        c.client_set_max = 96;
+        ProtocolConfig::Adcnet(c)
+    };
     let v1 = AnymoneRoundConfiguration::new(AnymoneRoundConfigurationBody {
         round: 1,
         epoch_unix_ms: now_unix_ms(),
         services,
         relay_exchange_keys: relay_xk,
         subnets: vec![
-            Subnet::new(0, relay_pks.clone(), proto()),
-            Subnet::new(1, relay_pks.clone(), proto()),
+            Subnet::new(0, relay_pks.clone(), resized()),
+            Subnet::new(1, relay_pks.clone(), resized()),
         ],
     })
     .sign_with(&[&committee]);
 
-    // Observer on subnet 0's broadcast topic → tracks its live anonymity set.
+    // Observer on subnet 0's broadcast topic → live anonymity set + frontier.
     let anon0 = Arc::new(AtomicU64::new(0));
+    let frontier0 = Arc::new(AtomicU64::new(0));
     {
         let mut sub0 = net
             .handle(Identity::generate().pubkey())
             .subscribe(&subnet_broadcast_topic(0))
             .await;
         let anon0 = anon0.clone();
+        let frontier0 = frontier0.clone();
         let roster = relay_pks.clone();
         let leader = {
             let mut r = relay_pks.clone();
@@ -418,6 +427,7 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
             while let Some(m) = sub0.recv().await {
                 o.on_inbound(m.from, m.payload);
                 anon0.store(o.anonymity_set().unwrap_or(0) as u64, Ordering::Relaxed);
+                frontier0.store(o.anon_set_round().unwrap_or(0), Ordering::Relaxed);
             }
         });
     }
@@ -553,6 +563,50 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
     assert!(
         !saw_forged,
         "publish from outside subnet 1's relay roster must be rejected"
+    );
+
+    // Config storm: several versions in quick succession, faster than one
+    // graceful cutover completes. The subnet must keep running afterwards.
+    for (v, max) in [(2u64, 80), (3, 88), (4, 96)] {
+        let cfg = AnymoneRoundConfiguration::new(AnymoneRoundConfigurationBody {
+            round: v,
+            epoch_unix_ms: now_unix_ms(),
+            services: vec![ServiceEntry {
+                tag: echo_tag(),
+                pubkey: service.pubkey(),
+            }],
+            relay_exchange_keys: relays.iter().map(|i| (i.pubkey(), xkw(i))).collect(),
+            subnets: vec![
+                Subnet::new(0, relay_pks.clone(), {
+                    let ProtocolConfig::Adcnet(mut c) = proto() else {
+                        unreachable!()
+                    };
+                    c.client_set_max = max;
+                    ProtocolConfig::Adcnet(c)
+                }),
+                Subnet::new(1, relay_pks.clone(), proto()),
+            ],
+        })
+        .sign_with(&[&committee]);
+        net.handle(committee.pubkey())
+            .publish(TOPIC_CONFIG, bincode::serialize(&cfg).unwrap())
+            .await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let before = frontier0.load(Ordering::Relaxed);
+    let advanced = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if frontier0.load(Ordering::Relaxed) > before {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        advanced.is_ok(),
+        "subnet 0 stopped announcing after a config storm (frontier stuck at {before})"
     );
 
     drop(keep);

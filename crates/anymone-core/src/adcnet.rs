@@ -4,7 +4,7 @@
 //! ([`ScheduledAdcnetClientSession`] / [`ScheduledAdcnetServerSession`], which
 //! wrap the upstream stateful services). See IMPLEMENTATION.md §ADCNet sessions.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -39,7 +39,6 @@ use crate::runtime::{
 };
 use crate::session::{LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
 use crate::transport::Subscription;
-use crate::wire::RouteTag;
 
 /// Per-subnet ADCNet parameters (IBLT sizing), built once at subnet start.
 fn one_round_config(cfg: &AdcnetConfig) -> OneRoundConfig {
@@ -155,6 +154,7 @@ pub(crate) async fn run_subnet(
     mut subscriptions: Vec<Subscription>,
     base_round: Round,
     epoch_unix_ms: u64,
+    armed: bool,
 ) {
     let cfg = match &subnet.protocol {
         ProtocolConfig::Adcnet(c) => c.clone(),
@@ -166,7 +166,6 @@ pub(crate) async fn run_subnet(
     let client_agg_topic = client_aggregator_topic(&subnet, identity_pk);
 
     let mut sessions: HashMap<SessionKey, Box<dyn Session>> = HashMap::new();
-    let mut client_homes: HashSet<RouteTag> = HashSet::new();
     let mut cover_rate = subnet.cover_rate;
 
     if subnet.relays.contains(&identity_pk) {
@@ -182,14 +181,11 @@ pub(crate) async fn run_subnet(
     }
     if let Some(a) = subnet_aggregation(&subnet) {
         if let Some(group) = aggregator_group_of(a, identity_pk) {
-            sessions.insert(
-                SessionKey::Aggregator,
-                Box::new(AdcnetAggregatorSession::new(
-                    group,
-                    a.groups.len() as u32,
-                    inner.identity.clone(),
-                )),
-            );
+            let mut agg_session =
+                AdcnetAggregatorSession::new(group, a.groups.len() as u32, inner.identity.clone());
+            agg_session
+                .set_client_set_max((cfg.client_set_max as usize / a.groups.len().max(1)).max(1));
+            sessions.insert(SessionKey::Aggregator, Box::new(agg_session));
         }
     }
     // Leader-side liveness monitor: sees every relay's share and the local output,
@@ -222,8 +218,23 @@ pub(crate) async fn run_subnet(
     // so every node agrees regardless of when it joined; `deadline` aligns to
     // absolute boundaries and a node that falls behind re-derives and skips ahead.
     let dur_ms = (subnet.protocol.round_duration().as_millis() as u64).max(1);
+    if armed
+        && !crate::runtime::arm_until_cutover(
+            base_round,
+            epoch_unix_ms,
+            dur_ms,
+            &mut stage_rx,
+            &mut cover_rate,
+        )
+        .await
+    {
+        return;
+    }
+    let mut final_round: Option<Round> = None;
     let now_ms = crate::config::now_unix_ms();
     let mut round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms);
+    let spawn_round = round;
+    debug!(id = subnet.id, armed, round, "adcnet worker: start");
     let mut deadline = deadline_for(round, base_round, epoch_unix_ms, dur_ms, now_ms);
     let mut mid_deadline = deadline - std::time::Duration::from_millis(dur_ms / 2);
     let mut mid_done = false;
@@ -231,6 +242,9 @@ pub(crate) async fn run_subnet(
     if let Some(m) = fault_monitor.as_mut() {
         m.begin_round(round, Instant::now());
     }
+    crate::runtime::sync_client_round(&inner, subnet.id, round, cover_rate, &mut sessions, || {
+        client_session(&one_round, &relay_xk, &subnet, &inner.identity)
+    });
     let misbehavior = inner.misbehavior();
     let outs: Vec<(SessionKey, Vec<u8>)> = sessions
         .iter_mut()
@@ -306,8 +320,14 @@ pub(crate) async fn run_subnet(
                         n_messages: n_decoded,
                     });
                 }
-                gossip_faults(&inner, subnet.id, identity_pk, faults.into_iter().map(|f| (round, f)).collect()).await;
+                if round >= spawn_round + crate::runtime::RECONFIG_FAULT_GRACE {
+                    gossip_faults(&inner, subnet.id, identity_pk, faults.into_iter().map(|f| (round, f)).collect()).await;
+                }
 
+                if final_round.is_some_and(|f| round >= f) {
+                    debug!(id = subnet.id, round, "adcnet worker: graceful exit");
+                    return;
+                }
                 let now_ms = crate::config::now_unix_ms();
                 round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms).max(round + 1);
                 deadline = deadline_for(round, base_round, epoch_unix_ms, dur_ms, now_ms);
@@ -316,6 +336,9 @@ pub(crate) async fn run_subnet(
                 if let Some(m) = fault_monitor.as_mut() {
                     m.begin_round(round, Instant::now());
                 }
+                crate::runtime::sync_client_round(&inner, subnet.id, round, cover_rate, &mut sessions, || {
+                    client_session(&one_round, &relay_xk, &subnet, &inner.identity)
+                });
                 let misbehavior = inner.misbehavior();
                 let outs: Vec<(SessionKey, Vec<u8>)> = sessions
                     .iter_mut()
@@ -339,32 +362,9 @@ pub(crate) async fn run_subnet(
 
             Some(stage) = stage_rx.recv() => {
                 match stage {
-                    StageMsg::Join { client_tag } => {
-                        client_homes.insert(client_tag);
-                        sessions
-                            .entry(SessionKey::Client)
-                            .or_insert_with(|| client_session(&one_round, &relay_xk, &subnet, &inner.identity))
-                            .set_cover_rate(cover_rate);
-                    }
-                    StageMsg::Stage { client_tag, payload } => {
-                        client_homes.insert(client_tag);
-                        let sess = sessions
-                            .entry(SessionKey::Client)
-                            .or_insert_with(|| client_session(&one_round, &relay_xk, &subnet, &inner.identity));
-                        sess.set_cover_rate(cover_rate);
-                        sess.stage(payload);
-                    }
-                    StageMsg::Retire { client_tag } => {
-                        client_homes.remove(&client_tag);
-                        if client_homes.is_empty() {
-                            sessions.remove(&SessionKey::Client);
-                        }
-                    }
-                    StageMsg::SetCoverRate(rate) => {
-                        cover_rate = rate;
-                        if let Some(c) = sessions.get_mut(&SessionKey::Client) {
-                            c.set_cover_rate(rate);
-                        }
+                    StageMsg::SetCoverRate(rate) => cover_rate = rate,
+                    StageMsg::Shutdown => {
+                        final_round.get_or_insert(round + 1);
                     }
                 }
             }
@@ -667,6 +667,7 @@ impl Session for AdcnetObserverSession {
             }
             AdcnetObserved::ClientSet { size, round } if from == self.leader => {
                 if future(round) {
+                    debug!(round, size, cur = ?self.cur_round, "adcnet observer: rejected too-future ClientSet");
                     return Vec::new();
                 }
                 self.advance_cur_round(round);
@@ -969,6 +970,9 @@ pub struct AdcnetAggregatorSession {
     rounds: std::collections::BTreeMap<u32, HashMap<PublicKey, (Vec<u64>, Signed<KeyExchange>)>>,
     emitted: std::collections::HashSet<u32>,
     cur_round: u32,
+    /// Per-group ceiling: the groups' union forms the canonical set, which
+    /// servers reject above the subnet's `client_set_max`.
+    client_set_max: usize,
 }
 
 impl AdcnetAggregatorSession {
@@ -980,7 +984,14 @@ impl AdcnetAggregatorSession {
             rounds: std::collections::BTreeMap::new(),
             emitted: std::collections::HashSet::new(),
             cur_round: 0,
+            client_set_max: usize::MAX,
         }
+    }
+
+    /// See [`AdcnetServerSession`]'s `client_set_max`; call with the subnet's
+    /// `client_set_max / group_count`.
+    pub(crate) fn set_client_set_max(&mut self, max: usize) {
+        self.client_set_max = max;
     }
 }
 
@@ -1008,10 +1019,17 @@ impl Session for AdcnetAggregatorSession {
             {
                 return Vec::new();
             }
-            self.rounds
-                .entry(c.round)
-                .or_default()
-                .insert(signer.clone(), (c.blinded.clone(), key.clone()));
+            let bucket = self.rounds.entry(c.round).or_default();
+            if !bucket.contains_key(&signer) && bucket.len() >= self.client_set_max {
+                debug!(
+                    c_round = c.round,
+                    group = self.group,
+                    max = self.client_set_max,
+                    "adcnet aggregator: dropped client contribution, group at capacity"
+                );
+                return Vec::new();
+            }
+            bucket.insert(signer.clone(), (c.blinded.clone(), key.clone()));
         }
         Vec::new()
     }
@@ -1451,7 +1469,11 @@ impl Session for AdcnetServerSession {
                     cur = self.cur_round,
                     "adcnet leader: group aggregate received"
                 );
+                // An oversized group pushes the canonical union past what
+                // servers accept, making the whole round undecodable.
+                let group_cap = (self.client_set_max / agg.roster.len().max(1)).max(1);
                 if !roster.contains(&signer)
+                    || clients.len() > group_cap
                     || !signer.verify(
                         &group_aggregate_signing_bytes(round, group, &blinded, &clients),
                         &signature,
@@ -1462,6 +1484,7 @@ impl Session for AdcnetServerSession {
                     debug!(
                         round,
                         group,
+                        n = clients.len(),
                         cur = self.cur_round,
                         "adcnet leader: rejected group aggregate"
                     );

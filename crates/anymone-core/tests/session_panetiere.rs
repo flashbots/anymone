@@ -56,7 +56,7 @@ fn channel(
     msg_bytes: usize,
 ) -> (MseParams, Arc<ProtocolParams>) {
     let delta = (3 * rho.max(1)).div_ceil(4);
-    let xi = msg_bytes.div_ceil(2).max(1);
+    let xi = msg_bytes.div_ceil(4).max(1);
     // Draw the PRF key from the test's own RNG rather than a fixed constant —
     // one magic key reused everywhere can coincidentally peel-stall at a tight delta.
     let mut prf_key = [0u8; 32];
@@ -481,7 +481,7 @@ fn panetiere_concurrent_clients_all_decode() {
 /// client set. `run` returns how many payloads were decoded across all relays.
 #[test]
 fn panetiere_followers_use_leader_set_with_min_floor() {
-    fn run(min_clients: u32, n_clients: usize) -> usize {
+    fn run(min_clients: u32, n_clients: usize, client_set_max: usize) -> usize {
         let mut setup_rng = ChaCha20Rng::from_seed([11u8; 32]);
         let n_servers = 3;
         let (mse, pp) = channel(&mut setup_rng, n_servers, n_clients, 64);
@@ -514,7 +514,7 @@ fn panetiere_followers_use_leader_set_with_min_floor() {
                 } else {
                     SetMode::Follower { leader: leader_pk }
                 };
-                PanetiereServerSession::new(
+                let mut s = PanetiereServerSession::new(
                     pp.clone(),
                     mse.clone(),
                     *sid,
@@ -523,14 +523,22 @@ fn panetiere_followers_use_leader_set_with_min_floor() {
                     min_clients,
                     server_pubkeys(&server_pks),
                     None,
-                )
+                );
+                s.set_client_set_max(client_set_max);
+                s
             })
             .collect();
 
         let now = Instant::now();
-        for (i, c) in clients.iter_mut().enumerate() {
-            for m in c.begin_round(0, now) {
-                for s in servers.iter_mut() {
+        // Each server sees the clients in a different arrival order (as on a
+        // real network): once submitters exceed `client_set_max`, servers admit
+        // different subsets and the round must fail loudly (no decode, rejects
+        // logged) — capacity is governance, overflow means it was sized wrong.
+        let msgs: Vec<Vec<Vec<u8>>> = clients.iter_mut().map(|c| c.begin_round(0, now)).collect();
+        for (j, s) in servers.iter_mut().enumerate() {
+            for k in 0..n_clients {
+                let i = (k + j) % n_clients;
+                for m in &msgs[i] {
                     s.on_inbound(client_pks[i], m.clone());
                 }
             }
@@ -555,10 +563,19 @@ fn panetiere_followers_use_leader_set_with_min_floor() {
         decoded_total
     }
     assert!(
-        run(2, 2) >= 1,
+        run(2, 2, usize::MAX) >= 1,
         "followers adopt the leader's set and decode at the floor"
     );
-    assert_eq!(run(3, 2), 0, "decode is refused below the min client set");
+    assert_eq!(
+        run(3, 2, usize::MAX),
+        0,
+        "decode is refused below the min client set"
+    );
+    assert_eq!(
+        run(2, 6, 4),
+        0,
+        "submitters beyond client_set_max diverge admission; the round is refused, not truncated"
+    );
 }
 
 fn adcnet_config_body(n_subnets: usize) -> AnymoneRoundConfigurationBody {

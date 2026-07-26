@@ -149,6 +149,11 @@ const FAULT_THRESHOLD: u64 = 2;
 /// jitter without flagging a relay that's merely a round behind.
 const SHARE_LIVENESS_WINDOW: u64 = 3;
 
+/// How far the output frontier may lag the wire round before the anon set is
+/// treated as unknown rather than looked up at the frozen frontier — matches
+/// the "stalled" status boundary.
+const ANON_SET_STALL_ROUNDS: u64 = 5;
+
 /// Retry cadence for `spawn_config_loop`'s fetch_config fallback.
 const CONFIG_PULL_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -570,8 +575,15 @@ async fn watch_subnet(subnet: Subnet, transport: Arc<dyn Transport>, obs: Shared
                     .map(|idxs| idxs.into_iter().filter_map(|i| roster.get(i).copied()).collect())
                     .unwrap_or_default();
                 // Anon set for the output frontier (the round whose msgs we count),
-                // so per-round msgs never exceed it (anon = msgs + cover).
+                // so per-round msgs never exceed it (anon = msgs + cover). A
+                // stalled decode freezes the frontier, and the fallback lookup
+                // would replay the set of that long-dead round (possibly from a
+                // different client-population era) indefinitely — show nothing
+                // instead once the frontier lags the wire.
                 let anon_set = output_frontier
+                    .filter(|of| {
+                        wire_round.is_none_or(|w| w.saturating_sub(*of) <= ANON_SET_STALL_ROUNDS)
+                    })
                     .and_then(|r| {
                         adcnet_obs
                             .as_ref()

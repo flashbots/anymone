@@ -253,6 +253,12 @@ async fn committee_scales_to_second_subnet_under_load() {
         escalation_grace: 5,
         subnet_grow_at: 31,
         message_size: 64,
+        // This test's proposals (3 relays, ≤2 subnets) are ~2KB; the full 12KB
+        // channel costs ~3× the KAHE work per committee round for nothing.
+        committee_msg_bytes: 4096,
+        // Subnet-count growth is the subject here, not protocol crypto: Noop
+        // subnets isolate the scheduling/runtime control loop entirely.
+        protocol: Some("noop".into()),
         ..PanetiereCommitteeConfig::default()
     };
     let mut committee_tasks = Vec::new();

@@ -12,7 +12,7 @@
 //! `PanetiereWatchSession`) — only the plaintext layout and checkpoint
 //! cadence differ.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -43,7 +43,6 @@ use crate::runtime::{
 };
 use crate::session::{LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
 use crate::transport::Subscription;
-use crate::wire::RouteTag;
 
 /// `(rand, size)` per reservation.
 const SCHED_TOKEN_SYMBOLS: usize = 2;
@@ -132,6 +131,7 @@ fn seal_roster(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn client_session(
     pp: &Arc<ProtocolParams>,
     sched_mse: &MseParams,
@@ -140,6 +140,7 @@ fn client_session(
     subnet: &Subnet,
     identity: &Identity,
     leader_pk: Pubkey,
+    delivery_rounds: Arc<std::sync::Mutex<BTreeSet<Round>>>,
 ) -> Box<dyn Session> {
     let servers = seal_roster(relay_xk, subnet);
     if servers.len() != subnet.relays.len() {
@@ -151,7 +152,7 @@ fn client_session(
     }
     let mut seed = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut seed);
-    Box::new(ScheduledPanetiereClientSession::new(
+    let mut s = ScheduledPanetiereClientSession::new(
         pp.clone(),
         sched_mse.clone(),
         vector_bytes,
@@ -159,7 +160,9 @@ fn client_session(
         servers,
         leader_pk,
         seed,
-    ))
+    );
+    s.set_delivery_rounds(delivery_rounds);
+    Box::new(s)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -222,6 +225,9 @@ pub struct ScheduledPanetiereClientSession {
     cover_rate: f32,
     cover_rng: ChaCha20Rng,
     rand_rng: ChaCha20Rng,
+    /// Node-shared grant calendar; a due delivery is the node's one write that
+    /// round, so the runtime skips the participation draw.
+    delivery_rounds: Option<Arc<std::sync::Mutex<BTreeSet<Round>>>>,
 }
 
 impl ScheduledPanetiereClientSession {
@@ -253,7 +259,12 @@ impl ScheduledPanetiereClientSession {
             cover_rate: 1.0,
             cover_rng: ChaCha20Rng::from_seed(cover_seed),
             rand_rng: ChaCha20Rng::from_seed(rand_seed),
+            delivery_rounds: None,
         }
+    }
+
+    pub fn set_delivery_rounds(&mut self, due: Arc<std::sync::Mutex<BTreeSet<Round>>>) {
+        self.delivery_rounds = Some(due);
     }
 }
 
@@ -300,7 +311,12 @@ impl Session for ScheduledPanetiereClientSession {
                 .iter()
                 .position(|&(r, s)| r == rand && s as usize == data.len());
             match idx.and_then(|i| offs[i]) {
-                Some(offset) => self.granted.push((target, offset, data)),
+                Some(offset) => {
+                    if let Some(due) = &self.delivery_rounds {
+                        due.lock().unwrap().insert(target);
+                    }
+                    self.granted.push((target, offset, data));
+                }
                 // Dropped: rand tie, vector overflow, or no match — retry with a fresh rand.
                 None => self.deferred.push(data),
             }
@@ -347,6 +363,15 @@ impl Session for ScheduledPanetiereClientSession {
             }
         }
 
+        // Cover enacts the full scheduled flow — a zero-length reservation now,
+        // its zero message at the granted round — indistinguishable from a real
+        // sender. Reserved EVERY round (pipelined, ≤ GAP+1 outstanding): gating
+        // on being idle would keep clients off the wire between reservation and
+        // grant, halving each round's canonical set.
+        if self.staged.is_empty() && self.cover_rng.gen::<f32>() < self.cover_rate {
+            self.staged.push(Vec::new());
+        }
+
         let mut sched = MseEncoding::new(self.sched_mse.clone());
         let mut reservations = Vec::new();
         for data in std::mem::take(&mut self.staged) {
@@ -372,8 +397,8 @@ impl Session for ScheduledPanetiereClientSession {
             self.reserved.insert(round, reservations);
         }
 
-        // Nothing forcing a submit this round — only cover with probability `cover_rate`.
-        if !has_grant && !real_reservation && self.cover_rng.gen::<f32>() >= self.cover_rate {
+        // Nothing to submit: no message due, no reservation (real or cover).
+        if !has_grant && !real_reservation {
             return Vec::new();
         }
 
@@ -656,6 +681,7 @@ pub(crate) async fn run_subnet(
     mut subscriptions: Vec<Subscription>,
     base_round: Round,
     epoch_unix_ms: u64,
+    armed: bool,
 ) {
     let cfg = match &subnet.protocol {
         ProtocolConfig::ScheduledPanetiere(c) => c.clone(),
@@ -673,7 +699,6 @@ pub(crate) async fn run_subnet(
     let client_agg_topic = client_aggregator_topic(&subnet, identity_pk);
 
     let mut sessions: HashMap<SessionKey, Box<dyn Session>> = HashMap::new();
-    let mut client_homes: HashSet<RouteTag> = HashSet::new();
     let mut cover_rate = subnet.cover_rate;
 
     if subnet.relays.contains(&identity_pk) {
@@ -702,7 +727,9 @@ pub(crate) async fn run_subnet(
                 a.groups.len() as u32,
                 inner.identity.clone(),
             );
-            agg_session.set_client_set_max(cfg.client_set_max as usize);
+            agg_session
+                .set_client_set_max((cfg.client_set_max as usize / a.groups.len().max(1)).max(1));
+            agg_session.set_entry_len(crate::panetiere::entry_wire_len(&pp));
             sessions.insert(
                 SessionKey::Aggregator,
                 Box::new(ScheduledAggregatorSession(agg_session)),
@@ -736,8 +763,22 @@ pub(crate) async fn run_subnet(
     let dur_ms = (subnet.protocol.round_duration().as_millis() as u64).max(4);
     let (k1_ms, k2_ms, k3_ms) = (dur_ms / 4, dur_ms / 2, 3 * dur_ms / 4);
 
+    if armed
+        && !crate::runtime::arm_until_cutover(
+            base_round,
+            epoch_unix_ms,
+            dur_ms,
+            &mut stage_rx,
+            &mut cover_rate,
+        )
+        .await
+    {
+        return;
+    }
+    let mut final_round: Option<Round> = None;
     let now_ms = crate::config::now_unix_ms();
     let mut round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms);
+    let spawn_round = round;
     let mut deadline = deadline_for(round, base_round, epoch_unix_ms, dur_ms, now_ms);
     let mut k1_deadline = deadline - std::time::Duration::from_millis(dur_ms - k1_ms);
     let mut k2_deadline = deadline - std::time::Duration::from_millis(dur_ms - k2_ms);
@@ -749,6 +790,18 @@ pub(crate) async fn run_subnet(
     if let Some(m) = fault_monitor.as_mut() {
         m.begin_round(round, Instant::now());
     }
+    crate::runtime::sync_client_round(&inner, subnet.id, round, cover_rate, &mut sessions, || {
+        client_session(
+            &pp,
+            &sched_mse,
+            cfg.vector_bytes,
+            &relay_xk,
+            &subnet,
+            &inner.identity,
+            leader_pk,
+            inner.delivery_rounds.clone(),
+        )
+    });
     let misbehavior = inner.misbehavior();
     let outs: Vec<(SessionKey, Vec<u8>)> = sessions
         .iter_mut()
@@ -860,8 +913,13 @@ pub(crate) async fn run_subnet(
                     .into_iter()
                     .map(|f| (crate::panetiere::evidence_round(&f.evidence).unwrap_or(round), f))
                     .collect();
-                gossip_faults(&inner, subnet.id, identity_pk, faults).await;
+                if round >= spawn_round + crate::runtime::RECONFIG_FAULT_GRACE {
+                    gossip_faults(&inner, subnet.id, identity_pk, faults).await;
+                }
 
+                if final_round.is_some_and(|f| round >= f) {
+                    return;
+                }
                 let now_ms = crate::config::now_unix_ms();
                 round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms).max(round + 1);
                 deadline = deadline_for(round, base_round, epoch_unix_ms, dur_ms, now_ms);
@@ -874,6 +932,18 @@ pub(crate) async fn run_subnet(
                 if let Some(m) = fault_monitor.as_mut() {
                     m.begin_round(round, Instant::now());
                 }
+                crate::runtime::sync_client_round(&inner, subnet.id, round, cover_rate, &mut sessions, || {
+                    client_session(
+                        &pp,
+                        &sched_mse,
+                        cfg.vector_bytes,
+                        &relay_xk,
+                        &subnet,
+                        &inner.identity,
+                        leader_pk,
+                        inner.delivery_rounds.clone(),
+                    )
+                });
                 let misbehavior = inner.misbehavior();
                 let outs: Vec<(SessionKey, Vec<u8>)> = sessions
                     .iter_mut()
@@ -897,32 +967,9 @@ pub(crate) async fn run_subnet(
 
             Some(stage) = stage_rx.recv() => {
                 match stage {
-                    StageMsg::Join { client_tag } => {
-                        client_homes.insert(client_tag);
-                        sessions
-                            .entry(SessionKey::Client)
-                            .or_insert_with(|| client_session(&pp, &sched_mse, cfg.vector_bytes, &relay_xk, &subnet, &inner.identity, leader_pk))
-                            .set_cover_rate(cover_rate);
-                    }
-                    StageMsg::Stage { client_tag, payload } => {
-                        client_homes.insert(client_tag);
-                        let sess = sessions
-                            .entry(SessionKey::Client)
-                            .or_insert_with(|| client_session(&pp, &sched_mse, cfg.vector_bytes, &relay_xk, &subnet, &inner.identity, leader_pk));
-                        sess.set_cover_rate(cover_rate);
-                        sess.stage(payload);
-                    }
-                    StageMsg::Retire { client_tag } => {
-                        client_homes.remove(&client_tag);
-                        if client_homes.is_empty() {
-                            sessions.remove(&SessionKey::Client);
-                        }
-                    }
-                    StageMsg::SetCoverRate(rate) => {
-                        cover_rate = rate;
-                        if let Some(c) = sessions.get_mut(&SessionKey::Client) {
-                            c.set_cover_rate(rate);
-                        }
+                    StageMsg::SetCoverRate(rate) => cover_rate = rate,
+                    StageMsg::Shutdown => {
+                        final_round.get_or_insert(round + 1);
                     }
                 }
             }

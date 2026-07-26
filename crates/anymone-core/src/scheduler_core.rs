@@ -71,6 +71,14 @@ pub const ESCALATION_GRACE: u32 = 5;
 const AGGREGATION_THRESHOLD: u32 = 16;
 /// Max distance between a `FaultReport.round` and its subnet's `share_frontier`.
 const FAULT_REPORT_ROUND_WINDOW: Round = 32;
+/// How far a subnet's last canonical set may lag the freshest one and still
+/// count toward sizing (tolerates per-subnet decode latency, not dead subnets).
+const ANON_SET_FRESHNESS: Round = 4;
+/// Committee ticks after an observer is rebuilt (roster/protocol change) during
+/// which its faults are ignored — a cutover gap or forming mesh is not a fault.
+const OBSERVER_FAULT_GRACE: u32 = 3;
+/// Consecutive ticks the capacity-resize condition must hold before acting.
+const CAPACITY_RESIZE_GRACE: u32 = 3;
 /// Aggregators per group. One, deliberately: replicas were meant to agree
 /// byte-for-byte, but on a real lossy/async network they receive different
 /// client subsets and diverge, and the leader keeps only the first it sees
@@ -245,6 +253,7 @@ mod sizing_tests {
                 message_size: 1024,
                 integrity_backoff_ms: 6 * 60 * 1000,
                 sideline: false,
+                renegotiate_on_fault: true,
                 min_capacity: 8,
                 pin: None,
                 aggregation: true,
@@ -306,6 +315,7 @@ mod sizing_tests {
                 message_size: 256,
                 integrity_backoff_ms: 6 * 60 * 1000,
                 sideline: true,
+                renegotiate_on_fault: true,
                 min_capacity: 8,
                 pin: None,
                 aggregation: true,
@@ -397,6 +407,11 @@ pub struct SchedulerParams {
     /// but leaves the roster intact — for showcases where a corrupted relay
     /// should be *seen*, not removed.
     pub sideline: bool,
+    /// Whether observed faults change the network at all (escalation ladder,
+    /// sidelining, re-roster). `false` logs faults and otherwise ignores them —
+    /// a fault-triggered reconfiguration is itself a round-losing cutover, so a
+    /// stabilizing deployment turns the reaction off rather than tuning graces.
+    pub renegotiate_on_fault: bool,
     /// Force every subnet onto one protocol, bypassing the escalation ladder.
     /// `Panetiere` still traffic-upgrades to `ScheduledPanetiere`; pinning
     /// `ScheduledPanetiere` fixes it outright.
@@ -476,6 +491,8 @@ pub struct SchedulerCore {
     /// Per-subnet liveness observers (one per public subnet), keyed by id. They
     /// drive both fault detection (every subnet) and the total client tally.
     observers: std::collections::BTreeMap<SubnetId, PublicObserver>,
+    /// Remaining grace ticks per freshly rebuilt observer ([`OBSERVER_FAULT_GRACE`]).
+    observer_grace: HashMap<SubnetId, u32>,
     /// Signature of the current public-subnet set (id + sorted roster + proto);
     /// observers are rebuilt only when this changes, so fault state survives the
     /// committee's periodic config re-broadcasts.
@@ -485,6 +502,8 @@ pub struct SchedulerCore {
     /// Consecutive ticks the shrink condition has held — gates subnet removal
     /// so a re-home transient can't immediately undo a just-added subnet.
     shrink_streak: u32,
+    /// Consecutive ticks the capacity-resize condition has held.
+    capacity_streak: u32,
     /// Subnet capacity (`client_set_max` / IBLT sizing). Starts medium and is
     /// resized to fit the observed client population, keeping per-round CPU
     /// proportional to actual usage rather than a fixed worst case.
@@ -538,9 +557,11 @@ impl SchedulerCore {
             services: HashMap::new(),
             relay_xpubs: HashMap::new(),
             observers: std::collections::BTreeMap::new(),
+            observer_grace: HashMap::new(),
             current_subnets_sig: Vec::new(),
             subnet_count: 1,
             shrink_streak: 0,
+            capacity_streak: 0,
             capacity,
             cover_rate: 1.0,
             last_content: None,
@@ -605,6 +626,17 @@ impl SchedulerCore {
         now_unix_ms: u64,
     ) {
         if faults.is_empty() {
+            return;
+        }
+        if !self.params.renegotiate_on_fault {
+            for fault in &faults {
+                tracing::info!(
+                    subnet,
+                    kind = ?fault.kind,
+                    attribution = ?fault.attribution,
+                    "observed fault ignored: renegotiate_on_fault is off"
+                );
+            }
             return;
         }
         self.escalation.entry(subnet).or_default().clean_streak = 0;
@@ -717,6 +749,15 @@ impl SchedulerCore {
                 .get_mut(&id)
                 .map(|o| o.end_round_faults(round))
                 .unwrap_or_default();
+            // A rebuilt observer watching a subnet mid-cutover sees a gap, not
+            // a fault; reacting would renegotiate and cause the next gap.
+            if let Some(g) = self.observer_grace.get_mut(&id) {
+                *g -= 1;
+                if *g == 0 {
+                    self.observer_grace.remove(&id);
+                }
+                continue;
+            }
             if !faults.is_empty() {
                 faulted.insert(id);
             }
@@ -744,25 +785,56 @@ impl SchedulerCore {
         self.integrity_offenders
             .retain(|_, t| now_unix_ms.saturating_sub(*t) < self.params.integrity_backoff_ms);
 
-        // Busiest subnet's own anon set (each subnet sizes its IBLT to its load).
-        // Clients hash across all current subnets, so the per-subnet load is
-        // ~total/subnet_count; add a subnet when any nears the grow mark, drop one
-        // when all sit well below. One step per tick.
         // Total observed submitters across all subnets. Each client appears in
-        // exactly one subnet's canonical set, so this is conserved as clients
-        // re-home — unlike `busiest`, which only drops once a freshly-scheduled
-        // subnet is adopted and clients move onto it.
-        let total: usize = self
+        // exactly one subnet's canonical set per round, so a round-aligned sum
+        // is conserved. A set whose round lags the freshest frontier is a ghost
+        // (a quiet or dead subnet's last announcement) — counting it inflates
+        // `total` cumulatively and drives runaway subnet growth.
+        let freshest = self
             .observers
             .values()
-            .filter_map(|o| o.anonymity_set())
-            .sum();
+            .filter_map(|o| o.anon_set_round())
+            .max();
+        let fresh_set = |o: &PublicObserver| -> Option<usize> {
+            let r = o.anon_set_round()?;
+            (r + ANON_SET_FRESHNESS >= freshest?).then(|| o.anonymity_set())?
+        };
+        // Union ids: a scheduled-flow client sits in two subnets' sets in one
+        // round (reservation + grant delivery), so summing sizes double-counts.
+        let mut ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut sized = 0usize;
+        for o in self.observers.values() {
+            let fresh = o
+                .anon_set_round()
+                .zip(freshest)
+                .is_some_and(|(r, f)| r + ANON_SET_FRESHNESS >= f);
+            if !fresh {
+                continue;
+            }
+            match o.latest_clients() {
+                Some(c) => ids.extend(c.iter().copied()),
+                None => sized += o.anonymity_set().unwrap_or(0),
+            }
+        }
+        let total = ids.len() + sized;
         let busiest = self
             .observers
             .values()
-            .filter_map(|o| o.anonymity_set())
+            .filter_map(&fresh_set)
             .max()
             .unwrap_or(0) as u32;
+        // Leader-announced demand is not censored at `client_set_max`, so
+        // capacity converges in one resize instead of ratcheting.
+        let demand = self
+            .observers
+            .values()
+            .filter_map(|o| {
+                let r = o.anon_set_round()?;
+                (r + ANON_SET_FRESHNESS >= freshest?).then(|| o.demand())?
+            })
+            .max()
+            .unwrap_or(0)
+            .min(MAX_SUBNET_CLIENTS);
         tracing::debug!(
             is_lead = self.is_lead,
             observers = self.observers.len(),
@@ -770,8 +842,10 @@ impl SchedulerCore {
             services = self.services.len(),
             sidelined = self.sidelined.len(),
             total,
+            demand,
             per_subnet = total / self.subnet_count.max(1),
             subnet_count = self.subnet_count,
+            freshest = ?freshest,
             "scheduler tick: subnet sizing"
         );
         // Size the subnet count to the load each subnet WOULD carry once clients
@@ -781,14 +855,19 @@ impl SchedulerCore {
         // MAX_SUBNETS, and — because the proposal body then changes every round
         // — never converge on a config to publish. `total / subnet_count`
         // converges: at total=63 it grows 1→2 (63≥63) then holds (31<63).
-        let per_subnet = (total / self.subnet_count.max(1)) as u32;
+        // `total` (union of announced sets) is capped at the current capacity,
+        // so demand — uncensored — must feed the count too, or the count can
+        // never grow while capacity is the bottleneck.
+        let load = (total as u32).max(demand);
+        let per_subnet = load / self.subnet_count.max(1) as u32;
         // Shrink only when merging back to one fewer subnet would still leave the
         // load below grow_at (10% hysteresis), so a shrink never immediately re-grows.
-        let merged_per_subnet = (total / (self.subnet_count.max(2) - 1)) as u32;
+        let merged_per_subnet = load / (self.subnet_count.max(2) - 1) as u32;
         let shrink_floor = self.params.grow_at.saturating_sub(self.params.grow_at / 10);
         if per_subnet >= self.params.grow_at && self.subnet_count < MAX_SUBNETS {
-            // Grow immediately.
-            self.subnet_count += 1;
+            // Grow immediately, straight to the count that absorbs the load.
+            let absorbing = (load / self.params.grow_at.max(1)) as usize + 1;
+            self.subnet_count = absorbing.clamp(self.subnet_count, MAX_SUBNETS);
             self.shrink_streak = 0;
         } else if self.subnet_count > 1 && merged_per_subnet <= shrink_floor {
             // Shrink only after the condition holds for a few ticks, so the
@@ -802,13 +881,26 @@ impl SchedulerCore {
         } else {
             self.shrink_streak = 0;
         }
-        // Size capacity to the busiest observed set (every subnet's IBLT uses it),
-        // with hysteresis so cover-traffic jitter doesn't churn. `min_capacity`
-        // is a hard floor — set it above the expected load to keep the subnet
-        // from resizing (and respawning workers) at all during a demo.
-        let desired = size_capacity(busiest as usize).max(self.params.min_capacity);
-        if desired.abs_diff(self.capacity) >= capacity_resize_margin(self.capacity) {
-            self.capacity = desired;
+        // Per-subnet share AFTER count growth: splitting absorbs load first,
+        // so capacity never inflates to a pre-split concentration spike.
+        // `min_capacity` is a hard floor — set it above the expected load to
+        // keep the subnet from resizing at all during a demo.
+        let observed = busiest.max(load.div_ceil(self.subnet_count.max(1) as u32));
+        let desired = size_capacity(observed as usize).max(self.params.min_capacity);
+        if observed >= self.capacity {
+            // Overflowing right now (clients being rejected): grow immediately.
+            self.capacity = desired.max(self.capacity);
+            self.capacity_streak = 0;
+        } else if desired.abs_diff(self.capacity) >= capacity_resize_margin(self.capacity) {
+            // Drift within headroom, either direction: damped, so demand
+            // jitter neither creeps capacity up nor flaps it down.
+            self.capacity_streak += 1;
+            if self.capacity_streak >= CAPACITY_RESIZE_GRACE {
+                self.capacity = desired;
+                self.capacity_streak = 0;
+            }
+        } else {
+            self.capacity_streak = 0;
         }
         // Cap clients per subnet so the biggest message stays under the p2p limit.
         self.capacity = self.capacity.min(MAX_SUBNET_CLIENTS);
@@ -1018,9 +1110,12 @@ impl SchedulerCore {
                     build_observer(*proto, roster.clone(), leader, self.params.fault_threshold)
                 {
                     observers.insert(*id, o);
+                    self.observer_grace.insert(*id, OBSERVER_FAULT_GRACE);
                 }
             }
             self.observers = observers;
+            self.observer_grace
+                .retain(|id, _| sig.iter().any(|(s, _, _)| s == id));
             self.current_subnets_sig = sig;
         }
     }
@@ -1267,8 +1362,13 @@ impl SchedulerCore {
                             },
                         )
                     }
-                    // ADCNet for `Adcnet` (and the never-scheduled `Noop`).
-                    _ => ProtocolConfig::Adcnet(AdcnetConfig {
+                    SchedulerProtocol::Noop => ProtocolConfig::Noop(crate::config::NoopConfig {
+                        round_duration_ms: dur_ms,
+                        message_size: self.params.message_size,
+                        client_set_min: 0,
+                        client_set_max: self.capacity,
+                    }),
+                    SchedulerProtocol::Adcnet => ProtocolConfig::Adcnet(AdcnetConfig {
                         round_duration_ms: dur_ms,
                         max_payload_bytes: self.params.message_size,
                         estimated_messages: expected_active(self.capacity),
@@ -1318,6 +1418,7 @@ fn content_key(
             SchedulerProtocol::Adcnet => 1,
             SchedulerProtocol::Panetiere => 2,
             SchedulerProtocol::ScheduledPanetiere => 3,
+            SchedulerProtocol::Noop => 4,
         });
         if *p == SchedulerProtocol::ScheduledPanetiere {
             key.extend_from_slice(&(vector_bytes[i] as u32).to_le_bytes());
@@ -1329,6 +1430,7 @@ fn content_key(
         Some(SchedulerProtocol::Adcnet) => 1,
         Some(SchedulerProtocol::Panetiere) => 2,
         Some(SchedulerProtocol::ScheduledPanetiere) => 3,
+        Some(SchedulerProtocol::Noop) => 4,
     });
     key.extend_from_slice(&capacity.to_le_bytes());
     // Quantize so a change in the committee's cover target re-proposes a config.
@@ -1381,9 +1483,8 @@ fn proto_kind(p: &ProtocolConfig) -> Option<SchedulerProtocol> {
         ProtocolConfig::Adcnet(_) => Some(SchedulerProtocol::Adcnet),
         ProtocolConfig::Panetiere(_) => Some(SchedulerProtocol::Panetiere),
         ProtocolConfig::ScheduledPanetiere(_) => Some(SchedulerProtocol::ScheduledPanetiere),
-        ProtocolConfig::Noop(_) | ProtocolConfig::ScheduledAdcnet(_) | ProtocolConfig::Nym(_) => {
-            None
-        }
+        ProtocolConfig::Noop(_) => Some(SchedulerProtocol::Noop),
+        ProtocolConfig::ScheduledAdcnet(_) | ProtocolConfig::Nym(_) => None,
     }
 }
 
@@ -1394,6 +1495,7 @@ fn proto_kind(p: &ProtocolConfig) -> Option<SchedulerProtocol> {
 enum PublicObserver {
     Adcnet(AdcnetObserverSession),
     Panetiere(PanetiereObserverSession),
+    Noop(NoopWireCount),
 }
 
 impl PublicObserver {
@@ -1405,6 +1507,9 @@ impl PublicObserver {
             PublicObserver::Panetiere(o) => {
                 o.on_inbound(from, bytes);
             }
+            PublicObserver::Noop(o) => {
+                o.current.insert(from);
+            }
         }
     }
 
@@ -1413,6 +1518,13 @@ impl PublicObserver {
         match self {
             PublicObserver::Adcnet(o) => o.end_round(round, now).faults,
             PublicObserver::Panetiere(o) => o.end_round(round, now).faults,
+            PublicObserver::Noop(o) => {
+                if !o.current.is_empty() {
+                    o.last = Some((round, o.current.len()));
+                    o.current.clear();
+                }
+                Vec::new()
+            }
         }
     }
 
@@ -1431,6 +1543,7 @@ impl PublicObserver {
                     o.begin_round(r, now);
                 }
             }
+            PublicObserver::Noop(_) => {}
         }
     }
 
@@ -1440,6 +1553,33 @@ impl PublicObserver {
         match self {
             PublicObserver::Adcnet(o) => o.anonymity_set(),
             PublicObserver::Panetiere(o) => o.anonymity_set(),
+            PublicObserver::Noop(o) => o.last.map(|(_, n)| n),
+        }
+    }
+
+    /// Round of the most recent canonical set, for freshness gating.
+    fn anon_set_round(&self) -> Option<Round> {
+        match self {
+            PublicObserver::Adcnet(o) => o.anon_set_round(),
+            PublicObserver::Panetiere(o) => o.anon_set_round(),
+            PublicObserver::Noop(o) => o.last.map(|(r, _)| r),
+        }
+    }
+
+    /// Leader-announced per-round demand (admitted + capacity-rejected clients).
+    /// Only Panetiere announces it; the others fall back to censored sizing.
+    fn demand(&self) -> Option<u32> {
+        match self {
+            PublicObserver::Panetiere(o) => o.demand(),
+            PublicObserver::Adcnet(_) | PublicObserver::Noop(_) => None,
+        }
+    }
+
+    /// Members of the most recent canonical set, where the wire carries them.
+    fn latest_clients(&self) -> Option<&[u32]> {
+        match self {
+            PublicObserver::Panetiere(o) => o.latest_clients().map(|(_, c)| c),
+            PublicObserver::Adcnet(_) | PublicObserver::Noop(_) => None,
         }
     }
 
@@ -1447,6 +1587,7 @@ impl PublicObserver {
         match self {
             PublicObserver::Adcnet(o) => o.share_frontier(),
             PublicObserver::Panetiere(o) => o.share_frontier(),
+            PublicObserver::Noop(o) => o.last.map(|(r, _)| r),
         }
     }
 
@@ -1454,7 +1595,7 @@ impl PublicObserver {
     /// signal. `None` for ADCNet (not part of the Panetiere family).
     fn decoded_bytes_recent(&self, window: u64) -> Option<usize> {
         match self {
-            PublicObserver::Adcnet(_) => None,
+            PublicObserver::Adcnet(_) | PublicObserver::Noop(_) => None,
             PublicObserver::Panetiere(o) => Some(o.decoded_bytes_recent(window)),
         }
     }
@@ -1477,6 +1618,15 @@ fn build_observer(
                 fault_threshold,
             )))
         }
+        Some(SchedulerProtocol::Noop) => Some(PublicObserver::Noop(NoopWireCount::default())),
         _ => None,
     }
+}
+
+/// Noop has no protocol-level canonical set; the anonymity set is the count of
+/// distinct senders seen on the subnet's topics between committee ticks.
+#[derive(Default)]
+struct NoopWireCount {
+    current: HashSet<Pubkey>,
+    last: Option<(Round, usize)>,
 }

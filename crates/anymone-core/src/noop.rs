@@ -130,15 +130,15 @@ pub(crate) async fn run_subnet(
     mut subscriptions: Vec<crate::transport::Subscription>,
     base_round: crate::config::Round,
     epoch_unix_ms: u64,
+    armed: bool,
 ) {
     use crate::config::ProtocolConfig;
     use crate::runtime::{
         deadline_for, gossip_faults, recv_any, round_at, route_to_pipe, subnet_broadcast_topic,
-        SessionKey, StageMsg,
+        sync_client_round, SessionKey, StageMsg,
     };
     use crate::transport::Inbound;
-    use crate::wire::RouteTag;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     let cfg = match &subnet.protocol {
         ProtocolConfig::Noop(c) => c.clone(),
@@ -148,7 +148,6 @@ pub(crate) async fn run_subnet(
     let topic = subnet_broadcast_topic(subnet.id);
 
     let mut sessions: HashMap<SessionKey, Box<dyn Session>> = HashMap::new();
-    let mut client_homes: HashSet<RouteTag> = HashSet::new();
     let mut cover_rate = subnet.cover_rate;
     let key = if subnet.relays.contains(&identity_pk) {
         SessionKey::Server
@@ -158,10 +157,27 @@ pub(crate) async fn run_subnet(
     sessions.insert(key, server_session(&cfg));
 
     let dur_ms = (subnet.protocol.round_duration().as_millis() as u64).max(1);
+    if armed
+        && !crate::runtime::arm_until_cutover(
+            base_round,
+            epoch_unix_ms,
+            dur_ms,
+            &mut stage_rx,
+            &mut cover_rate,
+        )
+        .await
+    {
+        return;
+    }
+    let mut final_round: Option<crate::config::Round> = None;
     let now_ms = crate::config::now_unix_ms();
     let mut round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms);
+    let spawn_round = round;
     let mut deadline = deadline_for(round, base_round, epoch_unix_ms, dur_ms, now_ms);
 
+    sync_client_round(&inner, subnet.id, round, cover_rate, &mut sessions, || {
+        client_session(&cfg)
+    });
     for s in sessions.values_mut() {
         for out in s.begin_round(round, Instant::now()) {
             inner.transport.publish(&topic, out).await;
@@ -194,11 +210,19 @@ pub(crate) async fn run_subnet(
                         n_messages: n_decoded,
                     });
                 }
-                gossip_faults(&inner, subnet.id, identity_pk, faults.into_iter().map(|f| (round, f)).collect()).await;
+                if round >= spawn_round + crate::runtime::RECONFIG_FAULT_GRACE {
+                    gossip_faults(&inner, subnet.id, identity_pk, faults.into_iter().map(|f| (round, f)).collect()).await;
+                }
 
+                if final_round.is_some_and(|f| round >= f) {
+                    return;
+                }
                 let now_ms = crate::config::now_unix_ms();
                 round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms).max(round + 1);
                 deadline = deadline_for(round, base_round, epoch_unix_ms, dur_ms, now_ms);
+                sync_client_round(&inner, subnet.id, round, cover_rate, &mut sessions, || {
+                    client_session(&cfg)
+                });
                 for s in sessions.values_mut() {
                     for out in s.begin_round(round, Instant::now()) {
                         inner.transport.publish(&topic, out).await;
@@ -217,32 +241,9 @@ pub(crate) async fn run_subnet(
 
             Some(stage) = stage_rx.recv() => {
                 match stage {
-                    StageMsg::Join { client_tag } => {
-                        client_homes.insert(client_tag);
-                        sessions
-                            .entry(SessionKey::Client)
-                            .or_insert_with(|| client_session(&cfg))
-                            .set_cover_rate(cover_rate);
-                    }
-                    StageMsg::Stage { client_tag, payload } => {
-                        client_homes.insert(client_tag);
-                        let sess = sessions
-                            .entry(SessionKey::Client)
-                            .or_insert_with(|| client_session(&cfg));
-                        sess.set_cover_rate(cover_rate);
-                        sess.stage(payload);
-                    }
-                    StageMsg::Retire { client_tag } => {
-                        client_homes.remove(&client_tag);
-                        if client_homes.is_empty() {
-                            sessions.remove(&SessionKey::Client);
-                        }
-                    }
-                    StageMsg::SetCoverRate(rate) => {
-                        cover_rate = rate;
-                        if let Some(c) = sessions.get_mut(&SessionKey::Client) {
-                            c.set_cover_rate(rate);
-                        }
+                    StageMsg::SetCoverRate(rate) => cover_rate = rate,
+                    StageMsg::Shutdown => {
+                        final_round.get_or_insert(round + 1);
                     }
                 }
             }

@@ -87,6 +87,9 @@ pub struct PanetiereCommitteeConfig {
     /// Whether attributed faults drop the culprit from the roster; `false`
     /// reports faults without removing relays.
     pub sideline: bool,
+    /// Whether observed faults change the network at all (escalation ladder,
+    /// sidelining, re-roster); `false` logs them and never reconfigures.
+    pub renegotiate_on_fault: bool,
     /// Hard floor / initial subnet capacity; set above expected load to hold
     /// capacity constant and avoid resize-driven worker respawns.
     pub min_capacity: u32,
@@ -100,6 +103,9 @@ pub struct PanetiereCommitteeConfig {
     pub protocol: Option<String>,
     /// Whether large Panetiere subnets may route through an aggregator layer.
     pub aggregation: bool,
+    /// Per-message byte bound of the committee's config-anonymising channel;
+    /// must fit the largest proposal it will carry and MATCH across members.
+    pub committee_msg_bytes: usize,
 }
 
 impl Default for PanetiereCommitteeConfig {
@@ -115,10 +121,12 @@ impl Default for PanetiereCommitteeConfig {
             message_size: 256,
             integrity_backoff_ms: crate::scheduler_core::INTEGRITY_BACKOFF_MS,
             sideline: true,
+            renegotiate_on_fault: true,
             min_capacity: crate::scheduler_core::INITIAL_CAPACITY,
             cover_rate: Arc::new(AtomicU32::new(1.0f32.to_bits())),
             protocol: None,
             aggregation: true,
+            committee_msg_bytes: COMMITTEE_MSG_BYTES,
         }
     }
 }
@@ -141,6 +149,9 @@ pub struct CommitteeParams {
     pub integrity_backoff_ms: u64,
     /// Whether attributed faults drop the culprit from the roster.
     pub sideline: bool,
+    /// Whether observed faults change the network at all (escalation ladder,
+    /// sidelining, re-roster); `false` logs them and never reconfigures.
+    pub renegotiate_on_fault: bool,
     /// Hard floor / initial subnet capacity.
     pub min_capacity: u32,
     /// Force every subnet onto one protocol ("adcnet" | "panetiere" |
@@ -149,6 +160,8 @@ pub struct CommitteeParams {
     pub protocol: Option<String>,
     /// Whether large Panetiere subnets may route through an aggregator layer.
     pub aggregation: bool,
+    /// See [`PanetiereCommitteeConfig::committee_msg_bytes`].
+    pub committee_msg_bytes: usize,
 }
 
 impl Default for CommitteeParams {
@@ -164,9 +177,11 @@ impl Default for CommitteeParams {
             message_size: 256,
             integrity_backoff_ms: crate::scheduler_core::INTEGRITY_BACKOFF_MS,
             sideline: true,
+            renegotiate_on_fault: true,
             min_capacity: crate::scheduler_core::INITIAL_CAPACITY,
             protocol: None,
             aggregation: true,
+            committee_msg_bytes: COMMITTEE_MSG_BYTES,
         }
     }
 }
@@ -184,10 +199,12 @@ impl CommitteeParams {
             message_size: self.message_size,
             integrity_backoff_ms: self.integrity_backoff_ms,
             sideline: self.sideline,
+            renegotiate_on_fault: self.renegotiate_on_fault,
             min_capacity: self.min_capacity,
             cover_rate: Arc::new(AtomicU32::new(1.0f32.to_bits())),
             protocol: self.protocol,
             aggregation: self.aggregation,
+            committee_msg_bytes: self.committee_msg_bytes,
         }
     }
 }
@@ -239,7 +256,7 @@ pub async fn spawn_panetiere_committee_scheduler(
     // Committee-anonymisation Panetiere parameters, derived deterministically.
     // ρ=3: a malicious member can't overwrite the lead's config in the IBLT.
     let setup_seed = crate::keys::derive_seed(b"anymone/committee-seed", &committee);
-    let committee_mse = channel_mse_params(3, COMMITTEE_MSG_BYTES, setup_seed);
+    let committee_mse = channel_mse_params(3, config.committee_msg_bytes, setup_seed);
     let pp = setup_pp(&committee_mse, committee.len(), setup_seed);
     let mut sorted_committee = committee.clone();
     sorted_committee.sort();
@@ -266,6 +283,7 @@ pub async fn spawn_panetiere_committee_scheduler(
         Some("scheduled-panetiere") => {
             Some(crate::scheduling::SchedulerProtocol::ScheduledPanetiere)
         }
+        Some("noop") => Some(crate::scheduling::SchedulerProtocol::Noop),
         Some(other) => {
             tracing::warn!(
                 protocol = other,
@@ -285,6 +303,7 @@ pub async fn spawn_panetiere_committee_scheduler(
         message_size: config.message_size,
         integrity_backoff_ms: config.integrity_backoff_ms,
         sideline: config.sideline,
+        renegotiate_on_fault: config.renegotiate_on_fault,
         min_capacity: config.min_capacity,
         pin,
         aggregation: config.aggregation,

@@ -161,4 +161,7 @@ pub enum SchedulerProtocol {
     /// (see `SchedulerCore::apply_sched_mode`); not chosen by the escalation
     /// ladder itself.
     ScheduledPanetiere,
+    /// Crypto-free broadcast, pin-only (`protocol = "noop"`): isolates the
+    /// scheduling/runtime control loop from protocol cost in load tests.
+    Noop,
 }

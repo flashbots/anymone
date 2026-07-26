@@ -3,14 +3,14 @@
 //! The runtime owns the clock and the transport-side I/O. Each subnet runs
 //! in its own task; sessions live inside the task and never see async.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::adcnet::AdcnetWatchSession;
 use crate::config::{AnymoneRoundConfiguration, ProtocolConfig, Round, Subnet, SubnetId};
@@ -28,6 +28,11 @@ use crate::wire::{Frame, RouteTag, ServiceTag, SERVICE_TAG_LEN};
 /// a `Liveness` fault — the established "fault on the second round" threshold
 /// (matches the committee + dashboard observers).
 pub(crate) const FAULT_THRESHOLD: u64 = 2;
+
+/// Rounds after a worker (re)spawn during which observed faults are not
+/// gossiped: a cutover gap or forming mesh reads as a Liveness fault and would
+/// trigger a renegotiation — which causes another cutover, sustaining a storm.
+pub(crate) const RECONFIG_FAULT_GRACE: Round = 3;
 
 /// Capacity of the [`Anymone::events`] broadcast. Slow consumers lag and lose
 /// the oldest events rather than blocking the subnet workers.
@@ -93,15 +98,26 @@ impl Drop for SubnetTasks {
 pub(crate) struct AnymoneInner {
     pub(crate) identity: Identity,
     pub(crate) transport: Arc<dyn Transport>,
-    /// Current signed config. Swapped in place on live reconfiguration; `open`/`bind`/`Pipe`
-    /// send-time resolution sees the latest subnet set and re-homes clients automatically.
+    /// Current signed config. Swapped in place on live reconfiguration; the
+    /// per-round participation draw sees the latest subnet set immediately.
     pub(crate) config: RwLock<AnymoneRoundConfiguration>,
     /// `service_tag` → inbox for the matching `Pipe` (service tags and return tags).
     pub(crate) pipes: Mutex<HashMap<RouteTag, mpsc::UnboundedSender<PipeIncoming>>>,
     /// Joined client pipes (`open`/`subscribe`), by client tag, to their carrier
-    /// service — reconfig uses this to re-Join a respawned/re-homed worker.
+    /// service. While non-empty, the node participates (cover or real) in one
+    /// randomly drawn subnet per round.
     pub(crate) joined: Mutex<HashMap<RouteTag, ServiceTag>>,
     pub(crate) subnets: Mutex<HashMap<SubnetId, mpsc::UnboundedSender<StageMsg>>>,
+    /// Framed payloads awaiting a round: drained one per round by the subnet
+    /// worker holding this round's participation draw. Node-level, so queued
+    /// messages survive worker respawns on reconfiguration.
+    pub(crate) outbox: Mutex<VecDeque<Vec<u8>>>,
+    /// Private seed for the per-round subnet draw: deterministic across this
+    /// node's workers (exactly one claims each round), unpredictable outside it.
+    participation_seed: [u8; 32],
+    /// Rounds with a scheduled-flow delivery due somewhere on this node; that
+    /// delivery is the round's one write, so the draw must not add another.
+    pub(crate) delivery_rounds: Arc<Mutex<std::collections::BTreeSet<Round>>>,
     /// Set only under governance; `None` for `start_with_config` (fixed-config
     /// tests). Drives topic admission on every adopted config.
     pub(crate) committee: Option<Vec<Pubkey>>,
@@ -131,22 +147,15 @@ fn misbehavior_code(mode: Option<Misbehavior>) -> u8 {
     }
 }
 
-/// Message to a subnet worker about a client session (keyed by the pipe's `return_tag`).
+/// Control message to a subnet worker. Client staging goes through the
+/// node-level outbox + per-round participation draw, not this channel.
 pub(crate) enum StageMsg {
-    /// Build the client session for an open `Pipe` so it ticks (and so emits
-    /// cover) every round, even with no `send`.
-    Join { client_tag: RouteTag },
-    /// Stage a payload on the client session (building it if needed).
-    Stage {
-        client_tag: RouteTag,
-        payload: Vec<u8>,
-    },
-    /// Drop the client session. Sent to a client's *old* subnet on re-home so it
-    /// leaves that anonymity set — otherwise the population is double-counted.
-    Retire { client_tag: RouteTag },
-    /// Adopt a new cover rate from a config change, without rebuilding the worker
-    /// (which would drop idle pipes from the anonymity set).
+    /// Adopt a new cover rate from a config change, without rebuilding the worker.
     SetCoverRate(f32),
+    /// Graceful cutover: finish the round in progress plus one more (routing
+    /// their decodes), then exit. The replacement worker arms to start at that
+    /// same boundary — see [`arm_until_cutover`].
+    Shutdown,
 }
 
 impl Anymone {
@@ -198,6 +207,8 @@ impl Anymone {
         governance: Option<(Subscription, GovernanceBootstrap)>,
     ) -> Self {
         let committee = governance.as_ref().map(|(_, gb)| gb.committee.clone());
+        let mut participation_seed = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut participation_seed);
         let inner = Arc::new(AnymoneInner {
             identity,
             transport: transport.clone(),
@@ -205,6 +216,9 @@ impl Anymone {
             pipes: Mutex::new(HashMap::new()),
             joined: Mutex::new(HashMap::new()),
             subnets: Mutex::new(HashMap::new()),
+            outbox: Mutex::new(VecDeque::new()),
+            participation_seed,
+            delivery_rounds: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             committee,
             events: broadcast::channel(EVENTS_CAPACITY).0,
             misbehavior: AtomicU8::new(0),
@@ -231,8 +245,9 @@ impl Anymone {
         }
     }
 
-    /// Open a pipe to a service. Spreads across all subnets carrying `tag`,
-    /// allocates a fresh return tag, registers an inbox.
+    /// Open a pipe to a service: allocates a fresh return tag, registers an
+    /// inbox. While the pipe lives, the node contributes (cover or real) to one
+    /// randomly drawn subnet per round.
     pub async fn open(&self, tag: ServiceTag) -> Result<Pipe, OpenError> {
         let has_carrier = self
             .inner
@@ -259,22 +274,10 @@ impl Anymone {
             .insert(return_tag, in_tx.clone());
         self.inner.joined.lock().unwrap().insert(return_tag, tag);
 
-        // Join the home subnet so the pipe contributes cover before any send.
-        let subnet = resolve_send_subnet(&self.inner, Some(tag), return_tag, tag.into());
-        if let Some(subnet) = subnet {
-            let tx = self.inner.subnets.lock().unwrap().get(&subnet).cloned();
-            if let Some(tx) = tx {
-                let _ = tx.send(StageMsg::Join {
-                    client_tag: return_tag,
-                });
-            }
-        }
-
         Ok(Pipe::new(
             Arc::downgrade(&self.inner),
             Some(tag),
             return_tag,
-            subnet,
             in_rx,
             in_tx,
         ))
@@ -310,7 +313,6 @@ impl Anymone {
             Arc::downgrade(&self.inner),
             None,
             tag.into(),
-            None,
             in_rx,
             in_tx,
         ))
@@ -342,22 +344,10 @@ impl Anymone {
             .insert(tag.into(), in_tx.clone());
         self.inner.joined.lock().unwrap().insert(tag.into(), tag);
 
-        // Join one carrier for cover; receiving is route-by-tag on every subnet.
-        let subnet = resolve_send_subnet(&self.inner, Some(tag), tag.into(), tag.into());
-        if let Some(subnet) = subnet {
-            let tx = self.inner.subnets.lock().unwrap().get(&subnet).cloned();
-            if let Some(tx) = tx {
-                let _ = tx.send(StageMsg::Join {
-                    client_tag: tag.into(),
-                });
-            }
-        }
-
         Ok(Pipe::new(
             Arc::downgrade(&self.inner),
             Some(tag),
             tag.into(),
-            subnet,
             in_rx,
             in_tx,
         ))
@@ -491,6 +481,11 @@ async fn apply_config(
     config: AnymoneRoundConfiguration,
 ) {
     let me = inner.identity.pubkey();
+    debug!(
+        version = config.body.round,
+        subnets = config.body.subnets.len(),
+        "applying config"
+    );
     // Global round clock (genesis epoch), so every node agrees regardless of which
     // config version it holds. `config.body.round` is the version, not the clock.
     let base_round = 0;
@@ -521,6 +516,10 @@ async fn apply_config(
     };
     let present: std::collections::HashSet<SubnetId> =
         config.body.subnets.iter().map(|s| s.id).collect();
+    // Live reconfiguration arms new workers to start at the cutover boundary
+    // while outgoing ones finish their in-flight round; at startup there is
+    // nothing to hand over from, so workers join the current round directly.
+    let armed = !current.is_empty();
 
     let mut built: Vec<(
         SubnetId,
@@ -558,6 +557,7 @@ async fn apply_config(
                 subscriptions,
                 base_round,
                 epoch_unix_ms,
+                armed,
             )),
             ProtocolConfig::Panetiere(_) => tokio::spawn(crate::panetiere::run_subnet(
                 subnet,
@@ -567,6 +567,7 @@ async fn apply_config(
                 subscriptions,
                 base_round,
                 epoch_unix_ms,
+                armed,
             )),
             ProtocolConfig::ScheduledPanetiere(_) => {
                 tokio::spawn(crate::panetiere_scheduled::run_subnet(
@@ -577,6 +578,7 @@ async fn apply_config(
                     subscriptions,
                     base_round,
                     epoch_unix_ms,
+                    armed,
                 ))
             }
             ProtocolConfig::Noop(_) => tokio::spawn(crate::noop::run_subnet(
@@ -586,6 +588,7 @@ async fn apply_config(
                 subscriptions,
                 base_round,
                 epoch_unix_ms,
+                armed,
             )),
             ProtocolConfig::ScheduledAdcnet(_) | ProtocolConfig::Nym(_) => {
                 unreachable!("filtered by subnet_runnable")
@@ -604,14 +607,21 @@ async fn apply_config(
             .copied()
             .filter(|id| !present.contains(id))
             .collect();
+        // Outgoing workers (removed or replaced) finish their in-flight round
+        // plus one more, then exit — the armed replacement starts at that
+        // boundary, so reconfiguration loses no round.
         for id in removed {
             if let Some(w) = workers.remove(&id) {
-                w.handle.abort();
-                stage_map.remove(&id);
+                if let Some(tx) = stage_map.remove(&id) {
+                    let _ = tx.send(StageMsg::Shutdown);
+                }
                 stale.push(w);
             }
         }
         for (id, sig, topics, stage_tx, handle) in built {
+            if let Some(old_tx) = stage_map.get(&id) {
+                let _ = old_tx.send(StageMsg::Shutdown);
+            }
             if let Some(old) = workers.insert(
                 id,
                 SubnetWorker {
@@ -620,7 +630,6 @@ async fn apply_config(
                     handle,
                 },
             ) {
-                old.handle.abort();
                 stale.push(old);
             }
             stage_map.insert(id, stage_tx);
@@ -634,13 +643,19 @@ async fn apply_config(
     // names, so only topics outside the live set may be unsubscribed — and only
     // after the stale worker has actually terminated and dropped its
     // `Subscription`s, else the transport still counts it as a listener.
-    for w in stale {
-        let _ = w.handle.await;
-        for topic in w.topics {
-            if !live_topics.contains(&topic) {
-                inner.transport.unsubscribe(&topic).await;
+    // Detached: graceful exits take up to two rounds and must not delay adoption.
+    if !stale.is_empty() {
+        let inner_unsub = inner.clone();
+        tokio::spawn(async move {
+            for w in stale {
+                let _ = w.handle.await;
+                for topic in w.topics {
+                    if !live_topics.contains(&topic) {
+                        inner_unsub.transport.unsubscribe(&topic).await;
+                    }
+                }
             }
-        }
+        });
     }
     // Deliver each subnet's cover rate to its (surviving) worker; a cover-only
     // change isn't in `subnet_sig`, so the worker isn't rebuilt for it.
@@ -657,41 +672,43 @@ async fn apply_config(
             .transport
             .set_topic_policy(crate::governance::topic_policy(&config.body, committee));
     }
-    // Re-home every joined pipe against the new config: a respawned worker
-    // starts with no joined pipes, and a re-home moves a listen-only pipe's
-    // home without it ever sending. Held across the whole loop so a
-    // concurrent `Pipe::drop` (same lock) can't interleave a stale Join
-    // after this drop's retire.
-    {
-        let joined = inner.joined.lock().unwrap();
-        let stage_map = inner.subnets.lock().unwrap();
-        for (&client_tag, &service) in joined.iter() {
-            let home = resolve_send_subnet(inner, Some(service), client_tag, service.into());
-            for (&id, tx) in stage_map.iter() {
-                let msg = if Some(id) == home {
-                    StageMsg::Join { client_tag }
-                } else {
-                    StageMsg::Retire { client_tag }
-                };
-                let _ = tx.send(msg);
-            }
-        }
-    }
     let _ = inner.events.send(Event::ConfigUpdated {
         round: config.body.round,
     });
 }
 
+/// How often a node re-pulls the config from peers to catch a version it
+/// missed on the push topic. A stale node keeps contributing with the old
+/// geometry, which every current-config relay must reject — catch-up bounds
+/// how long that divergence lasts.
+const CONFIG_CATCHUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Watch the governance config topic and adopt every newer signed version, for
-/// the node's lifetime. Exits when the `Anymone` is dropped (weak refs fail).
+/// the node's lifetime — with a periodic pull fallback for missed pushes.
+/// Exits when the `Anymone` is dropped (weak refs fail).
 async fn reconfig_watch(
     mut sub: Subscription,
     bootstrap: GovernanceBootstrap,
     inner: Weak<AnymoneInner>,
     tasks: Weak<SubnetTasks>,
 ) {
-    while let Some(msg) = sub.recv().await {
-        let Ok(cfg) = bincode::deserialize::<AnymoneRoundConfiguration>(&msg.payload) else {
+    let mut catchup = tokio::time::interval(CONFIG_CATCHUP_INTERVAL);
+    catchup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let payload = tokio::select! {
+            msg = sub.recv() => match msg {
+                Some(m) => m.payload,
+                None => return,
+            },
+            _ = catchup.tick() => {
+                let Some(inner) = inner.upgrade() else { return };
+                match inner.transport.fetch_config().await {
+                    Some(bytes) => bytes,
+                    None => continue,
+                }
+            }
+        };
+        let Ok(cfg) = bincode::deserialize::<AnymoneRoundConfiguration>(&payload) else {
             continue;
         };
         if cfg
@@ -713,7 +730,7 @@ async fn reconfig_watch(
         }
         *inner.config.write().unwrap() = cfg.clone();
         // Serve the new version to peers that pull instead of waiting for a push.
-        inner.transport.serve_config(msg.payload.clone());
+        inner.transport.serve_config(payload);
         apply_config(&inner, &tasks, cfg).await;
     }
 }
@@ -876,6 +893,46 @@ pub(crate) fn deadline_for(
     let boundary_ms = epoch_unix_ms + (round - base_round + 1) * dur_ms;
     let wait = boundary_ms.saturating_sub(now_ms);
     tokio::time::Instant::now() + std::time::Duration::from_millis(wait)
+}
+
+/// Armed spawn: sleep until the end of the round after the current one — the
+/// boundary where the outgoing worker (told to [`StageMsg::Shutdown`] at the
+/// same instant) exits. Round boundaries are epoch-aligned, so every node that
+/// adopts the config within the same round picks the same boundary, and the
+/// wait gives fresh gossip subscriptions time to form meshes. Absorbs
+/// cover-rate updates while waiting; returns `false` on `Shutdown` (or channel
+/// close), meaning this worker was itself replaced before ever running and must
+/// exit — its successor arms to its own boundary, and the round or two of gap a
+/// double reconfiguration leaves is accepted rather than bridged.
+pub(crate) async fn arm_until_cutover(
+    base_round: Round,
+    epoch_unix_ms: u64,
+    dur_ms: u64,
+    stage_rx: &mut mpsc::UnboundedReceiver<StageMsg>,
+    cover_rate: &mut f32,
+) -> bool {
+    let now_ms = crate::config::now_unix_ms();
+    let cur = round_at(base_round, epoch_unix_ms, dur_ms, now_ms);
+    let arm = tokio::time::sleep_until(deadline_for(
+        cur + 1,
+        base_round,
+        epoch_unix_ms,
+        dur_ms,
+        now_ms,
+    ));
+    tokio::pin!(arm);
+    loop {
+        tokio::select! {
+            _ = &mut arm => return true,
+            msg = stage_rx.recv() => match msg {
+                Some(StageMsg::SetCoverRate(r)) => *cover_rate = r,
+                Some(StageMsg::Shutdown) | None => {
+                    debug!("armed worker replaced before running; exiting");
+                    return false;
+                }
+            },
+        }
+    }
 }
 
 /// A non-empty roster and a protocol with runtime wiring.
@@ -1069,95 +1126,136 @@ pub(crate) fn route_to_pipe(inner: &AnymoneInner, bytes: &[u8]) {
     }
 }
 
-/// Resolve which subnet a send goes on, from the *current* config (so a pipe
-/// re-homes across reconfigs). Every subnet carries every service, so the
-/// candidate set is just the runnable subnets; client pipes hash their return
-/// tag, service replies hash `dst`.
-pub(crate) fn resolve_send_subnet(
-    inner: &AnymoneInner,
-    peer_tag: Option<ServiceTag>,
-    return_tag: RouteTag,
-    dst: RouteTag,
-) -> Option<SubnetId> {
+/// The one subnet this node participates in (cover or real) at `round`, drawn
+/// uniformly over the current config's runnable subnets. Deterministic across
+/// this node's workers — exactly one claims each round — and independent of
+/// subnet configuration, so all randomly-participating clients form a single
+/// anonymity set (whitepaper: anonymity superset).
+pub(crate) fn participation_subnet(inner: &AnymoneInner, round: Round) -> Option<SubnetId> {
     let cfg = inner.config.read().unwrap();
-    // Only runnable subnets carry workers — never route to one we skipped.
-    let candidates: Vec<SubnetId> = cfg
+    let mut candidates: Vec<SubnetId> = cfg
         .body
         .subnets
         .iter()
         .filter(|s| subnet_runnable(s))
         .map(|s| s.id)
         .collect();
-    let key = if peer_tag.is_some() { return_tag } else { dst };
-    select_subnet(candidates, key)
-}
-
-/// Pick one subnet for `key`, sorting first so the choice is independent of the
-/// config's subnet order — every node must resolve a tag to the same subnet.
-fn select_subnet(mut candidates: Vec<SubnetId>, key: RouteTag) -> Option<SubnetId> {
+    drop(cfg);
     if candidates.is_empty() {
         return None;
     }
     candidates.sort();
-    let h = key
-        .0
-        .iter()
-        .fold(0usize, |a, b| a.wrapping_mul(31).wrapping_add(*b as usize));
-    Some(candidates[h % candidates.len()])
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    inner.participation_seed.hash(&mut h);
+    round.hash(&mut h);
+    Some(candidates[(h.finish() % candidates.len() as u64) as usize])
 }
 
-#[cfg(test)]
-mod placement_tests {
-    use super::*;
-
-    #[test]
-    fn select_subnet_is_order_independent() {
-        let key = RouteTag([7u8; SERVICE_TAG_LEN]);
-        let a = select_subnet(vec![0, 1, 2, 3], key);
-        let b = select_subnet(vec![3, 1, 0, 2], key);
-        assert_eq!(a, b, "placement must not depend on candidate order");
-        assert!(a.is_some());
-        assert_eq!(select_subnet(vec![], key), None);
+/// Reconcile a worker's client session with the node's plan for `round`:
+/// create/drop the session, and when this subnet holds the round's
+/// participation draw, roll the messaging-rate coin — on a hit the session
+/// submits, carrying a queued frame if there is one and a zero-message
+/// otherwise. The rate coin gates the submission event itself, so P(submit)
+/// is independent of real traffic and send patterns can't distinguish users.
+pub(crate) fn sync_client_round(
+    inner: &AnymoneInner,
+    subnet: SubnetId,
+    round: Round,
+    messaging_rate: f32,
+    sessions: &mut HashMap<SessionKey, Box<dyn Session>>,
+    make: impl FnOnce() -> Box<dyn Session>,
+) {
+    let joined = !inner.joined.lock().unwrap().is_empty();
+    if !joined && inner.outbox.lock().unwrap().is_empty() {
+        sessions.remove(&SessionKey::Client);
+        return;
+    }
+    let busy = {
+        let mut due = inner.delivery_rounds.lock().unwrap();
+        *due = due.split_off(&round);
+        due.contains(&round)
+    };
+    let participating = !busy && participation_subnet(inner, round) == Some(subnet);
+    let submit = participating && rand::thread_rng().gen::<f32>() < messaging_rate;
+    if !submit {
+        debug!(
+            subnet,
+            round, participating, messaging_rate, "sync: client not submitting this round"
+        );
+    }
+    let sess = sessions.entry(SessionKey::Client).or_insert_with(make);
+    sess.set_cover_rate(if submit { 1.0 } else { 0.0 });
+    if submit {
+        let frame = inner.outbox.lock().unwrap().pop_front();
+        if let Some(frame) = frame {
+            sess.stage(frame);
+        }
     }
 }
 
-pub(crate) fn stage_outbound(
+/// Queue a framed payload for the next participating round (any subnet).
+pub(crate) fn queue_outbound(
     inner: &Weak<AnymoneInner>,
-    subnet: SubnetId,
-    client_tag: RouteTag,
     payload: Vec<u8>,
 ) -> Result<(), crate::pipe::SendError> {
     let inner = inner.upgrade().ok_or(crate::pipe::SendError::Closed)?;
-    let stage_tx = inner
-        .subnets
-        .lock()
-        .unwrap()
-        .get(&subnet)
-        .cloned()
-        .ok_or(crate::pipe::SendError::SubnetGone)?;
-    stage_tx
-        .send(StageMsg::Stage {
-            client_tag,
-            payload,
-        })
-        .map_err(|_| crate::pipe::SendError::SubnetGone)
+    inner.outbox.lock().unwrap().push_back(payload);
+    Ok(())
 }
 
-/// Best-effort: drop this pipe's client session on `subnet` after a re-home. A
-/// subnet that's already gone needs no retirement.
-pub(crate) fn retire_outbound(inner: &Weak<AnymoneInner>, subnet: SubnetId, client_tag: RouteTag) {
-    let Some(inner) = inner.upgrade() else { return };
-    let tx = inner.subnets.lock().unwrap().get(&subnet).cloned();
-    if let Some(tx) = tx {
-        let _ = tx.send(StageMsg::Retire { client_tag });
-    }
-}
+#[cfg(test)]
+mod participation_tests {
+    use super::*;
+    use crate::config::{AnymoneRoundConfiguration, NoopConfig, ProtocolConfig};
 
-/// Retire `client_tag` from every worker, not just its last known home — a
-/// reconfig can move a listen-only pipe's home without it ever sending.
-pub(crate) fn retire_outbound_everywhere(inner: &Weak<AnymoneInner>, client_tag: RouteTag) {
-    let Some(inner) = inner.upgrade() else { return };
-    for tx in inner.subnets.lock().unwrap().values() {
-        let _ = tx.send(StageMsg::Retire { client_tag });
+    #[test]
+    fn participation_draw_is_uniform_and_deterministic() {
+        let protocol = ProtocolConfig::Noop(NoopConfig {
+            round_duration_ms: 30,
+            message_size: 1024,
+            client_set_min: 0,
+            client_set_max: 256,
+        });
+        let relays = vec![crate::Identity::generate().pubkey()];
+        let cfg = AnymoneRoundConfiguration::singleton_subnet(
+            0,
+            protocol.clone(),
+            relays.clone(),
+            vec![],
+            vec![],
+        );
+        let mut cfg = cfg;
+        for id in 1..4u32 {
+            let mut s = cfg.body.subnets[0].clone();
+            s.id = id;
+            cfg.body.subnets.push(s);
+        }
+        let transport: Arc<dyn Transport> =
+            Arc::new(crate::transport::InMemoryNetwork::new().handle(relays[0]));
+        let inner = AnymoneInner {
+            identity: crate::Identity::generate(),
+            transport,
+            config: RwLock::new(cfg),
+            pipes: Mutex::new(HashMap::new()),
+            joined: Mutex::new(HashMap::new()),
+            subnets: Mutex::new(HashMap::new()),
+            outbox: Mutex::new(VecDeque::new()),
+            participation_seed: [42u8; 32],
+            delivery_rounds: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+            committee: None,
+            events: broadcast::channel(1).0,
+            misbehavior: AtomicU8::new(0),
+        };
+        let mut counts = [0usize; 4];
+        for round in 0..4000u64 {
+            let a = participation_subnet(&inner, round).unwrap();
+            // Deterministic: every worker computing the draw agrees.
+            assert_eq!(participation_subnet(&inner, round), Some(a));
+            counts[a as usize] += 1;
+        }
+        for c in counts {
+            assert!((800..1200).contains(&c), "skewed draw: {counts:?}");
+        }
     }
 }
