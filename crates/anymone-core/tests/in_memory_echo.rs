@@ -244,6 +244,21 @@ async fn subscribe_delivers_broadcast_to_participants() {
     let alice_pipe = alice_anymone.subscribe(echo_tag()).await.unwrap();
     let mut bob_pipe = bob_anymone.subscribe(echo_tag()).await.unwrap();
 
+    // A read-only member reads the room but cannot transmit, so it contributes
+    // no cover and stays out of the anonymity set.
+    let carol = Identity::generate();
+    let carol_anymone = Anymone::start_with_config(
+        carol.clone(),
+        Arc::new(net.handle(carol.pubkey())),
+        cfg.clone(),
+    )
+    .await;
+    let mut carol_pipe = carol_anymone.listen(echo_tag()).await.unwrap();
+    assert!(matches!(
+        carol_pipe.send(b"not allowed".to_vec()).await.unwrap_err(),
+        anymone_core::SendError::NoPeerTag
+    ));
+
     alice_pipe.send(b"hi room".to_vec()).await.unwrap();
 
     let got = tokio::time::timeout(Duration::from_secs(2), bob_pipe.recv())
@@ -252,6 +267,12 @@ async fn subscribe_delivers_broadcast_to_participants() {
         .expect("pipe closed");
     assert_eq!(got.payload, b"hi room");
     assert_eq!(got.return_tag, alice_pipe.return_tag());
+
+    let seen = tokio::time::timeout(Duration::from_secs(2), carol_pipe.recv())
+        .await
+        .expect("carol recv timed out")
+        .expect("pipe closed");
+    assert_eq!(seen.payload, b"hi room", "a listener still receives");
 
     // send_unlinkable: two sends from the same pipe carry different, random
     // return tags, neither equal to the pipe's own — bus traffic can't be

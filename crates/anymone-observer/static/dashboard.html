@@ -103,8 +103,7 @@
   .card.committee { border-color: var(--violet-dim); }
   .card.status-lagging { border-color: var(--warn); }
   .card.status-stalled { border-color: var(--bad); }
-  .card.status-renegotiating { border-color: var(--violet); animation: pulse 1s ease-in-out infinite; }
-  @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(185,166,255,0); } 50% { box-shadow: 0 0 16px 0 rgba(185,166,255,0.45); } }
+  .card.status-renegotiating { border-color: var(--violet); }
   .card-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
   .card-head .sid { color: var(--dim); }
   .card-head .status { margin-left: auto; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
@@ -241,7 +240,8 @@
  *      participants:   number,    // total distinct nodes known
  *    },
  *    participants: Array<{ pk: string, role: Role, live: boolean }>,
- *                                       // anonymous clients appear as pk "client:<subnet>:<i>"
+ *                                       // anonymous clients appear as pk "client:<id>", one per
+ *                                       // distinct announced client id across all subnets
  *    committee: Committee | null,
  *    subnets:   Array<Subnet>,
  *    faults:    Array<Fault>,           // chronological, oldest first

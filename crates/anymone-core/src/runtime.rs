@@ -10,13 +10,14 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use rand::{Rng, RngCore};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::adcnet::AdcnetWatchSession;
 use crate::config::{AnymoneRoundConfiguration, ProtocolConfig, Round, Subnet, SubnetId};
 use crate::faults::Fault;
 use crate::governance::{FaultReport, GovernanceBootstrap, GovernanceError, TOPIC_FAULTS};
 use crate::identity::{Identity, Pubkey};
+use crate::log_target::{GOV, SCHED, WIRE};
 use crate::noop;
 use crate::panetiere::PanetiereWatchSession;
 use crate::pipe::{Pipe, PipeIncoming, PipeMessage};
@@ -349,6 +350,44 @@ impl Anymone {
         ))
     }
 
+    /// Read a broadcast room without joining it: receive every message, send
+    /// none, contribute no cover, never appear in a round's anonymity set. For a
+    /// party that structurally cannot originate traffic — counting it would
+    /// overstate the set, since it hides nobody. Anyone who might send must
+    /// [`subscribe`](Self::subscribe): joining on first send would make the join
+    /// itself the signal.
+    pub async fn listen(&self, tag: ServiceTag) -> Result<Pipe, OpenError> {
+        let has_carrier = self
+            .inner
+            .config
+            .read()
+            .unwrap()
+            .body
+            .services
+            .iter()
+            .any(|svc| svc.tag == tag);
+        if !has_carrier {
+            return Err(OpenError::TagNotInConfig);
+        }
+
+        let (in_tx, in_rx) = mpsc::unbounded_channel();
+        self.inner
+            .pipes
+            .lock()
+            .unwrap()
+            .insert(tag.into(), in_tx.clone());
+
+        // No peer tag, so a send fails instead of silently making this node a
+        // client the moment it transmits.
+        Ok(Pipe::new(
+            Arc::downgrade(&self.inner),
+            None,
+            tag.into(),
+            in_rx,
+            in_tx,
+        ))
+    }
+
     /// Subscribe to subnet/round [`Event`]s; pure `Pipe` apps can ignore it. A slow
     /// consumer lags and drops the oldest events rather than blocking the runtime.
     pub fn events(&self) -> broadcast::Receiver<Event> {
@@ -416,10 +455,10 @@ impl AnymonePrep {
                     Some(b) => match bincode::deserialize::<AnymoneRoundConfiguration>(&b) {
                         Ok(c) if verify(&c) => break Ok(c),
                         Ok(_) => {
-                            tracing::debug!("anymone: fetched config failed multisig verification")
+                            tracing::debug!(target: GOV, "anymone: fetched config failed multisig verification")
                         }
                         Err(e) => {
-                            tracing::debug!(error = %e, "anymone: fetched config failed to deserialize")
+                            tracing::debug!(target: GOV, error = %e, "anymone: fetched config failed to deserialize")
                         }
                     },
                     None => {}
@@ -430,8 +469,8 @@ impl AnymonePrep {
                         let msg = msg.ok_or(GovernanceError::TopicClosed)?;
                         match bincode::deserialize::<AnymoneRoundConfiguration>(&msg.payload) {
                             Ok(c) if verify(&c) => break Ok(c),
-                            Ok(_) => tracing::debug!("anymone: pushed config failed multisig verification"),
-                            Err(e) => tracing::debug!(error = %e, "anymone: pushed config failed to deserialize"),
+                            Ok(_) => tracing::debug!(target: GOV, "anymone: pushed config failed multisig verification"),
+                            Err(e) => tracing::debug!(target: GOV, error = %e, "anymone: pushed config failed to deserialize"),
                         }
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
@@ -477,7 +516,8 @@ async fn apply_config(
     config: AnymoneRoundConfiguration,
 ) {
     let me = inner.identity.pubkey();
-    debug!(
+    info!(
+        target: GOV,
         version = config.body.round,
         subnets = config.body.subnets.len(),
         "applying config"
@@ -532,7 +572,7 @@ async fn apply_config(
         }
         // Skip (don't panic on) a subnet we can't run in a signed config.
         if !subnet_runnable(&subnet) {
-            warn!(id, "skipping unrunnable subnet in config");
+            warn!(target: SCHED, id, "skipping unrunnable subnet in config");
             continue;
         }
         let topics = subnet_subscription_topics(&subnet, me);
@@ -705,12 +745,18 @@ async fn reconfig_watch(
             }
         };
         let Ok(cfg) = bincode::deserialize::<AnymoneRoundConfiguration>(&payload) else {
+            debug!(target: GOV, len = payload.len(), "reconfig: undecodable config, ignored");
             continue;
         };
-        if cfg
-            .verify_multisig(&bootstrap.committee, bootstrap.threshold)
-            .is_err()
-        {
+        if let Err(e) = cfg.verify_multisig(&bootstrap.committee, bootstrap.threshold) {
+            debug!(
+                target: GOV,
+                version = cfg.body.round,
+                sigs = cfg.signatures.len(),
+                threshold = bootstrap.threshold,
+                ?e,
+                "reconfig: config failed multisig verification, ignored"
+            );
             continue;
         }
         let (Some(inner), Some(tasks)) = (inner.upgrade(), tasks.upgrade()) else {
@@ -721,6 +767,12 @@ async fn reconfig_watch(
         {
             let cur = inner.config.read().unwrap();
             if cfg.body.round <= cur.body.round {
+                trace!(
+                    target: GOV,
+                    version = cfg.body.round,
+                    current = cur.body.round,
+                    "reconfig: not newer than the adopted config, ignored"
+                );
                 continue;
             }
         }
@@ -923,7 +975,7 @@ pub(crate) async fn arm_until_cutover(
             msg = stage_rx.recv() => match msg {
                 Some(StageMsg::SetCoverRate(r)) => *cover_rate = r,
                 Some(StageMsg::Shutdown) | None => {
-                    debug!("armed worker replaced before running; exiting");
+                    debug!(target: SCHED, "armed worker replaced before running; exiting");
                     return false;
                 }
             },
@@ -1099,26 +1151,55 @@ pub(crate) fn route_to_pipe(inner: &AnymoneInner, bytes: &[u8]) {
     let frame = match Frame::decode(bytes) {
         Ok(f) => f,
         Err(e) => {
-            warn!("dropped malformed frame: {e}");
+            warn!(target: WIRE, len = bytes.len(), "dropped malformed frame: {e}");
             return;
         }
     };
     let outer_tag = frame.dst();
     let data = match frame {
         Frame::Raw { data, .. } => data,
-        Frame::Fragment { .. } => return, // reassembly not yet implemented
+        Frame::Fragment {
+            n_chunks,
+            chunk_index,
+            ..
+        } => {
+            // The payload is lost, not deferred — reassembly is unimplemented.
+            warn!(
+                target: WIRE,
+                dst = ?outer_tag,
+                chunk_index,
+                n_chunks,
+                "dropped fragment: reassembly is not implemented"
+            );
+            return;
+        }
     };
     let pipe_msg: PipeMessage = match bincode::deserialize(data) {
         Ok(m) => m,
-        Err(_) => return,
+        Err(e) => {
+            warn!(
+                target: WIRE,
+                dst = ?outer_tag,
+                len = data.len(),
+                error = %e,
+                "dropped decoded frame: payload is not a PipeMessage"
+            );
+            return;
+        }
     };
     let sender = inner.pipes.lock().unwrap().get(&outer_tag).cloned();
-    tracing::debug!(dst = ?outer_tag, matched = sender.is_some(), "route to pipe");
-    if let Some(tx) = sender {
-        let _ = tx.send(PipeIncoming {
-            return_tag: pipe_msg.return_tag,
-            payload: pipe_msg.payload,
-        });
+    match sender {
+        Some(tx) => {
+            trace!(target: WIRE, dst = ?outer_tag, "route to pipe");
+            let _ = tx.send(PipeIncoming {
+                return_tag: pipe_msg.return_tag,
+                payload: pipe_msg.payload,
+            });
+        }
+        // Every node decodes every subnet payload, so most are for other
+        // people's pipes — but this is also how a message to a pipe that has
+        // since closed disappears.
+        None => trace!(target: WIRE, dst = ?outer_tag, "no pipe for dst, dropped"),
     }
 }
 
@@ -1164,17 +1245,33 @@ pub(crate) fn sync_client_round(
 ) {
     let joined = !inner.joined.lock().unwrap().is_empty();
     if !joined && inner.outbox.lock().unwrap().is_empty() {
-        sessions.remove(&SessionKey::Client);
+        // Dropping the session strands anything queued after this check but
+        // before the next round's — worth seeing when a send goes missing.
+        if sessions.remove(&SessionKey::Client).is_some() {
+            debug!(
+                target: SCHED,
+                subnet, round, "sync: no pipe joined and nothing queued; client session dropped"
+            );
+        }
         return;
     }
     let drawn = participation_subnet(inner, round) == Some(subnet);
     let submit = drawn && rand::thread_rng().gen::<f32>() < messaging_rate;
+    let queued = inner.outbox.lock().unwrap().len();
     // Not being drawn is the normal case on every other subnet; only a coin
     // skip (messaging_rate < 1) is worth a line.
     if drawn && !submit {
         debug!(
-            subnet,
-            round, messaging_rate, "sync: drawn but not submitting"
+            target: SCHED,
+            subnet, round, messaging_rate, queued, "sync: drawn but not submitting"
+        );
+    }
+    // A payload queued while this subnet keeps losing the draw waits, silently,
+    // for however many rounds that takes.
+    if !drawn && queued > 0 {
+        trace!(
+            target: SCHED,
+            subnet, round, queued, "sync: payload queued but this subnet was not drawn"
         );
     }
     let sess = sessions.entry(SessionKey::Client).or_insert_with(make);
@@ -1182,9 +1279,37 @@ pub(crate) fn sync_client_round(
     if submit {
         let frame = inner.outbox.lock().unwrap().pop_front();
         if let Some(frame) = frame {
+            trace!(
+                target: SCHED,
+                subnet,
+                round,
+                len = frame.len(),
+                "sync: staging a queued payload"
+            );
             sess.stage(frame);
         }
     }
+}
+
+/// One line per round per subnet worker: the round's whole outcome, so a stalled
+/// subnet is visible as an absence of decodes rather than an absence of logs.
+/// `trace` — every round produces one, healthy or not.
+pub(crate) fn log_round_outcome(
+    protocol: &'static str,
+    subnet: SubnetId,
+    round: Round,
+    n_decoded: usize,
+    n_faults: usize,
+) {
+    trace!(
+        target: SCHED,
+        protocol,
+        subnet,
+        round,
+        decoded = n_decoded,
+        faults = n_faults,
+        "round complete"
+    );
 }
 
 /// Queue a framed payload for the next participating round (any subnet).

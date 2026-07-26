@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use tokio::sync::broadcast;
 
 use crate::identity::Pubkey;
+use crate::log_target::P2P;
 
 /// Pubkeys allowed to publish on each bound topic; a topic absent from the map is open.
 pub type TopicPolicy = HashMap<String, HashSet<Pubkey>>;
@@ -52,7 +53,7 @@ impl Subscription {
                 Ok(msg) => return Some(msg),
                 Err(broadcast::error::RecvError::Closed) => return None,
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(topic = %self.topic, skipped = n, "subscription lagged; oldest messages dropped");
+                    tracing::warn!(target: P2P, topic = %self.topic, skipped = n, "subscription lagged; oldest messages dropped");
                     continue;
                 }
             }
@@ -66,7 +67,7 @@ impl Subscription {
                 Ok(msg) if Some(msg.from) == self.owner => continue,
                 Ok(msg) => return Some(msg),
                 Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                    tracing::warn!(topic = %self.topic, skipped = n, "subscription lagged; oldest messages dropped");
+                    tracing::warn!(target: P2P, topic = %self.topic, skipped = n, "subscription lagged; oldest messages dropped");
                     continue;
                 }
                 Err(_) => return None,
@@ -168,7 +169,7 @@ impl Transport for InMemoryHandle {
     async fn publish(&self, topic: &str, bytes: Vec<u8>) {
         if let Some(roster) = self.net.policy.lock().unwrap().get(topic) {
             if !roster.contains(&self.identity) {
-                tracing::warn!(topic, from = %self.identity, "publish rejected: sender not in topic roster");
+                tracing::warn!(target: P2P, topic, from = %self.identity, "publish rejected: sender not in topic roster");
                 return;
             }
         }

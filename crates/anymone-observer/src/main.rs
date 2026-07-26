@@ -605,6 +605,12 @@ async fn watch_subnet(subnet: Subnet, transport: Arc<dyn Transport>, obs: Shared
                             })
                     })
                     .unwrap_or(0) as u64;
+                // Ids behind that set, so the participant count can dedupe a
+                // client announced on more than one subnet.
+                let clients: Vec<u32> = panetiere_obs
+                    .as_ref()
+                    .and_then(|o| o.latest_clients().map(|(_, c)| c.to_vec()))
+                    .unwrap_or_default();
                 {
                     let mut g = obs.lock().unwrap();
                     g.update_live(subnet.id, SubnetLive {
@@ -614,6 +620,7 @@ async fn watch_subnet(subnet: Subnet, transport: Arc<dyn Transport>, obs: Shared
                         output_frontier,
                         status: status.to_string(),
                         anon_set,
+                        clients,
                         live_relays,
                         raw_bytes,
                         goodput_bytes,

@@ -27,11 +27,12 @@ use adcnet::protocol::{
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, trace, warn};
 
 use crate::config::{AdcnetConfig, ExchangePublicKeyWire, ProtocolConfig, Round, Subnet};
 use crate::faults::Fault;
 use crate::identity::Pubkey;
+use crate::log_target::{ADCNET, SCHED};
 use crate::runtime::{
     aggregator_group_of, client_aggregator_topic, deadline_for, drain_inbound, egress_dest,
     gossip_faults, handle_inbound, publish_and_loop_back, recv_any, round_at, route_to_pipe,
@@ -234,7 +235,7 @@ pub(crate) async fn run_subnet(
     let now_ms = crate::config::now_unix_ms();
     let mut round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms);
     let spawn_round = round;
-    debug!(id = subnet.id, armed, round, "adcnet worker: start");
+    debug!(target: SCHED, id = subnet.id, armed, round, dur_ms, "adcnet worker: start");
     let mut deadline = deadline_for(round, base_round, epoch_unix_ms, dur_ms, now_ms);
     let mut mid_deadline = deadline - std::time::Duration::from_millis(dur_ms / 2);
     let mut mid_done = false;
@@ -320,12 +321,13 @@ pub(crate) async fn run_subnet(
                         n_messages: n_decoded,
                     });
                 }
+                crate::runtime::log_round_outcome("adcnet", subnet.id, round, n_decoded, faults.len());
                 if round >= spawn_round + crate::runtime::RECONFIG_FAULT_GRACE {
                     gossip_faults(&inner, subnet.id, identity_pk, faults.into_iter().map(|f| (round, f)).collect()).await;
                 }
 
                 if final_round.is_some_and(|f| round >= f) {
-                    debug!(id = subnet.id, round, "adcnet worker: graceful exit");
+                    debug!(target: SCHED, id = subnet.id, round, "adcnet worker: graceful exit");
                     return;
                 }
                 let now_ms = crate::config::now_unix_ms();
@@ -644,22 +646,40 @@ impl Session for AdcnetObserverSession {
                         .cur_round
                         .is_some_and(|cur| (round as u32).saturating_add(ROUND_WINDOW) < cur)
                 {
+                    debug!(
+                        target: ADCNET,
+                        round,
+                        cur = ?self.cur_round,
+                        "adcnet observer: share outside round window, no liveness credit"
+                    );
                     return Vec::new();
                 }
                 self.advance_cur_round(round);
                 // Credit the signer's own roster slot — a relay can't vouch for another.
-                if let Some(idx) = self
+                match self
                     .roster
                     .iter()
                     .position(|p| PublicKey::from_bytes(&p.0) == signer)
                 {
-                    self.tracker.observe_share(round, idx);
+                    Some(idx) => self.tracker.observe_share(round, idx),
+                    None => debug!(
+                        target: ADCNET,
+                        round,
+                        roster = self.roster.len(),
+                        "adcnet observer: share from a non-roster signer, no liveness credit"
+                    ),
                 }
             }
             // `round` names which past round this is for, not "now" — a decode/set
             // announcement can legitimately land late, so only a future claim rejects.
             AdcnetObserved::Output { round } if from == self.leader => {
                 if future(round) {
+                    debug!(
+                        target: ADCNET,
+                        round,
+                        cur = ?self.cur_round,
+                        "adcnet observer: rejected too-future Decoded"
+                    );
                     return Vec::new();
                 }
                 self.advance_cur_round(round);
@@ -667,7 +687,7 @@ impl Session for AdcnetObserverSession {
             }
             AdcnetObserved::ClientSet { size, round } if from == self.leader => {
                 if future(round) {
-                    debug!(round, size, cur = ?self.cur_round, "adcnet observer: rejected too-future ClientSet");
+                    debug!(target: ADCNET, round, size, cur = ?self.cur_round, "adcnet observer: rejected too-future ClientSet");
                     return Vec::new();
                 }
                 self.advance_cur_round(round);
@@ -677,7 +697,17 @@ impl Session for AdcnetObserverSession {
                     self.anon_set_by_round.remove(&oldest);
                 }
             }
-            _ => {}
+            // Leader-only messages from a non-leader: a stale roster here means
+            // the real leader's set and output are being ignored too.
+            AdcnetObserved::Output { round } | AdcnetObserved::ClientSet { round, .. } => {
+                debug!(
+                    target: ADCNET,
+                    round,
+                    expected_leader = %self.leader,
+                    "adcnet observer: leader-only message from a non-leader, ignored"
+                );
+            }
+            AdcnetObserved::Other => {}
         }
         Vec::new()
     }
@@ -910,7 +940,16 @@ impl Session for AdcnetClientSession {
                 },
             ) {
                 Ok(signed) => self.signed_key = Some(signed),
-                Err(_) => return Vec::new(),
+                Err(e) => {
+                    // Never recovers on its own: this client is silent forever.
+                    warn!(
+                        target: ADCNET,
+                        round,
+                        error = ?e,
+                        "adcnet client: failed to sign the exchange key; cannot contribute"
+                    );
+                    return Vec::new();
+                }
             }
         }
         let key = self.signed_key.clone().expect("signed key present");
@@ -918,6 +957,11 @@ impl Session for AdcnetClientSession {
         let round_u32 = round as u32;
         let payload = self.pending.take();
         if payload.is_none() && self.rng.gen::<f32>() >= self.cover_rate {
+            trace!(
+                target: ADCNET,
+                round,
+                "adcnet client: nothing staged and cover coin missed; silent this round"
+            );
             return Vec::new();
         }
         let contribution = match client_contribute(
@@ -930,14 +974,16 @@ impl Session for AdcnetClientSession {
         ) {
             Ok(s) => s,
             Err(e) => {
-                debug!(round = round_u32, secrets = self.shared_secrets.len(), error = ?e, "adcnet client: contribute failed");
+                debug!(target: ADCNET, round = round_u32, secrets = self.shared_secrets.len(), error = ?e, "adcnet client: contribute failed");
                 return Vec::new();
             }
         };
         let out = bincode::serialize(&AdcnetWire::Client { contribution, key })
             .expect("serialise client");
-        debug!(
+        trace!(
+            target: ADCNET,
             round = round_u32,
+            real = payload.is_some(),
             now_ms = crate::config::now_unix_ms(),
             "adcnet client: submit contribution"
         );
@@ -1010,18 +1056,47 @@ impl Session for AdcnetAggregatorSession {
         {
             let (Ok((c, signer)), Ok((_, key_signer))) = (contribution.recover(), key.recover())
             else {
+                debug!(
+                    target: ADCNET,
+                    group = self.group,
+                    "adcnet aggregator: contribution or key signature did not recover, dropped"
+                );
                 return Vec::new();
             };
-            if key_signer != signer
-                || adcnet_client_group(signer.as_bytes(), self.group_count) != self.group
-                || c.round.saturating_add(ROUND_WINDOW) < self.cur_round
+            if adcnet_client_group(signer.as_bytes(), self.group_count) != self.group {
+                trace!(
+                    target: ADCNET,
+                    c_round = c.round,
+                    group = self.group,
+                    "adcnet aggregator: contribution for another group, ignored"
+                );
+                return Vec::new();
+            }
+            if key_signer != signer {
+                debug!(
+                    target: ADCNET,
+                    c_round = c.round,
+                    group = self.group,
+                    "adcnet aggregator: key and contribution signers differ, dropped"
+                );
+                return Vec::new();
+            }
+            if c.round.saturating_add(ROUND_WINDOW) < self.cur_round
                 || c.round > self.cur_round.saturating_add(FUTURE_ROUND_SLACK)
             {
+                debug!(
+                    target: ADCNET,
+                    c_round = c.round,
+                    cur = self.cur_round,
+                    group = self.group,
+                    "adcnet aggregator: contribution outside round window, dropped"
+                );
                 return Vec::new();
             }
             let bucket = self.rounds.entry(c.round).or_default();
             if !bucket.contains_key(&signer) && bucket.len() >= self.client_set_max {
                 debug!(
+                    target: ADCNET,
                     c_round = c.round,
                     group = self.group,
                     max = self.client_set_max,
@@ -1063,7 +1138,8 @@ impl Session for AdcnetAggregatorSession {
                     signer: self.identity.pubkey(),
                     signature,
                 };
-                debug!(
+                trace!(
+                    target: ADCNET,
                     round,
                     group = self.group,
                     members = members.len(),
@@ -1259,13 +1335,29 @@ impl AdcnetServerSession {
         }
         let set = self.client_set_by_round.get(&target)?;
         if set.len() < self.min_clients {
+            debug!(
+                target: ADCNET,
+                round = target,
+                set = set.len(),
+                min_clients = self.min_clients,
+                "adcnet leader: client set below the anonymity floor, refusing to combine"
+            );
             return None;
         }
-        let shares = self.shares_by_round.get(&target)?;
+        let Some(shares) = self.shares_by_round.get(&target) else {
+            debug!(
+                target: ADCNET,
+                round = target,
+                set = set.len(),
+                "adcnet leader: no shares held for an announced round"
+            );
+            return None;
+        };
         let mut got_ids: Vec<u32> = shares.keys().map(|s| s.0).collect();
         got_ids.sort();
-        debug!(
-            target,
+        trace!(
+            target: ADCNET,
+            round = target,
             shares = shares.len(),
             expected = self.expected_servers,
             set = set.len(),
@@ -1278,8 +1370,15 @@ impl AdcnetServerSession {
         // Aggregated: each group's summed blinded is one ClientContribution; the
         // leader re-sums them (combine_round's aggregate_clients is associative).
         let clients: Vec<ClientContribution> = if self.aggregation.is_some() {
-            self.agg_by_round
-                .get(&target)?
+            let Some(groups) = self.agg_by_round.get(&target) else {
+                debug!(
+                    target: ADCNET,
+                    round = target,
+                    "adcnet leader: no group aggregates held for an announced round"
+                );
+                return None;
+            };
+            groups
                 .values()
                 .map(|(blinded, _)| ClientContribution {
                     round: target,
@@ -1287,12 +1386,27 @@ impl AdcnetServerSession {
                 })
                 .collect()
         } else {
-            let items = self.clients_by_round.get(&target)?;
+            let Some(items) = self.clients_by_round.get(&target) else {
+                debug!(
+                    target: ADCNET,
+                    round = target,
+                    set = set.len(),
+                    "adcnet leader: no client ciphertexts held for an announced round"
+                );
+                return None;
+            };
             let clients: Vec<ClientContribution> = set
                 .iter()
                 .filter_map(|pk| items.iter().find(|(_, s)| s == pk).map(|(c, _)| c.clone()))
                 .collect();
             if clients.len() != set.len() {
+                debug!(
+                    target: ADCNET,
+                    round = target,
+                    have = clients.len(),
+                    set = set.len(),
+                    "adcnet leader: missing ciphertexts for announced set members"
+                );
                 return None;
             }
             clients
@@ -1306,15 +1420,24 @@ impl AdcnetServerSession {
             self.expected_servers,
         ) {
             Ok(payloads) => {
-                debug!(target, n = payloads.len(), "adcnet leader: combined");
+                trace!(target: ADCNET, round = target, n = payloads.len(), "adcnet leader: combined");
                 self.combined_rounds.insert(target);
                 self.clients_by_round.remove(&target);
                 self.agg_by_round.remove(&target);
                 self.shares_by_round.remove(&target);
                 Some(payloads)
             }
+            // The round's payloads are lost: shares are consumed and clients
+            // sent them once.
             Err(e) => {
-                debug!(target, error = ?e, "adcnet leader: combine failed");
+                warn!(
+                    target: ADCNET,
+                    round = target,
+                    set = set.len(),
+                    shares = share_vec.len(),
+                    error = ?e,
+                    "adcnet leader: combine failed; round produced no output"
+                );
                 None
             }
         }
@@ -1329,8 +1452,17 @@ impl Session for AdcnetServerSession {
     }
 
     fn on_inbound(&mut self, from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
-        let Ok(msg) = bincode::deserialize::<AdcnetWire>(&payload) else {
-            return Vec::new();
+        let msg = match bincode::deserialize::<AdcnetWire>(&payload) {
+            Ok(m) => m,
+            Err(e) => {
+                debug!(
+                    target: ADCNET,
+                    len = payload.len(),
+                    error = %e,
+                    "adcnet server: undecodable wire message"
+                );
+                return Vec::new();
+            }
         };
         match msg {
             AdcnetWire::Client { contribution, key } => {
@@ -1339,11 +1471,20 @@ impl Session for AdcnetServerSession {
                     let (Ok((c, signer)), Ok((ke, key_signer))) =
                         (contribution.recover(), key.recover())
                     else {
+                        debug!(
+                            target: ADCNET,
+                            "adcnet leader: contribution or key signature did not recover, dropped"
+                        );
                         return Vec::new();
                     };
                     // Reject unless key and contribution share a signer, else the
                     // signing↔xpub binding can't be trusted.
                     if key_signer != signer {
+                        debug!(
+                            target: ADCNET,
+                            c_round = c.round,
+                            "adcnet leader: key and contribution signers differ, dropped"
+                        );
                         return Vec::new();
                     }
                     // Late: the set for `c.round` is already finalized.
@@ -1351,6 +1492,7 @@ impl Session for AdcnetServerSession {
                         || c.round > self.cur_round.saturating_add(FUTURE_ROUND_SLACK)
                     {
                         debug!(
+                            target: ADCNET,
                             signer = %hex::encode(&signer.as_bytes()[..4]),
                             c_round = c.round,
                             cur = self.cur_round,
@@ -1364,10 +1506,17 @@ impl Session for AdcnetServerSession {
                     // One contribution per signer per round: a replayed duplicate
                     // would double-sum into the combine and corrupt the round.
                     if bucket.iter().any(|(_, s)| *s == signer) {
+                        trace!(
+                            target: ADCNET,
+                            signer = %hex::encode(&signer.as_bytes()[..4]),
+                            c_round = c.round,
+                            "adcnet leader: duplicate client contribution ignored"
+                        );
                         return Vec::new();
                     }
                     if bucket.len() >= self.client_set_max {
                         debug!(
+                            target: ADCNET,
                             signer = %hex::encode(&signer.as_bytes()[..4]),
                             c_round = c.round,
                             max = self.client_set_max,
@@ -1376,7 +1525,8 @@ impl Session for AdcnetServerSession {
                         return Vec::new();
                     }
                     self.cache_client_key(&signer, ke, key.clone());
-                    debug!(
+                    trace!(
+                        target: ADCNET,
                         signer = %hex::encode(&signer.as_bytes()[..4]),
                         c_round = c.round,
                         cur = self.cur_round,
@@ -1391,15 +1541,33 @@ impl Session for AdcnetServerSession {
             }
             AdcnetWire::Server(signed) => {
                 if self.is_leader {
-                    if let Ok((s, signer)) = signed.recover() {
+                    // Every rejection here costs the round one share towards the
+                    // combine threshold.
+                    let Ok((s, signer)) = signed.recover() else {
+                        debug!(target: ADCNET, "adcnet leader: share signature did not recover, dropped");
+                        return Vec::new();
+                    };
+                    {
                         if s.round.saturating_add(ROUND_WINDOW) < self.cur_round
                             || s.round > self.cur_round.saturating_add(FUTURE_ROUND_SLACK)
                         {
+                            debug!(
+                                target: ADCNET,
+                                s_round = s.round,
+                                cur = self.cur_round,
+                                "adcnet leader: share outside round window, dropped"
+                            );
                             return Vec::new();
                         }
                         // The slot is the signer's roster position, not the self-claimed
                         // wire id: a relay can't occupy another's slot or forge its count.
                         let Some(sid) = self.server_id_of(signer) else {
+                            debug!(
+                                target: ADCNET,
+                                s_round = s.round,
+                                roster = self.roster.len(),
+                                "adcnet leader: share from a non-roster signer, dropped"
+                            );
                             return Vec::new();
                         };
                         let mut share = s.clone();
@@ -1415,11 +1583,25 @@ impl Session for AdcnetServerSession {
                 if round.saturating_add(ROUND_WINDOW) < self.cur_round
                     || round > self.cur_round.saturating_add(FUTURE_ROUND_SLACK)
                 {
+                    debug!(
+                        target: ADCNET,
+                        round,
+                        cur = self.cur_round,
+                        "adcnet: ClientSet outside round window, ignored"
+                    );
                     return Vec::new();
                 }
-                if from == self.leader_pk {
+                if from != self.leader_pk {
+                    debug!(
+                        target: ADCNET,
+                        round,
+                        n = clients.len(),
+                        "adcnet: ClientSet from a non-leader, ignored"
+                    );
+                } else {
                     if clients.len() > self.client_set_max {
                         debug!(
+                            target: ADCNET,
                             round,
                             n = clients.len(),
                             max = self.client_set_max,
@@ -1437,6 +1619,17 @@ impl Session for AdcnetServerSession {
                             signers.push(signer);
                         }
                     }
+                    // A member we can't recover leaves us short a shared secret, so
+                    // `end_round` skips sharing over this round entirely.
+                    if signers.len() != clients.len() {
+                        debug!(
+                            target: ADCNET,
+                            round,
+                            recovered = signers.len(),
+                            announced = clients.len(),
+                            "adcnet: unrecoverable member keys in the announced ClientSet"
+                        );
+                    }
                     self.client_set_by_round.entry(round).or_insert(signers);
                 }
             }
@@ -1444,8 +1637,21 @@ impl Session for AdcnetServerSession {
                 // `round` is a past round's label, not "now" — combine legitimately
                 // lands late, so only a future claim (mod boundary skew) is rejected.
                 let in_window = round <= self.cur_round.saturating_add(ROUND_WINDOW);
-                if from == self.leader_pk && in_window && !self.routed_rounds.contains(&round) {
-                    self.routed_rounds.insert(round);
+                if from != self.leader_pk {
+                    debug!(
+                        target: ADCNET,
+                        round,
+                        "adcnet: Decoded from a non-leader, ignored"
+                    );
+                } else if !in_window {
+                    debug!(
+                        target: ADCNET,
+                        round,
+                        cur = self.cur_round,
+                        n = payloads.len(),
+                        "adcnet: Decoded claims a future round, ignored"
+                    );
+                } else if self.routed_rounds.insert(round) {
                     self.pending_decoded.extend(payloads);
                 }
             }
@@ -1458,12 +1664,26 @@ impl Session for AdcnetServerSession {
                 signature,
             } => {
                 let Some(agg) = self.aggregation.as_ref() else {
+                    debug!(
+                        target: ADCNET,
+                        round,
+                        group,
+                        "adcnet: group aggregate on a non-aggregated subnet, dropped"
+                    );
                     return Vec::new();
                 };
                 let Some(roster) = agg.roster.get(&group) else {
+                    debug!(
+                        target: ADCNET,
+                        round,
+                        group,
+                        groups = agg.roster.len(),
+                        "adcnet: group aggregate for an unknown group, dropped"
+                    );
                     return Vec::new();
                 };
-                debug!(
+                trace!(
+                    target: ADCNET,
                     round,
                     group,
                     cur = self.cur_round,
@@ -1482,10 +1702,13 @@ impl Session for AdcnetServerSession {
                     || round > self.cur_round.saturating_add(FUTURE_ROUND_SLACK)
                 {
                     debug!(
+                        target: ADCNET,
                         round,
                         group,
                         n = clients.len(),
+                        group_cap,
                         cur = self.cur_round,
+                        in_roster = roster.contains(&signer),
                         "adcnet leader: rejected group aggregate"
                     );
                     return Vec::new();
@@ -1497,6 +1720,16 @@ impl Session for AdcnetServerSession {
                         self.cache_client_key(&s, ke, signed.clone());
                         signers.push(s);
                     }
+                }
+                if signers.len() != clients.len() {
+                    debug!(
+                        target: ADCNET,
+                        round,
+                        group,
+                        recovered = signers.len(),
+                        announced = clients.len(),
+                        "adcnet leader: unrecoverable member keys in a group aggregate"
+                    );
                 }
                 self.agg_by_round
                     .entry(round)
@@ -1536,14 +1769,20 @@ impl Session for AdcnetServerSession {
                 let Some(keys) = self.leader_agg_set_for_round(r) else {
                     continue;
                 };
-                debug!(
-                    r,
+                if keys.is_empty() {
+                    debug!(
+                        target: ADCNET,
+                        round = r,
+                        "adcnet leader: group aggregates held but no announceable members"
+                    );
+                    continue;
+                }
+                trace!(
+                    target: ADCNET,
+                    round = r,
                     set = keys.len(),
                     "adcnet leader: announce aggregated client set"
                 );
-                if keys.is_empty() {
-                    continue;
-                }
                 let signers: Vec<PublicKey> = keys
                     .iter()
                     .filter_map(|k| k.recover().ok().map(|(_, s)| s.clone()))
@@ -1563,7 +1802,7 @@ impl Session for AdcnetServerSession {
         // Phase A (leader only, direct): announce the canonical client set for `cur`.
         if self.is_leader && self.aggregation.is_none() && !self.announced_rounds.contains(&cur) {
             let keys = self.leader_set_for_round(cur);
-            if tracing::enabled!(tracing::Level::DEBUG) {
+            if tracing::enabled!(target: ADCNET, tracing::Level::TRACE) {
                 // Contribution spread across round buckets: clients landing in
                 // many rounds means each canonical set is a fraction of the population.
                 let mut buckets: Vec<(u32, usize)> = self
@@ -1572,7 +1811,8 @@ impl Session for AdcnetServerSession {
                     .map(|(r, v)| (*r, v.len()))
                     .collect();
                 buckets.sort_unstable();
-                debug!(
+                trace!(
+                    target: ADCNET,
                     round = cur,
                     contributions_this_round =
                         self.clients_by_round.get(&cur).map_or(0, |v| v.len()),
@@ -1619,7 +1859,17 @@ impl Session for AdcnetServerSession {
                     secrets.insert(pk.clone(), s.clone());
                 }
             }
+            // Without a secret per canonical member the share would be over a
+            // different set, so we stay silent for this round — and the leader
+            // never reaches its threshold.
             if secrets.len() != set.len() || secrets.is_empty() {
+                debug!(
+                    target: ADCNET,
+                    round = t,
+                    secrets = secrets.len(),
+                    set = set.len(),
+                    "adcnet: missing shared secrets for the canonical set; no share emitted"
+                );
                 continue;
             }
             // CorruptShare: flip a byte of one shared secret so the (validly
@@ -1632,21 +1882,38 @@ impl Session for AdcnetServerSession {
                     }
                 }
             }
-            if let Ok(signed) =
-                server_contribute(&self.config, t, self.server_id, &self.signing_key, &secrets)
-            {
-                if self.is_leader {
-                    if let Ok((own, _)) = signed.recover() {
-                        self.shares_by_round
-                            .entry(t)
-                            .or_default()
-                            .insert(self.server_id, own.clone());
+            match server_contribute(&self.config, t, self.server_id, &self.signing_key, &secrets) {
+                Ok(signed) => {
+                    if self.is_leader {
+                        if let Ok((own, _)) = signed.recover() {
+                            self.shares_by_round
+                                .entry(t)
+                                .or_default()
+                                .insert(self.server_id, own.clone());
+                        }
                     }
+                    trace!(
+                        target: ADCNET,
+                        round = t,
+                        server_id = self.server_id.0,
+                        set = set.len(),
+                        "adcnet: emitting share"
+                    );
+                    outbound.push(
+                        bincode::serialize(&AdcnetWire::Server(signed)).expect("serialise share"),
+                    );
+                    self.shared_rounds.insert(t);
                 }
-                outbound.push(
-                    bincode::serialize(&AdcnetWire::Server(signed)).expect("serialise share"),
-                );
-                self.shared_rounds.insert(t);
+                // Retried next round (`shared_rounds` is not marked), but until it
+                // succeeds this relay is missing from the combine.
+                Err(e) => warn!(
+                    target: ADCNET,
+                    round = t,
+                    server_id = self.server_id.0,
+                    set = set.len(),
+                    error = ?e,
+                    "adcnet: server_contribute failed; no share for this round"
+                ),
             }
         }
 
@@ -1703,8 +1970,16 @@ impl Session for AdcnetWatchSession {
         if let Ok(AdcnetWire::Decoded { round, payloads }) =
             bincode::deserialize::<AdcnetWire>(&payload)
         {
-            if from == self.leader_pk && !self.routed_rounds.contains(&round) {
-                self.routed_rounds.insert(round);
+            if from != self.leader_pk {
+                // A stale leader here means this watcher never surfaces any
+                // output at all — every inbound payload disappears.
+                debug!(
+                    target: ADCNET,
+                    round,
+                    expected_leader = %self.leader_pk,
+                    "adcnet watch: Decoded from a non-leader, ignored"
+                );
+            } else if self.routed_rounds.insert(round) {
                 self.pending_decoded.extend(payloads);
             }
         }

@@ -41,6 +41,7 @@ struct ConfigRequest;
 struct ConfigResponse(Option<Vec<u8>>);
 
 use crate::identity::{Identity, Pubkey};
+use crate::log_target::{P2P, WIRE};
 use crate::transport::{Inbound, Subscription, Transport};
 
 /// gossipsub per-message ceiling; the committee sizes subnets under it (`scheduler_core::MAX_SUBNET_WIRE`).
@@ -314,7 +315,7 @@ fn peer_score_params() -> PeerScoreParams {
         match v.parse::<f64>() {
             Ok(threshold) => params.ip_colocation_factor_threshold = threshold,
             Err(e) => {
-                tracing::warn!(value = %v, error = %e, "invalid ANYMONE_IP_COLOCATION_THRESHOLD")
+                tracing::warn!(target: P2P, value = %v, error = %e, "invalid ANYMONE_IP_COLOCATION_THRESHOLD")
             }
         }
     }
@@ -440,20 +441,20 @@ async fn swarm_loop(
                         .map(|(p, _)| p.to_string())
                         .collect();
                     let len = bytes.len();
-                    tracing::trace!(topic = %name, recipients = ?subs, "publish recipients");
+                    tracing::trace!(target: WIRE, topic = %name, recipients = ?subs, "publish recipients");
                     let topic = IdentTopic::new(name.clone());
                     match swarm.behaviour_mut().gossipsub.publish(topic, bytes.clone()) {
-                        Ok(id) => tracing::debug!(topic = %name, len, n_subs = subs.len(), msg = %id, "publish ok"),
+                        Ok(id) => tracing::trace!(target: WIRE, topic = %name, len, n_subs = subs.len(), msg = %id, "publish ok"),
                         Err(gossipsub::PublishError::InsufficientPeers) => {
-                            tracing::debug!(topic = %name, len, n_subs = subs.len(), "publish buffered (InsufficientPeers)");
+                            tracing::debug!(target: P2P, topic = %name, len, n_subs = subs.len(), "publish buffered (InsufficientPeers)");
                             let queue = pending.entry(name.clone()).or_default();
                             if queue.len() >= MAX_PENDING_PER_TOPIC {
                                 queue.pop_front();
-                                tracing::warn!(topic = %name, cap = MAX_PENDING_PER_TOPIC, "pending publish queue full; dropping oldest");
+                                tracing::warn!(target: P2P, topic = %name, cap = MAX_PENDING_PER_TOPIC, "pending publish queue full; dropping oldest");
                             }
                             queue.push_back(bytes);
                         }
-                        Err(e) => tracing::warn!(topic = %name, len, limit = MAX_TRANSMIT_SIZE, error = %e, "publish dropped"),
+                        Err(e) => tracing::warn!(target: P2P, topic = %name, len, limit = MAX_TRANSMIT_SIZE, error = %e, "publish dropped"),
                     }
                 }
                 Some(Cmd::FetchConfig { peer, reply }) => {
@@ -496,7 +497,7 @@ async fn swarm_loop(
                         .is_none_or(|roster| roster.contains(&from));
                     if !admitted {
                         // Ignore avoids penalizing an honest forwarder during reconfig skew.
-                        tracing::warn!(topic = %topic_name, from = %from, "publish ignored: sender not in topic roster");
+                        tracing::warn!(target: P2P, topic = %topic_name, from = %from, "publish ignored: sender not in topic roster");
                         swarm.behaviour_mut().gossipsub.report_message_validation_result(
                             &message_id, &propagation_source, MessageAcceptance::Ignore,
                         );
@@ -506,10 +507,19 @@ async fn swarm_loop(
                         &message_id, &propagation_source, MessageAcceptance::Accept,
                     );
                     crate::wire_debug::trace_in(&topic_name, &from, &message.data);
-                    tracing::debug!(topic = %topic_name, from = %from, len = message.data.len(), "recv");
+                    tracing::trace!(target: WIRE, topic = %topic_name, from = %from, len = message.data.len(), "recv");
                     let topics = topics.lock().unwrap();
-                    if let Some(s) = topics.get(&topic_name) {
-                        let _ = s.send(Inbound { from, payload: message.data });
+                    // Still joined at the swarm but nothing local is listening (a
+                    // worker exited before the topic was left): the message is
+                    // accepted off the wire and then dropped.
+                    match topics.get(&topic_name) {
+                        Some(s) if s.send(Inbound { from, payload: message.data }).is_ok() => {}
+                        _ => tracing::debug!(
+                            target: P2P,
+                            topic = %topic_name,
+                            from = %from,
+                            "recv on a topic with no local listener, dropped"
+                        ),
                     }
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
@@ -560,7 +570,7 @@ async fn swarm_loop(
                     }
                 }
                 SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), error, .. } => {
-                    tracing::debug!(peer = %peer_id, %error, "dial failed");
+                    tracing::debug!(target: P2P, peer = %peer_id, %error, "dial failed");
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                     peers.lock().unwrap().insert(peer_id);
@@ -599,7 +609,7 @@ fn flush_pending(
             }
         }
         if before != queue.len() {
-            tracing::debug!(topic = %name, drained = before - queue.len(), remaining = queue.len(), "flush_pending");
+            tracing::debug!(target: P2P, topic = %name, drained = before - queue.len(), remaining = queue.len(), "flush_pending");
         }
     }
     pending.retain(|_, q| !q.is_empty());

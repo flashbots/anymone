@@ -12,6 +12,7 @@ pub mod faults;
 pub mod governance;
 pub mod identity;
 pub mod keys;
+pub mod log_target;
 pub mod noop;
 pub mod p2p;
 pub mod panetiere;

@@ -31,6 +31,7 @@ use crate::config::{
     ExchangePublicKeyWire, ProtocolConfig, Round, ScheduledPanetiereConfig, Subnet,
 };
 use crate::identity::{Identity, Pubkey};
+use crate::log_target::{PANETIERE, SCHED};
 use crate::panetiere::{
     client_id_from_pubkey, server_index, PanetiereAggregatorSession, PanetiereObserverSession,
     PanetiereServerSession, PanetiereWatchSession, PanetiereWire, SetMode,
@@ -143,6 +144,7 @@ fn client_session(
     let servers = seal_roster(relay_xk, subnet);
     if servers.len() != subnet.relays.len() {
         tracing::warn!(
+            target: PANETIERE,
             have = servers.len(),
             need = subnet.relays.len(),
             "scheduled panetiere client: relay exchange keys incomplete"
@@ -269,12 +271,21 @@ impl Session for ScheduledPanetiereClientSession {
             .collect();
         for r in stale {
             if let Some(entries) = self.reserved.remove(&r) {
-                self.deferred.extend(
-                    entries
-                        .into_iter()
-                        .map(|(_, payload)| payload)
-                        .filter(|p| !p.is_empty()),
-                );
+                let real: Vec<Vec<u8>> = entries
+                    .into_iter()
+                    .map(|(_, payload)| payload)
+                    .filter(|p| !p.is_empty())
+                    .collect();
+                if !real.is_empty() {
+                    tracing::debug!(
+                        target: PANETIERE,
+                        round,
+                        reservation_round = r,
+                        payloads = real.len(),
+                        "scheduled panetiere client: grant never arrived; re-reserving"
+                    );
+                }
+                self.deferred.extend(real);
             }
         }
         Vec::new()
@@ -290,6 +301,11 @@ impl Session for ScheduledPanetiereClientSession {
             return Vec::new();
         };
         let Some(mine) = self.reserved.remove(&round) else {
+            tracing::trace!(
+                target: PANETIERE,
+                round,
+                "scheduled panetiere client: reservations for a round we did not reserve in"
+            );
             return Vec::new();
         };
         let rands: Vec<u16> = entries.iter().map(|&(r, _)| r).collect();
@@ -311,8 +327,24 @@ impl Session for ScheduledPanetiereClientSession {
                 // Dropped: rand tie, vector overflow, or no match — real
                 // payloads retry with a fresh rand; a dropped cover
                 // reservation just ends that chain.
-                None if !data.is_empty() => self.deferred.push(data),
-                None => {}
+                None if !data.is_empty() => {
+                    tracing::debug!(
+                        target: PANETIERE,
+                        round,
+                        rand,
+                        len = data.len(),
+                        entries = entries.len(),
+                        matched = idx.is_some(),
+                        "scheduled panetiere client: reservation not granted; deferring payload"
+                    );
+                    self.deferred.push(data);
+                }
+                None => tracing::trace!(
+                    target: PANETIERE,
+                    round,
+                    rand,
+                    "scheduled panetiere client: cover reservation not granted"
+                ),
             }
         }
         Vec::new()
@@ -324,8 +356,12 @@ impl Session for ScheduledPanetiereClientSession {
         }
         if self.servers.len() != self.pp.cs.n_servers {
             tracing::debug!(
+                target: PANETIERE,
+                round,
                 have = self.servers.len(),
                 need = self.pp.cs.n_servers,
+                staged = self.staged.len(),
+                granted = self.granted.len(),
                 "scheduled panetiere client: missing relay exchange keys; skipping round"
             );
             return Vec::new();
@@ -337,10 +373,32 @@ impl Session for ScheduledPanetiereClientSession {
         for (target, offset, data) in std::mem::take(&mut self.granted) {
             if target == round {
                 let end = (offset + data.len()).min(self.vector_bytes);
+                // A grant whose slot runs past the vector delivers a truncated
+                // payload — the receiver gets corrupt bytes, not nothing.
+                if end - offset < data.len() {
+                    tracing::warn!(
+                        target: PANETIERE,
+                        round,
+                        offset,
+                        len = data.len(),
+                        vector_bytes = self.vector_bytes,
+                        kept = end - offset,
+                        "scheduled panetiere client: granted slot overruns the message vector; payload truncated"
+                    );
+                }
                 msg_buf[offset..end].copy_from_slice(&data[..end - offset]);
                 has_grant = true;
             } else if target < round {
                 // Missed its window (boundary skew) — retry with a fresh rand.
+                if !data.is_empty() {
+                    tracing::debug!(
+                        target: PANETIERE,
+                        round,
+                        grant_round = target,
+                        len = data.len(),
+                        "scheduled panetiere client: grant window missed; re-reserving"
+                    );
+                }
                 self.deferred.push(data);
             } else {
                 remaining.push((target, offset, data));
@@ -355,6 +413,17 @@ impl Session for ScheduledPanetiereClientSession {
             } else {
                 self.deferred.push(data);
             }
+        }
+        // A backlog that never shrinks is a payload the client will keep failing
+        // to place, round after round.
+        if !self.deferred.is_empty() {
+            tracing::debug!(
+                target: PANETIERE,
+                round,
+                deferred = self.deferred.len(),
+                retrying = self.staged.len(),
+                "scheduled panetiere client: payloads still waiting for a reservation"
+            );
         }
 
         // Cover enacts the full scheduled flow: a fresh zero-length
@@ -392,6 +461,12 @@ impl Session for ScheduledPanetiereClientSession {
 
         // Nothing to submit: no message due, no reservation (real or cover).
         if !has_grant && !real_reservation {
+            tracing::trace!(
+                target: PANETIERE,
+                round,
+                client_id = self.client_id.0,
+                "scheduled panetiere client: no grant and no reservation; silent this round"
+            );
             return Vec::new();
         }
 
@@ -520,6 +595,16 @@ impl Session for ScheduledPanetiereServerSession {
             {
                 if crate::panetiere::round_in_window(round, self.cur_round) {
                     self.entries_by_round.entry(round).or_insert(entries);
+                } else {
+                    // Without this round's entries we can't place any message
+                    // vector fulfilling it, so those payloads never surface.
+                    tracing::debug!(
+                        target: PANETIERE,
+                        round,
+                        cur = ?self.cur_round,
+                        entries = entries.len(),
+                        "scheduled panetiere: Reservations outside round window, dropped"
+                    );
                 }
             }
         }
@@ -553,10 +638,11 @@ impl Session for ScheduledPanetiereServerSession {
                         .collect(),
                     Err(e) => {
                         // Peel stall loses the whole round's reservations (retried by clients).
-                        tracing::debug!(
+                        tracing::warn!(
+                            target: PANETIERE,
                             round = rd,
                             ?e,
-                            "scheduled panetiere: reservation MSE peel failed"
+                            "scheduled panetiere: reservation MSE peel failed; round's reservations lost"
                         );
                         Vec::new()
                     }
@@ -599,10 +685,12 @@ impl Session for ScheduledPanetiereServerSession {
                     .filter(|b| b.iter().any(|x| *x != 0))
                     .collect::<Vec<_>>(),
                 Err(e) => {
-                    tracing::debug!(
+                    tracing::warn!(
+                        target: PANETIERE,
                         round = rd,
+                        ranges = ranges.len(),
                         ?e,
-                        "scheduled panetiere: message-vector decode failed"
+                        "scheduled panetiere: message-vector decode failed; round's messages lost"
                     );
                     Vec::new()
                 }
@@ -621,6 +709,16 @@ impl Session for ScheduledPanetiereServerSession {
 
         self.inner.gc(round);
         let cutoff = round.saturating_sub(SCHED_ENTRIES_RETENTION);
+        // A message vector whose reservation round's entries never arrived can't
+        // be unpacked, so its senders' payloads are lost here.
+        for r in self.pending_msg.range(..cutoff) {
+            tracing::warn!(
+                target: PANETIERE,
+                round = r.0,
+                reservation_round = r.0.saturating_sub(RESERVATION_TO_MSG_GAP),
+                "scheduled panetiere: message vector aged out without its reservations"
+            );
+        }
         self.entries_by_round.retain(|r, _| *r >= cutoff);
         self.pending_msg.retain(|r, _| *r >= cutoff);
 
@@ -772,6 +870,16 @@ pub(crate) async fn run_subnet(
     let now_ms = crate::config::now_unix_ms();
     let mut round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms);
     let spawn_round = round;
+    tracing::debug!(
+        target: SCHED,
+        subnet = subnet.id,
+        round,
+        relay = subnet.relays.contains(&identity_pk),
+        leader = leader_pk == identity_pk,
+        vector_bytes = cfg.vector_bytes,
+        dur_ms,
+        "scheduled panetiere worker: start"
+    );
     let mut deadline = deadline_for(round, base_round, epoch_unix_ms, dur_ms, now_ms);
     let mut k1_deadline = deadline - std::time::Duration::from_millis(dur_ms - k1_ms);
     let mut k2_deadline = deadline - std::time::Duration::from_millis(dur_ms - k2_ms);
@@ -901,6 +1009,7 @@ pub(crate) async fn run_subnet(
                         n_messages: n_decoded,
                     });
                 }
+                crate::runtime::log_round_outcome("scheduled-panetiere", subnet.id, round, n_decoded, faults.len());
                 let faults = faults
                     .into_iter()
                     .map(|f| (crate::panetiere::evidence_round(&f.evidence).unwrap_or(round), f))
@@ -910,10 +1019,25 @@ pub(crate) async fn run_subnet(
                 }
 
                 if final_round.is_some_and(|f| round >= f) {
+                    tracing::debug!(
+                        target: SCHED,
+                        subnet = subnet.id,
+                        round,
+                        "scheduled panetiere worker: graceful exit"
+                    );
                     return;
                 }
                 let now_ms = crate::config::now_unix_ms();
-                round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms).max(round + 1);
+                let next = round_at(base_round, epoch_unix_ms, dur_ms, now_ms).max(round + 1);
+                if next > round + 1 {
+                    tracing::debug!(
+                        target: SCHED,
+                        from = round,
+                        to = next,
+                        "scheduled panetiere worker: lagged past a round boundary, skipping rounds"
+                    );
+                }
+                round = next;
                 deadline = deadline_for(round, base_round, epoch_unix_ms, dur_ms, now_ms);
                 k1_deadline = deadline - std::time::Duration::from_millis(dur_ms - k1_ms);
                 k2_deadline = deadline - std::time::Duration::from_millis(dur_ms - k2_ms);

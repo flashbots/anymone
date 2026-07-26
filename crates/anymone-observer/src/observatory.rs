@@ -33,6 +33,9 @@ pub struct SubnetLive {
     /// Live anonymity set: size of the latest observed canonical client set
     /// (actual submitters this round), not the `client_set_max` config cap.
     pub anon_set: u64,
+    /// Ids in that canonical set. The participant count is the union of these
+    /// across subnets: a client announced on two subnets is one participant.
+    pub clients: Vec<u32>,
     /// Relays observed broadcasting a share recently (on the subnet's shares
     /// topic). Relays in the roster but absent here render as "missing" on the
     /// dashboard. Empty ⇒ no share seen yet (treat all roster relays as live).
@@ -423,11 +426,25 @@ impl Observatory {
             .collect();
 
         if let Some(cfg) = &self.config {
+            // Keyed by announced client id, so the same client seen on two
+            // subnets counts once. Ids are unavailable until a canonical set is
+            // observed; fall back to the per-subnet count then.
+            let mut ids: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+            let mut unnamed = 0u64;
             for s in &cfg.body.subnets {
-                let n = self.live.get(&s.id).map(|l| l.anon_set).unwrap_or(0);
-                for i in 0..n {
-                    out.push(json!({ "pk": format!("client:{}:{}", s.id, i), "role": "client", "live": true }));
+                match self.live.get(&s.id) {
+                    Some(l) if !l.clients.is_empty() => ids.extend(l.clients.iter().copied()),
+                    Some(l) => unnamed += l.anon_set,
+                    None => {}
                 }
+            }
+            for id in ids {
+                out.push(
+                    json!({ "pk": format!("client:{id:08x}"), "role": "client", "live": true }),
+                );
+            }
+            for i in 0..unnamed {
+                out.push(json!({ "pk": format!("client:?:{i}"), "role": "client", "live": true }));
             }
         }
         out

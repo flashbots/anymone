@@ -131,17 +131,16 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow!("anymone start: {e}"))?;
 
-    // One standing pipe for the process lifetime, serving both directions.
-    // `subscribe` (rather than `open`) receives the bus as well as sending to
-    // it, which is what lets the page show what the bus carried and confirm a
-    // submission came back off it; it joins the bus's home subnet just the
-    // same, so the process contributes cover every round it is up (design §6).
-    // Exactly one subscription per process: the runtime keys pipes by tag, so a
-    // second one would silently leave the first deaf.
-    let pipe = anymone
-        .subscribe(anymone_txbus::tx_bus_tag(args.chain_id))
-        .await
-        .map_err(|e| anyhow!("subscribing to the tx bus: {e}"))?;
+    // One pipe per process, both directions: the runtime keys pipes by tag, so a
+    // second would leave the first deaf. Forward-only originates nothing, so it
+    // `listen`s — no cover, out of the anonymity set.
+    let tag = anymone_txbus::tx_bus_tag(args.chain_id);
+    let pipe = if args.serve.is_some() {
+        anymone.subscribe(tag).await
+    } else {
+        anymone.listen(tag).await
+    }
+    .map_err(|e| anyhow!("attaching to the tx bus: {e}"))?;
     let feed = Arc::new(TxFeed::new());
     let (staging, staging_rx) = mpsc::unbounded_channel();
 

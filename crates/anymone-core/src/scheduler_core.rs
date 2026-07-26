@@ -34,6 +34,7 @@ use crate::config::{
 use crate::faults::{Attribution, Fault, FaultKind};
 use crate::governance::{FaultReport, TOPIC_CONFIG};
 use crate::identity::{Identity, Pubkey};
+use crate::log_target::{GOV, SCHED};
 use crate::panetiere::PanetiereObserverSession;
 use crate::scheduling::{Registration, SchedulerProtocol};
 use crate::session::Session;
@@ -593,7 +594,15 @@ impl SchedulerCore {
                 exchange_pubkey,
                 ..
             } => {
-                if !self.integrity_offenders.contains_key(&pubkey) {
+                if self.integrity_offenders.contains_key(&pubkey) {
+                    // Held out until `integrity_backoff_ms` expires; the relay
+                    // re-announces the whole time with no visible effect.
+                    tracing::debug!(
+                        target: GOV,
+                        relay = %pubkey,
+                        "registration ignored: relay is serving an integrity backoff"
+                    );
+                } else {
                     self.sidelined.remove(&pubkey);
                     self.registered.insert(pubkey);
                     self.relay_xpubs.insert(pubkey, exchange_pubkey);
@@ -635,6 +644,7 @@ impl SchedulerCore {
         if !self.params.renegotiate_on_fault {
             for fault in &faults {
                 tracing::info!(
+                    target: GOV,
                     subnet,
                     kind = ?fault.kind,
                     attribution = ?fault.attribution,
@@ -649,6 +659,14 @@ impl SchedulerCore {
             match fault.attribution {
                 Attribution::Peers(pks) => {
                     for pk in pks {
+                        tracing::warn!(
+                            target: GOV,
+                            subnet,
+                            relay = %pk,
+                            kind = ?fault.kind,
+                            sidelined = self.params.sideline,
+                            "escalating subnet: attributed fault"
+                        );
                         self.escalation.entry(subnet).or_default().relays.insert(pk);
                         if !self.params.sideline {
                             continue;
@@ -661,6 +679,12 @@ impl SchedulerCore {
                     }
                 }
                 Attribution::None => {
+                    tracing::warn!(
+                        target: GOV,
+                        subnet,
+                        kind = ?fault.kind,
+                        "escalating subnet: unattributable fault"
+                    );
                     self.escalation.entry(subnet).or_default().general = true;
                 }
             }
@@ -685,9 +709,22 @@ impl SchedulerCore {
             .find(|(id, _, _)| *id == report.subnet)
         {
             Some((_, roster, _)) if !roster.is_empty() => roster.clone(),
-            _ => return,
+            _ => {
+                tracing::debug!(
+                    target: GOV,
+                    subnet = report.subnet,
+                    "fault report for a subnet we don't track, ignored"
+                );
+                return;
+            }
         };
         if from != roster[(report.subnet as usize) % roster.len()] {
+            tracing::debug!(
+                target: GOV,
+                subnet = report.subnet,
+                reporter = %from,
+                "fault report from a non-leader, ignored"
+            );
             return;
         }
         if let Some(frontier) = self
@@ -699,6 +736,7 @@ impl SchedulerCore {
                 && report.round <= frontier.saturating_add(FAULT_REPORT_ROUND_WINDOW);
             if !in_window {
                 tracing::debug!(
+                    target: GOV,
                     subnet = report.subnet,
                     report_round = report.round,
                     frontier,
@@ -707,18 +745,41 @@ impl SchedulerCore {
                 return;
             }
         }
+        // The leader claims an integrity fault we can't re-derive from its own
+        // evidence: either the evidence is malformed or the leader is lying.
         let Some(culprit) =
             crate::panetiere::integrity_culprit_from_evidence(&report.fault.evidence, &roster)
         else {
+            tracing::warn!(
+                target: GOV,
+                subnet = report.subnet,
+                report_round = report.round,
+                reporter = %from,
+                "fault report evidence does not attribute a culprit, ignored"
+            );
             return;
         };
         if report.fault.attribution != Attribution::Peers(vec![culprit]) {
+            tracing::warn!(
+                target: GOV,
+                subnet = report.subnet,
+                report_round = report.round,
+                reporter = %from,
+                derived = %culprit,
+                "fault report attributes a relay its evidence does not, ignored"
+            );
             return;
         }
         if !self
             .seen_integrity_faults
             .insert((report.subnet, report.round, culprit))
         {
+            tracing::trace!(
+                target: GOV,
+                subnet = report.subnet,
+                report_round = report.round,
+                "fault report already applied, ignored"
+            );
             return;
         }
         self.apply_observed_faults(report.subnet, vec![report.fault], now_unix_ms);
@@ -840,6 +901,7 @@ impl SchedulerCore {
             .unwrap_or(0)
             .min(MAX_SUBNET_CLIENTS);
         tracing::debug!(
+            target: SCHED,
             is_lead = self.is_lead,
             observers = self.observers.len(),
             registered = self.registered.len(),
@@ -920,6 +982,20 @@ impl SchedulerCore {
         // governance — it must still escalate with the relays that remain.
         let enough_relays = self.registered.len() >= self.params.min_relays
             || (faulted && !self.registered.is_empty());
+        // The lead holding back is how the network wedges with no config at all:
+        // the floors are never met, so nothing is ever proposed.
+        if self.is_lead && !(enough_relays && self.services.len() >= self.params.min_services) {
+            tracing::debug!(
+                target: GOV,
+                round,
+                registered = self.registered.len(),
+                min_relays = self.params.min_relays,
+                services = self.services.len(),
+                min_services = self.params.min_services,
+                sidelined = self.sidelined.len(),
+                "scheduler: lead is below the registration floors; no proposal this round"
+            );
+        }
         if self.is_lead && enough_relays && self.services.len() >= self.params.min_services {
             // Per-subnet protocol, so a fault escalates only its own subnet.
             let mut protos = self.subnet_protocols();
@@ -956,6 +1032,16 @@ impl SchedulerCore {
                     signature,
                 };
                 let bytes = bincode::serialize(&proposal).expect("proposal serialises");
+                tracing::debug!(
+                    target: GOV,
+                    round,
+                    version = self.public_round,
+                    published = ?self.published_round,
+                    subnets = protos.len(),
+                    capacity = self.capacity,
+                    len = bytes.len(),
+                    "scheduler: lead staging a proposal"
+                );
                 actions.push(SchedulerAction::StageProposal(bytes));
             }
         }
@@ -965,13 +1051,26 @@ impl SchedulerCore {
     /// Raise the round counters to a network-adopted config, so a restarted
     /// member proposes above the network instead of wedging on stale-round rejections.
     pub fn on_published_config(&mut self, cfg: &AnymoneRoundConfiguration) -> bool {
-        if cfg
-            .verify_multisig(&self.committee, self.threshold)
-            .is_err()
-        {
+        if let Err(e) = cfg.verify_multisig(&self.committee, self.threshold) {
+            tracing::debug!(
+                target: GOV,
+                version = cfg.body.round,
+                sigs = cfg.signatures.len(),
+                threshold = self.threshold,
+                ?e,
+                "scheduler: published config failed multisig verification"
+            );
             return false;
         }
         if !validate_structure(&cfg.body) {
+            // We stay pinned to a stale round and keep proposing below the
+            // network, which every current member rejects.
+            tracing::warn!(
+                target: GOV,
+                version = cfg.body.round,
+                subnets = cfg.body.subnets.len(),
+                "scheduler: published config failed structural validation"
+            );
             return false;
         }
         let r = cfg.body.round;
@@ -993,6 +1092,13 @@ impl SchedulerCore {
         // 1. Proposer authentication: only the lead may propose, and the
         //    signature must cover the body.
         if proposal.proposer != self.lead {
+            tracing::debug!(
+                target: GOV,
+                round = proposal.body.round,
+                proposer = %proposal.proposer,
+                lead = %self.lead,
+                "scheduler: rejecting proposal from a non-lead member"
+            );
             return Vec::new();
         }
         let canonical = proposal.body.canonical_bytes();
@@ -1000,6 +1106,12 @@ impl SchedulerCore {
             .proposer
             .verify(&proposal.body.propose_bytes(), &proposal.signature)
         {
+            tracing::warn!(
+                target: GOV,
+                round = proposal.body.round,
+                proposer = %proposal.proposer,
+                "scheduler: rejecting proposal whose signature does not cover the body"
+            );
             return Vec::new();
         }
         // 2. Replay freshness: reject a strictly older proposal (rollback). The
@@ -1008,12 +1120,20 @@ impl SchedulerCore {
             .last_accepted_round
             .is_some_and(|last| proposal.body.round < last)
         {
+            tracing::debug!(
+                target: GOV,
+                round = proposal.body.round,
+                last_accepted = ?self.last_accepted_round,
+                "scheduler: rejecting stale proposal"
+            );
             return Vec::new();
         }
         // 3. Independent validation: a malicious lead can't insert relays or
-        //    services we never saw registered.
+        //    services we never saw registered. `validate_body` logs the reason.
         if !self.validate_body(&proposal.body) {
             tracing::debug!(
+                target: GOV,
+                round = proposal.body.round,
                 registered = self.registered.len(),
                 services = self.services.len(),
                 "scheduler: rejecting proposal in validate_body"
@@ -1053,6 +1173,11 @@ impl SchedulerCore {
     /// crosses the threshold.
     pub fn on_committee_sig(&mut self, sig_msg: CommitteeSig) -> Vec<SchedulerAction> {
         if !self.committee.contains(&sig_msg.signer) {
+            tracing::debug!(
+                target: GOV,
+                signer = %sig_msg.signer,
+                "scheduler: signature from outside the committee, ignored"
+            );
             return Vec::new();
         }
         // `body_bytes` is canonical (fixint/big-endian) — decode it the same
@@ -1060,12 +1185,24 @@ impl SchedulerCore {
         // match the stored one and assembly never fires.
         let Ok(body) = AnymoneRoundConfigurationBody::from_canonical_bytes(&sig_msg.body_bytes)
         else {
+            tracing::debug!(
+                target: GOV,
+                signer = %sig_msg.signer,
+                len = sig_msg.body_bytes.len(),
+                "scheduler: signature over an undecodable body, ignored"
+            );
             return Vec::new();
         };
         if !sig_msg
             .signer
             .verify(&body.approve_bytes(), &sig_msg.signature)
         {
+            tracing::warn!(
+                target: GOV,
+                round = body.round,
+                signer = %sig_msg.signer,
+                "scheduler: committee signature does not verify, ignored"
+            );
             return Vec::new();
         }
         self.sigs
@@ -1145,9 +1282,24 @@ impl SchedulerCore {
             signatures,
         };
         if let Err(e) = cfg.verify_multisig(&self.committee, self.threshold) {
-            tracing::debug!(?e, "scheduler: assembled config failed verify_multisig");
+            // Threshold signatures collected but the assembly won't verify, so
+            // this config can never publish and governance stalls here.
+            tracing::warn!(
+                target: GOV,
+                round = body.round,
+                sigs = cfg.signatures.len(),
+                threshold = self.threshold,
+                ?e,
+                "scheduler: assembled config failed verify_multisig"
+            );
             return None;
         }
+        tracing::debug!(
+            target: GOV,
+            round = body.round,
+            sigs = cfg.signatures.len(),
+            "scheduler: assembled a threshold-signed config; publishing"
+        );
         self.published.insert(canonical);
         self.published_round = Some(
             self.published_round
@@ -1168,6 +1320,12 @@ impl SchedulerCore {
     /// out-of-bounds size, or a protocol the scheduler never emits all reject it.
     fn validate_body(&self, body: &AnymoneRoundConfigurationBody) -> bool {
         if !validate_structure(body) {
+            tracing::debug!(
+                target: GOV,
+                round = body.round,
+                subnets = body.subnets.len(),
+                "validate_body: structural bounds"
+            );
             return false;
         }
         if !body
@@ -1175,13 +1333,35 @@ impl SchedulerCore {
             .iter()
             .all(|svc| self.services.get(&svc.tag) == Some(&svc.pubkey))
         {
+            tracing::debug!(
+                target: GOV,
+                round = body.round,
+                proposed = body.services.len(),
+                known = self.services.len(),
+                "validate_body: a proposed service is not one we saw register"
+            );
             return false;
         }
         if !self.exchange_keys_match(&body.relay_exchange_keys) {
+            tracing::debug!(
+                target: GOV,
+                round = body.round,
+                proposed = body.relay_exchange_keys.len(),
+                known = self.relay_xpubs.len(),
+                "validate_body: a relay exchange key differs from what its owner registered"
+            );
             return false;
         }
         for s in &body.subnets {
             if !s.relays.iter().all(|pk| self.registered.contains(pk)) {
+                tracing::debug!(
+                    target: GOV,
+                    round = body.round,
+                    subnet = s.id,
+                    relays = s.relays.len(),
+                    registered = self.registered.len(),
+                    "validate_body: a proposed relay is not one we saw register"
+                );
                 return false;
             }
             let keys_ok = match &s.protocol {
@@ -1193,6 +1373,12 @@ impl SchedulerCore {
                 ProtocolConfig::ScheduledAdcnet(_) | ProtocolConfig::Nym(_) => false,
             };
             if !keys_ok {
+                tracing::debug!(
+                    target: GOV,
+                    round = body.round,
+                    subnet = s.id,
+                    "validate_body: subnet aggregation groups are not valid"
+                );
                 return false;
             }
         }

@@ -28,6 +28,7 @@ use tokio::sync::mpsc;
 use crate::config::{ExchangePublicKeyWire, PanetiereConfig, ProtocolConfig, Round, Subnet};
 use crate::faults::{Attribution, Fault, FaultKind, OutputFaultTracker};
 use crate::identity::{Identity, Pubkey};
+use crate::log_target::{PANETIERE, SCHED};
 use crate::runtime::{
     aggregator_group_of, client_aggregator_topic, deadline_for, drain_inbound, egress_dest,
     gossip_faults, handle_inbound, publish_and_loop_back, recv_any, round_at, route_to_pipe,
@@ -176,6 +177,7 @@ fn client_session(
     let servers = seal_roster(relay_xk, subnet);
     if servers.len() != subnet.relays.len() {
         tracing::warn!(
+            target: PANETIERE,
             have = servers.len(),
             need = subnet.relays.len(),
             "panetiere client: relay exchange keys incomplete"
@@ -333,6 +335,16 @@ pub(crate) async fn run_subnet(
     let now_ms = crate::config::now_unix_ms();
     let mut round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms);
     let spawn_round = round;
+    tracing::debug!(
+        target: SCHED,
+        subnet = subnet.id,
+        round,
+        relay = subnet.relays.contains(&identity_pk),
+        leader = leader_pk == identity_pk,
+        aggregated = aggregated_subnet,
+        dur_ms,
+        "panetiere worker: start"
+    );
     let mut deadline = deadline_for(round, base_round, epoch_unix_ms, dur_ms, now_ms);
     let mut mid_deadline = deadline - std::time::Duration::from_millis(mid_offset_ms);
     let mut commit_deadline = deadline - std::time::Duration::from_millis(commit_offset_ms);
@@ -436,6 +448,7 @@ pub(crate) async fn run_subnet(
                         n_messages: n_decoded,
                     });
                 }
+                crate::runtime::log_round_outcome("panetiere", subnet.id, round, n_decoded, faults.len());
                 let faults = faults
                     .into_iter()
                     .map(|f| (evidence_round(&f.evidence).unwrap_or(round), f))
@@ -445,12 +458,19 @@ pub(crate) async fn run_subnet(
                 }
 
                 if final_round.is_some_and(|f| round >= f) {
+                    tracing::debug!(
+                        target: SCHED,
+                        subnet = subnet.id,
+                        round,
+                        "panetiere worker: graceful exit"
+                    );
                     return;
                 }
                 let now_ms = crate::config::now_unix_ms();
                 let next = round_at(base_round, epoch_unix_ms, dur_ms, now_ms).max(round + 1);
                 if next > round + 1 {
                     tracing::debug!(
+                        target: SCHED,
                         from = round,
                         to = next,
                         "panetiere worker: lagged past a round boundary, skipping rounds"
@@ -916,9 +936,27 @@ impl Session for PanetiereObserverSession {
     }
 
     fn on_inbound(&mut self, from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
-        if let Ok(msg) = bincode::deserialize::<PanetiereWire>(&payload) {
+        let msg = match bincode::deserialize::<PanetiereWire>(&payload) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::debug!(
+                    target: PANETIERE,
+                    len = payload.len(),
+                    error = %e,
+                    "panetiere observer: undecodable wire message"
+                );
+                return Vec::new();
+            }
+        };
+        {
             let round = msg.round();
             if !round_in_window(round, self.cur_round) {
+                tracing::debug!(
+                    target: PANETIERE,
+                    msg_round = round,
+                    cur_round = ?self.cur_round,
+                    "panetiere observer: message outside round window, not counted"
+                );
                 return Vec::new();
             }
             self.max_round = Some(self.max_round.map_or(round, |m| m.max(round)));
@@ -933,6 +971,13 @@ impl Session for PanetiereObserverSession {
                 } => {
                     // Liveness credit and attribution bind to the slot owner's key.
                     let Some(&expected) = self.roster.get(*server_id as usize) else {
+                        tracing::debug!(
+                            target: PANETIERE,
+                            round,
+                            server_id,
+                            roster = self.roster.len(),
+                            "panetiere observer: share for a slot outside the roster, no liveness credit"
+                        );
                         return Vec::new();
                     };
                     if from != expected
@@ -943,6 +988,13 @@ impl Session for PanetiereObserverSession {
                             signature,
                         )
                     {
+                        tracing::debug!(
+                            target: PANETIERE,
+                            round,
+                            server_id,
+                            wrong_sender = from != expected,
+                            "panetiere observer: share failed slot-owner authentication, no liveness credit"
+                        );
                         return Vec::new();
                     }
                     // Panetiere server ids are the 0-based sorted-roster index.
@@ -998,7 +1050,21 @@ impl Session for PanetiereObserverSession {
                 PanetiereWire::Reservations { round, .. } if self.leader == Some(from) => {
                     self.tracker.observe_output(*round);
                 }
-                _ => {}
+                // A leader-only message from a non-leader: either a stale roster
+                // (so the real leader's set is being ignored too, and the
+                // anonymity set reads low) or a peer forging one.
+                PanetiereWire::ClientSet { round, .. }
+                | PanetiereWire::Decoded { round, .. }
+                | PanetiereWire::Reservations { round, .. } => {
+                    tracing::debug!(
+                        target: PANETIERE,
+                        round,
+                        expected_leader = ?self.leader,
+                        "panetiere observer: leader-only message from a non-leader, ignored"
+                    );
+                }
+                PanetiereWire::ClientPublic { .. } | PanetiereWire::Opening { .. } => {}
+                PanetiereWire::GroupAggregate { .. } => {}
             }
         }
         Vec::new()
@@ -1067,12 +1133,16 @@ impl Session for PanetiereClientSession {
         // partial set would poison the servers' all-or-nothing rounds.
         if self.servers.len() != self.pp.cs.n_servers {
             tracing::debug!(
+                target: PANETIERE,
+                round,
                 have = self.servers.len(),
                 need = self.pp.cs.n_servers,
+                staged = self.pending.is_some(),
                 "panetiere client: missing relay exchange keys; skipping round"
             );
             return Vec::new();
         }
+        let had_pending = self.pending.is_some();
         let msg = match self.pending.take() {
             Some(m) => m,
             None if self.cover_rng.gen::<f32>() < self.cover_rate => {
@@ -1080,7 +1150,15 @@ impl Session for PanetiereClientSession {
                 cover.resize(message_polys(&self.pp), KahePoly::default());
                 cover
             }
-            None => return Vec::new(),
+            None => {
+                tracing::trace!(
+                    target: PANETIERE,
+                    round,
+                    client_id = self.client_id.0,
+                    "panetiere client: nothing staged and cover coin missed; silent this round"
+                );
+                return Vec::new();
+            }
         };
         // The RNG is rebuilt from the seed each round; folding the round into
         // the trailing bytes keeps per-round randomness distinct.
@@ -1088,7 +1166,13 @@ impl Session for PanetiereClientSession {
         seed[24..32].copy_from_slice(&round.to_le_bytes());
         let mut rng = ChaCha20Rng::from_seed(seed);
         let round_out = run_client_round(&mut rng, &self.pp, self.client_id, msg, &self.servers);
-        tracing::debug!(round, client_id = self.client_id.0, "panetiere client: emitting");
+        tracing::trace!(
+            target: PANETIERE,
+            round,
+            client_id = self.client_id.0,
+            real = had_pending,
+            "panetiere client: emitting"
+        );
 
         let mut out: Vec<Vec<u8>> = Vec::with_capacity(1 + self.servers.len());
 
@@ -1125,11 +1209,21 @@ impl Session for PanetiereClientSession {
         let cap = self.mse.payload_symbols * BYTES_PER_SYMBOL;
         if payload.len() > cap {
             tracing::error!(
+                target: PANETIERE,
                 len = payload.len(),
                 cap,
                 "panetiere client: staged payload exceeds channel capacity, dropped"
             );
             return;
+        }
+        // Overwrites a payload staged but not yet emitted (the runtime stages at
+        // most one per round, but the committee's StageProposal path can).
+        if self.pending.is_some() {
+            tracing::debug!(
+                target: PANETIERE,
+                client_id = self.client_id.0,
+                "panetiere client: staged payload replaced one that had not been emitted"
+            );
         }
         // One MSE insert per message: the leader peels every active client's
         // element out of the summed plaintext, so concurrent senders don't collide.
@@ -1353,7 +1447,8 @@ impl PanetiereServerSession {
             canonical.dedup();
             // Admitted + capacity-rejected: uncensored, unlike the capped set.
             let demand = (state.owners.len() + state.rejected.len()).max(canonical.len()) as u32;
-            tracing::debug!(
+            tracing::trace!(
+                target: PANETIERE,
                 round = r,
                 aggregated,
                 publics = state.publics.len(),
@@ -1363,7 +1458,30 @@ impl PanetiereServerSession {
                 demand,
                 "panetiere leader: canonical set"
             );
-            if !canonical.is_empty() {
+            // Openings without a matching public (or vice versa) are clients the
+            // leader saw but can't announce, so they're excluded from the round.
+            if !aggregated && canonical.len() < state.inbox_items.len() {
+                tracing::debug!(
+                    target: PANETIERE,
+                    round = r,
+                    announced = canonical.len(),
+                    inbox = state.inbox_items.len(),
+                    publics = state.publics.len(),
+                    capped_at = self.client_set_max,
+                    "panetiere leader: clients excluded from the canonical set"
+                );
+            }
+            if canonical.is_empty() {
+                tracing::debug!(
+                    target: PANETIERE,
+                    round = r,
+                    aggregated,
+                    publics = state.publics.len(),
+                    inbox = state.inbox_items.len(),
+                    groups = state.group_aggregates.len(),
+                    "panetiere leader: nothing to announce for a non-empty round"
+                );
+            } else {
                 announce.push((r, canonical, demand));
             }
         }
@@ -1390,11 +1508,21 @@ impl PanetiereServerSession {
 /// run while `rounds` is borrowed mutably for iteration.
 fn try_decode_round(
     pp: &ProtocolParams,
+    round: Round,
     state: &PanetiereRoundState,
     anchor: Option<&[ClientId]>,
     min_clients: usize,
 ) -> (Option<Vec<KahePoly>>, Vec<ServerId>) {
     if state.peer_server_publics.len() < pp.shamir.t {
+        // Peers' shares for a round arrive during the next one, so this is the
+        // normal state for the round that just ended.
+        tracing::trace!(
+            target: PANETIERE,
+            round,
+            shares = state.peer_server_publics.len(),
+            need = pp.shamir.t,
+            "panetiere decode: below the share threshold, not yet decodable"
+        );
         return (None, Vec::new());
     }
     // Public subnets pass the leader's single announced set as `anchor` — decode
@@ -1433,11 +1561,29 @@ fn try_decode_round(
         }
     };
 
+    // The round holds enough shares to decode, so every remaining rejection is a
+    // real reason this round produced nothing — not just "too early".
     for (canonical, mut outputs) in candidates {
         if canonical.len() < min_clients {
+            tracing::debug!(
+                target: PANETIERE,
+                round,
+                canonical = canonical.len(),
+                min_clients,
+                "panetiere decode: canonical set below the anonymity floor, refusing to decode"
+            );
             continue;
         }
         if outputs.len() < pp.shamir.t {
+            tracing::debug!(
+                target: PANETIERE,
+                round,
+                agreeing = outputs.len(),
+                shares = state.peer_server_publics.len(),
+                need = pp.shamir.t,
+                canonical = canonical.len(),
+                "panetiere decode: too few relays shared over this client set"
+            );
             continue;
         }
         let publics: Vec<(ClientId, ClientBulletinEntry)> = canonical
@@ -1445,11 +1591,26 @@ fn try_decode_round(
             .filter_map(|cid| state.publics.get(cid).map(|p| (*cid, p.clone())))
             .collect();
         if publics.len() != canonical.len() {
+            tracing::debug!(
+                target: PANETIERE,
+                round,
+                have = publics.len(),
+                canonical = canonical.len(),
+                "panetiere decode: missing client publics for the canonical set"
+            );
             continue;
         }
         let mut culprits = Vec::new();
         loop {
             if outputs.len() < pp.shamir.t {
+                tracing::debug!(
+                    target: PANETIERE,
+                    round,
+                    remaining = outputs.len(),
+                    need = pp.shamir.t,
+                    excluded = culprits.len(),
+                    "panetiere decode: dropped too many bad shares to reach the threshold"
+                );
                 break;
             }
             match aggregate_and_decrypt(pp, &canonical, &publics, &outputs) {
@@ -1457,12 +1618,29 @@ fn try_decode_round(
                 Err(VerifyError::InvalidServerOpening(i))
                 | Err(VerifyError::ShareOpeningMismatch(i)) => {
                     if i >= outputs.len() {
+                        tracing::debug!(
+                            target: PANETIERE,
+                            round,
+                            i,
+                            outputs = outputs.len(),
+                            "panetiere decode: culprit index out of range"
+                        );
                         break;
                     }
                     culprits.push(outputs[i].server_id);
                     outputs.remove(i);
                 }
-                Err(_) => break,
+                Err(e) => {
+                    tracing::debug!(
+                        target: PANETIERE,
+                        round,
+                        canonical = canonical.len(),
+                        outputs = outputs.len(),
+                        ?e,
+                        "panetiere decode: unattributable verify error"
+                    );
+                    break;
+                }
             }
         }
     }
@@ -1475,6 +1653,7 @@ fn try_decode_round(
 /// a still-arriving group is just "not yet decodable", not a permanent mismatch.
 fn try_decode_round_aggregated(
     pp: &ProtocolParams,
+    round: Round,
     agg: &LeaderAggregation,
     state: &PanetiereRoundState,
     anchor: Option<&[ClientId]>,
@@ -1482,6 +1661,13 @@ fn try_decode_round_aggregated(
 ) -> (Option<Vec<KahePoly>>, Vec<ServerId>) {
     let mut culprits = Vec::new();
     if state.peer_server_publics.len() < pp.shamir.t {
+        tracing::trace!(
+            target: PANETIERE,
+            round,
+            shares = state.peer_server_publics.len(),
+            need = pp.shamir.t,
+            "panetiere decode: below the share threshold, not yet decodable"
+        );
         return (None, culprits);
     }
     let canonical = match anchor {
@@ -1493,11 +1679,23 @@ fn try_decode_round_aggregated(
             .map(|sp| sp.clients.clone()),
     };
     let Some(mut canonical) = canonical else {
+        tracing::debug!(
+            target: PANETIERE,
+            round,
+            "panetiere decode: no canonical set for a round holding enough shares"
+        );
         return (None, culprits);
     };
     canonical.sort();
     canonical.dedup();
     if canonical.len() < min_clients {
+        tracing::debug!(
+            target: PANETIERE,
+            round,
+            canonical = canonical.len(),
+            min_clients,
+            "panetiere decode: canonical set below the anonymity floor, refusing to decode"
+        );
         return (None, culprits);
     }
 
@@ -1511,11 +1709,27 @@ fn try_decode_round_aggregated(
     for (group, mut expected) in by_group {
         expected.sort();
         let Some(g) = state.group_aggregates.get(&group) else {
+            tracing::debug!(
+                target: PANETIERE,
+                round,
+                group,
+                members = expected.len(),
+                have_groups = state.group_aggregates.len(),
+                "panetiere decode: a canonical group's aggregate never arrived"
+            );
             return (None, culprits);
         };
         let mut got = g.clients.clone();
         got.sort();
         if got != expected {
+            tracing::debug!(
+                target: PANETIERE,
+                round,
+                group,
+                got = got.len(),
+                expected = expected.len(),
+                "panetiere decode: group aggregate membership disagrees with the canonical set"
+            );
             return (None, culprits);
         }
         ctxts.push(g.entry.ctxt.clone());
@@ -1540,6 +1754,16 @@ fn try_decode_round_aggregated(
         .collect();
     loop {
         if outputs.len() < pp.shamir.t {
+            tracing::debug!(
+                target: PANETIERE,
+                round,
+                agreeing = outputs.len(),
+                shares = state.peer_server_publics.len(),
+                need = pp.shamir.t,
+                excluded = culprits.len(),
+                canonical = canonical.len(),
+                "panetiere decode: too few relays shared over this client set"
+            );
             return (None, culprits);
         }
         match decrypt_aggregate(pp, &total_ctxt, &total_comm, &outputs) {
@@ -1547,12 +1771,29 @@ fn try_decode_round_aggregated(
             Err(VerifyError::InvalidServerOpening(i))
             | Err(VerifyError::ShareOpeningMismatch(i)) => {
                 if i >= outputs.len() {
+                    tracing::debug!(
+                        target: PANETIERE,
+                        round,
+                        i,
+                        outputs = outputs.len(),
+                        "panetiere decode: culprit index out of range"
+                    );
                     return (None, culprits);
                 }
                 culprits.push(outputs[i].server_id);
                 outputs.remove(i);
             }
-            Err(_) => return (None, culprits),
+            Err(e) => {
+                tracing::debug!(
+                    target: PANETIERE,
+                    round,
+                    canonical = canonical.len(),
+                    outputs = outputs.len(),
+                    ?e,
+                    "panetiere decode: unattributable verify error"
+                );
+                return (None, culprits);
+            }
         }
     }
 }
@@ -1581,8 +1822,17 @@ impl Session for PanetiereServerSession {
     }
 
     fn on_inbound(&mut self, from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
-        let Ok(msg) = bincode::deserialize::<PanetiereWire>(&payload) else {
-            return Vec::new();
+        let msg = match bincode::deserialize::<PanetiereWire>(&payload) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::debug!(
+                    target: PANETIERE,
+                    len = payload.len(),
+                    error = %e,
+                    "panetiere server: undecodable wire message"
+                );
+                return Vec::new();
+            }
         };
         if !round_in_window(msg.round(), self.cur_round) {
             // A client whose round clock drifts past the window is silently
@@ -1593,6 +1843,7 @@ impl Session for PanetiereServerSession {
                 PanetiereWire::ClientPublic { .. } | PanetiereWire::Opening { .. }
             ) {
                 tracing::debug!(
+                    target: PANETIERE,
                     msg_round = msg.round(),
                     cur_round = ?self.cur_round,
                     kind = if matches!(msg, PanetiereWire::ClientPublic { .. }) { "public" } else { "opening" },
@@ -1609,6 +1860,7 @@ impl Session for PanetiereServerSession {
             } => {
                 if entry.len() != self.entry_len {
                     tracing::debug!(
+                        target: PANETIERE,
                         round,
                         client_id,
                         len = entry.len(),
@@ -1627,6 +1879,7 @@ impl Session for PanetiereServerSession {
                             bucket.rejected.insert(cid);
                         }
                         tracing::debug!(
+                            target: PANETIERE,
                             round,
                             client_id,
                             max,
@@ -1634,10 +1887,33 @@ impl Session for PanetiereServerSession {
                         );
                         return Vec::new();
                     }
-                    Admit::NotOwner => return Vec::new(),
+                    // Either an id not derived from the sender's key, or a second
+                    // signer claiming an id someone else already owns.
+                    Admit::NotOwner => {
+                        tracing::debug!(
+                            target: PANETIERE,
+                            round,
+                            client_id,
+                            from = %from,
+                            derived = client_id_from_pubkey(from).0,
+                            "panetiere server: public rejected, client id not owned by the sender"
+                        );
+                        return Vec::new();
+                    }
                 }
-                if let Some(entry) = ClientBulletinEntry::from_bytes(&entry) {
-                    bucket.publics.insert(cid, entry);
+                match ClientBulletinEntry::from_bytes(&entry) {
+                    Some(entry) => {
+                        bucket.publics.insert(cid, entry);
+                    }
+                    // Right length, wrong contents: the client holds this round's
+                    // slot but has no usable public, so the round can't decode.
+                    None => tracing::debug!(
+                        target: PANETIERE,
+                        round,
+                        client_id,
+                        len = entry.len(),
+                        "panetiere server: unparseable client public dropped"
+                    ),
                 }
             }
             PanetiereWire::Opening {
@@ -1652,6 +1928,7 @@ impl Session for PanetiereServerSession {
                 // `publics` yet excluded from `inbox_items ∩ publics`.
                 if target_server != self.server_id.0 {
                     tracing::trace!(
+                        target: PANETIERE,
                         round,
                         client_id,
                         target_server,
@@ -1673,22 +1950,47 @@ impl Session for PanetiereServerSession {
                                 bucket.rejected.insert(cid);
                             }
                             tracing::debug!(
+                                target: PANETIERE,
                                 round,
                                 client_id,
+                                max,
                                 "panetiere server: opening admission rejected"
                             );
                             return Vec::new();
                         }
-                        Admit::NotOwner => return Vec::new(),
+                        Admit::NotOwner => {
+                            tracing::debug!(
+                                target: PANETIERE,
+                                round,
+                                client_id,
+                                from = %from,
+                                derived = client_id_from_pubkey(from).0,
+                                "panetiere server: opening rejected, client id not owned by the sender"
+                            );
+                            return Vec::new();
+                        }
                     }
                     let Some(opening) = unseal_opening(self.identity.exchange().pke(), &sealed)
                     else {
-                        tracing::debug!(client_id, "panetiere server: undecodable sealed opening");
+                        // Sealed to a stale exchange key: this relay holds the
+                        // client's slot but can never open its share.
+                        tracing::debug!(
+                            target: PANETIERE,
+                            round,
+                            client_id,
+                            "panetiere server: undecodable sealed opening"
+                        );
                         return Vec::new();
                     };
                     let bucket = self.rounds.entry(round).or_default();
                     // First-writer-wins per client per round.
                     if bucket.inbox_items.iter().any(|(c, _)| *c == cid) {
+                        tracing::trace!(
+                            target: PANETIERE,
+                            round,
+                            client_id,
+                            "panetiere server: duplicate opening ignored"
+                        );
                         return Vec::new();
                     }
                     bucket.inbox_items.push((cid, opening));
@@ -1702,8 +2004,16 @@ impl Session for PanetiereServerSession {
                 agg_share,
                 signature,
             } => {
-                // Attribution binds to the slot owner's key.
+                // Attribution binds to the slot owner's key. Every rejection here
+                // costs the round one share towards the decode threshold.
                 let Some(&expected) = self.server_pubkeys.get(&ServerId(server_id)) else {
+                    tracing::debug!(
+                        target: PANETIERE,
+                        round,
+                        server_id,
+                        roster = self.server_pubkeys.len(),
+                        "panetiere server: share for a slot outside our roster, dropped"
+                    );
                     return Vec::new();
                 };
                 if from != expected
@@ -1714,26 +2024,57 @@ impl Session for PanetiereServerSession {
                         &signature,
                     )
                 {
+                    tracing::debug!(
+                        target: PANETIERE,
+                        round,
+                        server_id,
+                        wrong_sender = from != expected,
+                        "panetiere server: share failed slot-owner authentication, dropped"
+                    );
                     return Vec::new();
                 }
                 let Some(packed) = PackedOpening::from_bytes(&agg_open) else {
+                    tracing::debug!(
+                        target: PANETIERE,
+                        round,
+                        server_id,
+                        len = agg_open.len(),
+                        "panetiere server: unparseable packed opening in a share, dropped"
+                    );
                     return Vec::new();
                 };
                 let n_shares = packed.mu_cs as usize;
                 let Ok(agg_open) = Opening::from_packed(&packed) else {
+                    tracing::debug!(
+                        target: PANETIERE,
+                        round,
+                        server_id,
+                        n_shares,
+                        "panetiere server: packed opening failed to unpack, share dropped"
+                    );
                     return Vec::new();
                 };
-                if let Some(agg_share) = panetiere::cs::unpack_cs_shares(&agg_share, n_shares) {
-                    let bucket = self.rounds.entry(round).or_default();
-                    bucket.peer_server_publics.insert(
-                        ServerId(server_id),
-                        ServerBulletinEntry {
-                            server_id: ServerId(server_id),
-                            clients: clients.into_iter().map(ClientId).collect(),
-                            agg_open,
-                            agg_share,
-                        },
-                    );
+                match panetiere::cs::unpack_cs_shares(&agg_share, n_shares) {
+                    Some(agg_share) => {
+                        let bucket = self.rounds.entry(round).or_default();
+                        bucket.peer_server_publics.insert(
+                            ServerId(server_id),
+                            ServerBulletinEntry {
+                                server_id: ServerId(server_id),
+                                clients: clients.into_iter().map(ClientId).collect(),
+                                agg_open,
+                                agg_share,
+                            },
+                        );
+                    }
+                    None => tracing::debug!(
+                        target: PANETIERE,
+                        round,
+                        server_id,
+                        len = agg_share.len(),
+                        n_shares,
+                        "panetiere server: share body failed to unpack, dropped"
+                    ),
                 }
             }
             // Servers decode themselves; `Decoded` is for watchers.
@@ -1746,7 +2087,24 @@ impl Session for PanetiereServerSession {
                 demand: _,
             } => {
                 if let SetMode::Follower { leader } = self.mode {
-                    if from == leader && clients.len() <= self.client_set_max {
+                    if from != leader {
+                        tracing::debug!(
+                            target: PANETIERE,
+                            round,
+                            n = clients.len(),
+                            "panetiere server: ClientSet from a non-leader, ignored"
+                        );
+                    } else if clients.len() > self.client_set_max {
+                        // We never share over this round, so the leader can't
+                        // reach the decode threshold either.
+                        tracing::debug!(
+                            target: PANETIERE,
+                            round,
+                            n = clients.len(),
+                            max = self.client_set_max,
+                            "panetiere server: leader announced a set above our cap, ignored"
+                        );
+                    } else {
                         self.client_set_by_round
                             .entry(round)
                             .or_insert_with(|| clients.into_iter().map(ClientId).collect());
@@ -1762,9 +2120,22 @@ impl Session for PanetiereServerSession {
                 signature,
             } => {
                 let Some(agg) = self.aggregation.as_ref() else {
+                    tracing::debug!(
+                        target: PANETIERE,
+                        round,
+                        group,
+                        "panetiere server: group aggregate on a non-aggregated subnet, dropped"
+                    );
                     return Vec::new();
                 };
                 let Some(roster) = agg.roster.get(&group) else {
+                    tracing::debug!(
+                        target: PANETIERE,
+                        round,
+                        group,
+                        groups = agg.roster.len(),
+                        "panetiere server: group aggregate for an unknown group, dropped"
+                    );
                     return Vec::new();
                 };
                 if !roster.contains(&signer)
@@ -1773,6 +2144,14 @@ impl Session for PanetiereServerSession {
                         &signature,
                     )
                 {
+                    tracing::debug!(
+                        target: PANETIERE,
+                        round,
+                        group,
+                        signer = %signer,
+                        in_roster = roster.contains(&signer),
+                        "panetiere server: group aggregate failed aggregator authentication, dropped"
+                    );
                     return Vec::new();
                 }
                 // A client outside the group's partition would poison the frozen
@@ -1781,23 +2160,28 @@ impl Session for PanetiereServerSession {
                 let group_count = (agg.roster.len() as u32).max(1);
                 if clients.iter().any(|c| c % group_count != group) {
                     tracing::debug!(
+                        target: PANETIERE,
                         round,
                         group,
+                        group_count,
                         "panetiere: aggregate with out-of-group client"
                     );
                     return Vec::new();
                 }
                 if clients.len() > self.client_set_max {
                     tracing::debug!(
+                        target: PANETIERE,
                         round,
                         group,
                         n = clients.len(),
+                        max = self.client_set_max,
                         "panetiere: oversized group aggregate"
                     );
                     return Vec::new();
                 }
                 if entry.len() != self.entry_len {
                     tracing::debug!(
+                        target: PANETIERE,
                         round,
                         group,
                         len = entry.len(),
@@ -1807,6 +2191,13 @@ impl Session for PanetiereServerSession {
                     return Vec::new();
                 }
                 let Some(parsed) = ClientBulletinEntry::from_bytes(&entry) else {
+                    tracing::debug!(
+                        target: PANETIERE,
+                        round,
+                        group,
+                        len = entry.len(),
+                        "panetiere: unparseable group aggregate entry dropped"
+                    );
                     return Vec::new();
                 };
                 // 1-of-n: replicas emit identical bytes, so the first valid
@@ -1933,7 +2324,9 @@ impl PanetiereServerSession {
                     Some(set) => set.clone(),
                     None => {
                         tracing::debug!(
+                            target: PANETIERE,
                             round = r,
+                            openings = state.inbox_items.len(),
                             "panetiere server: no leader ClientSet yet; share deferred"
                         );
                         continue;
@@ -1941,6 +2334,13 @@ impl PanetiereServerSession {
                 }
             };
             if canonical.is_empty() {
+                tracing::debug!(
+                    target: PANETIERE,
+                    round = r,
+                    openings = state.inbox_items.len(),
+                    publics = state.publics.len(),
+                    "panetiere server: empty canonical set with openings held; no share emitted"
+                );
                 continue;
             }
             // run_server_round is all-or-nothing: skip a round we can't fully
@@ -1951,9 +2351,11 @@ impl PanetiereServerSession {
                 let missing = canonical.iter().filter(|c| !present.contains(c)).count();
                 if missing > 0 {
                     tracing::debug!(
+                        target: PANETIERE,
                         round = r,
                         missing,
                         canonical = canonical.len(),
+                        held = present.len(),
                         "panetiere server: openings incomplete for canonical set; share deferred"
                     );
                     continue;
@@ -1963,38 +2365,59 @@ impl PanetiereServerSession {
                 server_id: sid,
                 items: std::mem::take(&mut state.inbox_items),
             };
-            if let Ok(sp) = run_server_round(&inbox, &canonical) {
-                let (r_b, s_b, t_b) =
-                    panetiere::cs::aggregated_opening_pack_bounds(cs, sp.clients.len() as u32);
-                let packed = sp.agg_open.pack(r_b, s_b, t_b);
-                let mut agg_share = panetiere::cs::pack_cs_shares(&sp.agg_share);
-                if corrupt_share {
-                    if let Some(b) = agg_share.first_mut() {
-                        *b ^= 0x01;
+            let n_items = inbox.items.len();
+            match run_server_round(&inbox, &canonical) {
+                Ok(sp) => {
+                    let (r_b, s_b, t_b) =
+                        panetiere::cs::aggregated_opening_pack_bounds(cs, sp.clients.len() as u32);
+                    let packed = sp.agg_open.pack(r_b, s_b, t_b);
+                    let mut agg_share = panetiere::cs::pack_cs_shares(&sp.agg_share);
+                    if corrupt_share {
+                        if let Some(b) = agg_share.first_mut() {
+                            *b ^= 0x01;
+                        }
                     }
+                    let clients: Vec<u32> = sp.clients.iter().map(|c| c.0).collect();
+                    let agg_open = packed.to_bytes();
+                    // Sign what we publish — a corrupted share stays attributable.
+                    let signature = identity.sign(&server_public_signing_bytes(
+                        r,
+                        sp.server_id.0,
+                        &clients,
+                        &agg_open,
+                        &agg_share,
+                    ));
+                    let wire = PanetiereWire::ServerPublic {
+                        round: r,
+                        server_id: sp.server_id.0,
+                        clients,
+                        agg_open,
+                        agg_share,
+                        signature,
+                    };
+                    // Cache our own honest public so try_decode sees it as a peer entry.
+                    tracing::trace!(
+                        target: PANETIERE,
+                        round = r,
+                        server_id = sp.server_id.0,
+                        clients = sp.clients.len(),
+                        "panetiere server: emitting share"
+                    );
+                    state.peer_server_publics.insert(sp.server_id, sp);
+                    outbound.push(bincode::serialize(&wire).expect("serialise server public"));
+                    state.emitted_my_public = true;
                 }
-                let clients: Vec<u32> = sp.clients.iter().map(|c| c.0).collect();
-                let agg_open = packed.to_bytes();
-                // Sign what we publish — a corrupted share stays attributable.
-                let signature = identity.sign(&server_public_signing_bytes(
-                    r,
-                    sp.server_id.0,
-                    &clients,
-                    &agg_open,
-                    &agg_share,
-                ));
-                let wire = PanetiereWire::ServerPublic {
-                    round: r,
-                    server_id: sp.server_id.0,
-                    clients,
-                    agg_open,
-                    agg_share,
-                    signature,
-                };
-                // Cache our own honest public so try_decode sees it as a peer entry.
-                state.peer_server_publics.insert(sp.server_id, sp);
-                outbound.push(bincode::serialize(&wire).expect("serialise server public"));
-                state.emitted_my_public = true;
+                // The openings were consumed by `take` above, so this round can
+                // never produce a share now — it costs the whole round a relay.
+                Err(e) => tracing::warn!(
+                    target: PANETIERE,
+                    round = r,
+                    server_id = sid.0,
+                    canonical = canonical.len(),
+                    openings = n_items,
+                    ?e,
+                    "panetiere server: run_server_round failed; no share for this round"
+                ),
             }
         }
         outbound
@@ -2022,12 +2445,13 @@ impl PanetiereServerSession {
             let (decoded_round, _bad) = match self.aggregation.as_ref() {
                 Some(agg) => try_decode_round_aggregated(
                     &self.pp,
+                    *r,
                     agg,
                     state,
                     anchor.as_deref(),
                     self.min_clients,
                 ),
-                None => try_decode_round(&self.pp, state, anchor.as_deref(), self.min_clients),
+                None => try_decode_round(&self.pp, *r, state, anchor.as_deref(), self.min_clients),
             };
             if let Some(plain) = decoded_round {
                 out.push((*r, plain));
@@ -2051,10 +2475,14 @@ impl PanetiereServerSession {
         let t = self.pp.shamir.t;
         for (r, state) in self.rounds.range(..cutoff) {
             if !state.decoded && !state.peer_server_publics.is_empty() {
-                tracing::debug!(
+                // The round's payloads are gone for good; clients sent them once.
+                tracing::warn!(
+                    target: PANETIERE,
                     round = r,
                     shares = state.peer_server_publics.len(),
                     need = t,
+                    publics = state.publics.len(),
+                    openings = state.inbox_items.len(),
                     "panetiere server: round aged out undecoded"
                 );
             }
@@ -2135,6 +2563,7 @@ impl Session for PanetiereAggregatorSession {
         {
             if !round_in_window(round, self.cur_round) {
                 tracing::debug!(
+                    target: PANETIERE,
                     round,
                     client_id,
                     cur = ?self.cur_round,
@@ -2142,9 +2571,18 @@ impl Session for PanetiereAggregatorSession {
                 );
                 return Vec::new();
             }
-            if client_id % self.group_count == self.group {
+            if client_id % self.group_count != self.group {
+                tracing::trace!(
+                    target: PANETIERE,
+                    round,
+                    client_id,
+                    group = self.group,
+                    "panetiere aggregator: public for another group, ignored"
+                );
+            } else {
                 if self.entry_len != usize::MAX && entry.len() != self.entry_len {
                     tracing::debug!(
+                        target: PANETIERE,
                         round,
                         client_id,
                         len = entry.len(),
@@ -2155,18 +2593,31 @@ impl Session for PanetiereAggregatorSession {
                 }
                 let cid = ClientId(client_id);
                 let max = self.client_set_max;
-                if admit_client(self.owners.entry(round).or_default(), cid, from, max)
-                    != Admit::Admitted
-                {
+                let admit = admit_client(self.owners.entry(round).or_default(), cid, from, max);
+                if admit != Admit::Admitted {
                     tracing::debug!(
+                        target: PANETIERE,
                         round,
                         client_id,
+                        max,
+                        at_capacity = admit == Admit::AtCapacity,
                         "panetiere aggregator: public admission rejected"
                     );
                     return Vec::new();
                 }
-                if let Some(entry) = ClientBulletinEntry::from_bytes(&entry) {
-                    self.rounds.entry(round).or_default().insert(cid, entry);
+                match ClientBulletinEntry::from_bytes(&entry) {
+                    Some(entry) => {
+                        self.rounds.entry(round).or_default().insert(cid, entry);
+                    }
+                    // Holds the group slot but contributes nothing summable, so
+                    // the group aggregate omits it and the leader's set won't match.
+                    None => tracing::debug!(
+                        target: PANETIERE,
+                        round,
+                        client_id,
+                        len = entry.len(),
+                        "panetiere aggregator: unparseable client public dropped"
+                    ),
                 }
             }
         }
@@ -2208,7 +2659,8 @@ impl Session for PanetiereAggregatorSession {
             let signature = self.identity.sign(&group_aggregate_signing_bytes(
                 r, self.group, &clients, &entry,
             ));
-            tracing::debug!(
+            tracing::trace!(
+                target: PANETIERE,
                 round = r,
                 group = self.group,
                 of = self.group_count,
@@ -2577,7 +3029,7 @@ mod concurrent_decode_tests {
         let anchor: Vec<ClientId> = announced.iter().map(|&c| ClientId(c)).collect();
         for (si, s) in servers.iter().enumerate() {
             let state = s.rounds.get(&0).unwrap();
-            let (plain, culprits) = try_decode_round(&pp, state, Some(&anchor), 0);
+            let (plain, culprits) = try_decode_round(&pp, 0, state, Some(&anchor), 0);
             assert!(
                 culprits.is_empty(),
                 "server {si}: unexpected culprits {culprits:?}"
@@ -2632,8 +3084,16 @@ impl Session for PanetiereWatchSession {
         if let Ok(PanetiereWire::Decoded { round, payloads }) =
             bincode::deserialize::<PanetiereWire>(&payload)
         {
-            if from == self.leader_pk && !self.routed_rounds.contains(&round) {
-                self.routed_rounds.insert(round);
+            if from != self.leader_pk {
+                // A stale leader here means this watcher never surfaces any
+                // output at all — every inbound payload disappears.
+                tracing::debug!(
+                    target: PANETIERE,
+                    round,
+                    expected_leader = %self.leader_pk,
+                    "panetiere watch: Decoded from a non-leader, ignored"
+                );
+            } else if self.routed_rounds.insert(round) {
                 self.pending_decoded.extend(payloads);
             }
         }

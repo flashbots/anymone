@@ -13,10 +13,11 @@ use std::time::{Duration, Instant};
 
 use rand::RngCore;
 use tokio::task::JoinHandle;
-use tracing::debug;
+use tracing::{debug, trace, warn};
 
 use crate::governance::{FaultReport, TOPIC_FAULTS, TOPIC_REGISTRATION};
 use crate::identity::{Identity, Pubkey};
+use crate::log_target::GOV;
 use crate::panetiere::{
     channel_mse_params, setup_pp, PanetiereClientSession, PanetiereServerSession, SetMode,
     COMMITTEE_MSG_BYTES,
@@ -293,6 +294,7 @@ pub async fn spawn_panetiere_committee_scheduler(
         Some("noop") => Some(crate::scheduling::SchedulerProtocol::Noop),
         Some(other) => {
             tracing::warn!(
+                target: GOV,
                 protocol = other,
                 "unrecognized committee protocol pin, ignoring"
             );
@@ -379,20 +381,26 @@ pub async fn spawn_panetiere_committee_scheduler(
                             ))
                         });
                         cs.stage(bytes);
-                        debug!("committee: lead staged proposal");
+                        trace!(target: GOV, "committee: lead staged proposal");
                     }
                     SchedulerAction::Publish { topic, bytes } => {
                         if topic == crate::governance::TOPIC_CONFIG {
-                            debug!("committee: publishing config");
+                            debug!(target: GOV, len = bytes.len(), "committee: publishing config");
                             // Serve it so a joining node can pull rather than await a push.
                             transport.serve_config(bytes.clone());
-                            if let Ok(cfg) = bincode::deserialize::<
-                                crate::config::AnymoneRoundConfiguration,
-                            >(&bytes)
-                            {
-                                transport.set_topic_policy(crate::governance::topic_policy(
-                                    &cfg.body, &committee,
-                                ));
+                            match bincode::deserialize::<crate::config::AnymoneRoundConfiguration>(
+                                &bytes,
+                            ) {
+                                Ok(cfg) => transport.set_topic_policy(
+                                    crate::governance::topic_policy(&cfg.body, &committee),
+                                ),
+                                // The policy keeps the previous config's rosters,
+                                // so the new subnets' topics reject their publishers.
+                                Err(e) => warn!(
+                                    target: GOV,
+                                    error = %e,
+                                    "committee: published config did not round-trip; topic policy not updated"
+                                ),
                             }
                         }
                         transport.publish(&topic, bytes).await;
@@ -427,7 +435,14 @@ pub async fn spawn_panetiere_committee_scheduler(
                                 execute!(action);
                             }
                         } else {
-                            debug!("committee: decoded payload was not a valid proposal");
+                            // Kept permanently: a decode that isn't a proposal is
+                            // how a governance stall looks from the inside.
+                            warn!(
+                                target: GOV,
+                                round = anymone_round,
+                                len = decoded.len(),
+                                "committee: decoded payload was not a valid proposal"
+                            );
                         }
                     }
                     if let Some(cs) = client_session.as_mut() {
@@ -470,16 +485,33 @@ pub async fn spawn_panetiere_committee_scheduler(
                 }
 
                 Some(msg) = reg_sub.recv() => {
-                    if let Ok(reg) = bincode::deserialize::<Registration>(&msg.payload) {
-                        if reg.verify() {
-                            core.on_registration(reg);
-                        }
+                    match bincode::deserialize::<Registration>(&msg.payload) {
+                        // An unverifiable registration keeps the relay/service out
+                        // of every proposal, so the config never includes it.
+                        Ok(reg) if !reg.verify() => debug!(
+                            target: GOV,
+                            from = %msg.from,
+                            "committee: registration failed signature verification, ignored"
+                        ),
+                        Ok(reg) => core.on_registration(reg),
+                        Err(e) => debug!(
+                            target: GOV,
+                            from = %msg.from,
+                            error = %e,
+                            "committee: undecodable registration, ignored"
+                        ),
                     }
                 }
 
                 Some(msg) = faults_sub.recv() => {
-                    if let Some(report) = FaultReport::decode(&msg.payload) {
-                        core.on_fault_report(msg.from, report, crate::config::now_unix_ms());
+                    match FaultReport::decode(&msg.payload) {
+                        Some(report) => core.on_fault_report(msg.from, report, crate::config::now_unix_ms()),
+                        None => debug!(
+                            target: GOV,
+                            from = %msg.from,
+                            len = msg.payload.len(),
+                            "committee: undecodable fault report, ignored"
+                        ),
                     }
                 }
 
@@ -490,19 +522,37 @@ pub async fn spawn_panetiere_committee_scheduler(
                 }
 
                 Some(msg) = config_sub.recv() => {
-                    if let Ok(cfg) = bincode::deserialize::<crate::config::AnymoneRoundConfiguration>(&msg.payload) {
-                        if core.on_published_config(&cfg) {
-                            transport.set_topic_policy(crate::governance::topic_policy(&cfg.body, &committee));
-                            seeded = true;
+                    match bincode::deserialize::<crate::config::AnymoneRoundConfiguration>(&msg.payload) {
+                        Ok(cfg) => {
+                            if core.on_published_config(&cfg) {
+                                transport.set_topic_policy(crate::governance::topic_policy(&cfg.body, &committee));
+                                seeded = true;
+                            }
                         }
+                        Err(e) => debug!(
+                            target: GOV,
+                            from = %msg.from,
+                            error = %e,
+                            "committee: undecodable config on the governance topic, ignored"
+                        ),
                     }
                 }
 
                 Some(msg) = sigs_sub.recv() => {
-                    if let Ok(sig) = bincode::deserialize::<crate::scheduler_core::CommitteeSig>(&msg.payload) {
-                        for action in core.on_committee_sig(sig) {
-                            execute!(action);
+                    match bincode::deserialize::<crate::scheduler_core::CommitteeSig>(&msg.payload) {
+                        Ok(sig) => {
+                            for action in core.on_committee_sig(sig) {
+                                execute!(action);
+                            }
                         }
+                        // A signature we can't read never counts towards the
+                        // threshold, so assembly silently never fires.
+                        Err(e) => debug!(
+                            target: GOV,
+                            from = %msg.from,
+                            error = %e,
+                            "committee: undecodable committee signature, ignored"
+                        ),
                     }
                 }
             }

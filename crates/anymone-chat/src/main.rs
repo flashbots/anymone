@@ -47,7 +47,10 @@ struct Args {
     dashboard_origin: Option<String>,
 }
 
-#[tokio::main(flavor = "multi_thread")]
+// A chat client is one gossip subscription and one client round per protocol
+// round; the default pool sizes to the machine's CPUs, so a demo box running
+// dozens of bots spends thousands of threads to do nothing between rounds.
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
