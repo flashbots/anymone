@@ -30,7 +30,7 @@ use crate::faults::{Attribution, Fault, FaultKind, OutputFaultTracker};
 use crate::identity::{Identity, Pubkey};
 use crate::log_target::{PANETIERE, SCHED};
 use crate::runtime::{
-    aggregator_group_of, client_aggregator_topic, deadline_for, drain_inbound, egress_dest,
+    aggregator_group_of, client_aggregator_topic, deadline_for, egress_dest,
     gossip_faults, handle_inbound, publish_and_loop_back, recv_any, round_at, route_to_pipe,
     subnet_aggregation, subnet_leader_pk, AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
 };
@@ -332,6 +332,9 @@ pub(crate) async fn run_subnet(
         return;
     }
     let mut final_round: Option<Round> = None;
+    // Set on entering the drain round: the last round this worker owns. Wire
+    // for later rounds belongs to the successor and is not ingested.
+    let mut drain_cap: Option<Round> = None;
     let now_ms = crate::config::now_unix_ms();
     let mut round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms);
     let spawn_round = round;
@@ -389,7 +392,7 @@ pub(crate) async fn run_subnet(
 
             _ = tokio::time::sleep_until(mid_deadline), if !mid_done => {
                 mid_done = true;
-                drain_inbound(&mut subscriptions, &mut sessions, &mut fault_monitor, &inner, &egress, identity_pk).await;
+                drain_inbound_upto(&mut subscriptions, &mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, drain_cap).await;
                 let outs: Vec<(SessionKey, Vec<u8>)> = sessions
                     .iter_mut()
                     .flat_map(|(key, s)| {
@@ -405,7 +408,7 @@ pub(crate) async fn run_subnet(
 
             _ = tokio::time::sleep_until(commit_deadline), if !commit_done => {
                 commit_done = true;
-                drain_inbound(&mut subscriptions, &mut sessions, &mut fault_monitor, &inner, &egress, identity_pk).await;
+                drain_inbound_upto(&mut subscriptions, &mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, drain_cap).await;
                 let outs: Vec<(SessionKey, Vec<u8>)> = sessions
                     .iter_mut()
                     .flat_map(|(key, s)| {
@@ -420,7 +423,7 @@ pub(crate) async fn run_subnet(
             }
 
             _ = tokio::time::sleep_until(deadline) => {
-                drain_inbound(&mut subscriptions, &mut sessions, &mut fault_monitor, &inner, &egress, identity_pk).await;
+                drain_inbound_upto(&mut subscriptions, &mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, drain_cap).await;
                 let mut decoded_all: Vec<Vec<u8>> = Vec::new();
                 let mut faults: Vec<Fault> = Vec::new();
                 let mut outs: Vec<(SessionKey, Vec<u8>)> = Vec::new();
@@ -434,9 +437,6 @@ pub(crate) async fn run_subnet(
                     publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
                         .await;
                 }
-                if let Some(m) = fault_monitor.as_mut() {
-                    faults.extend(m.end_round(round, Instant::now()).faults);
-                }
                 let n_decoded = decoded_all.len();
                 for bytes in decoded_all {
                     route_to_pipe(&inner, &bytes);
@@ -448,6 +448,19 @@ pub(crate) async fn run_subnet(
                         n_messages: n_decoded,
                     });
                 }
+                if drain_cap.is_some() {
+                    tracing::debug!(
+                        target: SCHED,
+                        subnet = subnet.id,
+                        round,
+                        decoded = n_decoded,
+                        "panetiere worker: drain exit"
+                    );
+                    return;
+                }
+                if let Some(m) = fault_monitor.as_mut() {
+                    faults.extend(m.end_round(round, Instant::now()).faults);
+                }
                 crate::runtime::log_round_outcome("panetiere", subnet.id, round, n_decoded, faults.len());
                 let faults = faults
                     .into_iter()
@@ -458,13 +471,30 @@ pub(crate) async fn run_subnet(
                 }
 
                 if final_round.is_some_and(|f| round >= f) {
+                    // A round decodes from shares arriving the round after it,
+                    // so a relay stays one drain round: sessions that only
+                    // consume and revisit, no new submissions against the
+                    // successor. Watch-only workers hold no crypto state — the
+                    // successor's watcher routes the drained leader's late
+                    // `Decoded` instead.
+                    if !sessions.contains_key(&SessionKey::Server) {
+                        tracing::debug!(
+                            target: SCHED,
+                            subnet = subnet.id,
+                            round,
+                            "panetiere worker: graceful exit"
+                        );
+                        return;
+                    }
                     tracing::debug!(
                         target: SCHED,
                         subnet = subnet.id,
                         round,
-                        "panetiere worker: graceful exit"
+                        "panetiere worker: graceful exit; draining one round"
                     );
-                    return;
+                    drain_cap = Some(round);
+                    sessions.remove(&SessionKey::Client);
+                    sessions.remove(&SessionKey::Aggregator);
                 }
                 let now_ms = crate::config::now_unix_ms();
                 let next = round_at(base_round, epoch_unix_ms, dur_ms, now_ms).max(round + 1);
@@ -482,31 +512,35 @@ pub(crate) async fn run_subnet(
                 commit_deadline = deadline - std::time::Duration::from_millis(commit_offset_ms);
                 mid_done = false;
                 commit_done = false;
-                if let Some(m) = fault_monitor.as_mut() {
-                    m.begin_round(round, Instant::now());
-                }
-                crate::runtime::sync_client_round(&inner, subnet.id, round, cover_rate, &mut sessions, || {
-                    client_session(&pp, &mse, &relay_xk, &subnet, &inner.identity)
-                });
-                let misbehavior = inner.misbehavior();
-                let outs: Vec<(SessionKey, Vec<u8>)> = sessions
-                    .iter_mut()
-                    .flat_map(|(key, s)| {
-                        if let SessionKey::Server = key {
-                            s.set_misbehavior(misbehavior);
-                        }
-                        let key = *key;
-                        s.begin_round(round, Instant::now()).into_iter().map(move |out| (key, out))
-                    })
-                    .collect();
-                for (key, out) in outs {
-                    publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
-                        .await;
+                if drain_cap.is_none() {
+                    if let Some(m) = fault_monitor.as_mut() {
+                        m.begin_round(round, Instant::now());
+                    }
+                    crate::runtime::sync_client_round(&inner, subnet.id, round, cover_rate, &mut sessions, || {
+                        client_session(&pp, &mse, &relay_xk, &subnet, &inner.identity)
+                    });
+                    let misbehavior = inner.misbehavior();
+                    let outs: Vec<(SessionKey, Vec<u8>)> = sessions
+                        .iter_mut()
+                        .flat_map(|(key, s)| {
+                            if let SessionKey::Server = key {
+                                s.set_misbehavior(misbehavior);
+                            }
+                            let key = *key;
+                            s.begin_round(round, Instant::now()).into_iter().map(move |out| (key, out))
+                        })
+                        .collect();
+                    for (key, out) in outs {
+                        publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
+                            .await;
+                    }
                 }
             }
 
             msg = recv_any(&mut subscriptions) => {
-                handle_inbound(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, msg).await;
+                if !drain_cap.is_some_and(|c| wire_round_past(&msg.payload, c)) {
+                    handle_inbound(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, msg).await;
+                }
             }
 
             Some(stage) = stage_rx.recv() => {
@@ -613,6 +647,34 @@ pub(crate) fn round_in_window(round: u64, cur: Option<u64>) -> bool {
                 && round.saturating_add(PANETIERE_ROUND_WINDOW) >= cur
         }
         None => true,
+    }
+}
+
+/// True if `payload` is a Panetiere wire message for a round past `cap` —
+/// successor traffic a draining worker must not ingest (it would validate it
+/// under the outgoing config).
+pub(crate) fn wire_round_past(payload: &[u8], cap: Round) -> bool {
+    bincode::deserialize::<PanetiereWire>(payload).is_ok_and(|m| m.round() > cap)
+}
+
+/// [`crate::runtime::drain_inbound`] with an optional round cap for a draining
+/// worker; `None` delivers everything (normal operation).
+pub(crate) async fn drain_inbound_upto(
+    subscriptions: &mut [Subscription],
+    sessions: &mut HashMap<SessionKey, Box<dyn Session>>,
+    fault_monitor: &mut Option<Box<dyn Session>>,
+    inner: &Arc<AnymoneInner>,
+    egress: &impl Fn(&SessionKey, &[u8]) -> String,
+    identity_pk: Pubkey,
+    cap: Option<Round>,
+) {
+    for i in 0..subscriptions.len() {
+        while let Some(msg) = subscriptions[i].try_recv() {
+            if cap.is_some_and(|c| wire_round_past(&msg.payload, c)) {
+                continue;
+            }
+            handle_inbound(sessions, fault_monitor, inner, egress, identity_pk, msg).await;
+        }
     }
 }
 
@@ -1850,6 +1912,19 @@ impl Session for PanetiereServerSession {
                     "panetiere server: client contribution outside round window, dropped"
                 );
             }
+            return Vec::new();
+        }
+        // Rounds before this session's first tick belong to the predecessor
+        // worker, which drains and decodes them under its own config; wire
+        // produced under a different config (e.g. another aggregator group
+        // count) must never be validated against this one.
+        if self.first_round.is_some_and(|f| msg.round() < f) {
+            tracing::trace!(
+                target: PANETIERE,
+                msg_round = msg.round(),
+                first_round = ?self.first_round,
+                "panetiere server: pre-spawn round, dropped"
+            );
             return Vec::new();
         }
         match msg {

@@ -140,10 +140,36 @@ fn bot_payload(handle: &str, n: usize) -> Vec<u8> {
 /// send — a random line with probability `send_rate` each round. One bot = one
 /// client.
 pub async fn run_bot(anymone: Anymone, handle: String, send_rate: f64) -> Result<()> {
+    // Until the adopted config carries the chat tag there is nothing to join,
+    // and an unjoined bot contributes no cover either — it is absent from the
+    // anonymity set, not merely idle. Log the wait: it is otherwise invisible,
+    // and it lasts until the committee has both heard the chat service's
+    // registration and published a config carrying it.
+    let mut waited = 0u32;
     let pipe = loop {
         match anymone.subscribe(chat_tag()).await {
-            Ok(p) => break p,
-            Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+            Ok(p) => {
+                if waited > 0 {
+                    tracing::info!(
+                        handle,
+                        waited_ms = waited * 500,
+                        "chat bot: joined the room"
+                    );
+                }
+                break p;
+            }
+            Err(e) => {
+                if waited % 20 == 0 {
+                    tracing::info!(
+                        handle,
+                        waited_ms = waited * 500,
+                        error = %e,
+                        "chat bot: waiting to join the chat room"
+                    );
+                }
+                waited += 1;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
         }
     };
     let send_p = send_rate.clamp(0.0, 1.0);
@@ -152,9 +178,13 @@ pub async fn run_bot(anymone: Anymone, handle: String, send_rate: f64) -> Result
         // tracks reconfig); one real-message decision per round.
         tokio::time::sleep(anymone.round_duration()).await;
         if rand::random::<f64>() < send_p {
-            let _ = pipe
+            if let Err(e) = pipe
                 .send(bot_payload(&handle, rand::random::<usize>()))
-                .await;
+                .await
+            {
+                // The payload is gone; the bot has no retry of its own.
+                tracing::warn!(handle, error = %e, "chat bot: send failed");
+            }
         }
     }
 }

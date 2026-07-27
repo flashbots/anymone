@@ -604,7 +604,18 @@ impl SchedulerCore {
                     );
                 } else {
                     self.sidelined.remove(&pubkey);
-                    self.registered.insert(pubkey);
+                    // Registrations re-announce every few seconds; only the first
+                    // one is news. Until it lands the registrant is invisible to
+                    // governance, so the gap between a process starting and this
+                    // line is the cost of gossip mesh formation.
+                    if self.registered.insert(pubkey) {
+                        tracing::debug!(
+                            target: GOV,
+                            relay = %pubkey,
+                            registered = self.registered.len(),
+                            "registration: first announcement from a relay"
+                        );
+                    }
                     self.relay_xpubs.insert(pubkey, exchange_pubkey);
                 }
             }
@@ -614,7 +625,14 @@ impl SchedulerCore {
                 exchange_pubkey: _,
                 ..
             } => {
-                self.services.insert(tag, pubkey);
+                if self.services.insert(tag, pubkey).is_none() {
+                    tracing::debug!(
+                        target: GOV,
+                        service = %pubkey,
+                        services = self.services.len(),
+                        "registration: first announcement for a service tag"
+                    );
+                }
             }
         }
     }

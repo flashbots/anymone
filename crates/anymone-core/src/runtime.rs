@@ -113,6 +113,10 @@ pub(crate) struct AnymoneInner {
     /// worker holding this round's participation draw. Node-level, so queued
     /// messages survive worker respawns on reconfiguration.
     pub(crate) outbox: Mutex<VecDeque<Vec<u8>>>,
+    /// Scheduled-Panetiere reservation entries per subnet. Node-level like the
+    /// outbox: a message vector unpacks `RESERVATION_TO_MSG_GAP` rounds after
+    /// its reservations, so a respawned worker reads what its predecessor decoded.
+    sched_entries: Mutex<HashMap<SubnetId, crate::panetiere_scheduled::ReservationEntries>>,
     /// Private seed for the per-round subnet draw: deterministic across this
     /// node's workers (exactly one claims each round), unpredictable outside it.
     participation_seed: [u8; 32],
@@ -128,6 +132,19 @@ pub(crate) struct AnymoneInner {
 }
 
 impl AnymoneInner {
+    /// The subnet's shared reservation-entries store, created on first use.
+    pub(crate) fn sched_reservation_entries(
+        &self,
+        subnet: SubnetId,
+    ) -> crate::panetiere_scheduled::ReservationEntries {
+        self.sched_entries
+            .lock()
+            .unwrap()
+            .entry(subnet)
+            .or_default()
+            .clone()
+    }
+
     pub(crate) fn misbehavior(&self) -> Option<Misbehavior> {
         match self.misbehavior.load(Ordering::Relaxed) {
             1 => Some(Misbehavior::Withhold),
@@ -215,6 +232,7 @@ impl Anymone {
             joined: Mutex::new(HashMap::new()),
             subnets: Mutex::new(HashMap::new()),
             outbox: Mutex::new(VecDeque::new()),
+            sched_entries: Mutex::new(HashMap::new()),
             participation_seed,
             committee,
             events: broadcast::channel(EVENTS_CAPACITY).0,
@@ -1359,6 +1377,7 @@ mod participation_tests {
             joined: Mutex::new(HashMap::new()),
             subnets: Mutex::new(HashMap::new()),
             outbox: Mutex::new(VecDeque::new()),
+            sched_entries: Mutex::new(HashMap::new()),
             participation_seed: [42u8; 32],
             committee: None,
             events: broadcast::channel(1).0,

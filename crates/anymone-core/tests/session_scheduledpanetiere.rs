@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use anymone_core::panetiere::{client_id_from_pubkey, PanetiereAggregatorSession, SetMode};
 use anymone_core::panetiere_scheduled::{
-    ScheduledPanetiereClientSession, ScheduledPanetiereServerSession,
+    ReservationEntries, ScheduledPanetiereClientSession, ScheduledPanetiereServerSession,
 };
 use anymone_core::session::{LeaderAggregation, Session};
 use anymone_core::{Identity, Pubkey};
@@ -46,6 +46,10 @@ fn server_env(n: usize) -> (Vec<Identity>, Vec<Pubkey>, Vec<(ServerId, pke::Publ
     (ids, pks, xpubs)
 }
 
+fn fresh_entries(n: usize) -> Vec<ReservationEntries> {
+    (0..n).map(|_| ReservationEntries::default()).collect()
+}
+
 fn server_pubkeys(server_pks: &[Pubkey]) -> HashMap<ServerId, Pubkey> {
     server_pks
         .iter()
@@ -54,6 +58,8 @@ fn server_pubkeys(server_pks: &[Pubkey]) -> HashMap<ServerId, Pubkey> {
         .collect()
 }
 
+/// `entries`: each relay node's `ReservationEntries` store, index-aligned with
+/// `ids` — shared with a successor session to model a same-node worker respawn.
 fn make_servers(
     pp: &Arc<ProtocolParams>,
     sched_mse: &MseParams,
@@ -61,6 +67,7 @@ fn make_servers(
     ids: &[Identity],
     server_pks: &[Pubkey],
     aggregation: Option<&HashMap<u32, Vec<Pubkey>>>,
+    entries: &[ReservationEntries],
 ) -> Vec<ScheduledPanetiereServerSession> {
     (0..ids.len())
         .map(|i| {
@@ -83,6 +90,7 @@ fn make_servers(
                 aggregation.map(|roster| LeaderAggregation {
                     roster: roster.clone(),
                 }),
+                entries[i].clone(),
             )
         })
         .collect()
@@ -185,7 +193,15 @@ fn scheduled_direct_flow_pipelines_reservations() {
     clients[0].stage(payload_a.clone());
     clients[1].stage(payload_b.clone());
 
-    let mut servers = make_servers(&pp, &sched_mse, vector_bytes, &ids, &server_pks, None);
+    let mut servers = make_servers(
+        &pp,
+        &sched_mse,
+        vector_bytes,
+        &ids,
+        &server_pks,
+        None,
+        &fresh_entries(ids.len()),
+    );
     let now = Instant::now();
 
     let mut final_decoded: Vec<Vec<Vec<u8>>> = Vec::new();
@@ -283,7 +299,15 @@ fn dropped_reservation_is_retried() {
     clients[0].stage(payload_a.clone());
     clients[1].stage(payload_b.clone());
 
-    let mut servers = make_servers(&pp, &sched_mse, vector_bytes, &ids, &server_pks, None);
+    let mut servers = make_servers(
+        &pp,
+        &sched_mse,
+        vector_bytes,
+        &ids,
+        &server_pks,
+        None,
+        &fresh_entries(ids.len()),
+    );
     let now = Instant::now();
 
     // Run well past two fulfillment cycles: the overflowing client's payload
@@ -323,7 +347,7 @@ fn aggregated_round(
     aggregators: &mut [PanetiereAggregatorSession],
     servers: &mut [ScheduledPanetiereServerSession],
     server_pks: &[Pubkey],
-) -> Vec<Vec<Vec<u8>>> {
+) -> (Vec<Vec<Vec<u8>>>, Vec<(Pubkey, Vec<u8>)>) {
     for (i, c) in clients.iter_mut().enumerate() {
         c.begin_round(round, now);
         let out = c.checkpoint(round, 1, now);
@@ -371,7 +395,13 @@ fn aggregated_round(
             c.on_inbound(server_pks[*i], m.clone());
         }
     }
-    decoded
+    let mut wire: Vec<(Pubkey, Vec<u8>)> = group_aggs
+        .into_iter()
+        .chain(announce)
+        .map(|m| (server_pks[0], m))
+        .collect();
+    wire.extend(all_outbound.into_iter().map(|(i, m)| (server_pks[i], m)));
+    (decoded, wire)
 }
 
 #[test]
@@ -438,6 +468,7 @@ fn scheduled_aggregated_flow_decodes_through_groups() {
     clients[0].stage(payload_a.clone());
     clients[1].stage(payload_b.clone());
 
+    let stores = fresh_entries(ids.len());
     let mut servers = make_servers(
         &pp,
         &sched_mse,
@@ -445,6 +476,7 @@ fn scheduled_aggregated_flow_decodes_through_groups() {
         &ids,
         &server_pks,
         Some(&roster),
+        &stores,
     );
     let mut aggregators: Vec<PanetiereAggregatorSession> = agg_ids
         .iter()
@@ -454,8 +486,9 @@ fn scheduled_aggregated_flow_decodes_through_groups() {
     let now = Instant::now();
 
     let mut final_decoded: Vec<Vec<Vec<u8>>> = Vec::new();
+    let mut final_wire: Vec<(Pubkey, Vec<u8>)> = Vec::new();
     for round in 0..=(GAP + 1) {
-        let decoded = aggregated_round(
+        let (decoded, wire) = aggregated_round(
             round,
             now,
             &mut clients,
@@ -473,6 +506,7 @@ fn scheduled_aggregated_flow_decodes_through_groups() {
             }
         } else {
             final_decoded = decoded;
+            final_wire = wire;
         }
     }
     for (i, decoded) in final_decoded.iter().enumerate() {
@@ -483,6 +517,92 @@ fn scheduled_aggregated_flow_decodes_through_groups() {
         assert!(
             decoded.contains(&payload_b),
             "relay {i}: must decode group 1's payload"
+        );
+    }
+
+    // Cutover successor: a leader session first ticked at GAP+2 must ignore
+    // the predecessor's rounds wholesale — even with matching geometry it
+    // would otherwise re-decode round GAP+1 from the redelivered aggregates,
+    // set, and shares (and re-broadcast its reservations), duplicating the
+    // draining predecessor's work.
+    let mut successor = make_servers(
+        &pp,
+        &sched_mse,
+        vector_bytes,
+        &ids,
+        &server_pks,
+        Some(&roster),
+        &fresh_entries(ids.len()),
+    )
+    .remove(0);
+    successor.begin_round(GAP + 2, now);
+    for (from, m) in &final_wire {
+        let out = successor.on_inbound(*from, m.clone());
+        assert!(out.is_empty(), "successor: pre-spawn wire produced output");
+    }
+    let outcome = successor.end_round(GAP + 2, now);
+    assert!(
+        outcome.outbound.is_empty(),
+        "successor: emitted over a pre-spawn round"
+    );
+    assert!(
+        outcome.decoded.is_empty(),
+        "successor: decoded a pre-spawn round"
+    );
+
+    // Worker respawn with the node-scoped entries store: a payload reserved
+    // under the old workers (round GAP+2) must decode on successor sessions
+    // that never saw `Reservations{GAP+2}` — they read the entries the
+    // predecessors deposited. On the leader node that broadcast can never
+    // arrive (self-inbound is dropped); the store is what closes the window.
+    let payload_c = b"payload across the worker swap".to_vec();
+    clients[0].stage(payload_c.clone());
+    aggregated_round(
+        GAP + 2,
+        now,
+        &mut clients,
+        &client_pks,
+        &mut aggregators,
+        &mut servers,
+        &server_pks,
+    );
+    // Predecessors' drain round: decode round GAP+2 (its shares arrived above),
+    // depositing entries{GAP+2}; only the clients see the grant broadcast.
+    for s in servers.iter_mut() {
+        for m in s.end_round(GAP + 3, now).outbound {
+            for c in clients.iter_mut() {
+                c.on_inbound(server_pks[0], m.clone());
+            }
+        }
+    }
+    let mut servers = make_servers(
+        &pp,
+        &sched_mse,
+        vector_bytes,
+        &ids,
+        &server_pks,
+        Some(&roster),
+        &stores,
+    );
+    for s in servers.iter_mut() {
+        s.begin_round(GAP + 3, now);
+    }
+    let mut swap_decoded: Vec<Vec<Vec<u8>>> = Vec::new();
+    for round in (GAP + 3)..=(2 * GAP + 3) {
+        (swap_decoded, _) = aggregated_round(
+            round,
+            now,
+            &mut clients,
+            &client_pks,
+            &mut aggregators,
+            &mut servers,
+            &server_pks,
+        );
+    }
+    for (i, decoded) in swap_decoded.iter().enumerate() {
+        assert!(
+            decoded.contains(&payload_c),
+            "successor relay {i}: must decode the payload reserved before the swap"
         );
     }
 }

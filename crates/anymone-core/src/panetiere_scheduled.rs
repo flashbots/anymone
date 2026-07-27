@@ -13,7 +13,7 @@
 //! cadence differ.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use chipmunk_code::{KahePoly, N};
@@ -28,17 +28,17 @@ use rand_chacha::ChaCha20Rng;
 use tokio::sync::mpsc;
 
 use crate::config::{
-    ExchangePublicKeyWire, ProtocolConfig, Round, ScheduledPanetiereConfig, Subnet,
+    ExchangePublicKeyWire, ProtocolConfig, Round, ScheduledPanetiereConfig, Subnet, SubnetId,
 };
 use crate::identity::{Identity, Pubkey};
 use crate::log_target::{PANETIERE, SCHED};
 use crate::panetiere::{
-    client_id_from_pubkey, server_index, PanetiereAggregatorSession, PanetiereObserverSession,
-    PanetiereServerSession, PanetiereWatchSession, PanetiereWire, SetMode,
-    PANETIERE_ROUND_RETENTION,
+    client_id_from_pubkey, drain_inbound_upto, server_index, wire_round_past,
+    PanetiereAggregatorSession, PanetiereObserverSession, PanetiereServerSession,
+    PanetiereWatchSession, PanetiereWire, SetMode, PANETIERE_ROUND_RETENTION,
 };
 use crate::runtime::{
-    aggregator_group_of, client_aggregator_topic, deadline_for, drain_inbound, egress_dest,
+    aggregator_group_of, client_aggregator_topic, deadline_for, egress_dest,
     gossip_faults, handle_inbound, publish_and_loop_back, recv_any, round_at, route_to_pipe,
     subnet_aggregation, subnet_leader_pk, AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
 };
@@ -61,6 +61,13 @@ pub(crate) const RESERVATION_TO_MSG_GAP: Round = 3;
 
 /// Must outlive `RESERVATION_TO_MSG_GAP` plus the inner session's own retention.
 const SCHED_ENTRIES_RETENTION: Round = PANETIERE_ROUND_RETENTION + RESERVATION_TO_MSG_GAP;
+
+/// Decoded reservation entries per round. Node-scoped (held on `AnymoneInner`,
+/// handed to each worker generation, like the outbox): entries are public,
+/// deterministic per-round facts every relay derives itself, and a message
+/// vector unpacks `RESERVATION_TO_MSG_GAP` rounds after its reservations — a
+/// reconfig respawn in that window must not lose them.
+pub type ReservationEntries = Arc<Mutex<BTreeMap<Round, Vec<(u16, u16)>>>>;
 
 /// MSE parameters for a reservation channel sized for `rho` expected
 /// reservations per round; `prf_key` is domain-separated from the one-round
@@ -164,6 +171,7 @@ fn client_session(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn server_session(
     pp: &Arc<ProtocolParams>,
     sched_mse: &MseParams,
@@ -172,6 +180,7 @@ fn server_session(
     subnet: &Subnet,
     identity: &Identity,
     leader_pk: Pubkey,
+    entries: ReservationEntries,
 ) -> Box<dyn Session> {
     let identity_pk = identity.pubkey();
     let server_id = ServerId(
@@ -201,8 +210,10 @@ fn server_session(
         cfg.client_set_min,
         server_pubkeys,
         aggregation,
+        entries,
     );
     session.set_client_set_max(cfg.client_set_max as usize);
+    session.set_subnet(subnet.id);
     Box::new(session)
 }
 
@@ -254,6 +265,38 @@ impl ScheduledPanetiereClientSession {
             cover_rate: 1.0,
             cover_rng: ChaCha20Rng::from_seed(cover_seed),
             rand_rng: ChaCha20Rng::from_seed(rand_seed),
+        }
+    }
+}
+
+/// A dropped client session takes its in-flight payloads with it: they were
+/// popped from the node-level outbox at `stage` time and nothing puts them
+/// back, so a worker respawn (reconfig cutover) silently loses whatever was
+/// mid-flight. The scheduled flow spans `RESERVATION_TO_MSG_GAP` + 2 rounds,
+/// so a cutover almost always catches something.
+impl Drop for ScheduledPanetiereClientSession {
+    fn drop(&mut self) {
+        let real = |p: &Vec<u8>| !p.is_empty();
+        let staged = self.staged.iter().filter(|p| real(p)).count();
+        let deferred = self.deferred.iter().filter(|p| real(p)).count();
+        let reserved = self
+            .reserved
+            .values()
+            .flatten()
+            .filter(|(_, p)| real(p))
+            .count();
+        let granted = self.granted.iter().filter(|(_, _, p)| real(p)).count();
+        let lost = staged + deferred + reserved + granted;
+        if lost > 0 {
+            tracing::warn!(
+                target: PANETIERE,
+                client_id = self.client_id.0,
+                staged,
+                deferred,
+                reserved,
+                granted,
+                "scheduled panetiere client: session dropped holding payloads; they are lost"
+            );
         }
     }
 }
@@ -529,11 +572,16 @@ pub struct ScheduledPanetiereServerSession {
     vector_bytes: usize,
     is_leader: bool,
     leader_pk: PeerId,
-    entries_by_round: BTreeMap<Round, Vec<(u16, u16)>>,
+    /// Labels this session's logs; a node relays several subnets at once.
+    subnet: SubnetId,
+    entries_by_round: ReservationEntries,
     /// Msg sections awaiting their reservation round's entries.
     pending_msg: BTreeMap<Round, Vec<KahePoly>>,
     /// Own round clock, from `begin_round`; bounds accepted `Reservations` rounds.
     cur_round: Option<Round>,
+    /// First round this session ticked; rounds before it belong to a
+    /// predecessor worker, or to before this subnet existed.
+    first_round: Option<Round>,
 }
 
 impl ScheduledPanetiereServerSession {
@@ -549,6 +597,7 @@ impl ScheduledPanetiereServerSession {
         min_clients: u32,
         server_pubkeys: HashMap<ServerId, Pubkey>,
         aggregation: Option<LeaderAggregation>,
+        entries_by_round: ReservationEntries,
     ) -> Self {
         let is_leader = mode == SetMode::Leader;
         let sched_polys = MseEncoding::n_polys(&sched_mse);
@@ -570,9 +619,11 @@ impl ScheduledPanetiereServerSession {
             vector_bytes,
             is_leader,
             leader_pk,
-            entries_by_round: BTreeMap::new(),
+            subnet: 0,
+            entries_by_round,
             pending_msg: BTreeMap::new(),
             cur_round: None,
+            first_round: None,
         }
     }
 
@@ -580,11 +631,16 @@ impl ScheduledPanetiereServerSession {
     pub(crate) fn set_client_set_max(&mut self, max: usize) {
         self.inner.set_client_set_max(max);
     }
+
+    pub(crate) fn set_subnet(&mut self, subnet: SubnetId) {
+        self.subnet = subnet;
+    }
 }
 
 impl Session for ScheduledPanetiereServerSession {
     fn begin_round(&mut self, round: Round, now: Instant) -> Vec<Vec<u8>> {
         self.cur_round = Some(round);
+        self.first_round.get_or_insert(round);
         self.inner.begin_round(round, now)
     }
 
@@ -594,7 +650,11 @@ impl Session for ScheduledPanetiereServerSession {
                 bincode::deserialize::<PanetiereWire>(&payload)
             {
                 if crate::panetiere::round_in_window(round, self.cur_round) {
-                    self.entries_by_round.entry(round).or_insert(entries);
+                    self.entries_by_round
+                        .lock()
+                        .unwrap()
+                        .entry(round)
+                        .or_insert(entries);
                 } else {
                     // Without this round's entries we can't place any message
                     // vector fulfilling it, so those payloads never surface.
@@ -623,6 +683,7 @@ impl Session for ScheduledPanetiereServerSession {
         let mut outbound = self.inner.emit_server_publics(round);
         let mut decoded = Vec::new();
 
+        let mut entries_map = self.entries_by_round.lock().unwrap();
         for (rd, plain) in self.inner.decode_settled() {
             let n = self.sched_polys.min(plain.len());
             let entries: Vec<(u16, u16)> =
@@ -654,7 +715,7 @@ impl Session for ScheduledPanetiereServerSession {
                 };
                 outbound.push(bincode::serialize(&wire).expect("serialise reservations"));
             }
-            self.entries_by_round.insert(rd, entries);
+            entries_map.insert(rd, entries);
             self.pending_msg.insert(rd, plain[n..].to_vec());
         }
 
@@ -662,14 +723,11 @@ impl Session for ScheduledPanetiereServerSession {
             .pending_msg
             .keys()
             .copied()
-            .filter(|rd| {
-                self.entries_by_round
-                    .contains_key(&rd.saturating_sub(RESERVATION_TO_MSG_GAP))
-            })
+            .filter(|rd| entries_map.contains_key(&rd.saturating_sub(RESERVATION_TO_MSG_GAP)))
             .collect();
         for rd in ready {
             let plain = self.pending_msg.remove(&rd).expect("checked above");
-            let prev = &self.entries_by_round[&(rd.saturating_sub(RESERVATION_TO_MSG_GAP))];
+            let prev = &entries_map[&(rd.saturating_sub(RESERVATION_TO_MSG_GAP))];
             let rands: Vec<u16> = prev.iter().map(|&(r, _)| r).collect();
             let beacon = codec::beacon(&rands);
             let sized: Vec<(u16, usize)> = prev.iter().map(|&(r, s)| (r, s as usize)).collect();
@@ -710,16 +768,22 @@ impl Session for ScheduledPanetiereServerSession {
         self.inner.gc(round);
         let cutoff = round.saturating_sub(SCHED_ENTRIES_RETENTION);
         // A message vector whose reservation round's entries never arrived can't
-        // be unpacked, so its senders' payloads are lost here.
+        // be unpacked, so its senders' payloads are lost here. A subnet's own
+        // first rounds always trip this — their vectors reference rounds from
+        // before the subnet existed, and are necessarily empty — so the
+        // reservation round is reported against this session's first round.
         for r in self.pending_msg.range(..cutoff) {
+            let reservation_round = r.0.saturating_sub(RESERVATION_TO_MSG_GAP);
             tracing::warn!(
                 target: PANETIERE,
+                subnet = self.subnet,
                 round = r.0,
-                reservation_round = r.0.saturating_sub(RESERVATION_TO_MSG_GAP),
+                reservation_round,
+                predates_subnet = self.first_round.is_some_and(|f| reservation_round < f),
                 "scheduled panetiere: message vector aged out without its reservations"
             );
         }
-        self.entries_by_round.retain(|r, _| *r >= cutoff);
+        entries_map.retain(|r, _| *r >= cutoff);
         self.pending_msg.retain(|r, _| *r >= cutoff);
 
         RoundOutcome {
@@ -803,6 +867,7 @@ pub(crate) async fn run_subnet(
                 &subnet,
                 &inner.identity,
                 leader_pk,
+                inner.sched_reservation_entries(subnet.id),
             ),
         );
     } else {
@@ -867,6 +932,9 @@ pub(crate) async fn run_subnet(
         return;
     }
     let mut final_round: Option<Round> = None;
+    // Set on entering the drain round: the last round this worker owns. Wire
+    // for later rounds belongs to the successor and is not ingested.
+    let mut drain_cap: Option<Round> = None;
     let now_ms = crate::config::now_unix_ms();
     let mut round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms);
     let spawn_round = round;
@@ -934,7 +1002,7 @@ pub(crate) async fn run_subnet(
 
             _ = tokio::time::sleep_until(k1_deadline), if !k1_done => {
                 k1_done = true;
-                drain_inbound(&mut subscriptions, &mut sessions, &mut fault_monitor, &inner, &egress, identity_pk).await;
+                drain_inbound_upto(&mut subscriptions, &mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, drain_cap).await;
                 let outs: Vec<(SessionKey, Vec<u8>)> = sessions
                     .iter_mut()
                     .flat_map(|(key, s)| {
@@ -950,7 +1018,7 @@ pub(crate) async fn run_subnet(
 
             _ = tokio::time::sleep_until(k2_deadline), if !k2_done => {
                 k2_done = true;
-                drain_inbound(&mut subscriptions, &mut sessions, &mut fault_monitor, &inner, &egress, identity_pk).await;
+                drain_inbound_upto(&mut subscriptions, &mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, drain_cap).await;
                 let outs: Vec<(SessionKey, Vec<u8>)> = sessions
                     .iter_mut()
                     .flat_map(|(key, s)| {
@@ -966,7 +1034,7 @@ pub(crate) async fn run_subnet(
 
             _ = tokio::time::sleep_until(k3_deadline), if !k3_done => {
                 k3_done = true;
-                drain_inbound(&mut subscriptions, &mut sessions, &mut fault_monitor, &inner, &egress, identity_pk).await;
+                drain_inbound_upto(&mut subscriptions, &mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, drain_cap).await;
                 let outs: Vec<(SessionKey, Vec<u8>)> = sessions
                     .iter_mut()
                     .flat_map(|(key, s)| {
@@ -981,7 +1049,7 @@ pub(crate) async fn run_subnet(
             }
 
             _ = tokio::time::sleep_until(deadline) => {
-                drain_inbound(&mut subscriptions, &mut sessions, &mut fault_monitor, &inner, &egress, identity_pk).await;
+                drain_inbound_upto(&mut subscriptions, &mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, drain_cap).await;
                 let mut decoded_all: Vec<Vec<u8>> = Vec::new();
                 let mut faults = Vec::new();
                 let mut outs: Vec<(SessionKey, Vec<u8>)> = Vec::new();
@@ -995,9 +1063,6 @@ pub(crate) async fn run_subnet(
                     publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
                         .await;
                 }
-                if let Some(m) = fault_monitor.as_mut() {
-                    faults.extend(m.end_round(round, Instant::now()).faults);
-                }
                 let n_decoded = decoded_all.len();
                 for bytes in decoded_all {
                     route_to_pipe(&inner, &bytes);
@@ -1009,6 +1074,19 @@ pub(crate) async fn run_subnet(
                         n_messages: n_decoded,
                     });
                 }
+                if drain_cap.is_some() {
+                    tracing::debug!(
+                        target: SCHED,
+                        subnet = subnet.id,
+                        round,
+                        decoded = n_decoded,
+                        "scheduled panetiere worker: drain exit"
+                    );
+                    return;
+                }
+                if let Some(m) = fault_monitor.as_mut() {
+                    faults.extend(m.end_round(round, Instant::now()).faults);
+                }
                 crate::runtime::log_round_outcome("scheduled-panetiere", subnet.id, round, n_decoded, faults.len());
                 let faults = faults
                     .into_iter()
@@ -1019,13 +1097,30 @@ pub(crate) async fn run_subnet(
                 }
 
                 if final_round.is_some_and(|f| round >= f) {
+                    // A round decodes from shares arriving the round after it,
+                    // so a relay stays one drain round: sessions that only
+                    // consume and revisit, no new submissions against the
+                    // successor. Watch-only workers hold no crypto state — the
+                    // successor's watcher routes the drained leader's late
+                    // `Decoded` instead.
+                    if !sessions.contains_key(&SessionKey::Server) {
+                        tracing::debug!(
+                            target: SCHED,
+                            subnet = subnet.id,
+                            round,
+                            "scheduled panetiere worker: graceful exit"
+                        );
+                        return;
+                    }
                     tracing::debug!(
                         target: SCHED,
                         subnet = subnet.id,
                         round,
-                        "scheduled panetiere worker: graceful exit"
+                        "scheduled panetiere worker: graceful exit; draining one round"
                     );
-                    return;
+                    drain_cap = Some(round);
+                    sessions.remove(&SessionKey::Client);
+                    sessions.remove(&SessionKey::Aggregator);
                 }
                 let now_ms = crate::config::now_unix_ms();
                 let next = round_at(base_round, epoch_unix_ms, dur_ms, now_ms).max(round + 1);
@@ -1045,39 +1140,43 @@ pub(crate) async fn run_subnet(
                 k1_done = false;
                 k2_done = false;
                 k3_done = false;
-                if let Some(m) = fault_monitor.as_mut() {
-                    m.begin_round(round, Instant::now());
-                }
-                crate::runtime::sync_client_round(&inner, subnet.id, round, cover_rate, &mut sessions, || {
-                    client_session(
-                        &pp,
-                        &sched_mse,
-                        cfg.vector_bytes,
-                        &relay_xk,
-                        &subnet,
-                        &inner.identity,
-                        leader_pk,
-                    )
-                });
-                let misbehavior = inner.misbehavior();
-                let outs: Vec<(SessionKey, Vec<u8>)> = sessions
-                    .iter_mut()
-                    .flat_map(|(key, s)| {
-                        if let SessionKey::Server = key {
-                            s.set_misbehavior(misbehavior);
-                        }
-                        let key = *key;
-                        s.begin_round(round, Instant::now()).into_iter().map(move |out| (key, out))
-                    })
-                    .collect();
-                for (key, out) in outs {
-                    publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
-                        .await;
+                if drain_cap.is_none() {
+                    if let Some(m) = fault_monitor.as_mut() {
+                        m.begin_round(round, Instant::now());
+                    }
+                    crate::runtime::sync_client_round(&inner, subnet.id, round, cover_rate, &mut sessions, || {
+                        client_session(
+                            &pp,
+                            &sched_mse,
+                            cfg.vector_bytes,
+                            &relay_xk,
+                            &subnet,
+                            &inner.identity,
+                            leader_pk,
+                        )
+                    });
+                    let misbehavior = inner.misbehavior();
+                    let outs: Vec<(SessionKey, Vec<u8>)> = sessions
+                        .iter_mut()
+                        .flat_map(|(key, s)| {
+                            if let SessionKey::Server = key {
+                                s.set_misbehavior(misbehavior);
+                            }
+                            let key = *key;
+                            s.begin_round(round, Instant::now()).into_iter().map(move |out| (key, out))
+                        })
+                        .collect();
+                    for (key, out) in outs {
+                        publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
+                            .await;
+                    }
                 }
             }
 
             msg = recv_any(&mut subscriptions) => {
-                handle_inbound(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, msg).await;
+                if !drain_cap.is_some_and(|c| wire_round_past(&msg.payload, c)) {
+                    handle_inbound(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, msg).await;
+                }
             }
 
             Some(stage) = stage_rx.recv() => {
