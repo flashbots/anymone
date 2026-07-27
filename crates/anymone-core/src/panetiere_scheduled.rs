@@ -769,6 +769,9 @@ impl Session for ScheduledPanetiereServerSession {
     }
 
     fn checkpoint(&mut self, round: Round, k: u8, _now: Instant) -> Vec<Vec<u8>> {
+        // A leader never receives its own `Reservations` over the wire, so on a
+        // cutover boundary this is its only re-read before the round's entries.
+        self.sync_entry_lens();
         if k == 3 && self.is_leader {
             self.inner.announce_settled(round)
         } else {
@@ -986,6 +989,7 @@ impl Session for ScheduledAggregatorSession {
     }
 
     fn checkpoint(&mut self, round: Round, k: u8, now: Instant) -> Vec<Vec<u8>> {
+        self.sync_entry_lens();
         if k == 2 {
             self.inner.checkpoint(round, 1, now)
         } else {

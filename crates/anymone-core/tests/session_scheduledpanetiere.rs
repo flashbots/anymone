@@ -205,6 +205,7 @@ fn scheduled_direct_flow_pipelines_reservations() {
     clients[0].stage(payload_a.clone());
     clients[1].stage(payload_b.clone());
 
+    let stores = fresh_entries(ids.len());
     let mut servers = make_servers(
         &pp,
         &sched_mse,
@@ -212,7 +213,7 @@ fn scheduled_direct_flow_pipelines_reservations() {
         &ids,
         &server_pks,
         None,
-        &fresh_entries(ids.len()),
+        &stores,
     );
     let now = Instant::now();
 
@@ -283,6 +284,53 @@ fn scheduled_direct_flow_pipelines_reservations() {
         fulfilling_width - cover_width,
         one_poly,
         "a cover-only round must drop the message vector entirely"
+    );
+
+    // Worker respawn on a config cutover: the successor's first round is a
+    // fulfillment round, and its predecessor deposits that round's reservations
+    // in the very `end_round` the successor spawns alongside. A leader is fed
+    // only by that deposit — it never receives its own `Reservations` off the
+    // wire — so a width cache taken once at `begin_round` is stale for the whole
+    // round, and every client entry is rejected as wrong-geometry.
+    let res_round = cover_round + 1;
+    clients[0].stage(payload_a.clone());
+    for round in res_round..(res_round + GAP) {
+        direct_round(
+            round,
+            now,
+            &mut clients,
+            &client_pks,
+            &mut servers,
+            &server_pks,
+            &mut submitted,
+        );
+    }
+    let cut = res_round + GAP;
+    let deposit = stores[0].lock().unwrap()[&res_round].clone();
+    let successor_store = ReservationEntries::default();
+    let mut successor = make_servers(
+        &pp,
+        &sched_mse,
+        vector_bytes,
+        &ids[..1],
+        &server_pks,
+        None,
+        std::slice::from_ref(&successor_store),
+    )
+    .remove(0);
+    successor.begin_round(cut, now);
+    successor_store.lock().unwrap().insert(res_round, deposit);
+    successor.checkpoint(cut, 1, now);
+    for (i, c) in clients.iter_mut().enumerate() {
+        c.begin_round(cut, now);
+        for m in c.checkpoint(cut, 1, now) {
+            successor.on_inbound(client_pks[i], m);
+        }
+    }
+    assert!(
+        !successor.checkpoint(cut, 3, now).is_empty(),
+        "a successor spawned on the cutover boundary must admit round {cut}'s \
+         entries and announce a ClientSet"
     );
 }
 
