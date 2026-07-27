@@ -13,7 +13,7 @@
 //! cadence differ.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
 use chipmunk_code::{KahePoly, N};
@@ -55,9 +55,10 @@ const BYTES_PER_POLY: usize = N * 4;
 /// be a fixed constant, not derived from a session's local clock: the relay
 /// decodes one combined plaintext per round and can't distinguish which grant
 /// round each client used, so every participant needs to land on the same
-/// round independently. `R+3` because `Reservations{R}` broadcasts as
-/// `begin_round(R+2)` fires elsewhere, and delivery lands sometime during `R+2`.
-pub(crate) const RESERVATION_TO_MSG_GAP: Round = 3;
+/// round independently. `R+2` is the floor: `Reservations{R}` broadcasts at
+/// `end_round(R+1)`, leaving until the k=1 submit of `R+2` to arrive. Raise it
+/// if `grant window missed` becomes common.
+pub(crate) const RESERVATION_TO_MSG_GAP: Round = 2;
 
 /// Must outlive `RESERVATION_TO_MSG_GAP` plus the inner session's own retention.
 const SCHED_ENTRIES_RETENTION: Round = PANETIERE_ROUND_RETENTION + RESERVATION_TO_MSG_GAP;
@@ -81,6 +82,22 @@ pub(crate) fn sched_mse_params(rho: u32, setup_seed: [u8; 32]) -> MseParams {
 
 pub(crate) fn msg_polys(vector_bytes: usize) -> usize {
     vector_bytes.div_ceil(BYTES_PER_POLY)
+}
+
+/// Slot offsets (index-aligned with `entries`) and the poly count their grants
+/// need. Pure in `entries`, so every participant sizes a round from the
+/// leader's one public `Reservations` without further agreement.
+fn allocation(entries: &[(u16, u16)], cap: usize) -> (Vec<Option<usize>>, usize) {
+    let rands: Vec<u16> = entries.iter().map(|&(r, _)| r).collect();
+    let sized: Vec<(u16, usize)> = entries.iter().map(|&(r, s)| (r, s as usize)).collect();
+    let offs = codec::allocate(&sized, codec::beacon(&rands), cap);
+    let used = sized
+        .iter()
+        .zip(&offs)
+        .filter_map(|(&(_, size), off)| off.map(|o| o + size))
+        .max()
+        .unwrap_or(0);
+    (offs, msg_polys(used))
 }
 
 /// Joint params: `mu_kahe` covers the reservation MSE plus the message vector.
@@ -139,6 +156,7 @@ fn seal_roster(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn client_session(
     pp: &Arc<ProtocolParams>,
     sched_mse: &MseParams,
@@ -147,6 +165,8 @@ fn client_session(
     subnet: &Subnet,
     identity: &Identity,
     leader_pk: Pubkey,
+    entries_by_round: ReservationEntries,
+    node: Weak<AnymoneInner>,
 ) -> Box<dyn Session> {
     let servers = seal_roster(relay_xk, subnet);
     if servers.len() != subnet.relays.len() {
@@ -159,7 +179,7 @@ fn client_session(
     }
     let mut seed = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut seed);
-    Box::new(ScheduledPanetiereClientSession::new(
+    let mut session = ScheduledPanetiereClientSession::new(
         pp.clone(),
         sched_mse.clone(),
         vector_bytes,
@@ -167,10 +187,12 @@ fn client_session(
         servers,
         leader_pk,
         seed,
-    ))
+        entries_by_round,
+    );
+    session.set_node(node);
+    Box::new(session)
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn server_session(
     pp: &Arc<ProtocolParams>,
@@ -230,6 +252,12 @@ pub struct ScheduledPanetiereClientSession {
     deferred: Vec<Vec<u8>>,
     reserved: BTreeMap<Round, Vec<(u16, Vec<u8>)>>,
     granted: Vec<(Round, usize, Vec<u8>)>,
+    /// Shared with this node's relay session for the subnet, so a client
+    /// recreated by `sync_client_round` still knows the round's width.
+    entries_by_round: ReservationEntries,
+    /// `None` in session-level tests, which have no node to requeue to.
+    node: Option<Weak<AnymoneInner>>,
+    cur_round: Option<Round>,
     rng_seed: [u8; 32],
     cover_rate: f32,
     cover_rng: ChaCha20Rng,
@@ -237,6 +265,7 @@ pub struct ScheduledPanetiereClientSession {
 }
 
 impl ScheduledPanetiereClientSession {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pp: Arc<ProtocolParams>,
         sched_mse: MseParams,
@@ -245,6 +274,7 @@ impl ScheduledPanetiereClientSession {
         servers: Vec<(ServerId, pke::PublicKey)>,
         leader_pk: Pubkey,
         rng_seed: [u8; 32],
+        entries_by_round: ReservationEntries,
     ) -> Self {
         let mut cover_seed = rng_seed;
         cover_seed[0] ^= 0xA5;
@@ -261,48 +291,73 @@ impl ScheduledPanetiereClientSession {
             deferred: Vec::new(),
             reserved: BTreeMap::new(),
             granted: Vec::new(),
+            entries_by_round,
+            node: None,
+            cur_round: None,
             rng_seed,
             cover_rate: 1.0,
             cover_rng: ChaCha20Rng::from_seed(cover_seed),
             rand_rng: ChaCha20Rng::from_seed(rand_seed),
         }
     }
+
+    pub(crate) fn set_node(&mut self, node: Weak<AnymoneInner>) {
+        self.node = Some(node);
+    }
 }
 
-/// A dropped client session takes its in-flight payloads with it: they were
-/// popped from the node-level outbox at `stage` time and nothing puts them
-/// back, so a worker respawn (reconfig cutover) silently loses whatever was
-/// mid-flight. The scheduled flow spans `RESERVATION_TO_MSG_GAP` + 2 rounds,
-/// so a cutover almost always catches something.
+/// Return in-flight payloads to the outbox they were staged from, so a worker
+/// respawn re-sends them instead of losing them. A placed grant is already out
+/// of `granted`, so this re-sends without duplicating.
 impl Drop for ScheduledPanetiereClientSession {
     fn drop(&mut self) {
-        let real = |p: &Vec<u8>| !p.is_empty();
-        let staged = self.staged.iter().filter(|p| real(p)).count();
-        let deferred = self.deferred.iter().filter(|p| real(p)).count();
-        let reserved = self
-            .reserved
-            .values()
-            .flatten()
-            .filter(|(_, p)| real(p))
-            .count();
-        let granted = self.granted.iter().filter(|(_, _, p)| real(p)).count();
-        let lost = staged + deferred + reserved + granted;
-        if lost > 0 {
+        let staged = std::mem::take(&mut self.staged);
+        let deferred = std::mem::take(&mut self.deferred);
+        let reserved = std::mem::take(&mut self.reserved);
+        let granted = std::mem::take(&mut self.granted);
+        // Oldest first: `granted` and `reserved` have already waited rounds.
+        let unsent: Vec<Vec<u8>> = granted
+            .into_iter()
+            .map(|(_, _, p)| p)
+            .chain(reserved.into_values().flatten().map(|(_, p)| p))
+            .chain(deferred)
+            .chain(staged)
+            .filter(|p| !p.is_empty())
+            .collect();
+        if unsent.is_empty() {
+            return;
+        }
+        let Some(inner) = self.node.as_ref().and_then(|n| n.upgrade()) else {
             tracing::warn!(
                 target: PANETIERE,
                 client_id = self.client_id.0,
-                staged,
-                deferred,
-                reserved,
-                granted,
-                "scheduled panetiere client: session dropped holding payloads; they are lost"
+                unsent = unsent.len(),
+                "scheduled panetiere client: session dropped with no node to requeue to; payloads lost"
             );
+            return;
+        };
+        let mut outbox = inner.outbox.lock().unwrap();
+        for payload in unsent.into_iter().rev() {
+            outbox.push_front(payload);
         }
+        tracing::debug!(
+            target: PANETIERE,
+            client_id = self.client_id.0,
+            queued = outbox.len(),
+            "scheduled panetiere client: session dropped; unsent payloads requeued"
+        );
     }
 }
 
 impl Session for ScheduledPanetiereClientSession {
     fn begin_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
+        self.cur_round = Some(round);
+        // On a non-relay node no server session shares this store, so nothing
+        // else would ever prune it. Same cutoff, so the two are idempotent.
+        self.entries_by_round
+            .lock()
+            .unwrap()
+            .retain(|r, _| *r >= round.saturating_sub(SCHED_ENTRIES_RETENTION));
         // A reservation whose grant never arrived (leader silence, GC) goes
         // back to staged for a fresh attempt.
         let cutoff = round.saturating_sub(PANETIERE_ROUND_RETENTION);
@@ -343,6 +398,19 @@ impl Session for ScheduledPanetiereClientSession {
         else {
             return Vec::new();
         };
+        if !crate::panetiere::round_in_window(round, self.cur_round) {
+            return Vec::new();
+        }
+        let (offs, _) = allocation(&entries, self.vector_bytes);
+        // Fixed, round-number-only — see `RESERVATION_TO_MSG_GAP`.
+        let target = round + RESERVATION_TO_MSG_GAP;
+        // Recorded even when we reserved nothing: a client with no grant still
+        // has to match this round's entry width or the relay drops it.
+        self.entries_by_round
+            .lock()
+            .unwrap()
+            .entry(round)
+            .or_insert(entries.clone());
         let Some(mine) = self.reserved.remove(&round) else {
             tracing::trace!(
                 target: PANETIERE,
@@ -351,12 +419,6 @@ impl Session for ScheduledPanetiereClientSession {
             );
             return Vec::new();
         };
-        let rands: Vec<u16> = entries.iter().map(|&(r, _)| r).collect();
-        let beacon = codec::beacon(&rands);
-        let sized: Vec<(u16, usize)> = entries.iter().map(|&(r, s)| (r, s as usize)).collect();
-        let offs = codec::allocate(&sized, beacon, self.vector_bytes);
-        // Fixed, round-number-only — see `RESERVATION_TO_MSG_GAP`.
-        let target = round + RESERVATION_TO_MSG_GAP;
         for (rand, data) in mine {
             let idx = entries
                 .iter()
@@ -410,26 +472,35 @@ impl Session for ScheduledPanetiereClientSession {
             return Vec::new();
         }
 
-        let mut msg_buf = vec![0u8; self.vector_bytes];
+        let msg_bytes = round
+            .checked_sub(RESERVATION_TO_MSG_GAP)
+            .and_then(|prev| {
+                let entries = self.entries_by_round.lock().unwrap();
+                entries.get(&prev).map(|e| allocation(e, self.vector_bytes).1)
+            })
+            .unwrap_or(0)
+            * BYTES_PER_POLY;
+        let mut msg_buf = vec![0u8; msg_bytes];
         let mut has_grant = false;
         let mut remaining = Vec::new();
         for (target, offset, data) in std::mem::take(&mut self.granted) {
             if target == round {
-                let end = (offset + data.len()).min(self.vector_bytes);
+                let start = offset.min(msg_bytes);
+                let end = (offset + data.len()).min(msg_bytes);
                 // A grant whose slot runs past the vector delivers a truncated
                 // payload — the receiver gets corrupt bytes, not nothing.
-                if end - offset < data.len() {
+                if end - start < data.len() {
                     tracing::warn!(
                         target: PANETIERE,
                         round,
                         offset,
                         len = data.len(),
-                        vector_bytes = self.vector_bytes,
-                        kept = end - offset,
+                        msg_bytes,
+                        kept = end - start,
                         "scheduled panetiere client: granted slot overruns the message vector; payload truncated"
                     );
                 }
-                msg_buf[offset..end].copy_from_slice(&data[..end - offset]);
+                msg_buf[start..end].copy_from_slice(&data[..end - start]);
                 has_grant = true;
             } else if target < round {
                 // Missed its window (boundary skew) — retry with a fresh rand.
@@ -515,10 +586,9 @@ impl Session for ScheduledPanetiereClientSession {
 
         let mut plaintext = sched.pack();
         plaintext.extend(codec::encode_raw(&msg_buf));
-        debug_assert_eq!(
-            plaintext.len(),
-            message_polys(&self.pp),
-            "joint pp must fit sched + msg exactly"
+        debug_assert!(
+            plaintext.len() <= message_polys(&self.pp),
+            "joint pp must cover sched + the widest message vector"
         );
 
         let mut seed = self.rng_seed;
@@ -602,7 +672,7 @@ impl ScheduledPanetiereServerSession {
         let is_leader = mode == SetMode::Leader;
         let sched_polys = MseEncoding::n_polys(&sched_mse);
         // inner.mse is unused: this wrapper never calls inner's own end_round.
-        let inner = PanetiereServerSession::new(
+        let mut inner = PanetiereServerSession::new(
             pp,
             sched_mse.clone(),
             server_id,
@@ -612,7 +682,8 @@ impl ScheduledPanetiereServerSession {
             server_pubkeys,
             aggregation,
         );
-        ScheduledPanetiereServerSession {
+        inner.set_entry_len(ClientBulletinEntry::packed_len(sched_polys));
+        let mut session = ScheduledPanetiereServerSession {
             inner,
             sched_mse,
             sched_polys,
@@ -624,7 +695,9 @@ impl ScheduledPanetiereServerSession {
             pending_msg: BTreeMap::new(),
             cur_round: None,
             first_round: None,
-        }
+        };
+        session.sync_entry_lens();
+        session
     }
 
     /// See [`crate::panetiere::PanetiereServerSession::set_client_set_max`].
@@ -635,12 +708,35 @@ impl ScheduledPanetiereServerSession {
     pub(crate) fn set_subnet(&mut self, subnet: SubnetId) {
         self.subnet = subnet;
     }
+
+    /// Entry width for every round the store can place. Re-scanned rather than
+    /// pushed on decode: a successor worker inherits entries its predecessor
+    /// deposited and so never "learns" them.
+    fn sync_entry_lens(&mut self) {
+        let widths: Vec<(Round, usize)> = {
+            let map = self.entries_by_round.lock().unwrap();
+            map.iter()
+                .map(|(rd, e)| {
+                    (
+                        rd + RESERVATION_TO_MSG_GAP,
+                        ClientBulletinEntry::packed_len(
+                            self.sched_polys + allocation(e, self.vector_bytes).1,
+                        ),
+                    )
+                })
+                .collect()
+        };
+        for (round, len) in widths {
+            self.inner.set_round_entry_len(round, len);
+        }
+    }
 }
 
 impl Session for ScheduledPanetiereServerSession {
     fn begin_round(&mut self, round: Round, now: Instant) -> Vec<Vec<u8>> {
         self.cur_round = Some(round);
         self.first_round.get_or_insert(round);
+        self.sync_entry_lens();
         self.inner.begin_round(round, now)
     }
 
@@ -655,6 +751,7 @@ impl Session for ScheduledPanetiereServerSession {
                         .unwrap()
                         .entry(round)
                         .or_insert(entries);
+                    self.sync_entry_lens();
                 } else {
                     // Without this round's entries we can't place any message
                     // vector fulfilling it, so those payloads never surface.
@@ -719,24 +816,32 @@ impl Session for ScheduledPanetiereServerSession {
             self.pending_msg.insert(rd, plain[n..].to_vec());
         }
 
+        // `checked_sub`, not saturating: rounds below the gap fulfil nothing, and
+        // mapping them onto round 0's own reservations decodes garbage.
         let ready: Vec<Round> = self
             .pending_msg
             .keys()
             .copied()
-            .filter(|rd| entries_map.contains_key(&rd.saturating_sub(RESERVATION_TO_MSG_GAP)))
+            .filter(|rd| {
+                rd.checked_sub(RESERVATION_TO_MSG_GAP)
+                    .is_some_and(|prev| entries_map.contains_key(&prev))
+            })
             .collect();
         for rd in ready {
             let plain = self.pending_msg.remove(&rd).expect("checked above");
-            let prev = &entries_map[&(rd.saturating_sub(RESERVATION_TO_MSG_GAP))];
-            let rands: Vec<u16> = prev.iter().map(|&(r, _)| r).collect();
-            let beacon = codec::beacon(&rands);
-            let sized: Vec<(u16, usize)> = prev.iter().map(|&(r, s)| (r, s as usize)).collect();
-            let offs = codec::allocate(&sized, beacon, self.vector_bytes);
+            let prev = &entries_map[&(rd - RESERVATION_TO_MSG_GAP)];
+            let (offs, _) = allocation(prev, self.vector_bytes);
             let ranges: Vec<(usize, usize)> = prev
                 .iter()
                 .zip(offs)
                 .filter_map(|(&(_, size), off)| off.map(|o| (o, size as usize)))
+                .filter(|&(_, size)| size > 0)
                 .collect();
+            // An all-cover round reserves only zero-length slots, so there is no
+            // message vector to decode and `decode_raw` would reject the empty one.
+            if ranges.is_empty() {
+                continue;
+            }
             let msgs = match codec::decode_ranges(&plain, &ranges) {
                 Ok(payloads) => payloads
                     .into_iter()
@@ -768,10 +873,9 @@ impl Session for ScheduledPanetiereServerSession {
         self.inner.gc(round);
         let cutoff = round.saturating_sub(SCHED_ENTRIES_RETENTION);
         // A message vector whose reservation round's entries never arrived can't
-        // be unpacked, so its senders' payloads are lost here. A subnet's own
-        // first rounds always trip this — their vectors reference rounds from
-        // before the subnet existed, and are necessarily empty — so the
-        // reservation round is reported against this session's first round.
+        // be unpacked, so its senders' payloads are lost here. `predates_subnet`
+        // marks the benign case: a subnet's own first rounds reference rounds
+        // from before it existed, and those vectors are empty.
         for r in self.pending_msg.range(..cutoff) {
             let reservation_round = r.0.saturating_sub(RESERVATION_TO_MSG_GAP);
             tracing::warn!(
@@ -785,6 +889,8 @@ impl Session for ScheduledPanetiereServerSession {
         }
         entries_map.retain(|r, _| *r >= cutoff);
         self.pending_msg.retain(|r, _| *r >= cutoff);
+        drop(entries_map);
+        self.sync_entry_lens();
 
         RoundOutcome {
             outbound,
@@ -799,28 +905,96 @@ impl Session for ScheduledPanetiereServerSession {
 }
 
 /// Shifts [`PanetiereAggregatorSession`]'s hardcoded k==1 to k==2 (k==1 is
-/// the scheduled cadence's client-submit checkpoint).
-struct ScheduledAggregatorSession(PanetiereAggregatorSession);
+/// the scheduled cadence's client-submit checkpoint), and tracks each round's
+/// message-vector width: `run_aggregator_round` sums its group's ciphertexts,
+/// and summing ragged ones panics.
+pub(crate) struct ScheduledAggregatorSession {
+    inner: PanetiereAggregatorSession,
+    sched_polys: usize,
+    vector_bytes: usize,
+    entries_by_round: ReservationEntries,
+    leader_pk: PeerId,
+    cur_round: Option<Round>,
+}
+
+impl ScheduledAggregatorSession {
+    pub(crate) fn new(
+        mut inner: PanetiereAggregatorSession,
+        sched_polys: usize,
+        vector_bytes: usize,
+        entries_by_round: ReservationEntries,
+        leader_pk: Pubkey,
+    ) -> Self {
+        inner.set_entry_len(ClientBulletinEntry::packed_len(sched_polys));
+        let mut session = ScheduledAggregatorSession {
+            inner,
+            sched_polys,
+            vector_bytes,
+            entries_by_round,
+            leader_pk,
+            cur_round: None,
+        };
+        session.sync_entry_lens();
+        session
+    }
+
+    /// See [`ScheduledPanetiereServerSession::sync_entry_lens`]; a ragged group
+    /// panics `run_aggregator_round`'s ciphertext sum.
+    fn sync_entry_lens(&mut self) {
+        let widths: Vec<(Round, usize)> = {
+            let map = self.entries_by_round.lock().unwrap();
+            map.iter()
+                .map(|(rd, e)| {
+                    (
+                        rd + RESERVATION_TO_MSG_GAP,
+                        ClientBulletinEntry::packed_len(
+                            self.sched_polys + allocation(e, self.vector_bytes).1,
+                        ),
+                    )
+                })
+                .collect()
+        };
+        for (round, len) in widths {
+            self.inner.set_round_entry_len(round, len);
+        }
+    }
+}
 
 impl Session for ScheduledAggregatorSession {
     fn begin_round(&mut self, round: Round, now: Instant) -> Vec<Vec<u8>> {
-        self.0.begin_round(round, now)
+        self.cur_round = Some(round);
+        self.sync_entry_lens();
+        self.inner.begin_round(round, now)
     }
 
     fn on_inbound(&mut self, from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
-        self.0.on_inbound(from, payload)
+        if from == self.leader_pk {
+            if let Ok(PanetiereWire::Reservations { round, entries }) =
+                bincode::deserialize::<PanetiereWire>(&payload)
+            {
+                if crate::panetiere::round_in_window(round, self.cur_round) {
+                    self.entries_by_round
+                        .lock()
+                        .unwrap()
+                        .entry(round)
+                        .or_insert(entries);
+                    self.sync_entry_lens();
+                }
+            }
+        }
+        self.inner.on_inbound(from, payload)
     }
 
     fn checkpoint(&mut self, round: Round, k: u8, now: Instant) -> Vec<Vec<u8>> {
         if k == 2 {
-            self.0.checkpoint(round, 1, now)
+            self.inner.checkpoint(round, 1, now)
         } else {
             Vec::new()
         }
     }
 
     fn end_round(&mut self, round: Round, now: Instant) -> RoundOutcome {
-        self.0.end_round(round, now)
+        self.inner.end_round(round, now)
     }
 }
 
@@ -885,10 +1059,15 @@ pub(crate) async fn run_subnet(
             );
             agg_session
                 .set_client_set_max((cfg.client_set_max as usize / a.groups.len().max(1)).max(1));
-            agg_session.set_entry_len(crate::panetiere::entry_wire_len(&pp));
             sessions.insert(
                 SessionKey::Aggregator,
-                Box::new(ScheduledAggregatorSession(agg_session)),
+                Box::new(ScheduledAggregatorSession::new(
+                    agg_session,
+                    MseEncoding::n_polys(&sched_mse),
+                    cfg.vector_bytes,
+                    inner.sched_reservation_entries(subnet.id),
+                    leader_pk,
+                )),
             );
         }
     }
@@ -968,6 +1147,8 @@ pub(crate) async fn run_subnet(
             &subnet,
             &inner.identity,
             leader_pk,
+            inner.sched_reservation_entries(subnet.id),
+            Arc::downgrade(&inner),
         )
     });
     let misbehavior = inner.misbehavior();
@@ -1153,6 +1334,8 @@ pub(crate) async fn run_subnet(
                             &subnet,
                             &inner.identity,
                             leader_pk,
+                            inner.sched_reservation_entries(subnet.id),
+                            Arc::downgrade(&inner),
                         )
                     });
                     let misbehavior = inner.misbehavior();
@@ -1220,10 +1403,21 @@ mod sizing_tests {
             servers,
             leader,
             [2u8; 32],
+            ReservationEntries::default(),
+        );
+        // A grant filling the cap: the estimate bounds the widest round, and a
+        // client with no reservations to fulfil now sends no message vector.
+        c.on_inbound(
+            leader,
+            bincode::serialize(&PanetiereWire::Reservations {
+                round: 0,
+                entries: vec![(1, vector_bytes as u16)],
+            })
+            .unwrap(),
         );
         c.stage(vec![0xABu8; 64]);
         let client_public = c
-            .checkpoint(0, 1, Instant::now())
+            .checkpoint(RESERVATION_TO_MSG_GAP, 1, Instant::now())
             .iter()
             .map(|m| m.len())
             .max()

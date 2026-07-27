@@ -140,11 +140,8 @@ fn bot_payload(handle: &str, n: usize) -> Vec<u8> {
 /// send — a random line with probability `send_rate` each round. One bot = one
 /// client.
 pub async fn run_bot(anymone: Anymone, handle: String, send_rate: f64) -> Result<()> {
-    // Until the adopted config carries the chat tag there is nothing to join,
-    // and an unjoined bot contributes no cover either — it is absent from the
-    // anonymity set, not merely idle. Log the wait: it is otherwise invisible,
-    // and it lasts until the committee has both heard the chat service's
-    // registration and published a config carrying it.
+    // An unjoined bot contributes no cover either, so it is absent from the
+    // anonymity set rather than merely idle — worth logging the wait.
     let mut waited = 0u32;
     let pipe = loop {
         match anymone.subscribe(chat_tag()).await {
@@ -182,7 +179,6 @@ pub async fn run_bot(anymone: Anymone, handle: String, send_rate: f64) -> Result
                 .send(bot_payload(&handle, rand::random::<usize>()))
                 .await
             {
-                // The payload is gone; the bot has no retry of its own.
                 tracing::warn!(handle, error = %e, "chat bot: send failed");
             }
         }

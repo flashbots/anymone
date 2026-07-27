@@ -281,7 +281,7 @@ pub(crate) async fn run_subnet(
             );
             agg_session
                 .set_client_set_max((cfg.client_set_max as usize / a.groups.len().max(1)).max(1));
-            agg_session.set_entry_len(ClientBulletinEntry::packed_len(message_polys(&pp)));
+            agg_session.set_entry_len(entry_wire_len(&pp));
             sessions.insert(SessionKey::Aggregator, Box::new(agg_session));
         }
     }
@@ -1417,6 +1417,9 @@ pub struct PanetiereServerSession {
     /// geometry. A stale-config client's entry has a different width and, once
     /// summed, panics the KAHE math — reject it at ingestion instead.
     entry_len: usize,
+    /// Per-round override of `entry_len`. Scheduled subnets size each round's
+    /// message vector to that round's granted reservations; empty otherwise.
+    round_entry_len: std::collections::BTreeMap<Round, usize>,
 }
 
 /// Rounds kept after they go quiet. A bucket decodes at `end_round(r+1)`; one
@@ -1441,7 +1444,7 @@ impl PanetiereServerSession {
         server_pubkeys: HashMap<ServerId, Pubkey>,
         aggregation: Option<LeaderAggregation>,
     ) -> Self {
-        let entry_len = ClientBulletinEntry::packed_len(message_polys(&pp));
+        let entry_len = entry_wire_len(&pp);
         PanetiereServerSession {
             pp,
             mse,
@@ -1459,6 +1462,7 @@ impl PanetiereServerSession {
             first_round: None,
             client_set_max: usize::MAX,
             entry_len,
+            round_entry_len: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1468,6 +1472,22 @@ impl PanetiereServerSession {
     /// internal channel is naturally bounded by committee size and can skip this.
     pub fn set_client_set_max(&mut self, max: usize) {
         self.client_set_max = max;
+    }
+
+    /// Geometry default for rounds with no per-round width.
+    pub(crate) fn set_entry_len(&mut self, len: usize) {
+        self.entry_len = len;
+    }
+
+    pub(crate) fn set_round_entry_len(&mut self, round: Round, len: usize) {
+        self.round_entry_len.insert(round, len);
+    }
+
+    fn entry_len_for(&self, round: Round) -> usize {
+        self.round_entry_len
+            .get(&round)
+            .copied()
+            .unwrap_or(self.entry_len)
     }
 
     /// Leader-only: announce the one canonical set per settled round, once.
@@ -1933,13 +1953,14 @@ impl Session for PanetiereServerSession {
                 client_id,
                 entry,
             } => {
-                if entry.len() != self.entry_len {
+                let expected = self.entry_len_for(round);
+                if entry.len() != expected {
                     tracing::debug!(
                         target: PANETIERE,
                         round,
                         client_id,
                         len = entry.len(),
-                        expected = self.entry_len,
+                        expected,
                         "panetiere server: wrong-geometry public dropped"
                     );
                     return Vec::new();
@@ -2254,13 +2275,14 @@ impl Session for PanetiereServerSession {
                     );
                     return Vec::new();
                 }
-                if entry.len() != self.entry_len {
+                let expected = self.entry_len_for(round);
+                if entry.len() != expected {
                     tracing::debug!(
                         target: PANETIERE,
                         round,
                         group,
                         len = entry.len(),
-                        expected = self.entry_len,
+                        expected,
                         "panetiere: wrong-geometry group aggregate dropped"
                     );
                     return Vec::new();
@@ -2565,6 +2587,7 @@ impl PanetiereServerSession {
         self.rounds.retain(|r, _| *r >= cutoff);
         self.client_set_by_round.retain(|r, _| *r >= cutoff);
         self.announced_rounds.retain(|r| *r >= cutoff);
+        self.round_entry_len.retain(|r, _| *r >= cutoff);
     }
 }
 
@@ -2590,6 +2613,8 @@ pub struct PanetiereAggregatorSession {
     /// Expected `ClientBulletinEntry` wire length; wrong-geometry entries
     /// (stale-config clients) panic the KAHE sum if admitted.
     entry_len: usize,
+    /// Per-round override of `entry_len`, as on [`PanetiereServerSession`].
+    round_entry_len: std::collections::BTreeMap<Round, usize>,
 }
 
 impl PanetiereAggregatorSession {
@@ -2605,6 +2630,7 @@ impl PanetiereAggregatorSession {
             first_round: None,
             client_set_max: usize::MAX,
             entry_len: usize::MAX,
+            round_entry_len: std::collections::BTreeMap::new(),
         }
     }
 
@@ -2617,6 +2643,17 @@ impl PanetiereAggregatorSession {
     /// (`ClientBulletinEntry::packed_len(message_polys(&pp))`).
     pub(crate) fn set_entry_len(&mut self, len: usize) {
         self.entry_len = len;
+    }
+
+    pub(crate) fn set_round_entry_len(&mut self, round: Round, len: usize) {
+        self.round_entry_len.insert(round, len);
+    }
+
+    fn entry_len_for(&self, round: Round) -> usize {
+        self.round_entry_len
+            .get(&round)
+            .copied()
+            .unwrap_or(self.entry_len)
     }
 }
 
@@ -2655,13 +2692,14 @@ impl Session for PanetiereAggregatorSession {
                     "panetiere aggregator: public for another group, ignored"
                 );
             } else {
-                if self.entry_len != usize::MAX && entry.len() != self.entry_len {
+                let expected = self.entry_len_for(round);
+                if expected != usize::MAX && entry.len() != expected {
                     tracing::debug!(
                         target: PANETIERE,
                         round,
                         client_id,
                         len = entry.len(),
-                        expected = self.entry_len,
+                        expected,
                         "panetiere aggregator: wrong-geometry public dropped"
                     );
                     return Vec::new();
@@ -2761,6 +2799,7 @@ impl Session for PanetiereAggregatorSession {
         self.rounds.retain(|r, _| *r >= cutoff);
         self.owners.retain(|r, _| *r >= cutoff);
         self.emitted.retain(|r| *r >= cutoff);
+        self.round_entry_len.retain(|r, _| *r >= cutoff);
         RoundOutcome::default()
     }
 }

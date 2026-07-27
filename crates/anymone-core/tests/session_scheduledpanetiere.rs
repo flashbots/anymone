@@ -15,6 +15,7 @@ use anymone_core::session::{LeaderAggregation, Session};
 use anymone_core::{Identity, Pubkey};
 
 use chipmunk_code::N;
+use panetiere::bulletin::ClientBulletinEntry;
 use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::pke;
 use panetiere::protocol::{ProtocolParams, ServerId};
@@ -23,7 +24,7 @@ use rand_chacha::ChaCha20Rng;
 
 /// Must match `panetiere_scheduled::RESERVATION_TO_MSG_GAP` (crate-private):
 /// a grant from round `R`'s `Reservations` is always due at round `R + GAP`.
-const GAP: u64 = 3;
+const GAP: u64 = 2;
 const BYTES_PER_POLY: usize = N * 4;
 
 /// PRF key from the test's seeded RNG, like production `channel_mse_params` —
@@ -110,16 +111,26 @@ fn direct_round(
     client_pks: &[Pubkey],
     servers: &mut [ScheduledPanetiereServerSession],
     server_pks: &[Pubkey],
+    submitted: &mut Vec<Option<usize>>,
 ) -> Vec<Vec<Vec<u8>>> {
+    submitted.clear();
     for (i, c) in clients.iter_mut().enumerate() {
         c.begin_round(round, now);
         let out = c.checkpoint(round, 1, now);
+        // The head is the `ClientPublic`; its length is the round's geometry.
+        submitted.push(out.first().map(|m| m.len()));
         for s in servers.iter_mut() {
             for m in &out {
                 s.on_inbound(client_pks[i], m.clone());
             }
         }
     }
+    let widths: Vec<usize> = submitted.iter().flatten().copied().collect();
+    assert!(
+        widths.windows(2).all(|w| w[0] == w[1]),
+        "round {round}: clients disagreed on entry width {widths:?} — a ragged \
+         set panics the KAHE ciphertext sum"
+    );
     for s in servers.iter_mut() {
         s.begin_round(round, now);
     }
@@ -187,6 +198,7 @@ fn scheduled_direct_flow_pipelines_reservations() {
                 xpubs.clone(),
                 server_pks[0],
                 seed,
+                ReservationEntries::default(),
             )
         })
         .collect();
@@ -205,6 +217,8 @@ fn scheduled_direct_flow_pipelines_reservations() {
     let now = Instant::now();
 
     let mut final_decoded: Vec<Vec<Vec<u8>>> = Vec::new();
+    let mut submitted = Vec::new();
+    let mut fulfilling_width = 0usize;
     for round in 0..=(GAP + 1) {
         let decoded = direct_round(
             round,
@@ -213,7 +227,13 @@ fn scheduled_direct_flow_pipelines_reservations() {
             &client_pks,
             &mut servers,
             &server_pks,
+            &mut submitted,
         );
+        // Round 0's grants are placed at round GAP; the decode surfaces a round
+        // later, once the relays' shares are in.
+        if round == GAP {
+            fulfilling_width = submitted[0].expect("client 0 submits its granted payload");
+        }
         if round < GAP + 1 {
             for (i, d) in decoded.iter().enumerate() {
                 assert!(
@@ -245,6 +265,7 @@ fn scheduled_direct_flow_pipelines_reservations() {
         &client_pks,
         &mut servers,
         &server_pks,
+        &mut submitted,
     );
     for (i, d) in decoded.iter().enumerate() {
         assert!(
@@ -252,6 +273,17 @@ fn scheduled_direct_flow_pipelines_reservations() {
             "relay {i}: cover-only round must decode nothing"
         );
     }
+
+    // The saving: a round whose reservations are all zero-length cover carries
+    // no message vector at all, where a fulfilling round carries one poly.
+    let cover_width = submitted[0].expect("client 0 still reserves cover");
+    let one_poly = ClientBulletinEntry::packed_len(sched_polys + 1)
+        - ClientBulletinEntry::packed_len(sched_polys);
+    assert_eq!(
+        fulfilling_width - cover_width,
+        one_poly,
+        "a cover-only round must drop the message vector entirely"
+    );
 }
 
 #[test]
@@ -293,6 +325,7 @@ fn dropped_reservation_is_retried() {
                 xpubs.clone(),
                 server_pks[0],
                 seed,
+                ReservationEntries::default(),
             )
         })
         .collect();
@@ -314,6 +347,7 @@ fn dropped_reservation_is_retried() {
     // re-reserves at whichever round it lands back in `staged`, so it needs
     // its own full GAP+1 round-trip after that — generous margin here.
     let mut all_decoded: Vec<Vec<u8>> = Vec::new();
+    let mut submitted = Vec::new();
     for round in 0..(3 * (GAP + 1)) {
         let decoded = direct_round(
             round,
@@ -322,6 +356,7 @@ fn dropped_reservation_is_retried() {
             &client_pks,
             &mut servers,
             &server_pks,
+            &mut submitted,
         );
         all_decoded.extend(decoded[0].clone());
     }
@@ -462,6 +497,7 @@ fn scheduled_aggregated_flow_decodes_through_groups() {
                 xpubs.clone(),
                 server_pks[0],
                 seed,
+                ReservationEntries::default(),
             )
         })
         .collect();

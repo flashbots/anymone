@@ -1341,6 +1341,84 @@ pub(crate) fn queue_outbound(
 }
 
 #[cfg(test)]
+mod outbox_tests {
+    use super::*;
+    use crate::config::{AnymoneRoundConfiguration, NoopConfig, ProtocolConfig};
+    use crate::panetiere_scheduled::{
+        sched_mse_params, setup_joint_pp, ReservationEntries, ScheduledPanetiereClientSession,
+    };
+    use crate::panetiere::client_id_from_pubkey;
+
+    fn test_inner(relays: Vec<Pubkey>) -> Arc<AnymoneInner> {
+        let protocol = ProtocolConfig::Noop(NoopConfig {
+            round_duration_ms: 30,
+            message_size: 1024,
+            client_set_min: 0,
+            client_set_max: 256,
+        });
+        let cfg = AnymoneRoundConfiguration::singleton_subnet(
+            0,
+            protocol,
+            relays.clone(),
+            vec![],
+            vec![],
+        );
+        let transport: Arc<dyn Transport> =
+            Arc::new(crate::transport::InMemoryNetwork::new().handle(relays[0]));
+        Arc::new(AnymoneInner {
+            identity: crate::Identity::generate(),
+            transport,
+            config: RwLock::new(cfg),
+            pipes: Mutex::new(HashMap::new()),
+            joined: Mutex::new(HashMap::new()),
+            subnets: Mutex::new(HashMap::new()),
+            outbox: Mutex::new(VecDeque::new()),
+            sched_entries: Mutex::new(HashMap::new()),
+            participation_seed: [42u8; 32],
+            committee: None,
+            events: broadcast::channel(1).0,
+            misbehavior: AtomicU8::new(0),
+        })
+    }
+
+    /// A reconfig cutover drops the client session mid-flight; its payloads came
+    /// off the outbox, so they have to go back or the send is silently lost.
+    #[test]
+    fn dropped_client_session_requeues_unsent_payloads() {
+        let identity = crate::Identity::generate();
+        let inner = test_inner(vec![identity.pubkey()]);
+        let mse = sched_mse_params(2, [3u8; 32]);
+        let pp = setup_joint_pp(&mse, 128, 1, [3u8; 32]);
+
+        let mut session = ScheduledPanetiereClientSession::new(
+            pp,
+            mse,
+            128,
+            client_id_from_pubkey(identity.pubkey()),
+            Vec::new(),
+            identity.pubkey(),
+            [7u8; 32],
+            ReservationEntries::default(),
+        );
+        session.set_node(Arc::downgrade(&inner));
+        session.stage(b"first".to_vec());
+        session.stage(b"second".to_vec());
+        // Cover carries no payload and must not be resurrected as a real send.
+        session.stage(Vec::new());
+        assert!(inner.outbox.lock().unwrap().is_empty());
+
+        drop(session);
+
+        let outbox = inner.outbox.lock().unwrap();
+        assert_eq!(
+            outbox.iter().cloned().collect::<Vec<_>>(),
+            vec![b"first".to_vec(), b"second".to_vec()],
+            "unsent payloads must return to the outbox, in order, without cover"
+        );
+    }
+}
+
+#[cfg(test)]
 mod participation_tests {
     use super::*;
     use crate::config::{AnymoneRoundConfiguration, NoopConfig, ProtocolConfig};

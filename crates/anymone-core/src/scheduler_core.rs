@@ -103,6 +103,36 @@ fn size_capacity(clients: usize) -> u32 {
     (plus.max(mult) as u32).max(MIN_CAPACITY)
 }
 
+/// Busiest aggregator group when `clients` hash into `groups` by
+/// `client_id % groups`: half again the even split. Balls-in-bins at these
+/// counts routinely lands a third of the way past even, and a client its group
+/// turns away is missing from the round entirely, not merely delayed.
+fn busiest_group(clients: u32, groups: u32) -> u32 {
+    (clients.div_ceil(groups.max(1)) * 3).div_ceil(2)
+}
+
+/// Raise `desired` until each aggregator group's admission cap
+/// (`capacity / groups`) covers its busiest bin. The headroom has to come from
+/// capacity rather than the per-group cap: the canonical set is the union of
+/// the group aggregates and cannot be truncated, so groups admitting past
+/// `capacity / groups` would push the announced set over `client_set_max` and
+/// stall the round outright. Growing capacity also grows the group count, so
+/// solve rather than scale.
+fn capacity_for_group_balance(desired: u32, clients: u32, n_relays: usize) -> u32 {
+    let mut capacity = desired;
+    while capacity < MAX_SUBNET_CLIENTS {
+        let Some(groups) = aggregator_group_count(capacity, n_relays) else {
+            break;
+        };
+        let busiest = busiest_group(clients, groups);
+        if capacity / groups >= busiest {
+            break;
+        }
+        capacity = (busiest * groups).max(capacity + 1);
+    }
+    capacity.min(MAX_SUBNET_CLIENTS)
+}
+
 /// IBLT/MSE decode capacity for an anonymity set of `set`: ~half its members
 /// send real messages, the rest cover — and cover vanishes from the IBLT/sum.
 pub(crate) fn expected_active(set: u32) -> u32 {
@@ -219,6 +249,36 @@ fn validate_structure(body: &AnymoneRoundConfigurationBody) -> bool {
 #[cfg(test)]
 mod sizing_tests {
     use super::*;
+
+    /// A group turning clients away costs whole rounds of output, so every
+    /// group's admission cap must clear its busiest bin at the sized capacity.
+    #[test]
+    fn capacity_covers_the_busiest_aggregator_group() {
+        for n_relays in [4usize, 8, 16] {
+            for clients in 1u32..120 {
+                let capacity = capacity_for_group_balance(
+                    size_capacity(clients as usize),
+                    clients,
+                    n_relays,
+                );
+                let Some(groups) = aggregator_group_count(capacity, n_relays) else {
+                    continue;
+                };
+                assert!(
+                    capacity / groups >= busiest_group(clients, groups),
+                    "{clients} clients over {n_relays} relays: capacity {capacity} gives \
+                     {groups} groups a cap of {} but the busiest holds {}",
+                    capacity / groups,
+                    busiest_group(clients, groups)
+                );
+                assert!(capacity <= MAX_SUBNET_CLIENTS);
+            }
+        }
+        // The reported case: 13 per group was under the ~14 that actually hashed
+        // there, so clients were bounced and their rounds carried no message.
+        let sized = capacity_for_group_balance(size_capacity(31), 31, 8);
+        assert!(sized > 41, "sizing must clear the old per-group cap, got {sized}");
+    }
 
     #[test]
     fn reference_capacity_fits_budget() {
@@ -604,10 +664,8 @@ impl SchedulerCore {
                     );
                 } else {
                     self.sidelined.remove(&pubkey);
-                    // Registrations re-announce every few seconds; only the first
-                    // one is news. Until it lands the registrant is invisible to
-                    // governance, so the gap between a process starting and this
-                    // line is the cost of gossip mesh formation.
+                    // Re-announced every few seconds; the first arrival is the
+                    // one that measures gossip mesh formation.
                     if self.registered.insert(pubkey) {
                         tracing::debug!(
                             target: GOV,
@@ -970,7 +1028,11 @@ impl SchedulerCore {
         // `min_capacity` is a hard floor — set it above the expected load to
         // keep the subnet from resizing at all during a demo.
         let observed = busiest.max(load.div_ceil(self.subnet_count.max(1) as u32));
-        let desired = size_capacity(observed as usize).max(self.params.min_capacity);
+        let desired = capacity_for_group_balance(
+            size_capacity(observed as usize).max(self.params.min_capacity),
+            observed,
+            self.registered.len(),
+        );
         if observed >= self.capacity {
             // Overflowing right now (clients being rejected): grow immediately.
             self.capacity = desired.max(self.capacity);
@@ -1666,21 +1728,31 @@ fn content_key(
     key
 }
 
-/// Aggregator layer for a Panetiere subnet of `capacity` clients, or `None`
-/// below the threshold. Group count is `min(1 + capacity/16, √capacity/2)`,
-/// clamped to at least one and at most one distinct `replication`-sized committee
-/// per group (a node runs one aggregator session, so a relay can't staff two).
-fn build_subnet_aggregation(capacity: u32, relay_vec: &[Pubkey]) -> Option<Aggregation> {
-    let replication = AGGREGATOR_REPLICATION.min(relay_vec.len() as u32);
+/// Aggregator group count for a subnet of `capacity` clients over `n_relays`,
+/// or `None` when the subnet is below the aggregation threshold and clients
+/// reach relays directly. `min(1 + capacity/16, √capacity/2)`, clamped to at
+/// least one and at most one distinct `replication`-sized committee per group
+/// (a node runs one aggregator session, so a relay can't staff two).
+fn aggregator_group_count(capacity: u32, n_relays: usize) -> Option<u32> {
+    let replication = AGGREGATOR_REPLICATION.min(n_relays as u32);
     if capacity <= AGGREGATION_THRESHOLD || replication == 0 {
         return None;
     }
-    let max_groups = relay_vec.len() as u32 / replication;
-    let group_count = ((1.0 + capacity as f64 / 16.0)
-        .min((capacity as f64).sqrt() / 2.0)
-        .floor() as u32)
-        .min(max_groups)
-        .max(1);
+    let max_groups = n_relays as u32 / replication;
+    Some(
+        ((1.0 + capacity as f64 / 16.0)
+            .min((capacity as f64).sqrt() / 2.0)
+            .floor() as u32)
+            .min(max_groups)
+            .max(1),
+    )
+}
+
+/// Aggregator layer for a Panetiere subnet of `capacity` clients, or `None`
+/// below the threshold.
+fn build_subnet_aggregation(capacity: u32, relay_vec: &[Pubkey]) -> Option<Aggregation> {
+    let replication = AGGREGATOR_REPLICATION.min(relay_vec.len() as u32);
+    let group_count = aggregator_group_count(capacity, relay_vec.len())?;
     let groups = (0..group_count)
         .map(|g| {
             let aggregators: Vec<Pubkey> = (0..replication)
