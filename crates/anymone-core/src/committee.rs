@@ -19,7 +19,7 @@ use crate::governance::{FaultReport, TOPIC_FAULTS, TOPIC_REGISTRATION};
 use crate::identity::{Identity, Pubkey};
 use crate::log_target::GOV;
 use crate::panetiere::{
-    channel_mse_params, setup_pp, PanetiereClientSession, PanetiereServerSession, SetMode,
+    channel_params, setup_pp, PanetiereClientSession, PanetiereServerSession, SetMode,
     COMMITTEE_MSG_BYTES,
 };
 use crate::scheduler_core::{SchedulerAction, SchedulerCore, SchedulerParams};
@@ -264,7 +264,7 @@ pub async fn spawn_panetiere_committee_scheduler(
     // Committee-anonymisation Panetiere parameters, derived deterministically.
     // ρ=3: a malicious member can't overwrite the lead's config in the IBLT.
     let setup_seed = crate::keys::derive_seed(b"anymone/committee-seed", &committee);
-    let committee_mse = channel_mse_params(3, config.committee_msg_bytes, setup_seed);
+    let committee_mse = channel_params(3, config.committee_msg_bytes, setup_seed);
     let pp = setup_pp(&committee_mse, committee.len(), setup_seed);
     let mut sorted_committee = committee.clone();
     sorted_committee.sort();

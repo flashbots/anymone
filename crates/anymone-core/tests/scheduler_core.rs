@@ -26,6 +26,7 @@ use anymone_core::{FaultReport, Identity, Pubkey, Registration, ServiceTag, TOPI
 
 use adcnet::crypto::{ServerId, SharedKey};
 use adcnet::protocol::session::one_round::{IbltMsgParamsOwned, OneRoundConfig};
+use panetiere::channel::ChannelParams;
 use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::protocol::{ProtocolParams, ServerId as PanServerId};
 use rand::SeedableRng;
@@ -1171,13 +1172,12 @@ impl PanetiereSubnet {
         let mut setup_rng = ChaCha20Rng::from_seed([7u8; 32]);
         // One real sender per round (the rest of the demo's clients re-home
         // elsewhere); MSE sized to that.
-        let mse = MseParams::new(4, 1, 32, [0xAA; 32]);
-        let n_polys = MseEncoding::n_polys(&mse);
+        let mse = ChannelParams::from_mse(MseParams::new(4, 1, 32, [0xAA; 32]));
+        let n_polys = mse.n_polys();
         let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(
             &mut setup_rng,
             n,
             n_polys,
-            1,
         ));
         let server_ids: Vec<PanServerId> = (0..n as u32).map(PanServerId).collect();
 

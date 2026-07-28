@@ -14,13 +14,14 @@ use anymone_core::panetiere::{
 use anymone_core::session::{LeaderAggregation, Session};
 use anymone_core::{Identity, Pubkey};
 
+use panetiere::channel::ChannelParams;
 use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::pke;
 use panetiere::protocol::{ProtocolParams, ServerId};
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
-/// PRF key from the test's seeded RNG, like production `channel_mse_params` —
+/// PRF key from the test's seeded RNG, like production `channel_params` —
 /// a hardcoded key can land the IBLT on a rare peel stall at tight δ.
 fn prf_key(rng: &mut ChaCha20Rng) -> [u8; 32] {
     let mut key = [0u8; 32];
@@ -61,13 +62,12 @@ fn run_aggregated(
 ) -> Vec<Vec<u8>> {
     let mut setup_rng = ChaCha20Rng::from_seed([7u8; 32]);
     // Only client 0 is active; the IBLT is sized to the active count.
-    let mse = MseParams::new(4, 1, 32, prf_key(&mut setup_rng));
-    let n_polys = MseEncoding::n_polys(&mse);
+    let mse = ChannelParams::from_mse(MseParams::new(4, 1, 32, prf_key(&mut setup_rng)));
+    let n_polys = mse.n_polys();
     let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(
         &mut setup_rng,
         n_servers,
         n_polys,
-        1,
     ));
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let (ids, server_pks, xpubs) = server_env(n_servers);
@@ -239,13 +239,12 @@ fn aggregated_flow_survives_one_dead_replica_per_group() {
 fn late_group_aggregate_does_not_zero_the_round() {
     let mut setup_rng = ChaCha20Rng::from_seed([7u8; 32]);
     let n_servers = 3;
-    let mse = MseParams::new(4, 2, 32, prf_key(&mut setup_rng));
-    let n_polys = MseEncoding::n_polys(&mse);
+    let mse = ChannelParams::from_mse(MseParams::new(4, 2, 32, prf_key(&mut setup_rng)));
+    let n_polys = mse.n_polys();
     let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(
         &mut setup_rng,
         n_servers,
         n_polys,
-        1,
     ));
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let (ids, server_pks, xpubs) = server_env(n_servers);

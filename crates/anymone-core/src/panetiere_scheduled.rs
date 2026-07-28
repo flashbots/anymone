@@ -16,10 +16,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
-use chipmunk_code::{KahePoly, N};
+use chipmunk_code::KahePoly;
 use panetiere::bulletin::ClientBulletinEntry;
 use panetiere::codec;
-use panetiere::mse::{MseEncoding, MseParams};
+use panetiere::channel::ChannelParams;
+use panetiere::mse::MseEncoding;
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
 use panetiere::protocol::{message_polys, ClientId, ProtocolParams, ServerId};
@@ -45,11 +46,9 @@ use crate::runtime::{
 use crate::session::{LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
 use crate::transport::Subscription;
 
-/// `(rand, size)` per reservation.
+/// `(rand, size)` per reservation: two `Z_t` symbols carrying the `u16`s
+/// directly, so this channel is symbol-oriented and not byte-packed.
 const SCHED_TOKEN_SYMBOLS: usize = 2;
-const SCHED_GAMMA: usize = 4;
-/// Bytes one `KahePoly` (`N` coefficients, 4 bytes each) holds via `codec::encode_raw`.
-const BYTES_PER_POLY: usize = N * 4;
 
 /// `Reservations{R}` is fulfilled at round `R + RESERVATION_TO_MSG_GAP`. Must
 /// be a fixed constant, not derived from a session's local clock: the relay
@@ -72,16 +71,15 @@ pub type ReservationEntries = Arc<Mutex<BTreeMap<Round, Vec<(u16, u16)>>>>;
 
 /// MSE parameters for a reservation channel sized for `rho` expected
 /// reservations per round; `prf_key` is domain-separated from the one-round
-/// channel's (`0x5C` in `panetiere::channel_mse_params`).
-pub(crate) fn sched_mse_params(rho: u32, setup_seed: [u8; 32]) -> MseParams {
-    let delta = (3 * rho.max(1) as usize).div_ceil(SCHED_GAMMA);
+/// channel's (`0x5C` in `panetiere::channel_params`).
+pub(crate) fn sched_channel_params(rho: u32, setup_seed: [u8; 32]) -> ChannelParams {
     let mut prf_key = setup_seed;
     prf_key[0] ^= 0x77;
-    MseParams::new(SCHED_GAMMA, delta, SCHED_TOKEN_SYMBOLS, prf_key)
+    ChannelParams::for_symbols(rho, SCHED_TOKEN_SYMBOLS, prf_key)
 }
 
 pub(crate) fn msg_polys(vector_bytes: usize) -> usize {
-    vector_bytes.div_ceil(BYTES_PER_POLY)
+    vector_bytes.div_ceil(codec::BYTES_PER_POLY)
 }
 
 /// Slot offsets (index-aligned with `entries`) and the poly count their grants
@@ -102,16 +100,14 @@ fn allocation(entries: &[(u16, u16)], cap: usize) -> (Vec<Option<usize>>, usize)
 
 /// Joint params: `mu_kahe` covers the reservation MSE plus the message vector.
 pub(crate) fn setup_joint_pp(
-    sched_mse: &MseParams,
+    sched_mse: &ChannelParams,
     vector_bytes: usize,
     n_servers: usize,
     setup_seed: [u8; 32],
 ) -> Arc<ProtocolParams> {
     let mut rng = ChaCha20Rng::from_seed(setup_seed);
-    let mu_kahe = MseEncoding::n_polys(sched_mse) + msg_polys(vector_bytes);
-    Arc::new(ProtocolParams::setup_with_kahe_dims(
-        &mut rng, n_servers, mu_kahe, 1,
-    ))
+    let mu_kahe = sched_mse.n_polys() + msg_polys(vector_bytes);
+    Arc::new(ProtocolParams::setup_with_kahe_dims(&mut rng, n_servers, mu_kahe))
 }
 
 /// Conservative upper bound on the largest per-round wire message a scheduled
@@ -124,12 +120,12 @@ pub(crate) fn max_wire_estimate(
     n_relays: usize,
 ) -> usize {
     const FRAMING: usize = 512;
-    let sched_mse = sched_mse_params(estimated_messages, [0u8; 32]);
-    let n_polys = MseEncoding::n_polys(&sched_mse) + msg_polys(vector_bytes);
+    let sched_mse = sched_channel_params(estimated_messages, [0u8; 32]);
+    let n_polys = sched_mse.n_polys() + msg_polys(vector_bytes);
     // CS params depend only on n_servers; a tiny KAHE width skips sampling the
     // (large, unused-for-sizing) KAHE CRS — same trick as `panetiere::setup_pp`.
     let mut rng = ChaCha20Rng::from_seed([0u8; 32]);
-    let pp = ProtocolParams::setup_with_kahe_dims(&mut rng, n_relays.max(1), 1, 1);
+    let pp = ProtocolParams::setup_with_kahe_dims(&mut rng, n_relays.max(1), 1);
     let client_public = ClientBulletinEntry::packed_len(n_polys) + FRAMING;
     let server_public =
         pp.cs.aggregated_server_crypto_len(client_set_max) + client_set_max as usize * 4 + FRAMING;
@@ -159,7 +155,7 @@ fn seal_roster(
 #[allow(clippy::too_many_arguments)]
 fn client_session(
     pp: &Arc<ProtocolParams>,
-    sched_mse: &MseParams,
+    sched_mse: &ChannelParams,
     vector_bytes: usize,
     relay_xk: &[(Pubkey, ExchangePublicKeyWire)],
     subnet: &Subnet,
@@ -167,6 +163,7 @@ fn client_session(
     leader_pk: Pubkey,
     entries_by_round: ReservationEntries,
     node: Weak<AnymoneInner>,
+    setup_seed: [u8; 32],
 ) -> Box<dyn Session> {
     let servers = seal_roster(relay_xk, subnet);
     if servers.len() != subnet.relays.len() {
@@ -190,13 +187,14 @@ fn client_session(
         entries_by_round,
     );
     session.set_node(node);
+    session.set_setup_seed(setup_seed);
     Box::new(session)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn server_session(
     pp: &Arc<ProtocolParams>,
-    sched_mse: &MseParams,
+    sched_mse: &ChannelParams,
     vector_bytes: usize,
     cfg: &ScheduledPanetiereConfig,
     subnet: &Subnet,
@@ -236,12 +234,13 @@ fn server_session(
     );
     session.set_client_set_max(cfg.client_set_max as usize);
     session.set_subnet(subnet.id);
+    session.set_setup_seed(cfg.setup_seed);
     Box::new(session)
 }
 
 pub struct ScheduledPanetiereClientSession {
     pp: Arc<ProtocolParams>,
-    sched_mse: MseParams,
+    sched_mse: ChannelParams,
     vector_bytes: usize,
     client_id: ClientId,
     servers: Vec<(ServerId, pke::PublicKey)>,
@@ -262,13 +261,15 @@ pub struct ScheduledPanetiereClientSession {
     cover_rate: f32,
     cover_rng: ChaCha20Rng,
     rand_rng: ChaCha20Rng,
+    /// Subnet's `setup_seed`; with the round it forms the `sid` openings bind to.
+    setup_seed: [u8; 32],
 }
 
 impl ScheduledPanetiereClientSession {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         pp: Arc<ProtocolParams>,
-        sched_mse: MseParams,
+        sched_mse: ChannelParams,
         vector_bytes: usize,
         client_id: ClientId,
         servers: Vec<(ServerId, pke::PublicKey)>,
@@ -298,11 +299,16 @@ impl ScheduledPanetiereClientSession {
             cover_rate: 1.0,
             cover_rng: ChaCha20Rng::from_seed(cover_seed),
             rand_rng: ChaCha20Rng::from_seed(rand_seed),
+            setup_seed: [0u8; 32],
         }
     }
 
     pub(crate) fn set_node(&mut self, node: Weak<AnymoneInner>) {
         self.node = Some(node);
+    }
+
+    pub(crate) fn set_setup_seed(&mut self, setup_seed: [u8; 32]) {
+        self.setup_seed = setup_seed;
     }
 }
 
@@ -479,7 +485,7 @@ impl Session for ScheduledPanetiereClientSession {
                 entries.get(&prev).map(|e| allocation(e, self.vector_bytes).1)
             })
             .unwrap_or(0)
-            * BYTES_PER_POLY;
+            * codec::BYTES_PER_POLY;
         let mut msg_buf = vec![0u8; msg_bytes];
         let mut has_grant = false;
         let mut remaining = Vec::new();
@@ -548,7 +554,7 @@ impl Session for ScheduledPanetiereClientSession {
             self.staged.push(Vec::new());
         }
 
-        let mut sched = MseEncoding::new(self.sched_mse.clone());
+        let mut sched = MseEncoding::new(self.sched_mse.mse().clone());
         let mut reservations = Vec::new();
         for data in std::mem::take(&mut self.staged) {
             let len = data.len();
@@ -594,8 +600,9 @@ impl Session for ScheduledPanetiereClientSession {
         let mut seed = self.rng_seed;
         seed[24..32].copy_from_slice(&round.to_le_bytes());
         let mut rng = ChaCha20Rng::from_seed(seed);
+        let sid = crate::panetiere::session_id(&self.setup_seed, round);
         let round_out =
-            run_client_round(&mut rng, &self.pp, self.client_id, plaintext, &self.servers);
+            run_client_round(&mut rng, &self.pp, &sid, self.client_id, plaintext, &self.servers);
 
         let mut out: Vec<Vec<u8>> = Vec::with_capacity(1 + self.servers.len());
         out.push(
@@ -637,7 +644,7 @@ impl Session for ScheduledPanetiereClientSession {
 /// decode machinery, adding the sched/msg plaintext split and reservation hand-off.
 pub struct ScheduledPanetiereServerSession {
     inner: PanetiereServerSession,
-    sched_mse: MseParams,
+    sched_mse: ChannelParams,
     sched_polys: usize,
     vector_bytes: usize,
     is_leader: bool,
@@ -658,7 +665,7 @@ impl ScheduledPanetiereServerSession {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         pp: Arc<ProtocolParams>,
-        sched_mse: MseParams,
+        sched_mse: ChannelParams,
         vector_bytes: usize,
         server_id: ServerId,
         identity: Identity,
@@ -670,7 +677,7 @@ impl ScheduledPanetiereServerSession {
         entries_by_round: ReservationEntries,
     ) -> Self {
         let is_leader = mode == SetMode::Leader;
-        let sched_polys = MseEncoding::n_polys(&sched_mse);
+        let sched_polys = sched_mse.n_polys();
         // inner.mse is unused: this wrapper never calls inner's own end_round.
         let mut inner = PanetiereServerSession::new(
             pp,
@@ -707,6 +714,10 @@ impl ScheduledPanetiereServerSession {
 
     pub(crate) fn set_subnet(&mut self, subnet: SubnetId) {
         self.subnet = subnet;
+    }
+
+    pub(crate) fn set_setup_seed(&mut self, setup_seed: [u8; 32]) {
+        self.inner.set_setup_seed(setup_seed);
     }
 
     /// Entry width for every round the store can place. Re-scanned rather than
@@ -787,7 +798,7 @@ impl Session for ScheduledPanetiereServerSession {
         for (rd, plain) in self.inner.decode_settled() {
             let n = self.sched_polys.min(plain.len());
             let entries: Vec<(u16, u16)> =
-                match MseEncoding::unpack(&self.sched_mse, &plain[..n]).decode() {
+                match MseEncoding::unpack(self.sched_mse.mse(), &plain[..n]).decode() {
                     Ok(elements) => elements
                         .into_iter()
                         .filter_map(|symbols| match symbols.as_slice() {
@@ -1021,7 +1032,7 @@ pub(crate) async fn run_subnet(
         _ => unreachable!("panetiere_scheduled::run_subnet on a non-ScheduledPanetiere subnet"),
     };
     let identity_pk = inner.identity.pubkey();
-    let sched_mse = sched_mse_params(cfg.estimated_messages, cfg.setup_seed);
+    let sched_mse = sched_channel_params(cfg.estimated_messages, cfg.setup_seed);
     let pp = setup_joint_pp(
         &sched_mse,
         cfg.vector_bytes,
@@ -1069,7 +1080,7 @@ pub(crate) async fn run_subnet(
                 SessionKey::Aggregator,
                 Box::new(ScheduledAggregatorSession::new(
                     agg_session,
-                    MseEncoding::n_polys(&sched_mse),
+                    sched_mse.n_polys(),
                     cfg.vector_bytes,
                     inner.sched_reservation_entries(subnet.id),
                     leader_pk,
@@ -1155,6 +1166,7 @@ pub(crate) async fn run_subnet(
             leader_pk,
             inner.sched_reservation_entries(subnet.id),
             Arc::downgrade(&inner),
+            cfg.setup_seed,
         )
     });
     let misbehavior = inner.misbehavior();
@@ -1342,6 +1354,7 @@ pub(crate) async fn run_subnet(
                             leader_pk,
                             inner.sched_reservation_entries(subnet.id),
                             Arc::downgrade(&inner),
+                            cfg.setup_seed,
                         )
                     });
                     let misbehavior = inner.misbehavior();
@@ -1390,7 +1403,7 @@ mod sizing_tests {
         let (vector_bytes, rho, cset, n_relays) = (256usize, 4u32, 40u32, 3usize);
         let est = max_wire_estimate(vector_bytes, rho, cset, n_relays);
 
-        let sched_mse = sched_mse_params(rho, [1u8; 32]);
+        let sched_mse = sched_channel_params(rho, [1u8; 32]);
         let pp = setup_joint_pp(&sched_mse, vector_bytes, n_relays, [1u8; 32]);
         let servers: Vec<(ServerId, pke::PublicKey)> = (0..n_relays as u32)
             .map(|i| {

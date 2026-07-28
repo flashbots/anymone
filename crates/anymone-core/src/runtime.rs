@@ -1346,7 +1346,8 @@ mod outbox_tests {
     use super::*;
     use crate::config::{AnymoneRoundConfiguration, NoopConfig, ProtocolConfig};
     use crate::panetiere_scheduled::{
-        sched_mse_params, setup_joint_pp, ReservationEntries, ScheduledPanetiereClientSession,
+        sched_channel_params, setup_joint_pp, ReservationEntries,
+        ScheduledPanetiereClientSession,
     };
     use crate::panetiere::client_id_from_pubkey;
 
@@ -1388,7 +1389,7 @@ mod outbox_tests {
     fn dropped_client_session_requeues_unsent_payloads() {
         let identity = crate::Identity::generate();
         let inner = test_inner(vec![identity.pubkey()]);
-        let mse = sched_mse_params(2, [3u8; 32]);
+        let mse = sched_channel_params(2, [3u8; 32]);
         let pp = setup_joint_pp(&mse, 128, 1, [3u8; 32]);
 
         let mut session = ScheduledPanetiereClientSession::new(

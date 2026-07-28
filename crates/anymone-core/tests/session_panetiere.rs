@@ -18,6 +18,7 @@ use anymone_core::panetiere::{
 use anymone_core::session::{Misbehavior, Session};
 use anymone_core::{Identity, Pubkey, ServiceEntry, ServiceTag};
 
+use panetiere::channel::ChannelParams;
 use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::pke;
 use panetiere::protocol::ProtocolParams;
@@ -54,17 +55,17 @@ fn channel(
     n_servers: usize,
     rho: usize,
     msg_bytes: usize,
-) -> (MseParams, Arc<ProtocolParams>) {
+) -> (ChannelParams, Arc<ProtocolParams>) {
     let delta = (3 * rho.max(1)).div_ceil(4);
     let xi = msg_bytes.div_ceil(4).max(1);
     // Draw the PRF key from the test's own RNG rather than a fixed constant —
     // one magic key reused everywhere can coincidentally peel-stall at a tight delta.
     let mut prf_key = [0u8; 32];
     rng.fill_bytes(&mut prf_key);
-    let mse = MseParams::new(4, delta, xi, prf_key);
-    let n_polys = MseEncoding::n_polys(&mse);
+    let mse = ChannelParams::from_mse(MseParams::new(4, delta, xi, prf_key));
+    let n_polys = mse.n_polys();
     let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(
-        rng, n_servers, n_polys, 1,
+        rng, n_servers, n_polys,
     ));
     (mse, pp)
 }

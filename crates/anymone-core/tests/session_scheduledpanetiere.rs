@@ -16,6 +16,7 @@ use anymone_core::{Identity, Pubkey};
 
 use chipmunk_code::N;
 use panetiere::bulletin::ClientBulletinEntry;
+use panetiere::channel::ChannelParams;
 use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::pke;
 use panetiere::protocol::{ProtocolParams, ServerId};
@@ -27,7 +28,7 @@ use rand_chacha::ChaCha20Rng;
 const GAP: u64 = 2;
 const BYTES_PER_POLY: usize = N * 4;
 
-/// PRF key from the test's seeded RNG, like production `channel_mse_params` —
+/// PRF key from the test's seeded RNG, like production `channel_params` —
 /// a hardcoded key can land the IBLT on a rare peel stall at tight δ.
 fn prf_key(rng: &mut ChaCha20Rng) -> [u8; 32] {
     let mut key = [0u8; 32];
@@ -63,7 +64,7 @@ fn server_pubkeys(server_pks: &[Pubkey]) -> HashMap<ServerId, Pubkey> {
 /// `ids` — shared with a successor session to model a same-node worker respawn.
 fn make_servers(
     pp: &Arc<ProtocolParams>,
-    sched_mse: &MseParams,
+    sched_mse: &ChannelParams,
     vector_bytes: usize,
     ids: &[Identity],
     server_pks: &[Pubkey],
@@ -165,20 +166,19 @@ fn scheduled_direct_flow_pipelines_reservations() {
     let mut setup_rng = ChaCha20Rng::from_seed([7u8; 32]);
     let n_servers = 3;
     let rho = 2u32;
-    let sched_mse = MseParams::new(
+    let sched_mse = ChannelParams::from_mse(MseParams::new(
         4,
         (3 * rho as usize).div_ceil(4),
         2,
         prf_key(&mut setup_rng),
-    );
+    ));
     let vector_bytes = 128usize;
-    let sched_polys = MseEncoding::n_polys(&sched_mse);
+    let sched_polys = sched_mse.n_polys();
     let msg_polys = vector_bytes.div_ceil(BYTES_PER_POLY);
     let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(
         &mut setup_rng,
         n_servers,
         sched_polys + msg_polys,
-        1,
     ));
 
     let (ids, server_pks, xpubs) = server_env(n_servers);
@@ -339,22 +339,21 @@ fn dropped_reservation_is_retried() {
     let mut setup_rng = ChaCha20Rng::from_seed([9u8; 32]);
     let n_servers = 3;
     let rho = 2u32;
-    let sched_mse = MseParams::new(
+    let sched_mse = ChannelParams::from_mse(MseParams::new(
         4,
         (3 * rho as usize).div_ceil(4),
         2,
         prf_key(&mut setup_rng),
-    );
+    ));
     // Wide enough for exactly one 4-byte payload's aligned slot, not two —
     // the second reservation each round must overflow `codec::allocate`.
     let vector_bytes = 4usize;
-    let sched_polys = MseEncoding::n_polys(&sched_mse);
+    let sched_polys = sched_mse.n_polys();
     let msg_polys = vector_bytes.div_ceil(BYTES_PER_POLY);
     let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(
         &mut setup_rng,
         n_servers,
         sched_polys + msg_polys,
-        1,
     ));
     let (ids, server_pks, xpubs) = server_env(n_servers);
 
@@ -492,20 +491,19 @@ fn scheduled_aggregated_flow_decodes_through_groups() {
     let mut setup_rng = ChaCha20Rng::from_seed([11u8; 32]);
     let n_servers = 3;
     let rho = 2u32;
-    let sched_mse = MseParams::new(
+    let sched_mse = ChannelParams::from_mse(MseParams::new(
         4,
         (3 * rho as usize).div_ceil(4),
         2,
         prf_key(&mut setup_rng),
-    );
+    ));
     let vector_bytes = 128usize;
-    let sched_polys = MseEncoding::n_polys(&sched_mse);
+    let sched_polys = sched_mse.n_polys();
     let msg_polys = vector_bytes.div_ceil(BYTES_PER_POLY);
     let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(
         &mut setup_rng,
         n_servers,
         sched_polys + msg_polys,
-        1,
     ));
     let (ids, server_pks, xpubs) = server_env(n_servers);
 
