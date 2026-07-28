@@ -105,6 +105,23 @@ fn symbols_to_bytes(symbols: &[i64]) -> Vec<u8> {
     out
 }
 
+/// `client_id % groups` is never re-drawn, so an even share turns the busiest
+/// bin away every round for as long as that roster lasts.
+pub(crate) const AGGREGATOR_GROUP_SLACK: u32 = 2;
+
+pub(crate) fn aggregator_group_allowance(client_set_max: u32, groups: u32) -> usize {
+    client_set_max
+        .div_ceil(groups.max(1))
+        .saturating_mul(AGGREGATOR_GROUP_SLACK)
+        .max(1) as usize
+}
+
+/// Every group full: a frozen group sum can't be truncated, so this and not
+/// `client_set_max` is what the announced set can reach.
+pub(crate) fn aggregated_client_set_bound(client_set_max: u32, groups: u32) -> u32 {
+    (aggregator_group_allowance(client_set_max, groups) as u32).saturating_mul(groups.max(1))
+}
+
 /// Conservative upper bound on the largest per-round wire message a Panetiere subnet
 /// broadcasts, for the committee's p2p size-cap guard. Sizes the real bulletin entries
 /// (`ClientBulletinEntry::packed_len`, `CsParams::aggregated_server_crypto_len`).
@@ -279,8 +296,10 @@ pub(crate) async fn run_subnet(
                 a.groups.len() as u32,
                 inner.identity.clone(),
             );
-            agg_session
-                .set_client_set_max((cfg.client_set_max as usize / a.groups.len().max(1)).max(1));
+            agg_session.set_client_set_max(aggregator_group_allowance(
+                cfg.client_set_max,
+                a.groups.len() as u32,
+            ));
             agg_session.set_entry_len(entry_wire_len(&pp));
             sessions.insert(SessionKey::Aggregator, Box::new(agg_session));
         }
@@ -1490,6 +1509,18 @@ impl PanetiereServerSession {
             .unwrap_or(self.entry_len)
     }
 
+    /// Largest set this subnet can announce: an aggregated one is the union of
+    /// group aggregates, which overshoots `client_set_max` by the group slack.
+    fn canonical_bound(&self) -> usize {
+        match &self.aggregation {
+            Some(a) => {
+                aggregated_client_set_bound(self.client_set_max as u32, a.roster.len() as u32)
+                    as usize
+            }
+            None => self.client_set_max,
+        }
+    }
+
     /// Leader-only: announce the one canonical set per settled round, once.
     /// Called from `end_round` (direct flow) or checkpoint 2 (aggregated).
     pub(crate) fn announce_settled(&mut self, round: Round) -> Vec<Vec<u8>> {
@@ -2037,7 +2068,7 @@ impl Session for PanetiereServerSession {
                     // Admission is arrival-ordered and differs per relay, while
                     // the canonical set is frozen elsewhere; 2× headroom keeps
                     // every canonical member's opening servable.
-                    let max = self.client_set_max.saturating_mul(2);
+                    let max = self.canonical_bound().saturating_mul(2);
                     let bucket = self.rounds.entry(round).or_default();
                     match admit_client(&mut bucket.owners, cid, from, max) {
                         Admit::Admitted => {}

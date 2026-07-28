@@ -1061,8 +1061,10 @@ pub(crate) async fn run_subnet(
                 a.groups.len() as u32,
                 inner.identity.clone(),
             );
-            agg_session
-                .set_client_set_max((cfg.client_set_max as usize / a.groups.len().max(1)).max(1));
+            agg_session.set_client_set_max(crate::panetiere::aggregator_group_allowance(
+                cfg.client_set_max,
+                a.groups.len() as u32,
+            ));
             sessions.insert(
                 SessionKey::Aggregator,
                 Box::new(ScheduledAggregatorSession::new(

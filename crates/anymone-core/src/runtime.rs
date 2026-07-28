@@ -1311,7 +1311,8 @@ pub(crate) fn sync_client_round(
 
 /// One line per round per subnet worker: the round's whole outcome, so a stalled
 /// subnet is visible as an absence of decodes rather than an absence of logs.
-/// `trace` — every round produces one, healthy or not.
+/// `debug` — a round that carried nothing leaves no other trace, and every
+/// failure path here is silent by construction.
 pub(crate) fn log_round_outcome(
     protocol: &'static str,
     subnet: SubnetId,
@@ -1319,7 +1320,7 @@ pub(crate) fn log_round_outcome(
     n_decoded: usize,
     n_faults: usize,
 ) {
-    trace!(
+    debug!(
         target: SCHED,
         protocol,
         subnet,

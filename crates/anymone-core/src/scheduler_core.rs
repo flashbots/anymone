@@ -104,20 +104,16 @@ fn size_capacity(clients: usize) -> u32 {
 }
 
 /// Busiest aggregator group when `clients` hash into `groups` by
-/// `client_id % groups`: half again the even split. Balls-in-bins at these
-/// counts routinely lands a third of the way past even, and a client its group
-/// turns away is missing from the round entirely, not merely delayed.
+/// `client_id % groups`: half again the even split.
 fn busiest_group(clients: u32, groups: u32) -> u32 {
     (clients.div_ceil(groups.max(1)) * 3).div_ceil(2)
 }
 
-/// Raise `desired` until each aggregator group's admission cap
-/// (`capacity / groups`) covers its busiest bin. The headroom has to come from
-/// capacity rather than the per-group cap: the canonical set is the union of
-/// the group aggregates and cannot be truncated, so groups admitting past
-/// `capacity / groups` would push the announced set over `client_set_max` and
-/// stall the round outright. Growing capacity also grows the group count, so
-/// solve rather than scale.
+/// Raise `desired` until every group's allowance covers its busiest bin. The
+/// allowance already carries [`crate::panetiere::AGGREGATOR_GROUP_SLACK`] over
+/// the even split, so this only bites when the load itself outgrows capacity —
+/// growing capacity past a threshold adds a group and divides the share back
+/// down, so solve rather than scale.
 fn capacity_for_group_balance(desired: u32, clients: u32, n_relays: usize) -> u32 {
     let mut capacity = desired;
     while capacity < MAX_SUBNET_CLIENTS {
@@ -125,7 +121,7 @@ fn capacity_for_group_balance(desired: u32, clients: u32, n_relays: usize) -> u3
             break;
         };
         let busiest = busiest_group(clients, groups);
-        if capacity / groups >= busiest {
+        if crate::panetiere::aggregator_group_allowance(capacity, groups) >= busiest as usize {
             break;
         }
         capacity = (busiest * groups).max(capacity + 1);
@@ -148,6 +144,16 @@ const MAX_SUBNET_WIRE: usize = crate::p2p::MAX_TRANSMIT_SIZE * 3 / 4;
 /// so a fixed cap avoids sizing a subnet whose message would blow the p2p limit.
 const MAX_SUBNET_CLIENTS: u32 = 300;
 
+fn announced_set_bound(client_set_max: u32, aggregation: &Option<Aggregation>) -> u32 {
+    match aggregation {
+        Some(a) => crate::panetiere::aggregated_client_set_bound(
+            client_set_max,
+            a.groups.len().max(1) as u32,
+        ),
+        None => client_set_max,
+    }
+}
+
 /// Largest per-round wire message the given subnet protocol broadcasts, via each
 /// protocol's own packing-accurate estimator. Never-proposed protocols report 0
 /// (validate_body rejects them by variant).
@@ -162,13 +168,13 @@ fn subnet_max_wire(p: &ProtocolConfig, n_relays: usize) -> usize {
         ProtocolConfig::Panetiere(c) => crate::panetiere::max_wire_estimate(
             c.message_size,
             c.estimated_messages,
-            c.client_set_max,
+            announced_set_bound(c.client_set_max, &c.aggregation),
             n_relays,
         ),
         ProtocolConfig::ScheduledPanetiere(c) => crate::panetiere_scheduled::max_wire_estimate(
             c.vector_bytes,
             c.estimated_messages,
-            c.client_set_max,
+            announced_set_bound(c.client_set_max, &c.aggregation),
             n_relays,
         ),
         ProtocolConfig::Noop(c) => crate::noop::max_wire_estimate(
@@ -264,20 +270,23 @@ mod sizing_tests {
                 let Some(groups) = aggregator_group_count(capacity, n_relays) else {
                     continue;
                 };
+                let allowance = crate::panetiere::aggregator_group_allowance(capacity, groups);
                 assert!(
-                    capacity / groups >= busiest_group(clients, groups),
+                    allowance >= busiest_group(clients, groups) as usize,
                     "{clients} clients over {n_relays} relays: capacity {capacity} gives \
-                     {groups} groups a cap of {} but the busiest holds {}",
-                    capacity / groups,
+                     {groups} groups an allowance of {allowance} but the busiest holds {}",
                     busiest_group(clients, groups)
                 );
                 assert!(capacity <= MAX_SUBNET_CLIENTS);
             }
         }
-        // The reported case: 13 per group was under the ~14 that actually hashed
-        // there, so clients were bounced and their rounds carried no message.
-        let sized = capacity_for_group_balance(size_capacity(31), 31, 8);
-        assert!(sized > 41, "sizing must clear the old per-group cap, got {sized}");
+        // The slack lives in the allowance, so group balance alone no longer
+        // inflates capacity — 31 clients used to have to grow it past 41.
+        let desired = size_capacity(31);
+        assert_eq!(capacity_for_group_balance(desired, 31, 8), desired);
+        // Measured live: 43 clients hashed 14/19/10 over 3 groups at capacity 36,
+        // and an even share of 12 bounced the busiest bin every round.
+        assert!(crate::panetiere::aggregator_group_allowance(36, 3) >= 19);
     }
 
     #[test]
