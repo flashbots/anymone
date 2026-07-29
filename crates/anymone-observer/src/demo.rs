@@ -222,10 +222,25 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
         .await
         .map_err(|e| anyhow!("chat backend start: {e}"))?;
     let chat_port = args.chat_port;
+    // Virtual clients for the chat backend come off the same in-memory network
+    // as everyone else here.
+    let chat_spawn: anymone_core::SpawnClient = {
+        let net = net.clone();
+        let gov = gov.clone();
+        Arc::new(move || {
+            let net = net.clone();
+            let gov = gov.clone();
+            Box::pin(async move {
+                let id = Identity::generate();
+                let transport: Arc<dyn Transport> = Arc::new(net.handle(id.pubkey()));
+                Anymone::start(id, transport, gov).await.ok()
+            })
+        })
+    };
     tokio::spawn(async move {
         // Open CORS: the dashboard may be viewed from any host, and the feed is
         // the public broadcast transcript.
-        if let Err(e) = anymone_chat::serve(svc, chat_port, None).await {
+        if let Err(e) = anymone_chat::serve(svc, chat_port, None, chat_spawn, 8).await {
             tracing::warn!("chat backend: {e}");
         }
     });

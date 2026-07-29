@@ -5,11 +5,13 @@
 //! channel carried over a range of rounds, `GET /round` reports the round
 //! frontier so a caller can poll from where it left off.
 //!
-//! Submissions use [`anymone_core::Pipe::send_unlinkable`]: the gateway
-//! broadcasts, nobody replies, and reusing one return path across submissions
-//! would mark them as coming from the same submitter. Everything the gateway
-//! read back is public channel traffic — who sent a message is not knowable
-//! here, which is the property the channel exists to provide.
+//! Submissions go through an [`anymone_core::ClientPool`]: the gateway
+//! broadcasts unlinkably (nobody replies, and reusing one return path across
+//! submissions would mark them as coming from the same submitter), and since one
+//! client carries at most one message per round, the pool spawns virtual clients
+//! while callers are queued up. Everything the gateway read back is public
+//! channel traffic — who sent a message is not knowable here, which is the
+//! property the channel exists to provide.
 //!
 //! Retrieval is this process's own view: a bounded in-memory ring filled from
 //! the round the gateway joined onward. It is not a chain — restarting starts
@@ -22,7 +24,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use anymone_core::{Anymone, Event, Round, ServiceTag};
+use anymone_core::{
+    Anymone, ClientPool, Event, PoolError, Round, SendError, ServiceTag, SpawnClient,
+};
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
@@ -30,7 +34,6 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot};
 
 /// One message the channel carried, as served over REST. `data` is hex; `text`
 /// is present only when the payload is valid UTF-8, so a caller that put text
@@ -118,7 +121,11 @@ impl Store {
         let to = if to == 0 { latest } else { to };
         let mut msgs: Vec<Message> = Vec::new();
         let mut truncated = false;
-        for m in inner.msgs.iter().filter(|m| m.round >= from && m.round <= to) {
+        for m in inner
+            .msgs
+            .iter()
+            .filter(|m| m.round >= from && m.round <= to)
+        {
             if msgs.len() == limit {
                 truncated = true;
                 break;
@@ -141,18 +148,12 @@ pub struct Range {
     pub msgs: Vec<Message>,
 }
 
-/// A submission handed from an HTTP handler to [`gateway_loop`], which owns the
-/// pipe. `ack` carries the send's real outcome back, so `POST` answers
-/// "accepted onto the channel" rather than "queued somewhere".
-pub struct Staged {
-    pub payload: Vec<u8>,
-    pub ack: oneshot::Sender<Result<(), String>>,
-}
-
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
-    pub outgoing: mpsc::UnboundedSender<Staged>,
+    /// The clients that carry submissions, grown with virtual clients while
+    /// callers are queued up.
+    pub pool: ClientPool,
     /// Round duration of the adopted config, refreshed by [`gateway_loop`];
     /// `0` until the gateway has attached to the channel.
     pub round_ms: Arc<AtomicU64>,
@@ -167,19 +168,20 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// The one loop that owns the channel pipe: files everything the channel
-/// carries into `store`, tracks the round frontier from the runtime's own
-/// events, and performs the unlinkable sends the HTTP handler stages.
+/// The loop that owns the channel's receive pipe: files everything the channel
+/// carries into `store` and tracks the round frontier from the runtime's own
+/// events. Sending is the [`ClientPool`]'s job, straight from the handler.
 pub async fn gateway_loop(
     anymone: Anymone,
     mut pipe: anymone_core::Pipe,
     store: Arc<Store>,
     round_ms: Arc<AtomicU64>,
-    mut staged: mpsc::UnboundedReceiver<Staged>,
 ) {
     let mut events = anymone.events();
-    let mut staging_open = true;
-    round_ms.store(anymone.round_duration().as_millis() as u64, Ordering::Relaxed);
+    round_ms.store(
+        anymone.round_duration().as_millis() as u64,
+        Ordering::Relaxed,
+    );
     loop {
         tokio::select! {
             inbound = pipe.recv() => {
@@ -201,35 +203,28 @@ pub async fn gateway_loop(
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
-            submission = staged.recv(), if staging_open => {
-                // `None` = every HTTP sender is gone; stop polling this branch
-                // instead of spinning on it, and keep serving retrieval.
-                let Some(Staged { payload, ack }) = submission else { staging_open = false; continue };
-                let result = pipe.send_unlinkable(payload).await.map_err(|e| e.to_string());
-                if let Err(e) = &result {
-                    tracing::warn!(error = %e, "gateway: submission never reached the channel");
-                }
-                let _ = ack.send(result);
-            }
         }
     }
 }
 
-/// Attach to `tag` and serve the REST API on `port`. Blocks forever; holds
-/// `anymone` alive.
+/// Attach to `tag` and serve the REST API on `port`. Submissions ride the
+/// gateway's own client plus up to `max_clients - 1` virtual clients minted by
+/// `spawn` when callers queue up. Blocks forever; holds `anymone` alive.
 pub async fn serve(
     anymone: Anymone,
     tag: ServiceTag,
+    spawn: SpawnClient,
+    max_clients: usize,
     port: u16,
     capacity: usize,
     allow_origin: Option<String>,
 ) -> Result<()> {
     let store = Arc::new(Store::new(capacity));
     let round_ms = Arc::new(AtomicU64::new(0));
-    let (outgoing, staged) = mpsc::unbounded_channel::<Staged>();
+    let pool = ClientPool::new(anymone.clone(), tag, spawn, max_clients);
 
     // Attach in the background so the API is reachable before the committee has
-    // placed the tag on a subnet; submissions until then fail with the pipe's
+    // placed the tag on a subnet; submissions until then fail with the pool's
     // own error rather than the port refusing connections.
     {
         let store = store.clone();
@@ -249,13 +244,13 @@ pub async fn serve(
                 }
             };
             tracing::info!("gateway: attached to the channel");
-            gateway_loop(anymone, pipe, store, round_ms, staged).await;
+            gateway_loop(anymone, pipe, store, round_ms).await;
         });
     }
 
     let state = AppState {
         store,
-        outgoing,
+        pool,
         round_ms,
         allow_origin: allow_origin.unwrap_or_else(|| "*".to_string()),
     };
@@ -290,48 +285,33 @@ async fn submit(State(state): State<AppState>, body: axum::body::Bytes) -> impl 
         );
     }
     let len = body.len();
-    let (ack, acked) = oneshot::channel();
-    if state
-        .outgoing
-        .send(Staged {
-            payload: body.to_vec(),
-            ack,
-        })
-        .is_err()
-    {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            headers,
-            Json(json!({ "ok": false, "error": "gateway backend closed" })),
-        );
-    }
-    match acked.await {
-        // Accepted onto the channel, not yet carried by it: the message goes
-        // out in a later round (the sender's subnet draw, and under a scheduled
-        // protocol its reservation gap, decide which). `after_round` is where a
-        // reader should start looking for it.
-        Ok(Ok(())) => (
+    match state.pool.send(body.to_vec()) {
+        // Accepted onto the channel, not yet carried by it: the message goes out
+        // in a later round, on whichever client is free first (its subnet draw,
+        // and under a scheduled protocol its reservation gap, decide when).
+        // `after_round` is where a reader should start looking for it.
+        Ok(()) => (
             StatusCode::ACCEPTED,
             headers,
             Json(json!({
                 "ok": true,
                 "bytes": len,
                 "after_round": state.store.frontier(),
+                "clients": state.pool.clients(),
             })),
         ),
-        Ok(Err(e)) => {
-            let code = if e.contains("too large") {
-                StatusCode::PAYLOAD_TOO_LARGE
-            } else {
-                StatusCode::SERVICE_UNAVAILABLE
+        Err(e) => {
+            let code = match &e {
+                PoolError::Send(SendError::PayloadTooLarge { .. }) => StatusCode::PAYLOAD_TOO_LARGE,
+                _ => StatusCode::SERVICE_UNAVAILABLE,
             };
-            (code, headers, Json(json!({ "ok": false, "error": e })))
+            tracing::warn!(error = %e, "gateway: submission never reached the channel");
+            (
+                code,
+                headers,
+                Json(json!({ "ok": false, "error": e.to_string() })),
+            )
         }
-        Err(_) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            headers,
-            Json(json!({ "ok": false, "error": "gateway backend closed" })),
-        ),
     }
 }
 
@@ -375,6 +355,8 @@ async fn round(State(state): State<AppState>) -> impl IntoResponse {
             "earliest_round": state.store.earliest(),
             "round_ms": if round_ms == 0 { Value::Null } else { json!(round_ms) },
             "capacity": state.store.capacity,
+            "clients": state.pool.clients(),
+            "queued": state.pool.queued(),
         })),
     )
 }
@@ -382,22 +364,82 @@ async fn round(State(state): State<AppState>) -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anymone_core::{
+        AnymoneRoundConfiguration, Identity, InMemoryNetwork, NoopConfig, ProtocolConfig,
+        ServiceEntry,
+    };
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    fn state() -> (AppState, mpsc::UnboundedReceiver<Staged>) {
-        let (outgoing, rx) = mpsc::unbounded_channel();
-        (
-            AppState {
-                store: Arc::new(Store::new(4)),
-                outgoing,
-                round_ms: Arc::new(AtomicU64::new(1000)),
-                allow_origin: "*".to_string(),
-            },
-            rx,
+    fn test_tag() -> ServiceTag {
+        ServiceTag::from_label("anymone.gateway.unit")
+    }
+
+    /// State over a real (in-memory, single-node) mesh, so submissions exercise
+    /// the pool and the carrier's true size limit rather than a stand-in.
+    async fn state() -> AppState {
+        let committee = Identity::generate();
+        let relay = Identity::generate();
+        let gateway = Identity::generate();
+        let cfg = AnymoneRoundConfiguration::singleton_subnet(
+            0,
+            ProtocolConfig::Noop(NoopConfig {
+                round_duration_ms: 200,
+                message_size: 1024,
+                client_set_min: 0,
+                client_set_max: 8,
+            }),
+            vec![relay.pubkey()],
+            vec![(relay.pubkey(), relay.exchange_keys())],
+            vec![ServiceEntry {
+                tag: test_tag(),
+                pubkey: Identity::generate().pubkey(),
+            }],
         )
+        .sign_with(&[&committee]);
+
+        let net = InMemoryNetwork::new();
+        let anymone = Anymone::start_with_config(
+            gateway.clone(),
+            Arc::new(net.handle(gateway.pubkey())),
+            cfg.clone(),
+        )
+        .await;
+        let spawn: SpawnClient = {
+            let net = net.clone();
+            let cfg = cfg.clone();
+            Arc::new(move || {
+                let net = net.clone();
+                let cfg = cfg.clone();
+                Box::pin(async move {
+                    let id = Identity::generate();
+                    let transport = Arc::new(net.handle(id.pubkey()));
+                    Some(Anymone::start_with_config(id, transport, cfg).await)
+                })
+            })
+        };
+        let pool = ClientPool::new(anymone, test_tag(), spawn, 4);
+        wait_for_clients(&pool, 1).await;
+        AppState {
+            store: Arc::new(Store::new(4)),
+            pool,
+            round_ms: Arc::new(AtomicU64::new(1000)),
+            allow_origin: "*".to_string(),
+        }
+    }
+
+    async fn wait_for_clients(pool: &ClientPool, want: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while pool.clients() < want {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {want} client(s); pool has {}",
+                pool.clients()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     async fn call(state: AppState, method: &str, uri: &str, body: &[u8]) -> (StatusCode, Value) {
@@ -455,51 +497,57 @@ mod tests {
         assert_eq!(store.frontier(), Some(12));
     }
 
-    /// A submitted body reaches the pipe as the exact bytes posted, and the
-    /// response only claims acceptance once the send itself succeeded.
+    /// A submission is accepted and reported with the frontier to start polling
+    /// from. Three at once outrun one client — a client carries one message per
+    /// round — so the pool grows, and every accepted message leaves the queue
+    /// rather than piling up behind the first client.
     #[tokio::test]
-    async fn submit_stages_exact_bytes_and_waits_for_the_send() {
-        let (st, mut rx) = state();
+    async fn submit_grows_the_pool_and_drains_every_queued_message() {
+        let st = state().await;
         st.store.observe_round(41);
-        let handler = tokio::spawn({
-            let st = st.clone();
-            async move { call(st, "POST", "/messages", b"\x00hello\xff").await }
-        });
 
-        let staged = rx.recv().await.unwrap();
-        assert_eq!(staged.payload, b"\x00hello\xff");
-        staged.ack.send(Ok(())).unwrap();
-
-        let (status, body) = handler.await.unwrap();
+        let (status, body) = call(st.clone(), "POST", "/messages", b"\x00hello\xff").await;
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(body["bytes"], json!(7));
         assert_eq!(body["after_round"], json!(41));
+        assert_eq!(body["clients"], json!(1));
+
+        for body in [b"second".as_slice(), b"third".as_slice()] {
+            let (status, _) = call(st.clone(), "POST", "/messages", body).await;
+            assert_eq!(status, StatusCode::ACCEPTED);
+        }
+        wait_for_clients(&st.pool, 2).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while st.pool.queued() > 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "queue never drained: {} left on {} client(s)",
+                st.pool.queued(),
+                st.pool.clients()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
-    /// The one silent-loss path — a send that failed after the handler let go of
-    /// the payload — is reported to the submitter, oversize as 413.
+    /// Both refusals a submitter can hit: nothing to send, and a payload the
+    /// carrier cannot fit — reported against the subnet's real message size,
+    /// never truncated to fit.
     #[tokio::test]
-    async fn submit_reports_a_failed_send() {
-        let (st, mut rx) = state();
-        let handler = tokio::spawn({
-            let st = st.clone();
-            async move { call(st, "POST", "/messages", b"x").await }
-        });
-        rx.recv()
-            .await
-            .unwrap()
-            .ack
-            .send(Err(
-                "payload too large: 9000 bytes exceeds the subnet's 1024-byte message limit"
-                    .to_string(),
-            ))
-            .unwrap();
-        let (status, body) = handler.await.unwrap();
+    async fn submit_rejects_empty_and_oversize_bodies() {
+        let st = state().await;
+
+        let (status, _) = call(st.clone(), "POST", "/messages", b"").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, body) = call(st.clone(), "POST", "/messages", &vec![b'x'; 2048]).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(body["ok"], json!(false));
-
-        let (status, _) = call(st, "POST", "/messages", b"").await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"].as_str().unwrap().contains("too large"),
+            "saw {body}"
+        );
+        assert_eq!(st.pool.queued(), 0, "a refused payload is queued nowhere");
     }
 
     /// Retrieval over HTTP: hex plus decoded text for UTF-8 payloads, `text`
@@ -507,7 +555,7 @@ mod tests {
     /// quiet in.
     #[tokio::test]
     async fn get_messages_and_round_serve_the_stored_view() {
-        let (st, _rx) = state();
+        let st = state().await;
         let (status, body) = call(st.clone(), "GET", "/round", b"").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["last_round"], Value::Null);

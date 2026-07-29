@@ -10,14 +10,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use anymone_core::{Anymone, ServiceTag};
+use anymone_core::{Anymone, ClientPool, ServiceTag, SpawnClient};
 use axum::extract::State;
 use axum::http::header;
 use axum::response::Html;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
 
 /// Label of the chat room's service tag.
 pub const CHAT_TAG_LABEL: &str = "anymone.chat";
@@ -47,21 +46,31 @@ struct ChatEntry {
 #[derive(Clone)]
 struct AppState {
     transcript: Arc<Mutex<VecDeque<ChatEntry>>>,
-    outgoing: mpsc::UnboundedSender<Vec<u8>>,
+    /// The clients this backend speaks through: its own, plus virtual clients
+    /// while messages are queued behind each other.
+    pool: ClientPool,
     /// `Access-Control-Allow-Origin` for `/chat/feed`; `*` if unset.
     dashboard_origin: String,
 }
 
 pub(crate) const CHAT_HTML: &str = include_str!("../static/chat.html");
 
-/// Join the chat room as a participant and serve the chat app on `port`.
-/// Blocks forever; holds `anymone` alive.
-pub async fn serve(anymone: Anymone, port: u16, dashboard_origin: Option<String>) -> Result<()> {
+/// Join the chat room as a participant and serve the chat app on `port`. Sends
+/// go through this backend's own client plus up to `max_clients - 1` virtual
+/// clients minted by `spawn` while messages are queued. Blocks forever; holds
+/// `anymone` alive.
+pub async fn serve(
+    anymone: Anymone,
+    port: u16,
+    dashboard_origin: Option<String>,
+    spawn: SpawnClient,
+    max_clients: usize,
+) -> Result<()> {
     let transcript: Arc<Mutex<VecDeque<ChatEntry>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let (outgoing, mut outgoing_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let pool = ClientPool::new(anymone.clone(), chat_tag(), spawn, max_clients);
 
     // Connect in the background so the web app is reachable before the room is
-    // placed. One pipe: a real send replaces this round's cover.
+    // placed.
     {
         let transcript = transcript.clone();
         tokio::spawn(async move {
@@ -72,22 +81,17 @@ pub async fn serve(anymone: Anymone, port: u16, dashboard_origin: Option<String>
                 }
             };
             let mut seq = 0u64;
-            loop {
-                tokio::select! {
-                    inc = pipe.recv() => {
-                        let Some(inc) = inc else { break };
-                        if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&inc.payload) {
-                            let mut t = transcript.lock().unwrap();
-                            t.push_back(ChatEntry { seq, from: msg.from, text: msg.text });
-                            seq += 1;
-                            while t.len() > TRANSCRIPT_CAP {
-                                t.pop_front();
-                            }
-                        }
-                    }
-                    out = outgoing_rx.recv() => {
-                        let Some(payload) = out else { break };
-                        let _ = pipe.send(payload).await;
+            while let Some(inc) = pipe.recv().await {
+                if let Ok(msg) = serde_json::from_slice::<ChatMessage>(&inc.payload) {
+                    let mut t = transcript.lock().unwrap();
+                    t.push_back(ChatEntry {
+                        seq,
+                        from: msg.from,
+                        text: msg.text,
+                    });
+                    seq += 1;
+                    while t.len() > TRANSCRIPT_CAP {
+                        t.pop_front();
                     }
                 }
             }
@@ -96,7 +100,7 @@ pub async fn serve(anymone: Anymone, port: u16, dashboard_origin: Option<String>
 
     let state = AppState {
         transcript,
-        outgoing,
+        pool,
         dashboard_origin: dashboard_origin.unwrap_or_else(|| "*".to_string()),
     };
     let app = Router::new()
@@ -211,8 +215,16 @@ async fn send(
         text: text.to_string(),
     })
     .expect("ChatMessage serializes");
-    match state.outgoing.send(payload) {
-        Ok(()) => Json(serde_json::json!({ "ok": true })),
-        Err(_) => Json(serde_json::json!({ "ok": false, "error": "chat backend closed" })),
+    // The message is on a client, not yet on the wire: it goes out in a later
+    // round, and the sender sees it when the room's transcript carries it back.
+    match state.pool.send(payload) {
+        Ok(()) => Json(serde_json::json!({
+            "ok": true,
+            "clients": state.pool.clients(),
+        })),
+        Err(e) => {
+            tracing::warn!(error = %e, "chat: message never reached the room");
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() }))
+        }
     }
 }

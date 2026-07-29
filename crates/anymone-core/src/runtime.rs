@@ -423,6 +423,14 @@ impl Anymone {
             .unwrap_or(std::time::Duration::from_secs(1))
     }
 
+    /// Framed payloads accepted from this node's pipes but not yet on the wire.
+    /// At most one leaves per round (the round's participation draw stages it),
+    /// so a non-zero depth is how many rounds the next send waits — what
+    /// [`crate::client_pool::ClientPool`] balances over.
+    pub fn queued_outbound(&self) -> usize {
+        self.inner.outbox.lock().unwrap().len()
+    }
+
     /// Make this node's relay sessions misbehave (`None` = honest). For demos
     /// and fault-injection tests: a `Withhold`ing relay triggers an attributed
     /// `Liveness` fault; a `CorruptShare` relay is unattributable under ADCNet
@@ -1346,11 +1354,10 @@ pub(crate) fn queue_outbound(
 mod outbox_tests {
     use super::*;
     use crate::config::{AnymoneRoundConfiguration, NoopConfig, ProtocolConfig};
-    use crate::panetiere_scheduled::{
-        sched_channel_params, setup_joint_pp, ReservationEntries,
-        ScheduledPanetiereClientSession,
-    };
     use crate::panetiere::client_id_from_pubkey;
+    use crate::panetiere_scheduled::{
+        sched_channel_params, setup_joint_pp, ReservationEntries, ScheduledPanetiereClientSession,
+    };
 
     fn test_inner(relays: Vec<Pubkey>) -> Arc<AnymoneInner> {
         let protocol = ProtocolConfig::Noop(NoopConfig {

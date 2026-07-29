@@ -588,12 +588,7 @@ fn adcnet_config_body(n_subnets: usize) -> AnymoneRoundConfigurationBody {
     relay_pks.sort();
     let mut relay_xk: Vec<_> = relays
         .iter()
-        .map(|i| {
-            (
-                i.pubkey(),
-                i.exchange_keys(),
-            )
-        })
+        .map(|i| (i.pubkey(), i.exchange_keys()))
         .collect();
     relay_xk.sort_by_key(|(p, _)| *p);
     let svc = Identity::generate();

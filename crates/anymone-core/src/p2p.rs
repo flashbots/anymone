@@ -61,6 +61,51 @@ pub struct Libp2pConfig {
     pub bootstrap_peers: Vec<Multiaddr>,
 }
 
+/// Mint virtual clients as libp2p nodes of their own: a fresh identity that is
+/// never persisted, an OS-assigned port on the same listen interface, and the
+/// caller's bootstrap peers. Each is an ordinary client on the network —
+/// nothing marks it as belonging to this process.
+pub fn client_spawner(
+    listen: Libp2pConfig,
+    governance: crate::governance::GovernanceBootstrap,
+) -> crate::client_pool::SpawnClient {
+    Arc::new(move || {
+        let config = Libp2pConfig {
+            listen: with_ephemeral_port(&listen.listen),
+            bootstrap_peers: listen.bootstrap_peers.clone(),
+        };
+        let governance = governance.clone();
+        Box::pin(async move {
+            let identity = Identity::generate();
+            let net = match Libp2pNetwork::start(&identity, config).await {
+                Ok(net) => net,
+                Err(e) => {
+                    tracing::warn!(target: P2P, error = %e, "virtual client: libp2p start failed");
+                    return None;
+                }
+            };
+            match crate::runtime::Anymone::start(identity, net, governance).await {
+                Ok(anymone) => Some(anymone),
+                Err(e) => {
+                    tracing::warn!(target: P2P, error = %e, "virtual client: anymone start failed");
+                    None
+                }
+            }
+        })
+    })
+}
+
+/// `addr` with its TCP port replaced by 0: virtual clients listen on the same
+/// interface as their process but must not fight over its port.
+fn with_ephemeral_port(addr: &Multiaddr) -> Multiaddr {
+    addr.iter()
+        .map(|p| match p {
+            Protocol::Tcp(_) => Protocol::Tcp(0),
+            other => other,
+        })
+        .collect()
+}
+
 #[derive(Debug, Error)]
 pub enum Libp2pError {
     #[error("swarm build: {0}")]

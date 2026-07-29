@@ -269,11 +269,8 @@ mod sizing_tests {
     fn capacity_covers_the_busiest_aggregator_group() {
         for n_relays in [4usize, 8, 16] {
             for clients in 1u32..120 {
-                let capacity = capacity_for_group_balance(
-                    size_capacity(clients as usize),
-                    clients,
-                    n_relays,
-                );
+                let capacity =
+                    capacity_for_group_balance(size_capacity(clients as usize), clients, n_relays);
                 let Some(groups) = aggregator_group_count(capacity, n_relays) else {
                     continue;
                 };

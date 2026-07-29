@@ -41,6 +41,11 @@ struct Args {
     #[arg(long, default_value = "0.5")]
     send_rate: f64,
 
+    /// Clients to send through at most, this backend's own included. Virtual
+    /// clients are spawned while messages are queued; `1` disables them.
+    #[arg(long, default_value = "8")]
+    max_clients: usize,
+
     /// Origin allowed to read `/chat/feed` via CORS. Defaults to `*`.
     #[arg(long)]
     dashboard_origin: Option<String>,
@@ -63,7 +68,8 @@ async fn main() -> Result<()> {
     let identity = Identity::load_or_generate(&bootstrap.identity_path)
         .with_context(|| format!("identity at {}", bootstrap.identity_path.display()))?;
 
-    let net = Libp2pNetwork::start(&identity, bootstrap.libp2p_config()?)
+    let libp2p_config = bootstrap.libp2p_config()?;
+    let net = Libp2pNetwork::start(&identity, libp2p_config.clone())
         .await
         .map_err(|e| anyhow!("libp2p start: {e}"))?;
     let transport: Arc<dyn Transport> = net.clone();
@@ -90,12 +96,20 @@ async fn main() -> Result<()> {
                 xk,
             )
             .await;
+            let spawn = anymone_core::p2p::client_spawner(libp2p_config, gov.clone());
             let anymone = Anymone::prepare(identity, transport, gov)
                 .await
                 .start()
                 .await
                 .map_err(|e| anyhow!("anymone start: {e}"))?;
-            anymone_chat::serve(anymone, args.port, args.dashboard_origin).await
+            anymone_chat::serve(
+                anymone,
+                args.port,
+                args.dashboard_origin,
+                spawn,
+                args.max_clients,
+            )
+            .await
         }
     }
 }

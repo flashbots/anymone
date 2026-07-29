@@ -49,6 +49,11 @@ struct Args {
     #[arg(long)]
     announce: bool,
 
+    /// Clients to submit through at most, this gateway's own included. Virtual
+    /// clients are spawned while submissions are queued; `1` disables them.
+    #[arg(long, default_value = "8")]
+    max_clients: usize,
+
     /// Origin allowed to read the API via CORS. Defaults to `*`.
     #[arg(long)]
     allow_origin: Option<String>,
@@ -68,12 +73,14 @@ async fn main() -> Result<()> {
     let identity = Identity::load_or_generate(&bootstrap.identity_path)
         .with_context(|| format!("identity at {}", bootstrap.identity_path.display()))?;
 
-    let net = Libp2pNetwork::start(&identity, bootstrap.libp2p_config()?)
+    let libp2p_config = bootstrap.libp2p_config()?;
+    let net = Libp2pNetwork::start(&identity, libp2p_config.clone())
         .await
         .map_err(|e| anyhow!("libp2p start: {e}"))?;
     let transport: Arc<dyn Transport> = net.clone();
     let gov = GovernanceBootstrap::from_bootstrap_config(&bootstrap);
     let tag = ServiceTag::from_label(&args.tag);
+    let spawn = anymone_core::p2p::client_spawner(libp2p_config, gov.clone());
 
     // Announce before starting: `Anymone::start` blocks until the first config
     // is adopted, so registering first lets the committee carry the tag in that
@@ -89,10 +96,17 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow!("anymone start: {e}"))?;
 
-    tracing::info!(tag = %args.tag, port = args.port, "anymone-gateway starting");
+    tracing::info!(
+        tag = %args.tag,
+        port = args.port,
+        max_clients = args.max_clients,
+        "anymone-gateway starting"
+    );
     anymone_gateway::serve(
         anymone,
         tag,
+        spawn,
+        args.max_clients,
         args.port,
         args.capacity,
         args.allow_origin,

@@ -11,8 +11,8 @@ use std::time::Instant;
 
 use chipmunk_code::{CsPoly, KahePoly};
 use panetiere::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
-use panetiere::cs::{Opening, PackedOpening};
 use panetiere::channel::{self, ChannelParams};
+use panetiere::cs::{Opening, PackedOpening};
 use panetiere::pke;
 use panetiere::protocol::aggregator::run_aggregator_round;
 use panetiere::protocol::client::run_client_round;
@@ -34,9 +34,9 @@ use crate::faults::{Attribution, Fault, FaultKind, OutputFaultTracker};
 use crate::identity::{Identity, Pubkey};
 use crate::log_target::{PANETIERE, SCHED};
 use crate::runtime::{
-    aggregator_group_of, client_aggregator_topic, deadline_for, egress_dest,
-    gossip_faults, handle_inbound, publish_and_loop_back, recv_any, round_at, route_to_pipe,
-    subnet_aggregation, subnet_leader_pk, AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
+    aggregator_group_of, client_aggregator_topic, deadline_for, egress_dest, gossip_faults,
+    handle_inbound, publish_and_loop_back, recv_any, round_at, route_to_pipe, subnet_aggregation,
+    subnet_leader_pk, AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
 };
 use crate::session::{LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
 use crate::transport::Subscription;
@@ -44,7 +44,11 @@ use crate::transport::Subscription;
 /// Channel sizing for a subnet carrying up to `rho` real messages of
 /// `message_bytes` each. `prf_key` is domain-separated from the shared
 /// `setup_seed` so all participants agree.
-pub(crate) fn channel_params(rho: u32, message_bytes: usize, setup_seed: [u8; 32]) -> ChannelParams {
+pub(crate) fn channel_params(
+    rho: u32,
+    message_bytes: usize,
+    setup_seed: [u8; 32],
+) -> ChannelParams {
     let mut prf_key = setup_seed;
     prf_key[0] ^= 0x5C;
     ChannelParams::for_messages(rho, message_bytes, prf_key)
@@ -346,7 +350,14 @@ pub(crate) async fn run_subnet(
         m.begin_round(round, Instant::now());
     }
     crate::runtime::sync_client_round(&inner, subnet.id, round, cover_rate, &mut sessions, || {
-        client_session(&pp, &mse, &relay_xk, &subnet, &inner.identity, cfg.setup_seed)
+        client_session(
+            &pp,
+            &mse,
+            &relay_xk,
+            &subnet,
+            &inner.identity,
+            cfg.setup_seed,
+        )
     });
     let misbehavior = inner.misbehavior();
     let outs: Vec<(SessionKey, Vec<u8>)> = sessions
@@ -920,12 +931,7 @@ impl PanetiereObserverSession {
     /// message actually hides in (its reservation and delivery rounds).
     pub fn returning_set(&self) -> Option<usize> {
         let window = crate::panetiere_scheduled::RESERVATION_TO_MSG_GAP as usize + 1;
-        let recent: Vec<&Vec<u32>> = self
-            .clients_by_round
-            .values()
-            .rev()
-            .take(window)
-            .collect();
+        let recent: Vec<&Vec<u32>> = self.clients_by_round.values().rev().take(window).collect();
         if recent.len() < 2 {
             return None;
         }
@@ -1662,7 +1668,6 @@ fn group_aggregates_for(
         .map(|(_, g)| (g.clients.clone(), g.entry.clone()))
         .collect()
 }
-
 
 impl Session for PanetiereServerSession {
     fn begin_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {

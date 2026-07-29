@@ -36,7 +36,9 @@ pub const TOPIC_COMMITTEE_SIGS: &str = "anymone/committee/sigs";
 /// exchange pubkey. For callers holding the member `Identity`s (tests, the
 /// in-process demo); a deployment reads the same pairs from its config file.
 pub fn committee_roster(ids: &[Identity]) -> Vec<(Pubkey, crate::config::ExchangePublicKeyWire)> {
-    ids.iter().map(|i| (i.pubkey(), i.exchange_keys())).collect()
+    ids.iter()
+        .map(|i| (i.pubkey(), i.exchange_keys()))
+        .collect()
 }
 
 /// Await the next message from any public-subnet subscription, returning it

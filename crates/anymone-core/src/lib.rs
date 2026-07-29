@@ -6,6 +6,7 @@
 
 pub mod adcnet;
 pub mod bootstrap;
+pub mod client_pool;
 pub mod committee;
 pub mod config;
 pub mod faults;
@@ -32,6 +33,7 @@ pub mod test_util;
 
 pub use adcnet::AdcnetObserverSession;
 pub use bootstrap::{BootstrapConfig, NetworkConfig};
+pub use client_pool::{ClientPool, PoolError, SpawnClient};
 pub use committee::{
     committee_roster, spawn_panetiere_committee_scheduler, CommitteeParams,
     PanetiereCommitteeConfig,

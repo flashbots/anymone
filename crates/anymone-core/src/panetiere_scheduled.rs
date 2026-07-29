@@ -18,8 +18,8 @@ use std::time::Instant;
 
 use chipmunk_code::KahePoly;
 use panetiere::bulletin::ClientBulletinEntry;
-use panetiere::codec;
 use panetiere::channel::ChannelParams;
+use panetiere::codec;
 use panetiere::mse::MseEncoding;
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
@@ -39,9 +39,9 @@ use crate::panetiere::{
     PanetiereWatchSession, PanetiereWire, SetMode, PANETIERE_ROUND_RETENTION,
 };
 use crate::runtime::{
-    aggregator_group_of, client_aggregator_topic, deadline_for, egress_dest,
-    gossip_faults, handle_inbound, publish_and_loop_back, recv_any, round_at, route_to_pipe,
-    subnet_aggregation, subnet_leader_pk, AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
+    aggregator_group_of, client_aggregator_topic, deadline_for, egress_dest, gossip_faults,
+    handle_inbound, publish_and_loop_back, recv_any, round_at, route_to_pipe, subnet_aggregation,
+    subnet_leader_pk, AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
 };
 use crate::session::{LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
 use crate::transport::Subscription;
@@ -107,7 +107,9 @@ pub(crate) fn setup_joint_pp(
 ) -> Arc<ProtocolParams> {
     let mut rng = ChaCha20Rng::from_seed(setup_seed);
     let mu_kahe = sched_mse.n_polys() + msg_polys(vector_bytes);
-    Arc::new(ProtocolParams::setup_with_kahe_dims(&mut rng, n_servers, mu_kahe))
+    Arc::new(ProtocolParams::setup_with_kahe_dims(
+        &mut rng, n_servers, mu_kahe,
+    ))
 }
 
 /// Conservative upper bound on the largest per-round wire message a scheduled
@@ -479,7 +481,9 @@ impl Session for ScheduledPanetiereClientSession {
             .checked_sub(RESERVATION_TO_MSG_GAP)
             .and_then(|prev| {
                 let entries = self.entries_by_round.lock().unwrap();
-                entries.get(&prev).map(|e| allocation(e, self.vector_bytes).1)
+                entries
+                    .get(&prev)
+                    .map(|e| allocation(e, self.vector_bytes).1)
             })
             .unwrap_or(0)
             * codec::BYTES_PER_POLY;
@@ -598,8 +602,14 @@ impl Session for ScheduledPanetiereClientSession {
         seed[24..32].copy_from_slice(&round.to_le_bytes());
         let mut rng = ChaCha20Rng::from_seed(seed);
         let sid = crate::panetiere::session_id(&self.setup_seed, round);
-        let round_out =
-            run_client_round(&mut rng, &self.pp, &sid, self.client_id, plaintext, &self.servers);
+        let round_out = run_client_round(
+            &mut rng,
+            &self.pp,
+            &sid,
+            self.client_id,
+            plaintext,
+            &self.servers,
+        );
 
         let mut out: Vec<Vec<u8>> = Vec::with_capacity(1 + self.servers.len());
         out.push(
@@ -794,28 +804,32 @@ impl Session for ScheduledPanetiereServerSession {
         let mut entries_map = self.entries_by_round.lock().unwrap();
         for (rd, plain) in self.inner.decode_settled() {
             let n = self.sched_polys.min(plain.len());
-            let entries: Vec<(u16, u16)> =
-                match MseEncoding::unpack(self.sched_mse.mse(), &plain[..n]).decode() {
-                    Ok(elements) => elements
-                        .into_iter()
-                        .filter_map(|symbols| match symbols.as_slice() {
-                            [rand, size] if *rand != 0 || *size != 0 => {
-                                Some((*rand as u16, *size as u16))
-                            }
-                            _ => None,
-                        })
-                        .collect(),
-                    Err(e) => {
-                        // Peel stall loses the whole round's reservations (retried by clients).
-                        tracing::warn!(
-                            target: PANETIERE,
-                            round = rd,
-                            ?e,
-                            "scheduled panetiere: reservation MSE peel failed; round's reservations lost"
-                        );
-                        Vec::new()
-                    }
-                };
+            let entries: Vec<(u16, u16)> = match MseEncoding::unpack(
+                self.sched_mse.mse(),
+                &plain[..n],
+            )
+            .decode()
+            {
+                Ok(elements) => elements
+                    .into_iter()
+                    .filter_map(|symbols| match symbols.as_slice() {
+                        [rand, size] if *rand != 0 || *size != 0 => {
+                            Some((*rand as u16, *size as u16))
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+                Err(e) => {
+                    // Peel stall loses the whole round's reservations (retried by clients).
+                    tracing::warn!(
+                        target: PANETIERE,
+                        round = rd,
+                        ?e,
+                        "scheduled panetiere: reservation MSE peel failed; round's reservations lost"
+                    );
+                    Vec::new()
+                }
+            };
             if self.is_leader {
                 let wire = PanetiereWire::Reservations {
                     round: rd,

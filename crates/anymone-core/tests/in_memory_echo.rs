@@ -48,12 +48,7 @@ fn panetiere_config(
     relay_pks.sort();
     let relay_xk = relays
         .iter()
-        .map(|i| {
-            (
-                i.pubkey(),
-                i.exchange_keys(),
-            )
-        })
+        .map(|i| (i.pubkey(), i.exchange_keys()))
         .collect();
     AnymoneRoundConfiguration::singleton_subnet(
         0,

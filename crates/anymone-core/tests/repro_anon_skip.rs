@@ -32,12 +32,7 @@ async fn aggregated_subnet_counts_all_clients_every_round() {
     relay_pks.sort();
     let relay_xk = relays
         .iter()
-        .map(|i| {
-            (
-                i.pubkey(),
-                i.exchange_keys(),
-            )
-        })
+        .map(|i| (i.pubkey(), i.exchange_keys()))
         .collect();
     let aggregation = Aggregation {
         replication: 1,

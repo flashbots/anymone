@@ -38,6 +38,12 @@ pub struct PipeIncoming {
 /// the real `Frame::Raw` + `PipeMessage` encoding (not an estimate), so a
 /// caller can reject an oversized payload before attempting a send.
 pub fn max_message_payload(message_size: usize) -> usize {
+    message_size.saturating_sub(framing_overhead())
+}
+
+/// `Frame::Raw` header plus the bincode `PipeMessage` envelope a payload rides
+/// in. The `Vec` length prefix is fixed-width, so this is exact for any payload.
+fn framing_overhead() -> usize {
     let probe = PipeMessage {
         return_tag: RouteTag([0u8; SERVICE_TAG_LEN]),
         payload: Vec::new(),
@@ -45,8 +51,7 @@ pub fn max_message_payload(message_size: usize) -> usize {
     let empty_encoded = bincode::serialize(&probe)
         .expect("PipeMessage serialises")
         .len();
-    let frame_header = 1 + SERVICE_TAG_LEN; // Frame::Raw discriminant + dst
-    message_size.saturating_sub(frame_header + empty_encoded)
+    1 + SERVICE_TAG_LEN + empty_encoded // discriminant + dst + envelope
 }
 
 pub struct Pipe {
@@ -115,23 +120,19 @@ impl Pipe {
         self.send_inner(dst.into(), RouteTag(bytes), payload).await
     }
 
-    async fn send_inner(
-        &self,
-        dst: RouteTag,
-        return_tag: RouteTag,
-        payload: Vec<u8>,
-    ) -> Result<(), SendError> {
+    /// Whether a `payload_len`-byte payload fits one message, by the same
+    /// encoding `send*` uses — so a caller can refuse an oversized payload
+    /// before queueing it rather than at the head of a queue.
+    pub fn check_size(&self, payload_len: usize) -> Result<(), SendError> {
         let anymone = self.anymone.upgrade().ok_or(SendError::Closed)?;
-        let msg = PipeMessage {
-            return_tag,
-            payload,
-        };
-        let data = bincode::serialize(&msg).map_err(|e| SendError::Encode(e.to_string()))?;
-        // Reject payloads too big for one message rather than truncating/dropping
-        // them downstream; fragmentation across rounds is a later batch. The
-        // per-round draw can land the frame on any runnable subnet, so it must
-        // fit the smallest.
-        let framed = 1 + SERVICE_TAG_LEN + data.len();
+        Self::check_size_against(&anymone, payload_len)
+    }
+
+    /// Reject payloads too big for one message rather than truncating/dropping
+    /// them downstream; fragmentation across rounds is a later batch. The
+    /// per-round draw can land the frame on any runnable subnet, so it must fit
+    /// the smallest.
+    fn check_size_against(anymone: &AnymoneInner, payload_len: usize) -> Result<(), SendError> {
         let max = anymone
             .config
             .read()
@@ -143,9 +144,27 @@ impl Pipe {
             .map(|s| s.protocol.message_size())
             .min()
             .ok_or(SendError::SubnetGone)?;
+        let framed = framing_overhead() + payload_len;
         if framed > max {
             return Err(SendError::PayloadTooLarge { size: framed, max });
         }
+        Ok(())
+    }
+
+    async fn send_inner(
+        &self,
+        dst: RouteTag,
+        return_tag: RouteTag,
+        payload: Vec<u8>,
+    ) -> Result<(), SendError> {
+        let anymone = self.anymone.upgrade().ok_or(SendError::Closed)?;
+        Self::check_size_against(&anymone, payload.len())?;
+        let msg = PipeMessage {
+            return_tag,
+            payload,
+        };
+        let data = bincode::serialize(&msg).map_err(|e| SendError::Encode(e.to_string()))?;
+        let framed = 1 + SERVICE_TAG_LEN + data.len();
         let mut bytes = Vec::with_capacity(framed);
         Frame::Raw { dst, data: &data }.encode(&mut bytes);
         queue_outbound(&self.anymone, bytes)

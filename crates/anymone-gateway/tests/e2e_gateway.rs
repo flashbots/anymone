@@ -9,15 +9,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anymone_core::{
-    Anymone, AnymoneRoundConfiguration, Identity, InMemoryNetwork, PanetiereConfig, ProtocolConfig,
-    ServiceEntry, ServiceTag,
+    Anymone, AnymoneRoundConfiguration, ClientPool, Identity, InMemoryNetwork, PanetiereConfig,
+    ProtocolConfig, ServiceEntry, ServiceTag, SpawnClient,
 };
-use anymone_gateway::{router, AppState, Staged, Store};
+use anymone_gateway::{router, AppState, Store};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::Value;
-use tokio::sync::mpsc;
 use tower::ServiceExt;
 
 fn tag() -> ServiceTag {
@@ -56,6 +55,17 @@ async fn wait_for_messages(state: &AppState, count: usize) -> Value {
     }
 }
 
+/// Decode rounds of the retrieved messages whose text starts with `prefix`.
+fn decode_rounds(body: &Value, prefix: &str) -> Vec<u64> {
+    body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["text"].as_str().is_some_and(|t| t.starts_with(prefix)))
+        .map(|m| m["round"].as_u64().unwrap())
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn rest_submit_and_read_back_by_round() {
     let _ = tracing_subscriber::fmt()
@@ -72,8 +82,8 @@ async fn rest_submit_and_read_back_by_round() {
     let cfg = AnymoneRoundConfiguration::singleton_subnet(
         0,
         ProtocolConfig::Panetiere(PanetiereConfig {
-            round_duration_ms: 250,
-            message_size: 1024,
+            round_duration_ms: 400,
+            message_size: 128,
             estimated_messages: 4,
             client_set_min: 0,
             client_set_max: 8,
@@ -82,7 +92,10 @@ async fn rest_submit_and_read_back_by_round() {
             aggregation: None,
         }),
         relay_pks,
-        relays.iter().map(|i| (i.pubkey(), i.exchange_keys())).collect(),
+        relays
+            .iter()
+            .map(|i| (i.pubkey(), i.exchange_keys()))
+            .collect(),
         vec![ServiceEntry {
             tag: tag(),
             pubkey: service.pubkey(),
@@ -116,10 +129,27 @@ async fn rest_submit_and_read_back_by_round() {
 
     let store = Arc::new(Store::new(100));
     let round_ms = Arc::new(AtomicU64::new(0));
-    let (outgoing, staged) = mpsc::unbounded_channel::<Staged>();
+    // Virtual clients join the same in-memory mesh off the same static config —
+    // there is no committee here to publish one to them.
+    let spawn: SpawnClient = {
+        let net = net.clone();
+        let cfg = cfg.clone();
+        Arc::new(move || {
+            let net = net.clone();
+            let cfg = cfg.clone();
+            Box::pin(async move {
+                let id = Identity::generate();
+                let transport = Arc::new(net.handle(id.pubkey()));
+                Some(Anymone::start_with_config(id, transport, cfg).await)
+            })
+        })
+    };
+    // Two: every node here runs a client round of Panetiere crypto in this one
+    // process, and a saturated process makes relay workers skip whole rounds.
+    let pool = ClientPool::new(gateway_anymone.clone(), tag(), spawn, 2);
     let state = AppState {
         store: store.clone(),
-        outgoing,
+        pool: pool.clone(),
         round_ms: round_ms.clone(),
         allow_origin: "*".to_string(),
     };
@@ -128,7 +158,6 @@ async fn rest_submit_and_read_back_by_round() {
         pipe,
         store.clone(),
         round_ms,
-        staged,
     ));
 
     // Let both clients appear in a leader-announced canonical set before
@@ -192,8 +221,57 @@ async fn rest_submit_and_read_back_by_round() {
     let (_, body) = call(state.clone(), "GET", "/round", b"").await;
     assert!(body["last_round"].as_u64().unwrap() >= last_round);
     assert_eq!(body["earliest_round"], serde_json::json!(first));
-    assert_eq!(body["round_ms"], serde_json::json!(250));
+    assert_eq!(body["round_ms"], serde_json::json!(400));
     assert_eq!(body["capacity"], serde_json::json!(100));
+
+    // A burst: three submissions at once, where one client can carry one message
+    // per round. All are accepted, the pool answers with virtual clients, and
+    // every accepted message leaves its client's queue.
+    let burst: Vec<_> = (0..3)
+        .map(|i| {
+            let state = state.clone();
+            tokio::spawn(async move {
+                call(state, "POST", "/messages", format!("burst {i}").as_bytes()).await
+            })
+        })
+        .collect();
+    for handle in burst {
+        let (status, _) = handle.await.unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while pool.clients() < 2 || pool.queued() > 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "burst never drained: {} client(s), {} queued",
+            pool.clients(),
+            pool.queued()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let body = wait_for_messages(&state, 5).await;
+    assert_eq!(
+        decode_rounds(&body, "burst ").len(),
+        3,
+        "burst lost a message: {body}"
+    );
+
+    // Now that the pool is warm, a pair submitted together rides two clients and
+    // lands in one round — a single client could only manage one per round.
+    for i in 0..2 {
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/messages",
+            format!("pair {i}").as_bytes(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+    let body = wait_for_messages(&state, 7).await;
+    let pair = decode_rounds(&body, "pair ");
+    assert_eq!(pair.len(), 2, "pair lost a message: {body}");
+    assert_eq!(pair[0], pair[1], "pair decoded a round apart: {pair:?}");
 
     // Oversize: rejected with the pipe's own verdict rather than truncated.
     let too_big = vec![b'x'; 2048];
