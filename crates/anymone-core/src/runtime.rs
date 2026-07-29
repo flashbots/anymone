@@ -1165,7 +1165,7 @@ pub fn watch_session_for(subnet: &Subnet) -> Box<dyn Session> {
     }
 }
 
-pub(crate) fn route_to_pipe(inner: &AnymoneInner, bytes: &[u8]) {
+pub(crate) fn route_to_pipe(inner: &AnymoneInner, round: Round, bytes: &[u8]) {
     let frame = match Frame::decode(bytes) {
         Ok(f) => f,
         Err(e) => {
@@ -1212,6 +1212,7 @@ pub(crate) fn route_to_pipe(inner: &AnymoneInner, bytes: &[u8]) {
             let _ = tx.send(PipeIncoming {
                 return_tag: pipe_msg.return_tag,
                 payload: pipe_msg.payload,
+                round,
             });
         }
         // Every node decodes every subnet payload, so most are for other

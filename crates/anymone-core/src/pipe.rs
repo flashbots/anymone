@@ -9,6 +9,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use crate::config::Round;
 use crate::runtime::{queue_outbound, subnet_runnable, AnymoneInner};
 use crate::wire::{Frame, RouteTag, ServiceTag, SERVICE_TAG_LEN};
 
@@ -22,12 +23,14 @@ pub(crate) struct PipeMessage {
     pub payload: Vec<u8>,
 }
 
-/// What a `Pipe` yields on `recv`: the originator's return path plus their
-/// bytes. The tag is what the recipient should pass to `send_to` for replies.
+/// What a `Pipe` yields on `recv`: the originator's return path, their bytes,
+/// and the round the payload was decoded in. The tag is what the recipient
+/// should pass to `send_to` for replies.
 #[derive(Debug, Clone)]
 pub struct PipeIncoming {
     pub return_tag: RouteTag,
     pub payload: Vec<u8>,
+    pub round: Round,
 }
 
 /// The largest `send`/`send_to`/`send_unlinkable` payload that fits in one

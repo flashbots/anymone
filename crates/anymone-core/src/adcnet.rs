@@ -312,7 +312,7 @@ pub(crate) async fn run_subnet(
                 }
                 let n_decoded = decoded_all.len();
                 for bytes in decoded_all {
-                    route_to_pipe(&inner, &bytes);
+                    route_to_pipe(&inner, round, &bytes);
                 }
                 if n_decoded > 0 {
                     let _ = inner.events.send(crate::runtime::Event::RoundDecoded {

@@ -8,6 +8,7 @@ members = [
     "crates/anymone-chat",
     "crates/anymone-txbus",
     "crates/anymone-eth-bridge",
+    "crates/anymone-gateway",
 ]
 
 [workspace.package]

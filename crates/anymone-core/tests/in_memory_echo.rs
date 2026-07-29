@@ -78,7 +78,7 @@ fn panetiere_config(
 }
 
 /// Stand up 3 relays + service + client under `cfg`, run the echo service, send
-/// `msg`, and return the reply payload.
+/// `msg`, and return the reply as delivered (payload plus its decode round).
 async fn echo_roundtrip(
     cfg: AnymoneRoundConfiguration,
     relays: Vec<Identity>,
@@ -86,7 +86,7 @@ async fn echo_roundtrip(
     client: Identity,
     msg: &[u8],
     timeout: Duration,
-) -> Vec<u8> {
+) -> anymone_core::PipeIncoming {
     let net = InMemoryNetwork::new();
     let mut anymones: Vec<Anymone> = Vec::new();
     for id in relays {
@@ -122,7 +122,7 @@ async fn echo_roundtrip(
         .expect("recv timed out")
         .expect("pipe closed");
     drop(anymones);
-    reply.payload
+    reply
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -141,7 +141,10 @@ async fn noop_echo_roundtrip() {
         Duration::from_secs(2),
     )
     .await;
-    assert_eq!(reply, b"hello");
+    assert_eq!(reply.payload, b"hello");
+    // The round the reply decoded in: an echo needs the request's round plus a
+    // later one, so it can never be the genesis round the clock starts at.
+    assert!(reply.round > 0, "delivery round not tracked");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -160,7 +163,8 @@ async fn panetiere_echo_roundtrip() {
         Duration::from_secs(15),
     )
     .await;
-    assert_eq!(&reply[..15], b"hello panetiere");
+    assert_eq!(&reply.payload[..15], b"hello panetiere");
+    assert!(reply.round > 0, "delivery round not tracked");
 }
 
 /// A payload too big for one subnet message is rejected up front, not silently

@@ -1,0 +1,30 @@
+[package]
+name = "anymone-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "anymone_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "anymone-gateway"
+path = "src/main.rs"
+
+[dependencies]
+anymone-core = { path = "../anymone-core" }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

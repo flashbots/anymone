@@ -418,6 +418,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "anymone-gateway"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "anymone-core",
+ "axum",
+ "clap",
+ "hex",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "anymone-masque"
 version = "0.0.1"
 dependencies = [
