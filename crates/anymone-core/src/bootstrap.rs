@@ -125,11 +125,20 @@ mod tests {
 
     /// A `[[governance.committee]]` table for a fresh identity.
     fn member_table(id: &Identity) -> String {
-        let xpub = crate::config::ExchangePublicKeyWire::from_key(&id.exchange_pubkey());
         format!(
-            "[[governance.committee]]\npubkey = \"{}\"\nexchange_pubkey = \"{}\"\n",
+            "[[governance.committee]]\npubkey = \"{}\"\nexchange_pubkey = {}\n",
             id.pubkey(),
-            hex::encode(&xpub.0),
+            exchange_keys_inline(id),
+        )
+    }
+
+    /// The `exchange_pubkey` value as a TOML inline table.
+    fn exchange_keys_inline(id: &Identity) -> String {
+        let xk = id.exchange_keys();
+        format!(
+            "{{ ecdh = \"{}\", kem = \"{}\" }}",
+            hex::encode(&xk.ecdh),
+            hex::encode(&xk.kem),
         )
     }
 
@@ -233,8 +242,6 @@ threshold = 1
 
     #[test]
     fn bootstrap_rejects_malformed_pubkey() {
-        let xpub =
-            crate::config::ExchangePublicKeyWire::from_key(&Identity::generate().exchange_pubkey());
         let toml = format!(
             r#"
 identity_path = "/tmp/identity"
@@ -244,9 +251,9 @@ listen = "/ip4/0.0.0.0/tcp/7100"
 threshold = 1
 [[governance.committee]]
 pubkey = "not-a-key"
-exchange_pubkey = "{}"
+exchange_pubkey = {}
 "#,
-            hex::encode(&xpub.0),
+            exchange_keys_inline(&Identity::generate()),
         );
         assert!(BootstrapConfig::from_toml_str(&toml).is_err());
     }

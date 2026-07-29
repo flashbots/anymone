@@ -81,7 +81,7 @@ pub struct DemoArgs {
 }
 
 fn xk(id: &Identity) -> ExchangePublicKeyWire {
-    ExchangePublicKeyWire::from_key(&id.exchange_pubkey())
+    id.exchange_keys()
 }
 
 pub async fn run_demo(args: DemoArgs) -> Result<()> {

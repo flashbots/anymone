@@ -36,14 +36,7 @@ pub const TOPIC_COMMITTEE_SIGS: &str = "anymone/committee/sigs";
 /// exchange pubkey. For callers holding the member `Identity`s (tests, the
 /// in-process demo); a deployment reads the same pairs from its config file.
 pub fn committee_roster(ids: &[Identity]) -> Vec<(Pubkey, crate::config::ExchangePublicKeyWire)> {
-    ids.iter()
-        .map(|i| {
-            (
-                i.pubkey(),
-                crate::config::ExchangePublicKeyWire::from_key(&i.exchange_pubkey()),
-            )
-        })
-        .collect()
+    ids.iter().map(|i| (i.pubkey(), i.exchange_keys())).collect()
 }
 
 /// Await the next message from any public-subnet subscription, returning it
@@ -279,9 +272,8 @@ pub async fn spawn_panetiere_committee_scheduler(
         .iter()
         .enumerate()
         .filter_map(|(i, pk)| {
-            let xk = committee_xpubs.get(pk)?;
-            let pk256 = panetiere::pke::PublicKey::from_sec1_bytes(&xk.0).ok()?;
-            Some((ServerId(i as u32), pk256))
+            let seal_key = committee_xpubs.get(pk)?.to_seal_key().ok()?;
+            Some((ServerId(i as u32), seal_key))
         })
         .collect();
 

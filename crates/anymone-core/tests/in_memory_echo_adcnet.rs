@@ -26,7 +26,7 @@ fn echo_tag() -> ServiceTag {
 }
 
 fn xkw(id: &Identity) -> ExchangePublicKeyWire {
-    ExchangePublicKeyWire::from_key(&id.exchange_pubkey())
+    id.exchange_keys()
 }
 
 fn build_config(

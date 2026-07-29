@@ -16,7 +16,7 @@ use anymone_core::{
 };
 
 fn xkw(id: &Identity) -> ExchangePublicKeyWire {
-    ExchangePublicKeyWire::from_key(&id.exchange_pubkey())
+    id.exchange_keys()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -83,10 +83,10 @@ async fn committee_panetiere_publishes_multisig_config() {
     // Publish a relay + service registration via another observer handle.
     let relay = Identity::generate();
     let relay_pk = relay.pubkey();
-    let relay_xk = anymone_core::config::ExchangePublicKeyWire::from_key(&relay.exchange_pubkey());
+    let relay_xk = relay.exchange_keys();
     let svc = Identity::generate();
     let svc_pk = svc.pubkey();
-    let svc_xk = anymone_core::config::ExchangePublicKeyWire::from_key(&svc.exchange_pubkey());
+    let svc_xk = svc.exchange_keys();
     let publisher = Identity::generate();
     let pub_transport: Arc<dyn Transport> = Arc::new(net.handle(publisher.pubkey()));
     pub_transport

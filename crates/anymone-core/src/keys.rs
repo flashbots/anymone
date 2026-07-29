@@ -1,7 +1,7 @@
 //! Key and key-wire formats shared across the node: the ed25519 `Pubkey`, the
-//! P-256 `ExchangeIdentity` used by the ADCNet/Panetiere ECDH layer, and the
-//! `ExchangePublicKeyWire` wire form. One home for the representations so
-//! conversions aren't re-derived per call site.
+//! `ExchangeIdentity` holding ADCNet's P-256 ECDH key and Panetiere's ML-KEM
+//! sealing key, and the `ExchangePublicKeyWire` wire form. One home for the
+//! representations so conversions aren't re-derived per call site.
 
 use std::fmt;
 use std::fs;
@@ -91,26 +91,54 @@ fn parse_pubkey_str(s: &str) -> Result<Pubkey, String> {
     Ok(Pubkey(arr))
 }
 
-/// SEC1-encoded P-256 public key, the wire form of an exchange pubkey. Hex in
-/// human-readable formats, `serde_bytes` in bincode.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExchangePublicKeyWire(pub Vec<u8>);
+/// The public halves of an [`ExchangeIdentity`], as published in a registration
+/// and carried in a config: the SEC1 P-256 point ADCNet ECDHs against, and the
+/// ML-KEM-768 encapsulation key Panetiere clients seal openings to. Hex strings
+/// in human-readable formats, `serde_bytes` in bincode.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ExchangePublicKeyWire {
+    pub ecdh: Vec<u8>,
+    pub kem: Vec<u8>,
+}
 
 impl ExchangePublicKeyWire {
-    pub fn from_key(k: &adcnet::crypto::ExchangePublicKey) -> Self {
-        ExchangePublicKeyWire(k.to_sec1_bytes())
+    pub fn from_identity(id: &ExchangeIdentity) -> Self {
+        ExchangePublicKeyWire {
+            ecdh: id.public().to_sec1_bytes(),
+            kem: id.pke().public().to_bytes(),
+        }
     }
+
     pub fn to_key(&self) -> Result<adcnet::crypto::ExchangePublicKey, String> {
-        adcnet::crypto::ExchangePublicKey::from_sec1_bytes(&self.0).map_err(|e| format!("{e:?}"))
+        adcnet::crypto::ExchangePublicKey::from_sec1_bytes(&self.ecdh).map_err(|e| format!("{e:?}"))
     }
+
+    pub fn to_seal_key(&self) -> Result<panetiere::pke::PublicKey, String> {
+        panetiere::pke::PublicKey::from_bytes(&self.kem).map_err(|e| format!("{e:?}"))
+    }
+}
+
+/// Human-readable form: one hex string per key.
+#[derive(Serialize, Deserialize)]
+struct ExchangeKeysHex {
+    ecdh: String,
+    kem: String,
 }
 
 impl Serialize for ExchangePublicKeyWire {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         if s.is_human_readable() {
-            s.serialize_str(&hex::encode(&self.0))
+            ExchangeKeysHex {
+                ecdh: hex::encode(&self.ecdh),
+                kem: hex::encode(&self.kem),
+            }
+            .serialize(s)
         } else {
-            serde_bytes::Bytes::new(&self.0).serialize(s)
+            (
+                serde_bytes::Bytes::new(&self.ecdh),
+                serde_bytes::Bytes::new(&self.kem),
+            )
+                .serialize(s)
         }
     }
 }
@@ -118,35 +146,30 @@ impl Serialize for ExchangePublicKeyWire {
 impl<'de> Deserialize<'de> for ExchangePublicKeyWire {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         if d.is_human_readable() {
-            let s = String::deserialize(d)?;
-            let v = hex::decode(&s).map_err(serde::de::Error::custom)?;
-            Ok(ExchangePublicKeyWire(v))
+            let h = ExchangeKeysHex::deserialize(d)?;
+            Ok(ExchangePublicKeyWire {
+                ecdh: hex::decode(&h.ecdh).map_err(serde::de::Error::custom)?,
+                kem: hex::decode(&h.kem).map_err(serde::de::Error::custom)?,
+            })
         } else {
-            let v: serde_bytes::ByteBuf = serde_bytes::ByteBuf::deserialize(d)?;
-            Ok(ExchangePublicKeyWire(v.into_vec()))
+            let (ecdh, kem): (serde_bytes::ByteBuf, serde_bytes::ByteBuf) =
+                Deserialize::deserialize(d)?;
+            Ok(ExchangePublicKeyWire {
+                ecdh: ecdh.into_vec(),
+                kem: kem.into_vec(),
+            })
         }
     }
 }
 
-impl PartialOrd for ExchangePublicKeyWire {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for ExchangePublicKeyWire {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.cmp(&other.0)
-    }
-}
-
-/// The sorted relay roster paired with each relay's exchange pubkey looked up
-/// from `exchange_keys`, indexed 0-based — the per-protocol `ServerId`. Relays
-/// missing or with an undecodable key are skipped. Both protocols derive their
-/// server keying from this (ADCNet then ECDHs each; Panetiere seals to each).
-pub fn roster_exchange_pubkeys(
+/// The sorted relay roster paired with each relay's key looked up from
+/// `exchange_keys` and decoded by `decode`, indexed 0-based — the per-protocol
+/// `ServerId`. Relays missing or with an undecodable key are skipped.
+fn roster_keys<K>(
     relays: &[Pubkey],
     exchange_keys: &[(Pubkey, ExchangePublicKeyWire)],
-) -> Vec<(usize, adcnet::crypto::ExchangePublicKey)> {
+    decode: impl Fn(&ExchangePublicKeyWire) -> Result<K, String>,
+) -> Vec<(usize, K)> {
     let mut sorted = relays.to_vec();
     sorted.sort();
     let by_pk: std::collections::HashMap<Pubkey, &ExchangePublicKeyWire> =
@@ -154,8 +177,25 @@ pub fn roster_exchange_pubkeys(
     sorted
         .iter()
         .enumerate()
-        .filter_map(|(i, pk)| Some((i, by_pk.get(pk)?.to_key().ok()?)))
+        .filter_map(|(i, pk)| Some((i, decode(by_pk.get(pk)?).ok()?)))
         .collect()
+}
+
+/// Server roster for ADCNet, which ECDHs against each relay's P-256 point.
+pub fn roster_exchange_pubkeys(
+    relays: &[Pubkey],
+    exchange_keys: &[(Pubkey, ExchangePublicKeyWire)],
+) -> Vec<(usize, adcnet::crypto::ExchangePublicKey)> {
+    roster_keys(relays, exchange_keys, ExchangePublicKeyWire::to_key)
+}
+
+/// Server roster for Panetiere, whose clients seal one opening to each relay's
+/// ML-KEM encapsulation key.
+pub fn roster_seal_pubkeys(
+    relays: &[Pubkey],
+    exchange_keys: &[(Pubkey, ExchangePublicKeyWire)],
+) -> Vec<(usize, panetiere::pke::PublicKey)> {
+    roster_keys(relays, exchange_keys, ExchangePublicKeyWire::to_seal_key)
 }
 
 /// Version-stable 32-byte seed over `domain` and a sorted roster (SHA-256).
@@ -171,11 +211,12 @@ pub fn derive_seed(domain: &[u8], pubkeys: &[Pubkey]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// Long-lived P-256 keypair for the ADCNet ECDH layer and the Panetiere ECIES
-/// (`panetiere::pke`) sealing layer — one scalar, both protocol-native key
-/// types. Held alongside the Ed25519 [`crate::identity::Identity`] and
-/// persisted next to it so a node keeps one stable exchange pubkey across
-/// restarts.
+/// Long-lived exchange key material: the P-256 keypair the ADCNet ECDH layer
+/// uses, plus the ML-KEM-768 key the Panetiere sealing layer
+/// (`panetiere::pke`) opens envelopes with. The two schemes share no key
+/// material, so the ML-KEM key is derived from the P-256 scalar — one persisted
+/// secret, and both public keys stay stable across restarts. Held alongside the
+/// Ed25519 [`crate::identity::Identity`] and persisted next to it.
 pub struct ExchangeIdentity {
     key: adcnet::crypto::ExchangePrivateKey,
     pke: panetiere::pke::PrivateKey,
@@ -183,8 +224,12 @@ pub struct ExchangeIdentity {
 
 impl ExchangeIdentity {
     fn from_adcnet_key(key: adcnet::crypto::ExchangePrivateKey) -> Self {
-        let pke =
-            panetiere::pke::PrivateKey::from_bytes(&key.to_bytes()).expect("same P-256 scalar");
+        use sha2::{Digest, Sha512};
+        let mut h = Sha512::new();
+        h.update(b"anymone/exchange/mlkem768/v1");
+        h.update(key.to_bytes());
+        let pke = panetiere::pke::PrivateKey::from_bytes(&h.finalize())
+            .expect("Sha512 output is the 64-byte ML-KEM seed");
         ExchangeIdentity { key, pke }
     }
 
@@ -200,7 +245,7 @@ impl ExchangeIdentity {
         self.key.ecdh(other)
     }
 
-    /// The key ECIES envelopes (`panetiere::pke`) are opened with.
+    /// The key sealed envelopes (`panetiere::pke`) are opened with.
     pub fn pke(&self) -> &panetiere::pke::PrivateKey {
         &self.pke
     }

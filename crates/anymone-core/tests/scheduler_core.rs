@@ -33,7 +33,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
 fn xkw(id: &Identity) -> ExchangePublicKeyWire {
-    ExchangePublicKeyWire::from_key(&id.exchange_pubkey())
+    id.exchange_keys()
 }
 
 fn staged_proposal(actions: &[SchedulerAction]) -> Option<SignedProposal> {

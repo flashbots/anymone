@@ -5,11 +5,10 @@
 //! seed that peers dial to find each other. `keygen` mints node identities for
 //! a deployment's config.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use anymone_core::config::ExchangePublicKeyWire;
 use anymone_core::p2p::Libp2pNetwork;
 use anymone_core::transport::Transport;
 use anymone_core::{
@@ -36,6 +35,8 @@ enum Cmd {
     Bootnode(BootnodeArgs),
     /// Generate a node identity and print its public material for configs.
     Keygen(KeygenArgs),
+    /// Print the public material of an existing identity.
+    Pubkeys(PubkeysArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -69,6 +70,13 @@ struct KeygenArgs {
     /// Identity file to create (a `.exchange` sibling is written alongside).
     #[arg(long)]
     out: PathBuf,
+}
+
+#[derive(Parser, Debug)]
+struct PubkeysArgs {
+    /// Identity file to read (its `.exchange` sibling is read alongside).
+    #[arg(long)]
+    identity: PathBuf,
 }
 
 #[derive(ValueEnum, Clone, Debug, PartialEq, Eq)]
@@ -195,6 +203,7 @@ async fn main() -> Result<()> {
         Cmd::Run(args) => run(args).await,
         Cmd::Bootnode(args) => bootnode(args).await,
         Cmd::Keygen(args) => keygen(args),
+        Cmd::Pubkeys(args) => pubkeys(args),
     }
 }
 
@@ -209,13 +218,30 @@ fn keygen(args: KeygenArgs) -> Result<()> {
     identity
         .save(&args.out)
         .with_context(|| format!("writing identity to {}", args.out.display()))?;
-    let peer_id = PeerId::from(identity.to_libp2p_keypair().public());
-    let xpub = ExchangePublicKeyWire::from_key(&identity.exchange_pubkey());
-    println!("identity_path  {}", args.out.display());
-    println!("pubkey         {}", identity.pubkey());
-    println!("exchange_pubkey {}", hex::encode(&xpub.0));
-    println!("peer_id        {peer_id}");
+    print_public_material(&args.out, &identity);
     Ok(())
+}
+
+fn pubkeys(args: PubkeysArgs) -> Result<()> {
+    let identity = Identity::load(&args.identity)
+        .with_context(|| format!("loading identity from {}", args.identity.display()))?;
+    print_public_material(&args.identity, &identity);
+    Ok(())
+}
+
+/// The lines a deployment scrapes to render configs. `exchange_pubkey` in a
+/// `[[governance.committee]]` entry takes both keys:
+/// `{ ecdh = "<exchange_ecdh>", kem = "<exchange_kem>" }`.
+fn print_public_material(path: &Path, identity: &Identity) {
+    let xpub = identity.exchange_keys();
+    println!("identity_path  {}", path.display());
+    println!("pubkey         {}", identity.pubkey());
+    println!("exchange_ecdh  {}", hex::encode(&xpub.ecdh));
+    println!("exchange_kem   {}", hex::encode(&xpub.kem));
+    println!(
+        "peer_id        {}",
+        PeerId::from(identity.to_libp2p_keypair().public())
+    );
 }
 
 async fn bootnode(args: BootnodeArgs) -> Result<()> {
@@ -285,7 +311,7 @@ async fn run(args: RunArgs) -> Result<()> {
             tokio::signal::ctrl_c().await.ok();
         }
         Role::Relay => {
-            let xk = ExchangePublicKeyWire::from_key(&identity.exchange_pubkey());
+            let xk = identity.exchange_keys();
             let _reannounce = announce_relay_registration(transport.clone(), &identity, xk).await;
             let anymone = Arc::new(
                 Anymone::prepare(identity, transport, gov)
@@ -305,7 +331,7 @@ async fn run(args: RunArgs) -> Result<()> {
                 .service_tag
                 .ok_or_else(|| anyhow!("--service-tag is required for role=service"))?;
             let tag = ServiceTag::from_label(&label);
-            let xk = ExchangePublicKeyWire::from_key(&identity.exchange_pubkey());
+            let xk = identity.exchange_keys();
             let _reannounce =
                 announce_service_registration(transport.clone(), &identity, tag, xk).await;
             let anymone = Anymone::prepare(identity, transport, gov)

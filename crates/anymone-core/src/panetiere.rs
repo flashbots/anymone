@@ -51,9 +51,15 @@ pub(crate) fn channel_params(rho: u32, message_bytes: usize, setup_seed: [u8; 32
 }
 
 /// Message-byte bound for the committee's config-anonymising channel. Must fit
-/// a serialized `SignedProposal` at `MAX_SUBNETS` — asserted against the real
-/// `build_body` packing in `scheduler_core::sizing_tests`.
-pub(crate) const COMMITTEE_MSG_BYTES: usize = 12288;
+/// a serialized `SignedProposal` at `MAX_SUBNETS` and `MAX_COMMITTEE_RELAYS` —
+/// asserted against the real `build_body` packing in
+/// `scheduler_core::sizing_tests`, which measured 35940 bytes there.
+///
+/// A proposal grows ~2 KB per placed relay: its 1184-byte ML-KEM encapsulation
+/// key and 33-byte ECDH point, plus its pubkey in every subnet roster and
+/// aggregator group. Raising `MAX_COMMITTEE_RELAYS` means raising this, and it
+/// must match across members.
+pub const COMMITTEE_MSG_BYTES: usize = 36864;
 
 /// Per-subnet Panetiere parameters. The KAHE width is exactly one packed
 /// encoding, which `ChannelParams` derives.
@@ -126,23 +132,20 @@ pub fn client_id_from_pubkey(pk: Pubkey) -> ClientId {
     ClientId(u32::from_be_bytes([pk.0[0], pk.0[1], pk.0[2], pk.0[3]]))
 }
 
-/// Panetiere `(ServerId, pke::PublicKey)` roster for sealing client openings —
-/// relays whose exchange key is missing or undecodable are skipped.
 /// Wire length of a `ClientBulletinEntry` under `pp`'s geometry.
 pub(crate) fn entry_wire_len(pp: &Arc<ProtocolParams>) -> usize {
     ClientBulletinEntry::packed_len(message_polys(pp))
 }
 
+/// Panetiere `(ServerId, pke::PublicKey)` roster for sealing client openings —
+/// relays whose exchange key is missing or undecodable are skipped.
 pub(crate) fn seal_roster(
     relay_xk: &[(Pubkey, ExchangePublicKeyWire)],
     subnet: &Subnet,
 ) -> Vec<(ServerId, pke::PublicKey)> {
-    crate::keys::roster_exchange_pubkeys(&subnet.relays, relay_xk)
+    crate::keys::roster_seal_pubkeys(&subnet.relays, relay_xk)
         .into_iter()
-        .filter_map(|(i, xk)| {
-            let pk = pke::PublicKey::from_sec1_bytes(&xk.to_sec1_bytes()).ok()?;
-            Some((ServerId(i as u32), pk))
-        })
+        .map(|(i, pk)| (ServerId(i as u32), pk))
         .collect()
 }
 
@@ -554,7 +557,7 @@ pub(crate) enum PanetiereWire {
         round: u64,
         client_id: u32,
         target_server: u32,
-        /// ECIES envelope (`panetiere::pke`) over the packed `Opening`, opened
+        /// Sealed envelope (`panetiere::pke`) over the packed `Opening`, opened
         /// only by the target server. Never plaintext: ≥t openings reconstruct
         /// the client's message.
         #[serde(with = "serde_bytes")]

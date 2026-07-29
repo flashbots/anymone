@@ -55,6 +55,13 @@ const SUBNET_SHRINK_GRACE: u32 = 3;
 /// observability subscriptions; a safety cap, not an expected count).
 pub const MAX_SUBNETS: usize = 16;
 
+/// Most relays the committee will place. Every proposal carries each placed
+/// relay's exchange keys — the ML-KEM encapsulation key alone is 1184 bytes — so
+/// the roster is what sizes [`crate::panetiere::COMMITTEE_MSG_BYTES`]. Placing
+/// more than that channel can carry would wedge the committee, which rejects an
+/// oversize proposal rather than truncating it.
+pub const MAX_COMMITTEE_RELAYS: usize = 16;
+
 /// Subnet capacity before any client population has been observed, and the
 /// default [`SchedulerParams::min_capacity`].
 pub const INITIAL_CAPACITY: u32 = 8;
@@ -307,50 +314,55 @@ mod sizing_tests {
 
         // The worst-case proposal (MAX_SUBNETS, largest protocol config, max
         // aggregator groups) must fit the committee channel, or the committee
-        // wedges: it stages the config every round and never decodes it back.
-        let id = Identity::generate();
-        let mut core = SchedulerCore::new(
-            id.clone(),
-            vec![id.pubkey()],
-            1,
-            SchedulerParams {
-                public_round_duration: Duration::from_secs(8),
-                min_relays: 4,
-                min_services: 1,
-                fault_threshold: 2,
-                escalation_grace: ESCALATION_GRACE,
-                grow_at: SUBNET_GROW_AT,
-                message_size: 1024,
-                integrity_backoff_ms: 6 * 60 * 1000,
-                sideline: false,
-                renegotiate_on_fault: true,
-                min_capacity: 8,
-                vector_bytes: 0,
-                pin: None,
-                aggregation: true,
-            },
-        );
-        for _ in 0..8 {
-            let rid = Identity::generate();
-            core.registered.insert(rid.pubkey());
-            core.relay_xpubs.insert(
-                rid.pubkey(),
-                ExchangePublicKeyWire::from_key(&rid.exchange_pubkey()),
+        // wedges: it stages the config every round and never decodes it back. A
+        // body carries every placed relay's exchange keys, so it grows with the
+        // roster — measured at the largest roster the cap is sized for.
+        let mut worst = 0;
+        for n_relays in [4usize, 8, MAX_COMMITTEE_RELAYS] {
+            let id = Identity::generate();
+            let mut core = SchedulerCore::new(
+                id.clone(),
+                vec![id.pubkey()],
+                1,
+                SchedulerParams {
+                    public_round_duration: Duration::from_secs(8),
+                    min_relays: 4,
+                    min_services: 1,
+                    fault_threshold: 2,
+                    escalation_grace: ESCALATION_GRACE,
+                    grow_at: SUBNET_GROW_AT,
+                    message_size: 1024,
+                    integrity_backoff_ms: 6 * 60 * 1000,
+                    sideline: false,
+                    renegotiate_on_fault: true,
+                    min_capacity: 8,
+                    vector_bytes: 0,
+                    pin: None,
+                    aggregation: true,
+                },
             );
+            for _ in 0..n_relays {
+                let rid = Identity::generate();
+                core.registered.insert(rid.pubkey());
+                core.relay_xpubs.insert(rid.pubkey(), rid.exchange_keys());
+            }
+            core.services
+                .insert(ServiceTag([1u8; 20]), Identity::generate().pubkey());
+            core.capacity = MAX_SUBNET_CLIENTS;
+            let body = core.build_body(&vec![SchedulerProtocol::ScheduledPanetiere; MAX_SUBNETS]);
+            let proposal = SignedProposal {
+                body,
+                proposer: id.pubkey(),
+                signature: vec![0u8; 64],
+            };
+            let len = bincode::serialize(&proposal).unwrap().len();
+            println!("{MAX_SUBNETS} subnets, {n_relays} relays: {len} bytes");
+            worst = worst.max(len);
         }
-        core.services
-            .insert(ServiceTag([1u8; 20]), Identity::generate().pubkey());
-        core.capacity = MAX_SUBNET_CLIENTS;
-        let body = core.build_body(&vec![SchedulerProtocol::ScheduledPanetiere; MAX_SUBNETS]);
-        let proposal = SignedProposal {
-            body,
-            proposer: id.pubkey(),
-            signature: vec![0u8; 64],
-        };
-        let len = bincode::serialize(&proposal).unwrap().len();
         assert!(
-            len <= crate::panetiere::COMMITTEE_MSG_BYTES,
-            "{MAX_SUBNETS}-subnet proposal ({len} bytes) exceeds COMMITTEE_MSG_BYTES"
+            worst <= crate::panetiere::COMMITTEE_MSG_BYTES,
+            "{MAX_SUBNETS}-subnet proposal at {MAX_COMMITTEE_RELAYS} relays ({worst} bytes) \
+             exceeds COMMITTEE_MSG_BYTES"
         );
     }
 
@@ -1579,6 +1591,15 @@ impl SchedulerCore {
     fn build_body(&self, protos: &[SchedulerProtocol]) -> AnymoneRoundConfigurationBody {
         let mut relay_vec: Vec<Pubkey> = self.registered.iter().copied().collect();
         relay_vec.sort();
+        if relay_vec.len() > MAX_COMMITTEE_RELAYS {
+            tracing::warn!(
+                target: GOV,
+                registered = relay_vec.len(),
+                cap = MAX_COMMITTEE_RELAYS,
+                "more relays registered than a proposal can carry; placing the lowest pubkeys"
+            );
+            relay_vec.truncate(MAX_COMMITTEE_RELAYS);
+        }
         let mut service_vec: Vec<ServiceEntry> = self
             .services
             .iter()

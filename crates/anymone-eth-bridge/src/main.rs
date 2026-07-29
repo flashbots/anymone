@@ -8,7 +8,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anymone_core::config::ExchangePublicKeyWire;
 use anymone_core::p2p::Libp2pNetwork;
 use anymone_core::transport::Transport;
 use anymone_core::{
@@ -113,7 +112,7 @@ async fn main() -> Result<()> {
     // adopted), so the committee can see this registration in time to
     // include the tag in that very first config.
     let _reannounce = if args.announce {
-        let xk = ExchangePublicKeyWire::from_key(&identity.exchange_pubkey());
+        let xk = identity.exchange_keys();
         Some(
             announce_service_registration(
                 transport.clone(),

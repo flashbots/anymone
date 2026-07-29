@@ -18,9 +18,10 @@ pub use crate::keys::{ExchangeIdentity, IdentityError, Pubkey};
 
 /// A node's long-lived keypair. Persisted as the raw 32-byte Ed25519 seed.
 ///
-/// Carries an associated [`ExchangeIdentity`] (P-256, used by ADCNet's ECDH
-/// layer). The exchange key is persisted at `identity_path.with_extension("exchange")`
-/// so it survives restarts without changing the Ed25519 PeerId.
+/// Carries an associated [`ExchangeIdentity`] (ADCNet's ECDH key and
+/// Panetiere's ML-KEM sealing key). It is persisted at
+/// `identity_path.with_extension("exchange")` so it survives restarts without
+/// changing the Ed25519 PeerId.
 pub struct Identity {
     keypair: ed25519::Keypair,
     exchange: ExchangeIdentity,
@@ -53,6 +54,11 @@ impl Identity {
 
     pub fn exchange_pubkey(&self) -> adcnet::crypto::ExchangePublicKey {
         self.exchange.public()
+    }
+
+    /// Both exchange public keys in the form a registration and a config carry.
+    pub fn exchange_keys(&self) -> crate::keys::ExchangePublicKeyWire {
+        crate::keys::ExchangePublicKeyWire::from_identity(&self.exchange)
     }
 
     fn exchange_path(path: &Path) -> PathBuf {

@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use anymone_core::config::{
     now_unix_ms, AdcnetConfig, Aggregation, AggregatorGroup, AnymoneRoundConfigurationBody,
-    ExchangePublicKeyWire, ProtocolConfig, Subnet,
+    ProtocolConfig, Subnet,
 };
 use anymone_core::faults::{Attribution, FaultKind};
 use anymone_core::panetiere::{
@@ -151,8 +151,13 @@ fn panetiere_session_happy_path() {
 fn committee_panetiere_roundtrip(payload: &[u8]) -> Vec<u8> {
     let mut setup_rng = ChaCha20Rng::from_seed([7u8; 32]);
     let n_servers = 3;
-    // ρ=3, message bound matching the committee's COMMITTEE_MSG_BYTES.
-    let (mse, pp) = channel(&mut setup_rng, n_servers, 3, 12288);
+    // ρ=3, at the committee's own message bound.
+    let (mse, pp) = channel(
+        &mut setup_rng,
+        n_servers,
+        3,
+        anymone_core::panetiere::COMMITTEE_MSG_BYTES,
+    );
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_pk = Identity::generate().pubkey();
     let (ids, server_pks, xpubs) = server_env(n_servers);
@@ -586,7 +591,7 @@ fn adcnet_config_body(n_subnets: usize) -> AnymoneRoundConfigurationBody {
         .map(|i| {
             (
                 i.pubkey(),
-                ExchangePublicKeyWire::from_key(&i.exchange_pubkey()),
+                i.exchange_keys(),
             )
         })
         .collect();

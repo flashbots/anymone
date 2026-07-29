@@ -32,21 +32,23 @@ pub enum Registration {
 }
 
 /// Domain-tagged message a relay signs to register: `"anymone-relay" || pubkey
-/// || exchange_pubkey`.
+/// || ecdh_pubkey || kem_pubkey`.
 fn relay_sign_msg(pubkey: &Pubkey, xk: &ExchangePublicKeyWire) -> Vec<u8> {
     let mut msg = b"anymone-relay".to_vec();
     msg.extend_from_slice(&pubkey.0);
-    msg.extend_from_slice(&xk.0);
+    msg.extend_from_slice(&xk.ecdh);
+    msg.extend_from_slice(&xk.kem);
     msg
 }
 
 /// Domain-tagged message a service signs: `"anymone-service" || tag || pubkey
-/// || exchange_pubkey`.
+/// || ecdh_pubkey || kem_pubkey`.
 fn service_sign_msg(tag: &ServiceTag, pubkey: &Pubkey, xk: &ExchangePublicKeyWire) -> Vec<u8> {
     let mut msg = b"anymone-service".to_vec();
     msg.extend_from_slice(&tag.0);
     msg.extend_from_slice(&pubkey.0);
-    msg.extend_from_slice(&xk.0);
+    msg.extend_from_slice(&xk.ecdh);
+    msg.extend_from_slice(&xk.kem);
     msg
 }
 

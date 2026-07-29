@@ -23,7 +23,7 @@ fn echo_tag() -> ServiceTag {
 }
 
 fn xkw(id: &Identity) -> ExchangePublicKeyWire {
-    ExchangePublicKeyWire::from_key(&id.exchange_pubkey())
+    id.exchange_keys()
 }
 
 /// Outcome of one fault scenario: the leader's gossiped `FaultReport`, the

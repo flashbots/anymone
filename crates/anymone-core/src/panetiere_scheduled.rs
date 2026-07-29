@@ -143,12 +143,9 @@ fn seal_roster(
     relay_xk: &[(Pubkey, ExchangePublicKeyWire)],
     subnet: &Subnet,
 ) -> Vec<(ServerId, pke::PublicKey)> {
-    crate::keys::roster_exchange_pubkeys(&subnet.relays, relay_xk)
+    crate::keys::roster_seal_pubkeys(&subnet.relays, relay_xk)
         .into_iter()
-        .filter_map(|(i, xk)| {
-            let pk = pke::PublicKey::from_sec1_bytes(&xk.to_sec1_bytes()).ok()?;
-            Some((ServerId(i as u32), pk))
-        })
+        .map(|(i, pk)| (ServerId(i as u32), pk))
         .collect()
 }
 

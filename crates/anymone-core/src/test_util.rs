@@ -43,7 +43,7 @@ impl Node {
     pub fn fresh(net: &Arc<InMemoryNetwork>) -> Self {
         let id = Identity::generate();
         let pk = id.pubkey();
-        let exchange_pubkey = ExchangePublicKeyWire::from_key(&id.exchange_pubkey());
+        let exchange_pubkey = id.exchange_keys();
         let handle = net.handle(pk);
         Node {
             identity_pk: pk,

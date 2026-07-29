@@ -20,7 +20,7 @@ use anymone_core::{
 };
 
 fn xk(id: &Identity) -> ExchangePublicKeyWire {
-    ExchangePublicKeyWire::from_key(&id.exchange_pubkey())
+    id.exchange_keys()
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -35,7 +35,7 @@ async fn aggregated_subnet_counts_all_clients_every_round() {
         .map(|i| {
             (
                 i.pubkey(),
-                anymone_core::config::ExchangePublicKeyWire::from_key(&i.exchange_pubkey()),
+                i.exchange_keys(),
             )
         })
         .collect();

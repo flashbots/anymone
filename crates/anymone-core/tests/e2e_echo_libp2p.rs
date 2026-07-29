@@ -135,7 +135,7 @@ async fn deployment_schedules_subnet_via_bootnode() {
         portpicker::pick_unused_port().unwrap()
     }
     fn xk(id: &Identity) -> ExchangePublicKeyWire {
-        ExchangePublicKeyWire::from_key(&id.exchange_pubkey())
+        id.exchange_keys()
     }
 
     let echo_tag = ServiceTag::from_label("anymone.echo");
@@ -245,7 +245,7 @@ async fn deployment_echo_full_nodes_via_bootnode() {
         portpicker::pick_unused_port().unwrap()
     }
     fn xk(id: &Identity) -> ExchangePublicKeyWire {
-        ExchangePublicKeyWire::from_key(&id.exchange_pubkey())
+        id.exchange_keys()
     }
 
     // Bootnode: the lone seed; relays governance topics while the mesh forms.
