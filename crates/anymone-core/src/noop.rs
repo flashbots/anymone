@@ -1,7 +1,7 @@
 //! Noop anonymous broadcast: no crypto. Every client message becomes part of
 //! the round output.
 //!
-//! Used for bringing up the runtime, pipe, and libp2p layers before any
+//! Used for bringing up the runtime, pipe, and transport layers before any
 //! cryptography is involved. If a Noop subnet misbehaves, the bug isn't in
 //! panetiere/adcnet — it's in the runtime, the wire format, or the transport.
 

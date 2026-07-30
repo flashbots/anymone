@@ -34,16 +34,18 @@ use crate::config::{
 use crate::identity::{Identity, Pubkey};
 use crate::log_target::{PANETIERE, SCHED};
 use crate::panetiere::{
-    client_id_from_pubkey, drain_inbound_upto, server_index, wire_round_past,
-    PanetiereAggregatorSession, PanetiereObserverSession, PanetiereServerSession,
-    PanetiereWatchSession, PanetiereWire, SetMode, PANETIERE_ROUND_RETENTION,
+    drain_inbound_upto, server_index, wire_round_past, PanetiereAggregatorSession,
+    PanetiereObserverSession, PanetiereServerSession, PanetiereWatchSession, PanetiereWire, SetMode,
+    PANETIERE_ROUND_RETENTION,
 };
 use crate::runtime::{
     aggregator_group_of, client_aggregator_topic, deadline_for, egress_dest, gossip_faults,
     handle_inbound, publish_and_loop_back, recv_any, round_at, route_to_pipe, subnet_aggregation,
     subnet_leader_pk, AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
 };
-use crate::session::{LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
+use crate::session::{
+    GoodClients, LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session,
+};
 use crate::transport::Subscription;
 
 /// `(rand, size)` per reservation: two `Z_t` symbols carrying the `u16`s
@@ -179,7 +181,7 @@ fn client_session(
         pp.clone(),
         sched_mse.clone(),
         vector_bytes,
-        client_id_from_pubkey(identity.pubkey()),
+        identity.clone(),
         servers,
         leader_pk,
         seed,
@@ -200,6 +202,7 @@ fn server_session(
     identity: &Identity,
     leader_pk: Pubkey,
     entries: ReservationEntries,
+    good_clients: GoodClients,
 ) -> Box<dyn Session> {
     let identity_pk = identity.pubkey();
     let server_id = ServerId(
@@ -234,6 +237,7 @@ fn server_session(
     session.set_client_set_max(cfg.client_set_max as usize);
     session.set_subnet(subnet.id);
     session.set_setup_seed(cfg.setup_seed);
+    session.set_good_clients(good_clients);
     Box::new(session)
 }
 
@@ -241,6 +245,7 @@ pub struct ScheduledPanetiereClientSession {
     pp: Arc<ProtocolParams>,
     sched_mse: ChannelParams,
     vector_bytes: usize,
+    identity: Identity,
     client_id: ClientId,
     servers: Vec<(ServerId, pke::PublicKey)>,
     leader_pk: PeerId,
@@ -270,7 +275,7 @@ impl ScheduledPanetiereClientSession {
         pp: Arc<ProtocolParams>,
         sched_mse: ChannelParams,
         vector_bytes: usize,
-        client_id: ClientId,
+        identity: Identity,
         servers: Vec<(ServerId, pke::PublicKey)>,
         leader_pk: Pubkey,
         rng_seed: [u8; 32],
@@ -284,7 +289,8 @@ impl ScheduledPanetiereClientSession {
             pp,
             sched_mse,
             vector_bytes,
-            client_id,
+            client_id: crate::panetiere::client_id_from_pubkey(identity.pubkey()),
+            identity,
             servers,
             leader_pk,
             staged: Vec::new(),
@@ -612,11 +618,17 @@ impl Session for ScheduledPanetiereClientSession {
         );
 
         let mut out: Vec<Vec<u8>> = Vec::with_capacity(1 + self.servers.len());
+        let cid = round_out.client_id.0;
+        let entry = round_out.encrypted_message.to_bytes();
         out.push(
             bincode::serialize(&PanetiereWire::ClientPublic {
                 round,
-                client_id: round_out.client_id.0,
-                entry: round_out.encrypted_message.to_bytes(),
+                client_id: cid,
+                signature: self.identity.sign(
+                    &crate::panetiere::client_public_signing_bytes(round, cid, &entry),
+                ),
+                entry,
+                signer: self.identity.pubkey(),
             })
             .expect("serialise client public"),
         );
@@ -624,9 +636,18 @@ impl Session for ScheduledPanetiereClientSession {
             out.push(
                 bincode::serialize(&PanetiereWire::Opening {
                     round,
-                    client_id: round_out.client_id.0,
+                    client_id: cid,
                     target_server: server_id.0,
+                    signature: self.identity.sign(
+                        &crate::panetiere::client_opening_signing_bytes(
+                            round,
+                            cid,
+                            server_id.0,
+                            &sealed,
+                        ),
+                    ),
                     sealed,
+                    signer: self.identity.pubkey(),
                 })
                 .expect("serialise opening"),
             );
@@ -725,6 +746,10 @@ impl ScheduledPanetiereServerSession {
 
     pub(crate) fn set_setup_seed(&mut self, setup_seed: [u8; 32]) {
         self.inner.set_setup_seed(setup_seed);
+    }
+
+    pub(crate) fn set_good_clients(&mut self, good_clients: GoodClients) {
+        self.inner.set_good_clients(good_clients);
     }
 
     /// Entry width for every round the store can place. Re-scanned rather than
@@ -1068,6 +1093,7 @@ pub(crate) async fn run_subnet(
                 &inner.identity,
                 leader_pk,
                 inner.sched_reservation_entries(subnet.id),
+                inner.good_clients.clone(),
             ),
         );
     } else {
@@ -1087,6 +1113,7 @@ pub(crate) async fn run_subnet(
                 cfg.client_set_max,
                 a.groups.len() as u32,
             ));
+            agg_session.set_good_clients(inner.good_clients.clone());
             sessions.insert(
                 SessionKey::Aggregator,
                 Box::new(ScheduledAggregatorSession::new(
@@ -1429,7 +1456,7 @@ mod sizing_tests {
             pp.clone(),
             sched_mse,
             vector_bytes,
-            ClientId(1),
+            Identity::generate(),
             servers,
             leader,
             [2u8; 32],

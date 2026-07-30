@@ -185,7 +185,8 @@ fn scheduled_direct_flow_pipelines_reservations() {
 
     let payload_a = b"first client message".to_vec();
     let payload_b = b"second client message here".to_vec();
-    let client_pks: Vec<Pubkey> = (0..2).map(|_| Identity::generate().pubkey()).collect();
+    let client_identities: Vec<Identity> = (0..2).map(|_| Identity::generate()).collect();
+    let client_pks: Vec<Pubkey> = client_identities.iter().map(|id| id.pubkey()).collect();
     let mut clients: Vec<ScheduledPanetiereClientSession> = (0..2usize)
         .map(|i| {
             let mut seed = [0u8; 32];
@@ -194,7 +195,7 @@ fn scheduled_direct_flow_pipelines_reservations() {
                 pp.clone(),
                 sched_mse.clone(),
                 vector_bytes,
-                client_id_from_pubkey(client_pks[i]),
+                client_identities[i].clone(),
                 xpubs.clone(),
                 server_pks[0],
                 seed,
@@ -359,7 +360,8 @@ fn dropped_reservation_is_retried() {
 
     let payload_a = b"AAAA".to_vec();
     let payload_b = b"BBBB".to_vec();
-    let client_pks: Vec<Pubkey> = (0..2).map(|_| Identity::generate().pubkey()).collect();
+    let client_identities: Vec<Identity> = (0..2).map(|_| Identity::generate()).collect();
+    let client_pks: Vec<Pubkey> = client_identities.iter().map(|id| id.pubkey()).collect();
     let mut clients: Vec<ScheduledPanetiereClientSession> = (0..2usize)
         .map(|i| {
             let mut seed = [0u8; 32];
@@ -368,7 +370,7 @@ fn dropped_reservation_is_retried() {
                 pp.clone(),
                 sched_mse.clone(),
                 vector_bytes,
-                client_id_from_pubkey(client_pks[i]),
+                client_identities[i].clone(),
                 xpubs.clone(),
                 server_pks[0],
                 seed,
@@ -518,11 +520,11 @@ fn scheduled_aggregated_flow_decodes_through_groups() {
     let payload_a = b"group zero's scheduled message".to_vec();
     let payload_b = b"group one's scheduled message".to_vec();
     // Pick client pubkeys landing in distinct groups via `client_id % group_count`.
-    let (pk_a, pk_b) = loop {
-        let a = Identity::generate().pubkey();
-        let b = Identity::generate().pubkey();
-        let ga = client_id_from_pubkey(a).0 % group_count;
-        let gb = client_id_from_pubkey(b).0 % group_count;
+    let (id_a, id_b) = loop {
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let ga = client_id_from_pubkey(a.pubkey()).0 % group_count;
+        let gb = client_id_from_pubkey(b.pubkey()).0 % group_count;
         if ga == 0 && gb != 0 {
             break (a, b);
         }
@@ -530,7 +532,9 @@ fn scheduled_aggregated_flow_decodes_through_groups() {
             break (b, a);
         }
     };
+    let (pk_a, pk_b) = (id_a.pubkey(), id_b.pubkey());
     let client_pks = [pk_a, pk_b];
+    let client_identities = [id_a, id_b];
     let mut clients: Vec<ScheduledPanetiereClientSession> = (0..2usize)
         .map(|i| {
             let mut seed = [0u8; 32];
@@ -539,7 +543,7 @@ fn scheduled_aggregated_flow_decodes_through_groups() {
                 pp.clone(),
                 sched_mse.clone(),
                 vector_bytes,
-                client_id_from_pubkey(client_pks[i]),
+                client_identities[i].clone(),
                 xpubs.clone(),
                 server_pks[0],
                 seed,

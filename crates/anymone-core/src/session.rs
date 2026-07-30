@@ -34,9 +34,34 @@ impl LeaderAggregation {
     }
 }
 
-/// Identifier for the peer a message arrived from. Same shape as a node's
-/// long-lived `Pubkey` — libp2p PeerIds are derived from it.
+/// Identifier for the peer a message arrived from: a node's long-lived
+/// `Pubkey`, which is also what the transport authenticates the link against.
 pub type PeerId = Pubkey;
+
+/// Which client keys a relay accepts contributions from. The demo admits
+/// everyone; a deployment restricts it to attested clients.
+#[derive(Clone)]
+pub struct GoodClients(std::sync::Arc<dyn Fn(&Pubkey) -> bool + Send + Sync>);
+
+impl GoodClients {
+    pub fn all() -> Self {
+        GoodClients(std::sync::Arc::new(|_| true))
+    }
+
+    pub fn new(f: impl Fn(&Pubkey) -> bool + Send + Sync + 'static) -> Self {
+        GoodClients(std::sync::Arc::new(f))
+    }
+
+    pub fn allows(&self, client: &Pubkey) -> bool {
+        (self.0)(client)
+    }
+}
+
+impl Default for GoodClients {
+    fn default() -> Self {
+        GoodClients::all()
+    }
+}
 
 pub trait Session: Send {
     /// Set up state for `round`. Returns messages to broadcast at round start.

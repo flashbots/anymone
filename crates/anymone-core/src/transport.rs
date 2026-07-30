@@ -13,6 +13,10 @@ use crate::log_target::P2P;
 /// Pubkeys allowed to publish on each bound topic; a topic absent from the map is open.
 pub type TopicPolicy = HashMap<String, HashSet<Pubkey>>;
 
+/// Largest message any backend carries; the committee sizes subnets under it
+/// (`scheduler_core::MAX_SUBNET_WIRE`).
+pub const MAX_TRANSMIT_SIZE: usize = 16 * 1024 * 1024;
+
 /// A message arriving on a topic, tagged with its publisher.
 #[derive(Debug, Clone)]
 pub struct Inbound {
@@ -22,8 +26,8 @@ pub struct Inbound {
 
 /// Receiver of inbound messages on a single topic subscription.
 ///
-/// A transport never delivers a message back to its publisher (matching libp2p
-/// gossipsub). The in-memory backend shares one broadcast channel among all
+/// A transport never delivers a message back to its publisher. The in-memory
+/// backend shares one broadcast channel among all
 /// subscribers, so it carries the publisher's own messages too — `owner` filters
 /// those out in `recv`. Components that must consume their own output feed it to
 /// their local state in-process at emit time (see `committee.rs`, `run_subnet`).
@@ -35,7 +39,7 @@ pub struct Subscription {
 
 impl Subscription {
     /// Construct a `Subscription` from an existing broadcast receiver. Used by
-    /// the libp2p backend, where gossipsub already excludes the publisher.
+    /// the network backends, which never route a message back to its publisher.
     pub fn from_broadcast_receiver(rx: broadcast::Receiver<Inbound>, topic: String) -> Self {
         Subscription {
             rx,
@@ -102,6 +106,22 @@ pub trait Transport: Send + Sync + 'static {
 
     /// Maintain connections to these peers; default no-op.
     async fn ensure_peers(&self, _peers: Vec<Pubkey>) {}
+
+    /// Adopt a config's peer sets: `primary` is dialed outbound, `secondary` is
+    /// accepted inbound only. `index` must be monotonic and identical across
+    /// peers. Default no-op for backends without authenticated membership.
+    fn track_peers(&self, _index: u64, _primary: Vec<Pubkey>, _secondary: Vec<Pubkey>) {}
+
+    /// Peers this node has actually exchanged traffic with, for operator
+    /// endpoints. Observed, never the configured roster — a peer listed here is
+    /// one the transport has really heard from.
+    fn peers(&self) -> Vec<Pubkey> {
+        Vec::new()
+    }
+
+    /// This node's own key, so an endpoint can label itself without the caller
+    /// threading the identity separately.
+    fn local_pubkey(&self) -> Pubkey;
 }
 
 /// In-memory broadcast network shared by multiple `Anymone` instances in a
@@ -201,6 +221,10 @@ impl Transport for InMemoryHandle {
 
     fn set_topic_policy(&self, policy: TopicPolicy) {
         *self.net.policy.lock().unwrap() = policy;
+    }
+
+    fn local_pubkey(&self) -> Pubkey {
+        self.identity
     }
 }
 

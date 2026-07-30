@@ -21,7 +21,7 @@ use crate::log_target::{GOV, SCHED, WIRE};
 use crate::noop;
 use crate::panetiere::PanetiereWatchSession;
 use crate::pipe::{Pipe, PipeIncoming, PipeMessage};
-use crate::session::{Misbehavior, Session};
+use crate::session::{GoodClients, Misbehavior, Session};
 use crate::transport::{Inbound, Subscription, Transport};
 use crate::wire::{Frame, RouteTag, ServiceTag, SERVICE_TAG_LEN};
 
@@ -129,6 +129,8 @@ pub(crate) struct AnymoneInner {
     /// Byzantine misbehavior this node's relay sessions adopt (demo/testing):
     /// 0 = honest, 1 = withhold shares, 2 = corrupt shares.
     misbehavior: AtomicU8,
+    /// Which client keys this node's relay sessions accept contributions from.
+    pub(crate) good_clients: GoodClients,
 }
 
 impl AnymoneInner {
@@ -188,6 +190,7 @@ impl Anymone {
             transport,
             bootstrap,
             config_sub,
+            good_clients: GoodClients::all(),
         }
     }
 
@@ -209,7 +212,7 @@ impl Anymone {
         transport: Arc<dyn Transport>,
         config: AnymoneRoundConfiguration,
     ) -> Self {
-        Self::build_from_config(identity, transport, config, None).await
+        Self::build_from_config(identity, transport, config, None, GoodClients::all()).await
     }
 
     /// Build the node from `config`. When `governance` is set (the
@@ -220,6 +223,7 @@ impl Anymone {
         transport: Arc<dyn Transport>,
         config: AnymoneRoundConfiguration,
         governance: Option<(Subscription, GovernanceBootstrap)>,
+        good_clients: GoodClients,
     ) -> Self {
         let committee = governance.as_ref().map(|(_, gb)| gb.committee.clone());
         let mut participation_seed = [0u8; 32];
@@ -237,6 +241,7 @@ impl Anymone {
             committee,
             events: broadcast::channel(EVENTS_CAPACITY).0,
             misbehavior: AtomicU8::new(0),
+            good_clients,
         });
         let tasks = Arc::new(SubnetTasks {
             workers: Mutex::new(HashMap::new()),
@@ -460,6 +465,15 @@ pub struct AnymonePrep {
     transport: Arc<dyn Transport>,
     bootstrap: GovernanceBootstrap,
     config_sub: Subscription,
+    good_clients: GoodClients,
+}
+
+impl AnymonePrep {
+    /// Restrict which client keys this node's relays accept contributions from;
+    /// every client is accepted otherwise.
+    pub fn set_good_clients(&mut self, good_clients: GoodClients) {
+        self.good_clients = good_clients;
+    }
 }
 
 /// Overall bound on waiting for a first valid config at startup, so an
@@ -512,6 +526,7 @@ impl AnymonePrep {
             self.transport,
             cfg,
             Some((self.config_sub, self.bootstrap)),
+            self.good_clients,
         )
         .await)
     }
@@ -571,6 +586,16 @@ async fn apply_config(
     roster.sort();
     roster.dedup();
     inner.transport.ensure_peers(roster).await;
+
+    // Indexed by config version: positional discovery misreads sets that differ
+    // between peers at the same index.
+    let (primary, secondary) = crate::governance::tracked_peers(
+        &config.body,
+        inner.committee.as_deref().unwrap_or_default(),
+    );
+    inner
+        .transport
+        .track_peers(config.body.round, primary, secondary);
 
     let current: HashMap<SubnetId, Vec<u8>> = {
         let g = tasks.workers.lock().unwrap();
@@ -1354,7 +1379,6 @@ pub(crate) fn queue_outbound(
 mod outbox_tests {
     use super::*;
     use crate::config::{AnymoneRoundConfiguration, NoopConfig, ProtocolConfig};
-    use crate::panetiere::client_id_from_pubkey;
     use crate::panetiere_scheduled::{
         sched_channel_params, setup_joint_pp, ReservationEntries, ScheduledPanetiereClientSession,
     };
@@ -1388,6 +1412,7 @@ mod outbox_tests {
             committee: None,
             events: broadcast::channel(1).0,
             misbehavior: AtomicU8::new(0),
+            good_clients: GoodClients::all(),
         })
     }
 
@@ -1404,7 +1429,7 @@ mod outbox_tests {
             pp,
             mse,
             128,
-            client_id_from_pubkey(identity.pubkey()),
+            identity.clone(),
             Vec::new(),
             identity.pubkey(),
             [7u8; 32],
@@ -1470,6 +1495,7 @@ mod participation_tests {
             committee: None,
             events: broadcast::channel(1).0,
             misbehavior: AtomicU8::new(0),
+            good_clients: GoodClients::all(),
         };
         let mut counts = [0usize; 4];
         for round in 0..4000u64 {

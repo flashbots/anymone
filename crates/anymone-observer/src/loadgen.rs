@@ -2,12 +2,10 @@
 //!
 //! Backs the dashboard's `clients` knob with artificial chat clients, one OS
 //! process each (`anymone-chat --bot`), reconciled to the knob every tick. Each
-//! client gets a unique auto-generated identity and a distinct listen port (so
-//! relays can dial it into the subnet mesh — an ephemeral `tcp/0` port is not
-//! reachable and never joins). Everything else (bootstrap peers, governance) is
-//! inherited from the observer's own config. This is the real-network analogue
-//! of the in-memory demo's client supervisor — open the dashboard, raise the
-//! knob, watch the anonymity set climb.
+//! client gets a unique auto-generated identity; everything else (streams to
+//! dial, governance) is inherited from the observer's own config. This is the
+//! real-network analogue of the in-memory demo's client supervisor — open the
+//! dashboard, raise the knob, watch the anonymity set climb.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -17,25 +15,26 @@ use std::time::Duration;
 
 use crate::DemoControls;
 
-/// First listen port for load clients; client `n` listens on `BASE + n`. Chosen
-/// above the deployment's own ports (p2p 71xx, peers 72xx, chat 8080).
-const LISTEN_BASE: u16 = 7400;
-
 /// Hard ceiling on live bot processes, independent of the (uncapped) knob value.
 const MAX_LOAD_CLIENTS: usize = 512;
 
-/// Derive a per-client bootstrap config from the observer's own config text:
-/// same `[network] bootstrap_peers` + `[governance]`, but a unique identity and
-/// a distinct, dialable listen port.
-fn child_config(orig: &str, identity_path: &Path, listen_port: u16) -> String {
+/// Derive a per-client bootstrap config from the observer's own config text: the
+/// same streams + `[governance]`, but a unique identity. A bot is a client-plane
+/// process — it joins no peer set — so the observer's backbone keys are dropped.
+fn child_config(orig: &str, identity_path: &Path) -> String {
     let mut out = format!("identity_path = \"{}\"\n", identity_path.display());
     for line in orig.lines() {
-        let t = line.trim_start();
-        if t.starts_with("identity_path") {
-            continue; // replaced above
-        }
-        if t.starts_with("listen") && t.contains('=') {
-            out.push_str(&format!("listen = \"/ip4/0.0.0.0/tcp/{listen_port}\"\n"));
+        let key = line.split('=').next().unwrap_or("").trim();
+        if matches!(
+            key,
+            "identity_path"
+                | "listen_addr"
+                | "dialable_addr"
+                | "bootstrappers"
+                | "genesis_peers"
+                | "stream_listen"
+                | "local"
+        ) {
             continue;
         }
         out.push_str(line);
@@ -44,10 +43,38 @@ fn child_config(orig: &str, identity_path: &Path, listen_port: u16) -> String {
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_config_keeps_only_the_client_plane() {
+        let observer = "identity_path = \"/x/observer\"\n[network]\nlisten_addr = \"0.0.0.0:7140\"\ndialable_addr = \"10.0.0.1:7140\"\nlocal = true\ngenesis_peers = [\"ed25519:aa\"]\nbootstrappers = [\"ed25519:bb@10.0.0.1:7100\"]\nstream_bootstrappers = [\"ed25519:cc@10.0.0.1:7620\"]\n[governance]\nthreshold = 2\n";
+        let out = child_config(observer, Path::new("/x/bot-0"));
+        assert!(out.starts_with("identity_path = \"/x/bot-0\"\n"));
+        // A bot joins no peer set, so it keeps only what it dials.
+        let keys: Vec<&str> = out
+            .lines()
+            .map(|l| l.split('=').next().unwrap_or("").trim())
+            .collect();
+        for dropped in [
+            "listen_addr",
+            "dialable_addr",
+            "genesis_peers",
+            "bootstrappers",
+            "local",
+        ] {
+            assert!(!keys.contains(&dropped), "{dropped} survived: {out}");
+        }
+        assert!(out.contains("stream_bootstrappers = [\"ed25519:cc@10.0.0.1:7620\"]"));
+        assert!(out.contains("threshold = 2"));
+    }
+}
+
 /// Spawn the supervisor task. It reconciles the live child-process population to
 /// the `clients` knob forever, using stable slot indices (so each client keeps a
-/// fixed identity + port): surplus highest slots are killed, exited ones are
-/// pruned and refilled into the same slot.
+/// fixed identity): surplus highest slots are killed, exited ones are pruned and
+/// refilled into the same slot.
 pub fn spawn_supervisor(
     controls: Arc<DemoControls>,
     config_text: String,
@@ -59,7 +86,6 @@ pub fn spawn_supervisor(
             tracing::error!("loadgen: cannot create {}: {e}", state_dir.display());
             return;
         }
-        // (slot, child) — slots stay contiguous 0..len, so port = LISTEN_BASE + slot.
         let mut children: Vec<(usize, Child)> = Vec::new();
         loop {
             // Drop handles for clients that exited on their own; refilled below.
@@ -76,11 +102,8 @@ pub fn spawn_supervisor(
                 let slot = (0..).find(|s| !used.contains(s)).unwrap();
                 let id_path = state_dir.join(format!("bot-{slot}"));
                 let cfg_path = state_dir.join(format!("bot-{slot}.toml"));
-                let port = LISTEN_BASE + slot as u16;
                 let _ = std::fs::create_dir_all(&state_dir); // robust if the dir was removed
-                if let Err(e) =
-                    std::fs::write(&cfg_path, child_config(&config_text, &id_path, port))
-                {
+                if let Err(e) = std::fs::write(&cfg_path, child_config(&config_text, &id_path)) {
                     tracing::warn!("loadgen: write {}: {e}", cfg_path.display());
                     break;
                 }

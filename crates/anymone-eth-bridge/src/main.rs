@@ -8,8 +8,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anymone_core::p2p::Libp2pNetwork;
-use anymone_core::transport::Transport;
 use anymone_core::{
     announce_service_registration, Anymone, BootstrapConfig, GovernanceBootstrap, Identity,
 };
@@ -102,11 +100,18 @@ async fn main() -> Result<()> {
     let identity = Identity::load_or_generate(&bootstrap.identity_path)
         .with_context(|| format!("identity at {}", bootstrap.identity_path.display()))?;
 
-    let net = Libp2pNetwork::start(&identity, bootstrap.libp2p_config()?)
-        .await
-        .map_err(|e| anyhow!("libp2p start: {e}"))?;
-    let transport: Arc<dyn Transport> = net.clone();
     let gov = GovernanceBootstrap::from_bootstrap_config(&bootstrap);
+    // Registering the tx-bus tag makes this a service, which belongs on the
+    // backbone; a forward-only bridge is purely a client.
+    let transport = if args.announce {
+        anymone_core::backend::start_node_transport(
+            &identity,
+            &bootstrap,
+            anymone_core::GoodClients::all(),
+        )?
+    } else {
+        anymone_core::backend::start_client_transport(&identity, &bootstrap, gov.clone())?.0
+    };
 
     // Announce before Anymone::start (which blocks until the first config is
     // adopted), so the committee can see this registration in time to

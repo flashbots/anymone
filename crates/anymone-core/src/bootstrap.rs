@@ -12,7 +12,6 @@ use thiserror::Error;
 use crate::committee::CommitteeParams;
 use crate::governance::GovernanceConfig;
 use crate::identity::Pubkey;
-use crate::p2p::Libp2pConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapConfig {
@@ -27,9 +26,27 @@ pub struct BootstrapConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
-    pub listen: String,
+    /// `host:port` this node accepts backbone connections on.
     #[serde(default)]
-    pub bootstrap_peers: Vec<String>,
+    pub listen_addr: Option<String>,
+    /// Address peers dial us on; `listen_addr` unless behind a NAT.
+    #[serde(default)]
+    pub dialable_addr: Option<String>,
+    /// `ed25519:<hex>@host:port`.
+    #[serde(default)]
+    pub bootstrappers: Vec<String>,
+    /// Backbone peers reachable before the first signed config, beyond the committee.
+    #[serde(default)]
+    pub genesis_peers: Vec<Pubkey>,
+    /// `host:port` clients dial to reach this node; absent serves no clients.
+    #[serde(default)]
+    pub stream_listen: Option<String>,
+    /// `ed25519:<hex>@host:port` of nodes a client dials.
+    #[serde(default)]
+    pub stream_bootstrappers: Vec<String>,
+    /// Loopback deployment: allow private IPs and discover faster.
+    #[serde(default)]
+    pub local: bool,
 }
 
 impl BootstrapConfig {
@@ -53,29 +70,65 @@ impl BootstrapConfig {
         Ok(())
     }
 
-    /// Build the libp2p listen/bootstrap-peer config every binary that stands
-    /// up a `Libp2pNetwork` from a `BootstrapConfig` needs (`anymone-node`,
-    /// the tx-bus gateway, the reth bridge) — one parse of `network`, not one
-    /// per binary.
-    pub fn libp2p_config(&self) -> Result<Libp2pConfig, BootstrapError> {
-        let listen = self
+    /// Build the backbone listen/bootstrapper config. The genesis peer set is
+    /// the committee plus `network.genesis_peers`.
+    pub fn commonware_config(
+        &self,
+        good_clients: crate::session::GoodClients,
+    ) -> Result<crate::cw::CommonwareConfig, BootstrapError> {
+        let listen_str = self
             .network
-            .listen
+            .listen_addr
+            .as_deref()
+            .ok_or(BootstrapError::MissingListenAddr)?;
+        let listen = listen_str
             .parse()
-            .map_err(|_| BootstrapError::BadMultiaddr(self.network.listen.clone()))?;
-        let bootstrap_peers = self
+            .map_err(|_| BootstrapError::BadSocketAddr(listen_str.to_string()))?;
+        let dialable = match self.network.dialable_addr.as_deref() {
+            Some(s) => s
+                .parse()
+                .map_err(|_| BootstrapError::BadSocketAddr(s.to_string()))?,
+            None => listen,
+        };
+        let bootstrappers = self
             .network
-            .bootstrap_peers
+            .bootstrappers
             .iter()
-            .map(|s| {
+            .map(|s| parse_peer_addr(s))
+            .collect::<Result<_, BootstrapError>>()?;
+        let stream_listen = match self.network.stream_listen.as_deref() {
+            Some(s) => Some(
                 s.parse()
-                    .map_err(|_| BootstrapError::BadMultiaddr(s.clone()))
-            })
-            .collect::<Result<_, _>>()?;
-        Ok(Libp2pConfig {
+                    .map_err(|_| BootstrapError::BadSocketAddr(s.to_string()))?,
+            ),
+            None => None,
+        };
+        let mut genesis_peers: Vec<Pubkey> =
+            self.governance.committee.iter().map(|m| m.pubkey).collect();
+        genesis_peers.extend(self.network.genesis_peers.iter().copied());
+        Ok(crate::cw::CommonwareConfig {
             listen,
-            bootstrap_peers,
+            dialable,
+            bootstrappers,
+            genesis_peers,
+            local: self.network.local,
+            stream_listen,
+            good_clients,
         })
+    }
+
+    /// Servers a client-plane process dials.
+    pub fn stream_client_config(&self) -> Result<crate::cw::StreamClientConfig, BootstrapError> {
+        let servers = self
+            .network
+            .stream_bootstrappers
+            .iter()
+            .map(|s| parse_peer_addr(s))
+            .collect::<Result<Vec<_>, _>>()?;
+        if servers.is_empty() {
+            return Err(BootstrapError::NoStreamServers);
+        }
+        Ok(crate::cw::StreamClientConfig { servers })
     }
 
     fn validate(&self) -> Result<(), BootstrapError> {
@@ -100,6 +153,20 @@ impl BootstrapConfig {
     }
 }
 
+/// `ed25519:<hex>@host:port`.
+fn parse_peer_addr(s: &str) -> Result<(Pubkey, std::net::SocketAddr), BootstrapError> {
+    let (pk, addr) = s
+        .rsplit_once('@')
+        .ok_or_else(|| BootstrapError::BadBootstrapper(s.to_string()))?;
+    let pk: Pubkey = pk
+        .parse()
+        .map_err(|_| BootstrapError::BadBootstrapper(s.to_string()))?;
+    let addr = addr
+        .parse()
+        .map_err(|_| BootstrapError::BadSocketAddr(addr.to_string()))?;
+    Ok((pk, addr))
+}
+
 #[derive(Debug, Error)]
 pub enum BootstrapError {
     #[error("io: {0}")]
@@ -114,8 +181,16 @@ pub enum BootstrapError {
     BadThreshold { threshold: u32, committee: u32 },
     #[error("duplicate committee member: {0}")]
     DuplicateCommitteeMember(Pubkey),
-    #[error("bad multiaddr: {0}")]
-    BadMultiaddr(String),
+    #[error("bad socket address: {0}")]
+    BadSocketAddr(String),
+    #[error("bad bootstrapper, expected `ed25519:<hex>@host:port`: {0}")]
+    BadBootstrapper(String),
+    #[error("network.listen_addr is required by a backbone node")]
+    MissingListenAddr,
+    #[error("network.stream_bootstrappers is required by a client-plane process")]
+    NoStreamServers,
+    #[error("transport start: {0}")]
+    TransportStart(String),
 }
 
 #[cfg(test)]
@@ -147,15 +222,16 @@ mod tests {
         let members: String = (0..3)
             .map(|_| member_table(&Identity::generate()))
             .collect();
-        let seed_peer_id =
-            libp2p_identity::PeerId::from(Identity::generate().to_libp2p_keypair().public());
+        let seed = Identity::generate();
+        let seed_pubkey = seed.pubkey();
         let toml = format!(
             r#"
 identity_path = "/tmp/identity"
 
 [network]
-listen = "/ip4/0.0.0.0/tcp/7100"
-bootstrap_peers = ["/dns4/seed/tcp/7100/p2p/{seed_peer_id}"]
+listen_addr = "0.0.0.0:7100"
+bootstrappers = ["{seed_pubkey}@10.0.0.1:7100"]
+genesis_peers = ["{seed_pubkey}"]
 
 [governance]
 threshold = 2
@@ -168,18 +244,47 @@ aggregation = false"#
         let cfg = BootstrapConfig::from_toml_str(&toml).unwrap();
         assert_eq!(cfg.governance.committee.len(), 3);
         assert_eq!(cfg.governance.threshold, 2);
-        assert_eq!(cfg.network.bootstrap_peers.len(), 1);
         assert!(cfg.governance.committee[0].exchange_pubkey.to_key().is_ok());
-        // libp2p_config parses the same listen/bootstrap_peers strings every
-        // binary that stands up a Libp2pNetwork from this config relies on.
-        let net_cfg = cfg.libp2p_config().unwrap();
-        assert_eq!(net_cfg.listen.to_string(), "/ip4/0.0.0.0/tcp/7100");
-        assert_eq!(net_cfg.bootstrap_peers.len(), 1);
+        let cw = cfg
+            .commonware_config(crate::session::GoodClients::all())
+            .unwrap();
+        assert_eq!(cw.listen.to_string(), "0.0.0.0:7100");
+        // Absent `dialable_addr` falls back to the listen address.
+        assert_eq!(cw.dialable, cw.listen);
+        assert_eq!(
+            cw.bootstrappers,
+            vec![(seed_pubkey, "10.0.0.1:7100".parse().unwrap())]
+        );
+        assert_eq!(
+            cw.genesis_peers.len(),
+            4,
+            "genesis = the committee plus network.genesis_peers"
+        );
+        assert!(cw.genesis_peers.contains(&seed_pubkey));
         // Present fields parse; omitted committee fields fall back to defaults.
         assert_eq!(cfg.committee.public_round_ms, 2000);
         assert_eq!(cfg.committee.committee_round_ms, 10_000);
         assert_eq!(cfg.committee.protocol.as_deref(), Some("panetiere"));
         assert!(!cfg.committee.aggregation);
+        // The client plane a deployment renders for a bot/forwarder: streams to
+        // dial and nothing else, so it joins no peer set.
+        let client = BootstrapConfig::from_toml_str(&format!(
+            r#"
+identity_path = "/tmp/identity"
+
+[network]
+stream_bootstrappers = ["{seed_pubkey}@10.0.0.1:7600"]
+
+[governance]
+threshold = 2
+{members}"#
+        ))
+        .unwrap();
+        assert_eq!(client.stream_client_config().unwrap().servers.len(), 1);
+        assert!(matches!(
+            client.commonware_config(crate::session::GoodClients::all()),
+            Err(BootstrapError::MissingListenAddr)
+        ));
         // A config with no `[committee]` section at all uses all defaults.
         let no_committee = BootstrapConfig::from_toml_str(&toml.replace(
             "[committee]\npublic_round_ms = 2000\nprotocol = \"panetiere\"\naggregation = false",

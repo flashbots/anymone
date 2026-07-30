@@ -19,7 +19,6 @@ use std::time::{Duration, Instant};
 use anymone_core::committee::TOPIC_COMMITTEE_PANETIERE;
 use anymone_core::config::{AnymoneRoundConfiguration, ProtocolConfig, Subnet, SubnetId};
 use anymone_core::governance::{TOPIC_CONFIG, TOPIC_FAULTS, TOPIC_REGISTRATION};
-use anymone_core::p2p::{Libp2pConfig, Libp2pNetwork};
 use anymone_core::runtime::watch_session_for;
 use anymone_core::scheduling::Registration;
 use anymone_core::session::Session;
@@ -28,12 +27,11 @@ use anymone_core::{
     AdcnetObserverSession, BootstrapConfig, Identity, PanetiereObserverSession, Pubkey,
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use axum::response::Html;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::{Parser, Subcommand};
-use libp2p::Multiaddr;
 use observatory::{Observatory, SubnetLive};
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
@@ -166,7 +164,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Attach to a live network over libp2p and serve the global dashboard.
+    /// Attach to a live network as a watcher and serve the global dashboard.
     Run(RunArgs),
     /// Spin up a whole anymone network (committee + relays + service + client)
     /// in this process over an in-memory transport, and serve the dashboard.
@@ -299,31 +297,15 @@ async fn run(args: RunArgs) -> Result<()> {
     let identity = Identity::load_or_generate(&bootstrap.identity_path)
         .with_context(|| format!("identity at {}", bootstrap.identity_path.display()))?;
 
-    let listen: Multiaddr = bootstrap
-        .network
-        .listen
-        .parse()
-        .context("bad listen multiaddr")?;
-    let bootstrap_peers: Vec<Multiaddr> = bootstrap
-        .network
-        .bootstrap_peers
-        .iter()
-        .map(|s| {
-            s.parse::<Multiaddr>()
-                .with_context(|| format!("bad bootstrap multiaddr: {s}"))
-        })
-        .collect::<Result<_>>()?;
-
-    let net = Libp2pNetwork::start(
+    let transport = anymone_core::backend::start_node_transport(
         &identity,
-        Libp2pConfig {
-            listen,
-            bootstrap_peers,
-        },
-    )
-    .await
-    .map_err(|e| anyhow!("libp2p start: {e}"))?;
-    let transport: Arc<dyn Transport> = net.clone();
+        &bootstrap,
+        anymone_core::GoodClients::all(),
+    )?;
+    // A watcher follows without contributing, so governance lists it as a
+    // secondary peer: reachable, never in a subnet roster.
+    let _reannounce =
+        anymone_core::announce_watcher_registration(transport.clone(), &identity).await;
 
     let committee: Vec<Pubkey> = bootstrap
         .governance

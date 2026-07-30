@@ -1,14 +1,11 @@
 //! `anymone-chat` — a deployable anonymous-broadcast chat node.
 //!
-//! Reads a bootstrap TOML, joins over libp2p as a real participant, registers
+//! Reads a bootstrap TOML, joins the network as a real participant, registers
 //! the chat room, and serves the chat web app. Anyone with the config can run
 //! it and participate; every instance sees every message.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use anymone_core::p2p::Libp2pNetwork;
-use anymone_core::transport::Transport;
 use anymone_core::{
     announce_service_registration, Anymone, BootstrapConfig, GovernanceBootstrap, Identity,
 };
@@ -68,17 +65,14 @@ async fn main() -> Result<()> {
     let identity = Identity::load_or_generate(&bootstrap.identity_path)
         .with_context(|| format!("identity at {}", bootstrap.identity_path.display()))?;
 
-    let libp2p_config = bootstrap.libp2p_config()?;
-    let net = Libp2pNetwork::start(&identity, libp2p_config.clone())
-        .await
-        .map_err(|e| anyhow!("libp2p start: {e}"))?;
-    let transport: Arc<dyn Transport> = net.clone();
     let gov = GovernanceBootstrap::from_bootstrap_config(&bootstrap);
 
     match args.bot {
         // A bot is a pure client: no service registration, just a participant in
         // the anonymity set. One bot = one client.
         Some(handle) => {
+            let (transport, _spawn) =
+                anymone_core::backend::start_client_transport(&identity, &bootstrap, gov.clone())?;
             let anymone = Anymone::start(identity, transport, gov)
                 .await
                 .map_err(|e| anyhow!("anymone start: {e}"))?;
@@ -88,6 +82,13 @@ async fn main() -> Result<()> {
         // (placement is by tag, so a duplicate registration is harmless;
         // re-announced until placed).
         None => {
+            // The room is a service, so it joins the backbone; only the virtual
+            // clients it mints use the client plane.
+            let transport = anymone_core::backend::start_node_transport(
+                &identity,
+                &bootstrap,
+                anymone_core::GoodClients::all(),
+            )?;
             let xk = identity.exchange_keys();
             let _reannounce = announce_service_registration(
                 transport.clone(),
@@ -96,7 +97,7 @@ async fn main() -> Result<()> {
                 xk,
             )
             .await;
-            let spawn = anymone_core::p2p::client_spawner(libp2p_config, gov.clone());
+            let spawn = anymone_core::backend::virtual_client_spawner(&bootstrap, gov.clone())?;
             let anymone = Anymone::prepare(identity, transport, gov)
                 .await
                 .start()

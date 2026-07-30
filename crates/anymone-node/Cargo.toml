@@ -9,7 +9,6 @@ anymone-core = { path = "../anymone-core" }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "signal"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-libp2p.workspace = true
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 hex.workspace = true

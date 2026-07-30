@@ -123,3 +123,35 @@ pub fn topic_policy(body: &AnymoneRoundConfigurationBody, committee: &[Pubkey]) 
     );
     policy
 }
+
+/// Peer sets for [`crate::transport::Transport::track_peers`]: primary =
+/// committee + relays + aggregators, secondary = services + watchers. A pubkey
+/// in both is primary only.
+pub fn tracked_peers(
+    body: &AnymoneRoundConfigurationBody,
+    committee: &[Pubkey],
+) -> (Vec<Pubkey>, Vec<Pubkey>) {
+    let mut primary: Vec<Pubkey> = committee.to_vec();
+    for subnet in &body.subnets {
+        primary.extend(subnet.relays.iter().copied());
+        if let Some(agg) = crate::runtime::subnet_aggregation(subnet) {
+            primary.extend(
+                agg.groups
+                    .iter()
+                    .flat_map(|g| g.aggregators.iter().copied()),
+            );
+        }
+    }
+    primary.sort();
+    primary.dedup();
+    let mut secondary: Vec<Pubkey> = body
+        .services
+        .iter()
+        .map(|s| s.pubkey)
+        .chain(body.watchers.iter().copied())
+        .filter(|pk| primary.binary_search(pk).is_err())
+        .collect();
+    secondary.sort();
+    secondary.dedup();
+    (primary, secondary)
+}

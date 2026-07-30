@@ -40,7 +40,7 @@ struct Reported {
 /// Stand up a live ADCNet echo subnet, make the chosen non-leader relay adopt
 /// `mode` after a few healthy rounds, and collect the leader's reported fault
 /// from both `anymone/faults` and its `events()` stream.
-async fn fault_for(mode: Misbehavior, panetiere: bool) -> Reported {
+async fn fault_for(mode: Misbehavior, panetiere: bool, want: FaultKind) -> Reported {
     let net = InMemoryNetwork::new();
     let committee = Identity::generate();
     let relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
@@ -137,8 +137,32 @@ async fn fault_for(mode: Misbehavior, panetiere: bool) -> Reported {
         .subscribe(TOPIC_FAULTS)
         .await;
 
-    // A few healthy rounds first, then the victim starts misbehaving in-band.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Rounds up to the newest decoded one are warm-up, so an injected fault must
+    // be reported for a later one. This ADCNet channel routinely peel-stalls, so
+    // requiring health there would be flaky.
+    let mut healthy_through = 0;
+    let mut decoded = 0;
+    let reached = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match leader_events.recv().await {
+                Ok(Event::RoundDecoded { round, subnet: 0, .. }) => {
+                    healthy_through = healthy_through.max(round);
+                    decoded += 1;
+                    if decoded >= 3 {
+                        return;
+                    }
+                }
+                Ok(_) => continue,
+                Err(_) => return,
+            }
+        }
+    })
+    .await;
+    assert!(
+        !panetiere || reached.is_ok(),
+        "Panetiere subnet never decoded three healthy rounds before injection"
+    );
+
     let victim = relay_pks.iter().copied().find(|p| *p != leader_pk).unwrap();
     relay_nodes
         .iter()
@@ -146,11 +170,23 @@ async fn fault_for(mode: Misbehavior, panetiere: bool) -> Reported {
         .map(|(_, a)| a.set_misbehavior(Some(mode)))
         .expect("victim is among the relays");
 
+    // Warm-up stalls each gossip a Liveness fault; discard that backlog.
+    let mut last_healthy_round = healthy_through;
+    while let Some(msg) = faults_sub.try_recv() {
+        if let Some(r) = FaultReport::decode(&msg.payload) {
+            last_healthy_round = last_healthy_round.max(r.round);
+        }
+    }
+
     let report = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let msg = faults_sub.recv().await.expect("faults topic closed");
             if let Some(r) = FaultReport::decode(&msg.payload) {
-                return r;
+                // A corrupt share both fails verification (Integrity) and can cost
+                // the round its decode margin (Liveness); which fires first varies.
+                if r.round > last_healthy_round && r.fault.kind == want {
+                    return r;
+                }
             }
         }
     })
@@ -204,7 +240,7 @@ async fn misbehaving_relay_is_reported_as_a_liveness_fault() {
 
     // Withhold: the relay's share never appears, so the leader attributes the
     // stall to it — and the fault reaches both the gossip topic and events().
-    let r = fault_for(Misbehavior::Withhold, false).await;
+    let r = fault_for(Misbehavior::Withhold, false, FaultKind::Liveness).await;
     assert_eq!(r.report.subnet, 0);
     assert_eq!(r.report.fault.kind, FaultKind::Liveness);
     assert_eq!(
@@ -223,7 +259,7 @@ async fn misbehaving_relay_is_reported_as_a_liveness_fault() {
 
     // Corrupt-share under ADCNet: every relay's (validly signed) share is
     // present, but the leader can't combine — an unattributable fault.
-    let r = fault_for(Misbehavior::CorruptShare, false).await;
+    let r = fault_for(Misbehavior::CorruptShare, false, FaultKind::Liveness).await;
     assert_eq!(r.report.fault.kind, FaultKind::Liveness);
     assert_eq!(r.report.reporter, r.leader_pk);
     assert_eq!(
@@ -238,7 +274,7 @@ async fn misbehaving_relay_is_reported_as_a_liveness_fault() {
 /// subnet still decodes from the honest shares (t-of-n).
 #[tokio::test(flavor = "multi_thread")]
 async fn panetiere_corrupt_share_is_attributed_integrity() {
-    let r = fault_for(Misbehavior::CorruptShare, true).await;
+    let r = fault_for(Misbehavior::CorruptShare, true, FaultKind::Integrity).await;
     assert_eq!(r.report.subnet, 0);
     assert_eq!(r.report.fault.kind, FaultKind::Integrity);
     assert_eq!(r.report.reporter, r.leader_pk);

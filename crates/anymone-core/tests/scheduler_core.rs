@@ -15,8 +15,7 @@ use anymone_core::config::{
 };
 use anymone_core::faults::{Attribution, Fault, FaultKind};
 use anymone_core::panetiere::{
-    client_id_from_pubkey, PanetiereClientSession, PanetiereObserverSession,
-    PanetiereServerSession, SetMode,
+    PanetiereClientSession, PanetiereObserverSession, PanetiereServerSession, SetMode,
 };
 use anymone_core::scheduler_core::{
     CommitteeSig, SchedulerAction, SchedulerCore, SchedulerParams, SignedProposal,
@@ -529,6 +528,8 @@ fn multisig_assembles_via_committee_sig() {
                 client_set_max: 8,
             }),
         )],
+        relay_client_addrs: vec![],
+        watchers: vec![],
     })
     .sign_with(&sorted.iter().collect::<Vec<_>>());
     let mut fresh_for_bad_cfg = SchedulerCore::new(lead.clone(), pks.clone(), 2, params.clone());
@@ -1147,6 +1148,76 @@ fn registration_signature_binds_to_registrant() {
         signature[0] ^= 0xff;
     }
     assert!(!reg.verify(), "a tampered signature must not verify");
+
+    let mut watcher = Registration::watcher(&id);
+    assert!(watcher.verify());
+    if let Registration::Watcher { signature, .. } = &mut watcher {
+        signature[0] ^= 0xff;
+    }
+    assert!(!watcher.verify());
+
+    // The advertised client address is signed, so it can't be swapped to
+    // redirect a relay's clients elsewhere.
+    let mut at = Registration::relay_at(&id, xkw(&id), Some("10.0.0.1:9000".into()));
+    assert!(at.verify());
+    if let Registration::Relay { client_addr, .. } = &mut at {
+        *client_addr = Some("10.0.0.2:9000".into());
+    }
+    assert!(!at.verify(), "a rewritten client address must not verify");
+    // An absent address is distinct from an empty one.
+    let empty = Registration::relay_at(&id, xkw(&id), Some(String::new()));
+    let absent = Registration::relay(&id, xkw(&id));
+    let (Registration::Relay { signature: a, .. }, Registration::Relay { signature: b, .. }) =
+        (&empty, &absent)
+    else {
+        unreachable!()
+    };
+    assert_ne!(a, b, "absent and empty addresses must sign differently");
+}
+
+/// Watchers reach the config as secondary peers and placed relays carry their
+/// client address, so a client can find a relay without joining the p2p network.
+#[test]
+fn config_carries_watchers_and_relay_client_addrs() {
+    let committee: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
+    let pks: Vec<Pubkey> = committee.iter().map(|i| i.pubkey()).collect();
+    let mut core = lead_core(&committee, 2);
+    let relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
+    let service = Identity::generate();
+    let watcher = Identity::generate();
+
+    for r in &relays {
+        core.on_registration(Registration::relay_at(
+            r,
+            xkw(r),
+            Some(format!("127.0.0.1:{}", 9000 + r.pubkey().0[0] as u16)),
+        ));
+    }
+    core.on_registration(Registration::service(
+        &service,
+        ServiceTag::from_label("anymone.echo"),
+        xkw(&service),
+    ));
+    core.on_registration(Registration::watcher(&watcher));
+
+    let body = staged_body(&core.tick(1, anymone_core::config::now_unix_ms()))
+        .expect("lead stages a proposal once it has relays and a service");
+    assert_eq!(body.watchers, vec![watcher.pubkey()]);
+    let placed: Vec<Pubkey> = body.subnets.iter().flat_map(|s| s.relays.clone()).collect();
+    assert!(!placed.is_empty());
+    for (pk, addr) in &body.relay_client_addrs {
+        assert!(placed.contains(pk), "only placed relays are listed");
+        assert!(addr.starts_with("127.0.0.1:"));
+    }
+    assert_eq!(body.relay_client_addrs.len(), placed.len());
+
+    let (primary, secondary) = anymone_core::governance::tracked_peers(&body, &pks);
+    assert!(secondary.contains(&watcher.pubkey()), "watchers are secondary");
+    assert!(secondary.contains(&service.pubkey()));
+    assert!(!primary.contains(&watcher.pubkey()));
+    for r in &relays {
+        assert!(primary.contains(&r.pubkey()), "relays are primary");
+    }
 }
 
 /// A live Panetiere subnet (one client + 3 relays, relay 0 the decoding leader,
@@ -1197,13 +1268,8 @@ impl PanetiereSubnet {
             .collect();
 
         let client_id = Identity::generate();
-        let client = PanetiereClientSession::new(
-            pp.clone(),
-            mse.clone(),
-            client_id_from_pubkey(client_id.pubkey()),
-            xpubs,
-            [42u8; 32],
-        );
+        let client =
+            PanetiereClientSession::new(pp.clone(), mse.clone(), client_id.clone(), xpubs, [42u8; 32]);
         let mut servers: Vec<PanetiereServerSession> = server_ids
             .iter()
             .map(|sid| {

@@ -10,7 +10,6 @@ anymone-chat = { path = "../anymone-chat" }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "signal"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
-libp2p.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 axum.workspace = true

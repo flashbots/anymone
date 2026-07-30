@@ -86,9 +86,8 @@ fn run_aggregated(
     };
 
     // Clients: client 0 carries `payload`, the rest send cover (zero) traffic.
-    let client_pks: Vec<Pubkey> = (0..n_clients)
-        .map(|_| Identity::generate().pubkey())
-        .collect();
+    let client_identities: Vec<Identity> = (0..n_clients).map(|_| Identity::generate()).collect();
+    let client_pks: Vec<Pubkey> = client_identities.iter().map(|id| id.pubkey()).collect();
     let mut clients: Vec<PanetiereClientSession> = (0..n_clients as usize)
         .map(|i| {
             let mut seed = [0u8; 32];
@@ -96,7 +95,7 @@ fn run_aggregated(
             PanetiereClientSession::new(
                 pp.clone(),
                 mse.clone(),
-                client_id_from_pubkey(client_pks[i]),
+                client_identities[i].clone(),
                 xpubs.clone(),
                 seed,
             )
@@ -264,11 +263,11 @@ fn late_group_aggregate_does_not_zero_the_round() {
     let payload_b = b"group one arrives too late this round".to_vec();
     // Pick two client pubkeys landing in distinct groups: `pk_a`'s group gets
     // payload_a (arrives before the freeze), `pk_b`'s group gets payload_b (late).
-    let (pk_a, pk_b) = loop {
-        let a = Identity::generate().pubkey();
-        let b = Identity::generate().pubkey();
-        let ga = client_id_from_pubkey(a).0 % group_count;
-        let gb = client_id_from_pubkey(b).0 % group_count;
+    let (id_a, id_b) = loop {
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let ga = client_id_from_pubkey(a.pubkey()).0 % group_count;
+        let gb = client_id_from_pubkey(b.pubkey()).0 % group_count;
         if ga == 0 && gb != 0 {
             break (a, b);
         }
@@ -276,20 +275,11 @@ fn late_group_aggregate_does_not_zero_the_round() {
             break (b, a);
         }
     };
-    let mut client0 = PanetiereClientSession::new(
-        pp.clone(),
-        mse.clone(),
-        client_id_from_pubkey(pk_a),
-        xpubs.clone(),
-        [10u8; 32],
-    );
-    let mut client1 = PanetiereClientSession::new(
-        pp.clone(),
-        mse.clone(),
-        client_id_from_pubkey(pk_b),
-        xpubs.clone(),
-        [11u8; 32],
-    );
+    let (pk_a, pk_b) = (id_a.pubkey(), id_b.pubkey());
+    let mut client0 =
+        PanetiereClientSession::new(pp.clone(), mse.clone(), id_a, xpubs.clone(), [10u8; 32]);
+    let mut client1 =
+        PanetiereClientSession::new(pp.clone(), mse.clone(), id_b, xpubs.clone(), [11u8; 32]);
     client0.stage(payload_a.clone());
     client1.stage(payload_b.clone());
 

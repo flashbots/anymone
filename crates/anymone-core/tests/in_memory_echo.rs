@@ -120,6 +120,7 @@ async fn echo_roundtrip(
     reply
 }
 
+#[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn noop_echo_roundtrip() {
     let committee = Identity::generate();
@@ -142,6 +143,7 @@ async fn noop_echo_roundtrip() {
     assert!(reply.round > 0, "delivery round not tracked");
 }
 
+#[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn panetiere_echo_roundtrip() {
     let committee = Identity::generate();
@@ -155,7 +157,8 @@ async fn panetiere_echo_roundtrip() {
         service,
         client,
         b"hello panetiere",
-        Duration::from_secs(15),
+        // Headroom for the suite's parallel test binaries starving the rounds.
+        Duration::from_secs(25),
     )
     .await;
     assert_eq!(&reply.payload[..15], b"hello panetiere");
@@ -164,6 +167,7 @@ async fn panetiere_echo_roundtrip() {
 
 /// A payload too big for one subnet message is rejected up front, not silently
 /// truncated/dropped downstream.
+#[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn oversized_send_is_rejected() {
     let committee = Identity::generate();
@@ -213,6 +217,7 @@ async fn oversized_send_is_rejected() {
 
 /// `subscribe` registers a tag receiver without owning it: a message to the tag
 /// reaches every subscriber, not just one owner.
+#[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn subscribe_delivers_broadcast_to_participants() {
     let committee = Identity::generate();

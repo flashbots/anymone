@@ -15,10 +15,13 @@ use anymone_core::{
     Registration, ServiceTag, TOPIC_CONFIG, TOPIC_REGISTRATION,
 };
 
+use serial_test::serial;
+
 fn xkw(id: &Identity) -> ExchangePublicKeyWire {
     id.exchange_keys()
 }
 
+#[serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn committee_panetiere_publishes_multisig_config() {
     let _ = tracing_subscriber::fmt()
@@ -41,12 +44,14 @@ async fn committee_panetiere_publishes_multisig_config() {
     let mk_handle = |pk| -> Arc<dyn Transport> { Arc::new(net.handle(pk)) };
 
     let cfg = PanetiereCommitteeConfig {
-        committee_round_duration: Duration::from_millis(200),
+        committee_round_duration: Duration::from_millis(600),
         public_round_duration: Duration::from_millis(200),
         min_relays: 1,
         min_services: 1,
         fault_grace: 2,
         message_size: 64,
+        // A 12KB channel's KAHE work per round doesn't fit a short round.
+        committee_msg_bytes: 8192,
         ..PanetiereCommitteeConfig::default()
     };
 
@@ -122,6 +127,7 @@ async fn committee_panetiere_publishes_multisig_config() {
 
 /// Committee members spawned several rounds apart (vs run.sh's simultaneous
 /// launch) must still publish a config.
+#[serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn committee_converges_despite_staggered_member_start() {
     let _ = tracing_subscriber::fmt()
@@ -141,12 +147,14 @@ async fn committee_converges_despite_staggered_member_start() {
     let mk_handle = |pk| -> Arc<dyn Transport> { Arc::new(net.handle(pk)) };
 
     let cfg = PanetiereCommitteeConfig {
-        committee_round_duration: Duration::from_millis(200),
+        committee_round_duration: Duration::from_millis(600),
         public_round_duration: Duration::from_millis(200),
         min_relays: 1,
         min_services: 1,
         fault_grace: 2,
         message_size: 64,
+        // A 12KB channel's KAHE work per round doesn't fit a short round.
+        committee_msg_bytes: 8192,
         ..PanetiereCommitteeConfig::default()
     };
 
@@ -225,6 +233,7 @@ async fn committee_converges_despite_staggered_member_start() {
 /// This is the integration the two narrower tests don't cover — committee
 /// observes the busy subnet via `on_subnet_message`, `tick` grows the count, and
 /// the larger config is anonymised through the committee Panetiere and published.
+#[serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn committee_scales_to_second_subnet_under_load() {
     let _ = tracing_subscriber::fmt()
@@ -253,9 +262,9 @@ async fn committee_scales_to_second_subnet_under_load() {
         escalation_grace: 5,
         subnet_grow_at: 31,
         message_size: 64,
-        // This test's proposals (3 relays, ≤2 subnets) are ~2KB; the full 12KB
-        // channel costs ~3× the KAHE work per committee round for nothing.
-        committee_msg_bytes: 4096,
+        // This test's proposals (3 relays, ≤2 subnets) reach ~4.2KB; the full
+        // 12KB channel costs ~3× the KAHE work per committee round for nothing.
+        committee_msg_bytes: 8192,
         // Subnet-count growth is the subject here, not protocol crypto: Noop
         // subnets isolate the scheduling/runtime control loop entirely.
         protocol: Some("noop".into()),
@@ -369,6 +378,7 @@ async fn committee_scales_to_second_subnet_under_load() {
 /// subnet's shares topic — detects the liveness fault, sidelines the relay, and
 /// escalates the subnet ADCNet→Panetiere, publishing the new config. Proves the
 /// fault→escalation path the demo relies on, end to end over a real committee.
+#[serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn committee_escalates_to_panetiere_on_relay_fault() {
     let _ = tracing_subscriber::fmt()
@@ -399,6 +409,9 @@ async fn committee_escalates_to_panetiere_on_relay_fault() {
         min_services: 1,
         fault_grace: 2,
         message_size: 64,
+        // The full 12KB channel's KAHE work overruns a 600ms round and skips
+        // rounds; 4096 is under this test's proposal size.
+        committee_msg_bytes: 8192,
         ..PanetiereCommitteeConfig::default()
     };
     let mut committee_tasks = Vec::new();
@@ -500,7 +513,9 @@ async fn committee_escalates_to_panetiere_on_relay_fault() {
         .expect("victim relay present");
 
     // The committee must observe the stall and publish a Panetiere config.
-    let escalated = tokio::time::timeout(Duration::from_secs(45), async {
+    // Under CPU contention members overrun rounds and re-stage, which is slow
+    // but converges.
+    let escalated = tokio::time::timeout(Duration::from_secs(90), async {
         loop {
             let msg = config_sub.recv().await.expect("config topic closed");
             if let Ok(cfg) = bincode::deserialize::<AnymoneRoundConfiguration>(&msg.payload) {

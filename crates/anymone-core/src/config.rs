@@ -42,6 +42,13 @@ pub struct AnymoneRoundConfigurationBody {
     /// their relays up here (per-subnet copies blew the committee channel).
     pub relay_exchange_keys: Vec<(crate::identity::Pubkey, ExchangePublicKeyWire)>,
     pub subnets: Vec<Subnet>,
+    /// Where clients dial each relay, for backends whose clients don't join the
+    /// p2p network. Only relays that advertised one appear.
+    #[serde(default)]
+    pub relay_client_addrs: Vec<(crate::identity::Pubkey, String)>,
+    /// Registered follow-only nodes, tracked as secondary peers.
+    #[serde(default)]
+    pub watchers: Vec<crate::identity::Pubkey>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -407,6 +414,8 @@ impl AnymoneRoundConfiguration {
             services,
             relay_exchange_keys,
             subnets: vec![Subnet::new(0, relays, protocol)],
+            relay_client_addrs: Vec::new(),
+            watchers: Vec::new(),
         };
         AnymoneRoundConfiguration::new(body)
     }
@@ -438,6 +447,8 @@ mod tests {
                 (0..3).map(|_| Identity::generate().pubkey()).collect(),
                 ProtocolConfig::Noop(NoopConfig::default()),
             )],
+            relay_client_addrs: vec![],
+            watchers: vec![],
         }
     }
 

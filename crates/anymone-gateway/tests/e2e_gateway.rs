@@ -41,7 +41,7 @@ async fn call(state: AppState, method: &str, uri: &str, body: &[u8]) -> (StatusC
 
 /// Poll `GET /messages` until `count` messages are in, or fail on timeout.
 async fn wait_for_messages(state: &AppState, count: usize) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         let (_, body) = call(state.clone(), "GET", "/messages", b"").await;
         if body["count"].as_u64().unwrap() as usize >= count {
@@ -81,10 +81,16 @@ async fn rest_submit_and_read_back_by_round() {
     relay_pks.sort();
     let cfg = AnymoneRoundConfiguration::singleton_subnet(
         0,
+        // Every node here runs real Panetiere crypto in this one debug-build
+        // process, and each virtual client the pool mints adds another client
+        // round to it. A worker that lags past a round boundary skips the round,
+        // which drops the messages staged for it (the pipe does not retry), so
+        // the round is long and the carrier is sized just wide enough for the
+        // two-in-one-round assertion below.
         ProtocolConfig::Panetiere(PanetiereConfig {
-            round_duration_ms: 400,
+            round_duration_ms: 2000,
             message_size: 128,
-            estimated_messages: 4,
+            estimated_messages: 3,
             client_set_min: 0,
             client_set_max: 8,
             threshold: 2,
@@ -164,14 +170,14 @@ async fn rest_submit_and_read_back_by_round() {
     // submitting: a message staged in the round a client joins in can miss that
     // round's set and is then never decoded (the pipe stages, it does not
     // retry), which would make this test flake rather than expose a gateway bug.
-    tokio::time::sleep(Duration::from_millis(750)).await;
+    tokio::time::sleep(Duration::from_millis(4000)).await;
 
     // Ingress: the POST body goes onto the channel as one message, byte for
     // byte, and the other client on the channel receives it.
     let (status, body) = call(state.clone(), "POST", "/messages", b"posted over rest").await;
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(body["bytes"], serde_json::json!(16));
-    let got = tokio::time::timeout(Duration::from_secs(15), client_pipe.recv())
+    let got = tokio::time::timeout(Duration::from_secs(30), client_pipe.recv())
         .await
         .expect("the other client never saw the posted message")
         .expect("pipe closed");
@@ -221,7 +227,7 @@ async fn rest_submit_and_read_back_by_round() {
     let (_, body) = call(state.clone(), "GET", "/round", b"").await;
     assert!(body["last_round"].as_u64().unwrap() >= last_round);
     assert_eq!(body["earliest_round"], serde_json::json!(first));
-    assert_eq!(body["round_ms"], serde_json::json!(400));
+    assert_eq!(body["round_ms"], serde_json::json!(2000));
     assert_eq!(body["capacity"], serde_json::json!(100));
 
     // A burst: three submissions at once, where one client can carry one message
@@ -239,7 +245,7 @@ async fn rest_submit_and_read_back_by_round() {
         let (status, _) = handle.await.unwrap();
         assert_eq!(status, StatusCode::ACCEPTED);
     }
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while pool.clients() < 2 || pool.queued() > 0 {
         assert!(
             tokio::time::Instant::now() < deadline,

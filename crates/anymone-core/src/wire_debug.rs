@@ -1,6 +1,6 @@
 //! Protocol-aware transport tracing.
 //!
-//! Every transport (in-memory and libp2p) routes each published message
+//! Every transport (in-memory, backbone, stream) routes each published message
 //! through [`trace`], which — when the `ANYMONE_TRACE` env var is set —
 //! prints a decoded one-line summary keyed off the topic. This makes it easy
 //! to see exactly what's on the wire (which relay shared, when output stops,
@@ -80,6 +80,9 @@ fn describe_registration(bytes: &[u8]) -> String {
         }
         Ok(crate::scheduling::Registration::Service { tag, .. }) => {
             format!("register service tag={}", hex::encode(&tag.0[..4]))
+        }
+        Ok(crate::scheduling::Registration::Watcher { pubkey, .. }) => {
+            format!("register watcher {}", short(&pubkey))
         }
         Err(_) => "register <undecodable>".to_string(),
     }

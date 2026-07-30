@@ -38,7 +38,7 @@ use crate::runtime::{
     handle_inbound, publish_and_loop_back, recv_any, round_at, route_to_pipe, subnet_aggregation,
     subnet_leader_pk, AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
 };
-use crate::session::{LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
+use crate::session::{GoodClients, LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
 use crate::transport::Subscription;
 
 /// Channel sizing for a subnet carrying up to `rho` real messages of
@@ -174,13 +174,8 @@ fn client_session(
     // replay the client's round.
     let mut seed = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut seed);
-    let mut session = PanetiereClientSession::new(
-        pp.clone(),
-        mse.clone(),
-        client_id_from_pubkey(identity.pubkey()),
-        servers,
-        seed,
-    );
+    let mut session =
+        PanetiereClientSession::new(pp.clone(), mse.clone(), identity.clone(), servers, seed);
     session.set_setup_seed(setup_seed);
     Box::new(session)
 }
@@ -192,6 +187,7 @@ fn server_session(
     subnet: &Subnet,
     identity: &Identity,
     leader_pk: Pubkey,
+    good_clients: GoodClients,
 ) -> Box<dyn Session> {
     let identity_pk = identity.pubkey();
     let server_id = ServerId(
@@ -223,6 +219,7 @@ fn server_session(
     );
     session.set_client_set_max(cfg.client_set_max as usize);
     session.set_setup_seed(cfg.setup_seed);
+    session.set_good_clients(good_clients);
     Box::new(session)
 }
 
@@ -254,7 +251,15 @@ pub(crate) async fn run_subnet(
     if subnet.relays.contains(&identity_pk) {
         sessions.insert(
             SessionKey::Server,
-            server_session(&pp, &mse, &cfg, &subnet, &inner.identity, leader_pk),
+            server_session(
+                &pp,
+                &mse,
+                &cfg,
+                &subnet,
+                &inner.identity,
+                leader_pk,
+                inner.good_clients.clone(),
+            ),
         );
     } else {
         sessions.insert(
@@ -274,6 +279,7 @@ pub(crate) async fn run_subnet(
                 a.groups.len() as u32,
             ));
             agg_session.set_entry_len(entry_wire_len(&pp));
+            agg_session.set_good_clients(inner.good_clients.clone());
             sessions.insert(SessionKey::Aggregator, Box::new(agg_session));
         }
     }
@@ -563,6 +569,11 @@ pub(crate) enum PanetiereWire {
         /// Bit-packed `ClientBulletinEntry` (ciphertext + commitment).
         #[serde(with = "serde_bytes")]
         entry: Vec<u8>,
+        /// `client_id` must derive from this. Carried in-message because a relay
+        /// forwards client wire, so the transport peer isn't the origin.
+        signer: Pubkey,
+        #[serde(with = "serde_bytes")]
+        signature: Vec<u8>,
     },
     Opening {
         round: u64,
@@ -573,6 +584,9 @@ pub(crate) enum PanetiereWire {
         /// the client's message.
         #[serde(with = "serde_bytes")]
         sealed: Vec<u8>,
+        signer: Pubkey,
+        #[serde(with = "serde_bytes")]
+        signature: Vec<u8>,
     },
     ServerPublic {
         round: u64,
@@ -689,6 +703,28 @@ pub(crate) fn server_public_signing_bytes(
     let mut m = b"anymone/panetiere/server-public".to_vec();
     m.extend_from_slice(
         &bincode::serialize(&(round, server_id, clients, agg_open, agg_share))
+            .expect("serialise signing bytes"),
+    );
+    m
+}
+
+pub(crate) fn client_public_signing_bytes(round: u64, client_id: u32, entry: &[u8]) -> Vec<u8> {
+    let mut m = b"anymone/panetiere/client-public".to_vec();
+    m.extend_from_slice(
+        &bincode::serialize(&(round, client_id, entry)).expect("serialise signing bytes"),
+    );
+    m
+}
+
+pub(crate) fn client_opening_signing_bytes(
+    round: u64,
+    client_id: u32,
+    target_server: u32,
+    sealed: &[u8],
+) -> Vec<u8> {
+    let mut m = b"anymone/panetiere/client-opening".to_vec();
+    m.extend_from_slice(
+        &bincode::serialize(&(round, client_id, target_server, sealed))
             .expect("serialise signing bytes"),
     );
     m
@@ -1148,6 +1184,7 @@ impl Session for PanetiereObserverSession {
 pub struct PanetiereClientSession {
     pp: Arc<ProtocolParams>,
     mse: ChannelParams,
+    identity: Identity,
     client_id: ClientId,
     servers: Vec<(ServerId, pke::PublicKey)>,
     pending: Option<Vec<KahePoly>>,
@@ -1164,10 +1201,12 @@ pub struct PanetiereClientSession {
 }
 
 impl PanetiereClientSession {
+    /// `client_id` derives from `identity`, so a session can only ever claim the
+    /// slot its own key owns.
     pub fn new(
         pp: Arc<ProtocolParams>,
         mse: ChannelParams,
-        client_id: ClientId,
+        identity: Identity,
         servers: Vec<(ServerId, pke::PublicKey)>,
         rng_seed: [u8; 32],
     ) -> Self {
@@ -1179,7 +1218,8 @@ impl PanetiereClientSession {
         PanetiereClientSession {
             pp,
             mse,
-            client_id,
+            client_id: client_id_from_pubkey(identity.pubkey()),
+            identity,
             servers,
             pending: None,
             rng_seed,
@@ -1246,19 +1286,32 @@ impl Session for PanetiereClientSession {
 
         let mut out: Vec<Vec<u8>> = Vec::with_capacity(1 + self.servers.len());
 
+        let cid = round_out.client_id.0;
+        let entry = round_out.encrypted_message.to_bytes();
         let pub_msg = PanetiereWire::ClientPublic {
             round,
-            client_id: round_out.client_id.0,
-            entry: round_out.encrypted_message.to_bytes(),
+            client_id: cid,
+            signature: self
+                .identity
+                .sign(&client_public_signing_bytes(round, cid, &entry)),
+            entry,
+            signer: self.identity.pubkey(),
         };
         out.push(bincode::serialize(&pub_msg).expect("serialise client public"));
 
         for (server_id, sealed) in round_out.sealed_openings {
             let opening_msg = PanetiereWire::Opening {
                 round,
-                client_id: round_out.client_id.0,
+                client_id: cid,
                 target_server: server_id.0,
+                signature: self.identity.sign(&client_opening_signing_bytes(
+                    round,
+                    cid,
+                    server_id.0,
+                    &sealed,
+                )),
                 sealed,
+                signer: self.identity.pubkey(),
             };
             out.push(bincode::serialize(&opening_msg).expect("serialise opening"));
         }
@@ -1433,6 +1486,7 @@ pub struct PanetiereServerSession {
     round_entry_len: std::collections::BTreeMap<Round, usize>,
     /// Subnet's `setup_seed`; with the round it forms the `sid` openings bind to.
     setup_seed: [u8; 32],
+    good_clients: GoodClients,
 }
 
 /// Rounds kept after they go quiet. A bucket decodes at `end_round(r+1)`; one
@@ -1477,11 +1531,51 @@ impl PanetiereServerSession {
             entry_len,
             round_entry_len: std::collections::BTreeMap::new(),
             setup_seed: [0u8; 32],
+            good_clients: GoodClients::all(),
         }
     }
 
     pub(crate) fn set_setup_seed(&mut self, setup_seed: [u8; 32]) {
         self.setup_seed = setup_seed;
+    }
+
+    pub fn set_good_clients(&mut self, good_clients: GoodClients) {
+        self.good_clients = good_clients;
+    }
+
+    /// Signature-verifies a client contribution and screens its signer.
+    fn accept_client(
+        &self,
+        round: Round,
+        client_id: u32,
+        signer: Pubkey,
+        signature: &[u8],
+        signing_bytes: &[u8],
+        kind: &str,
+    ) -> bool {
+        if !signer.verify(signing_bytes, signature) {
+            tracing::debug!(
+                target: PANETIERE,
+                round,
+                client_id,
+                signer = %signer,
+                kind,
+                "panetiere server: client signature invalid, dropped"
+            );
+            return false;
+        }
+        if !self.good_clients.allows(&signer) {
+            tracing::debug!(
+                target: PANETIERE,
+                round,
+                client_id,
+                signer = %signer,
+                kind,
+                "panetiere server: signer not an accepted client, dropped"
+            );
+            return false;
+        }
+        true
     }
 
     /// Caps distinct clients admitted per round and the accepted canonical set
@@ -1741,6 +1835,8 @@ impl Session for PanetiereServerSession {
                 round,
                 client_id,
                 entry,
+                signer,
+                signature,
             } => {
                 let expected = self.entry_len_for(round);
                 if entry.len() != expected {
@@ -1754,10 +1850,20 @@ impl Session for PanetiereServerSession {
                     );
                     return Vec::new();
                 }
+                if !self.accept_client(
+                    round,
+                    client_id,
+                    signer,
+                    &signature,
+                    &client_public_signing_bytes(round, client_id, &entry),
+                    "public",
+                ) {
+                    return Vec::new();
+                }
                 let cid = ClientId(client_id);
                 let max = self.client_set_max;
                 let bucket = self.rounds.entry(round).or_default();
-                match admit_client(&mut bucket.owners, cid, from, max) {
+                match admit_client(&mut bucket.owners, cid, signer, max) {
                     Admit::Admitted => {}
                     Admit::AtCapacity => {
                         if bucket.rejected.len() < max.saturating_mul(4) {
@@ -1779,9 +1885,9 @@ impl Session for PanetiereServerSession {
                             target: PANETIERE,
                             round,
                             client_id,
-                            from = %from,
-                            derived = client_id_from_pubkey(from).0,
-                            "panetiere server: public rejected, client id not owned by the sender"
+                            signer = %signer,
+                            derived = client_id_from_pubkey(signer).0,
+                            "panetiere server: public rejected, client id not owned by the signer"
                         );
                         return Vec::new();
                     }
@@ -1806,6 +1912,8 @@ impl Session for PanetiereServerSession {
                 client_id,
                 target_server,
                 sealed,
+                signer,
+                signature,
             } => {
                 // The leader needs each canonical client's opening addressed to
                 // its OWN slot; a client sealing to a stale roster (wrong slot
@@ -1822,13 +1930,23 @@ impl Session for PanetiereServerSession {
                     );
                 }
                 if target_server == self.server_id.0 {
+                    if !self.accept_client(
+                        round,
+                        client_id,
+                        signer,
+                        &signature,
+                        &client_opening_signing_bytes(round, client_id, target_server, &sealed),
+                        "opening",
+                    ) {
+                        return Vec::new();
+                    }
                     let cid = ClientId(client_id);
                     // Admission is arrival-ordered and differs per relay, while
                     // the canonical set is frozen elsewhere; 2× headroom keeps
                     // every canonical member's opening servable.
                     let max = self.canonical_bound().saturating_mul(2);
                     let bucket = self.rounds.entry(round).or_default();
-                    match admit_client(&mut bucket.owners, cid, from, max) {
+                    match admit_client(&mut bucket.owners, cid, signer, max) {
                         Admit::Admitted => {}
                         Admit::AtCapacity => {
                             if bucket.rejected.len() < max.saturating_mul(4) {
@@ -1848,9 +1966,9 @@ impl Session for PanetiereServerSession {
                                 target: PANETIERE,
                                 round,
                                 client_id,
-                                from = %from,
-                                derived = client_id_from_pubkey(from).0,
-                                "panetiere server: opening rejected, client id not owned by the sender"
+                                signer = %signer,
+                                derived = client_id_from_pubkey(signer).0,
+                                "panetiere server: opening rejected, client id not owned by the signer"
                             );
                             return Vec::new();
                         }
@@ -2447,6 +2565,7 @@ pub struct PanetiereAggregatorSession {
     /// Upper bound on distinct clients admitted per round; unbounded until
     /// [`Self::set_client_set_max`] is called.
     client_set_max: usize,
+    good_clients: GoodClients,
     /// Expected `ClientBulletinEntry` wire length; wrong-geometry entries
     /// (stale-config clients) panic the KAHE sum if admitted.
     entry_len: usize,
@@ -2466,6 +2585,7 @@ impl PanetiereAggregatorSession {
             cur_round: None,
             first_round: None,
             client_set_max: usize::MAX,
+            good_clients: GoodClients::all(),
             entry_len: usize::MAX,
             round_entry_len: std::collections::BTreeMap::new(),
         }
@@ -2474,6 +2594,10 @@ impl PanetiereAggregatorSession {
     /// See [`PanetiereServerSession::set_client_set_max`].
     pub(crate) fn set_client_set_max(&mut self, max: usize) {
         self.client_set_max = max;
+    }
+
+    pub fn set_good_clients(&mut self, good_clients: GoodClients) {
+        self.good_clients = good_clients;
     }
 
     /// Expected entry length under the subnet's geometry
@@ -2503,11 +2627,13 @@ impl Session for PanetiereAggregatorSession {
         Vec::new()
     }
 
-    fn on_inbound(&mut self, from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
+    fn on_inbound(&mut self, _from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
         if let Ok(PanetiereWire::ClientPublic {
             round,
             client_id,
             entry,
+            signer,
+            signature,
         }) = bincode::deserialize::<PanetiereWire>(&payload)
         {
             if !round_in_window(round, self.cur_round) {
@@ -2541,9 +2667,23 @@ impl Session for PanetiereAggregatorSession {
                     );
                     return Vec::new();
                 }
+                if !signer.verify(
+                    &client_public_signing_bytes(round, client_id, &entry),
+                    &signature,
+                ) || !self.good_clients.allows(&signer)
+                {
+                    tracing::debug!(
+                        target: PANETIERE,
+                        round,
+                        client_id,
+                        signer = %signer,
+                        "panetiere aggregator: unsigned or unaccepted client public dropped"
+                    );
+                    return Vec::new();
+                }
                 let cid = ClientId(client_id);
                 let max = self.client_set_max;
-                let admit = admit_client(self.owners.entry(round).or_default(), cid, from, max);
+                let admit = admit_client(self.owners.entry(round).or_default(), cid, signer, max);
                 if admit != Admit::Admitted {
                     tracing::debug!(
                         target: PANETIERE,
@@ -2776,7 +2916,8 @@ mod observer_tests {
                 )
             })
             .collect();
-        let mut c = PanetiereClientSession::new(pp.clone(), mse, ClientId(1), servers, [2u8; 32]);
+        let mut c =
+            PanetiereClientSession::new(pp.clone(), mse, Identity::generate(), servers, [2u8; 32]);
         let client_public = c
             .begin_round(0, Instant::now())
             .iter()
@@ -2830,13 +2971,14 @@ mod concurrent_decode_tests {
         );
         let pp = setup_pp(&mse, n_servers, [7u8; 32]);
 
-        let client_pks: Vec<Pubkey> = (0..total).map(|_| Identity::generate().pubkey()).collect();
+        let client_ids: Vec<Identity> = (0..total).map(|_| Identity::generate()).collect();
+        let client_pks: Vec<Pubkey> = client_ids.iter().map(|id| id.pubkey()).collect();
         let mut clients: Vec<PanetiereClientSession> = (0..total)
             .map(|i| {
                 PanetiereClientSession::new(
                     pp.clone(),
                     mse.clone(),
-                    client_id_from_pubkey(client_pks[i]),
+                    client_ids[i].clone(),
                     xpubs.clone(),
                     [40 + i as u8; 32],
                 )

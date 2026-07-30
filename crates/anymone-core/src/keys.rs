@@ -10,9 +10,15 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
-use libp2p_identity::ed25519;
+use commonware_codec::DecodeExt;
+use commonware_cryptography::{ed25519, Verifier};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
+
+/// Domain tag over every governance signature. The same key authenticates
+/// backbone connections, so tagging keeps the two uses from validating in each
+/// other's context.
+pub(crate) const SIGN_NAMESPACE: &[u8] = b"anymone";
 
 /// Write `bytes` to `path` at mode 0600 — key material must never be group/world-readable.
 pub(crate) fn write_secret(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -38,10 +44,13 @@ impl Pubkey {
     }
 
     pub fn verify(&self, msg: &[u8], sig: &[u8]) -> bool {
-        match ed25519::PublicKey::try_from_bytes(&self.0) {
-            Ok(pk) => pk.verify(msg, sig),
-            Err(_) => false,
-        }
+        let (Ok(pk), Ok(sig)) = (
+            ed25519::PublicKey::decode(&self.0[..]),
+            ed25519::Signature::decode(sig),
+        ) else {
+            return false;
+        };
+        pk.verify(SIGN_NAMESPACE, msg, &sig)
     }
 }
 
@@ -76,6 +85,14 @@ impl<'de> Deserialize<'de> for Pubkey {
             let bytes = <[u8; 32]>::deserialize(d)?;
             Ok(Pubkey(bytes))
         }
+    }
+}
+
+impl std::str::FromStr for Pubkey {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_pubkey_str(s)
     }
 }
 

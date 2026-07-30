@@ -38,7 +38,7 @@ use crate::runtime::{
     gossip_faults, handle_inbound, publish_and_loop_back, recv_any, round_at, route_to_pipe,
     subnet_aggregation, subnet_leader_pk, AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
 };
-use crate::session::{LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
+use crate::session::{GoodClients, LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
 use crate::transport::Subscription;
 
 /// Per-subnet ADCNet parameters (IBLT sizing), built once at subnet start.
@@ -118,6 +118,7 @@ fn server_session(
     subnet: &Subnet,
     identity: &Identity,
     leader_pk: Pubkey,
+    good_clients: GoodClients,
 ) -> Box<dyn Session> {
     let identity_pk = identity.pubkey();
     let idx = relay_index(subnet, identity_pk).expect("server_session called on non-relay");
@@ -130,7 +131,7 @@ fn server_session(
     };
     let mut roster = subnet.relays.clone();
     roster.sort();
-    Box::new(AdcnetServerSession::new(
+    let mut session = AdcnetServerSession::new(
         one_round.clone(),
         ServerId(idx),
         identity.to_adcnet_signing_key(),
@@ -142,7 +143,9 @@ fn server_session(
         is_leader,
         leader_pk,
         aggregation,
-    ))
+    );
+    session.set_good_clients(good_clients);
+    Box::new(session)
 }
 
 /// Self-contained ADCNet subnet driver: builds this node's sessions, then owns
@@ -172,7 +175,14 @@ pub(crate) async fn run_subnet(
     if subnet.relays.contains(&identity_pk) {
         sessions.insert(
             SessionKey::Server,
-            server_session(&one_round, &cfg, &subnet, &inner.identity, leader_pk),
+            server_session(
+                &one_round,
+                &cfg,
+                &subnet,
+                &inner.identity,
+                leader_pk,
+                inner.good_clients.clone(),
+            ),
         );
     } else {
         sessions.insert(
@@ -1176,6 +1186,9 @@ pub struct AdcnetServerSession {
     min_clients: usize,
     /// Upper bound on the accepted per-round client set.
     client_set_max: usize,
+    /// Which client keys this relay accepts contributions from. ADCNet client
+    /// keys are the same ed25519 bytes as a [`Pubkey`], just adcnet-wrapped.
+    good_clients: GoodClients,
     /// This server leads canonical-set announcement (sorted-first relay).
     is_leader: bool,
     /// The leader's anymone pubkey — `ClientSet` announcements are only
@@ -1239,6 +1252,7 @@ impl AdcnetServerSession {
             roster,
             min_clients,
             client_set_max,
+            good_clients: GoodClients::all(),
             is_leader,
             leader_pk,
             clients_by_round: HashMap::new(),
@@ -1254,6 +1268,10 @@ impl AdcnetServerSession {
             aggregation,
             agg_by_round: HashMap::new(),
         }
+    }
+
+    pub(crate) fn set_good_clients(&mut self, good_clients: GoodClients) {
+        self.good_clients = good_clients;
     }
 
     /// The `ServerId` bound to `signer` by the sorted roster, if it's a relay.
@@ -1502,6 +1520,18 @@ impl Session for AdcnetServerSession {
                         return Vec::new();
                     }
                     let (c, signer) = (c.clone(), signer.clone());
+                    let signer_pk = <[u8; 32]>::try_from(signer.as_bytes())
+                        .map(Pubkey::from_bytes)
+                        .ok();
+                    if !signer_pk.is_some_and(|pk| self.good_clients.allows(&pk)) {
+                        debug!(
+                            target: ADCNET,
+                            signer = %hex::encode(&signer.as_bytes()[..4]),
+                            c_round = c.round,
+                            "adcnet leader: signer not an accepted client, dropped"
+                        );
+                        return Vec::new();
+                    }
                     let bucket = self.clients_by_round.entry(c.round).or_default();
                     // One contribution per signer per round: a replayed duplicate
                     // would double-sum into the combine and corrupt the round.

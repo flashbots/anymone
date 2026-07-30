@@ -28,8 +28,9 @@ use crate::runtime::Anymone;
 use crate::wire::ServiceTag;
 
 /// Mints a started client node on the same network as the caller's own — which
-/// transport that is stays the caller's business ([`crate::p2p::client_spawner`],
-/// or in-memory handles in a demo). `None` on failure; the spawner reports why.
+/// transport that is stays the caller's business
+/// ([`crate::cw::stream_client_spawner`], or in-memory handles in a demo).
+/// `None` on failure; the spawner reports why.
 pub type SpawnClient =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Option<Anymone>> + Send>> + Send + Sync>;
 

@@ -5,7 +5,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-libp2p-identity.workspace = true
 serde.workspace = true
 serde_bytes.workspace = true
 bincode.workspace = true
@@ -25,11 +24,16 @@ panetiere = { git = "ssh://git@github.com/flashbots/panetiere", rev = "cea3e928e
 chipmunk_code = { git = "https://github.com/Ruteri/Chipmunk", branch = "main", default-features = false, features = ["fast-ntt"] }
 adcnet = { git = "ssh://git@github.com/flashbots/adcnet-rs", rev = "08988b193a4fa78d08f7ffed221ce28c7a1aeb6e" }
 num-bigint = { version = "0.4", features = ["serde"] }
-libp2p.workspace = true
+rayon = "1.10"
+commonware-p2p.workspace = true
+commonware-stream.workspace = true
+commonware-runtime.workspace = true
+commonware-cryptography.workspace = true
+commonware-utils.workspace = true
+commonware-codec.workspace = true
 
 [features]
-default = []
-# Spawning full Anymone instances on loopback libp2p for tests.
+# Spawning full Anymone instances on a loopback transport for tests.
 test-util = []
 # Decoded-plaintext wire tracing (ANYMONE_TRACE=1). Off by default so a release
 # build can't dump decoded traffic even if the env var is set; opt in per binary.

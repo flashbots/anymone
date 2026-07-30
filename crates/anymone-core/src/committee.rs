@@ -41,20 +41,33 @@ pub fn committee_roster(ids: &[Identity]) -> Vec<(Pubkey, crate::config::Exchang
         .collect()
 }
 
-/// Await the next message from any public-subnet subscription, returning it
-/// tagged with that subnet's id (recovered from the subscription that fired).
-async fn poll_subnets(
-    subs: &mut [(crate::config::SubnetId, crate::transport::Subscription)],
-) -> (crate::config::SubnetId, Option<crate::transport::Inbound>) {
+/// Which topic a committee inbound message arrived on.
+#[derive(Clone, Copy)]
+enum Source {
+    Panetiere,
+    Registration,
+    Faults,
+    Subnet(crate::config::SubnetId),
+    Config,
+    Sigs,
+}
+
+/// Await the next message from any subscribed topic, tagged with its source.
+/// Rotating keeps it fair: the committee Panetiere out-volumes the governance
+/// topics and starves everything behind it under a fixed poll order.
+async fn recv_any(
+    subs: &mut [(Source, crate::transport::Subscription)],
+) -> (Source, Option<crate::transport::Inbound>) {
+    subs.rotate_left(1);
     let futures: Vec<_> = subs
         .iter_mut()
-        .map(|(id, sub)| {
-            let id = *id;
-            Box::pin(async move { (id, sub.recv().await) })
+        .map(|(src, sub)| {
+            let src = *src;
+            Box::pin(async move { (src, sub.recv().await) })
         })
         .collect();
-    let ((id, msg), _, _) = futures_util::future::select_all(futures).await;
-    (id, msg)
+    let ((src, msg), _, _) = futures_util::future::select_all(futures).await;
+    (src, msg)
 }
 
 /// Tunables for the Panetiere-coordinated committee scheduler.
@@ -225,31 +238,40 @@ pub async fn spawn_panetiere_committee_scheduler(
     config: PanetiereCommitteeConfig,
 ) -> JoinHandle<()> {
     // Subscribe-before-spawn for every consumed topic.
-    let mut reg_sub = transport.subscribe(TOPIC_REGISTRATION).await;
-    let mut faults_sub = transport.subscribe(TOPIC_FAULTS).await;
-    let mut panetiere_sub = transport.subscribe(TOPIC_COMMITTEE_PANETIERE).await;
-    let mut sigs_sub = transport.subscribe(TOPIC_COMMITTEE_SIGS).await;
-    let mut config_sub = transport.subscribe(crate::governance::TOPIC_CONFIG).await;
+    let mut inbound: Vec<(Source, crate::transport::Subscription)> = vec![
+        (Source::Registration, transport.subscribe(TOPIC_REGISTRATION).await),
+        (Source::Faults, transport.subscribe(TOPIC_FAULTS).await),
+        (
+            Source::Panetiere,
+            transport.subscribe(TOPIC_COMMITTEE_PANETIERE).await,
+        ),
+        (
+            Source::Sigs,
+            transport.subscribe(TOPIC_COMMITTEE_SIGS).await,
+        ),
+        (
+            Source::Config,
+            transport.subscribe(crate::governance::TOPIC_CONFIG).await,
+        ),
+    ];
     let committee_xpubs: std::collections::HashMap<Pubkey, crate::config::ExchangePublicKeyWire> =
         committee.iter().cloned().collect();
     let committee: Vec<Pubkey> = committee.into_iter().map(|(pk, _)| pk).collect();
 
     // One subscription per possible public subnet (the committee may schedule
     // several). Each subnet is observed independently (its own anonymity set, its own faults).
-    let mut subnet_subs: Vec<(crate::config::SubnetId, crate::transport::Subscription)> =
-        Vec::new();
     for id in 0..crate::scheduler_core::MAX_SUBNETS as crate::config::SubnetId {
         // Broadcast topic carries the leader's `ClientSet` (anonymity set) and
         // `Decoded` (round output); the shares topic carries each relay's share
         // (liveness / share frontier). Both feed the same per-subnet observer.
-        subnet_subs.push((
-            id,
+        inbound.push((
+            Source::Subnet(id),
             transport
                 .subscribe(&crate::runtime::subnet_broadcast_topic(id))
                 .await,
         ));
-        subnet_subs.push((
-            id,
+        inbound.push((
+            Source::Subnet(id),
             transport
                 .subscribe(&crate::runtime::subnet_shares_topic(id))
                 .await,
@@ -320,7 +342,7 @@ pub async fn spawn_panetiere_committee_scheduler(
         let mut core = SchedulerCore::new(identity.clone(), committee.clone(), threshold, params);
         let mut seeded = match pull_config(&transport).await {
             Some(cfg) if core.on_published_config(&cfg) => {
-                transport.set_topic_policy(crate::governance::topic_policy(&cfg.body, &committee));
+                adopt_transport_policy(&transport, &committee, &cfg);
                 true
             }
             _ => false,
@@ -369,7 +391,7 @@ pub async fn spawn_panetiere_committee_scheduler(
                             Box::new(PanetiereClientSession::new(
                                 pp.clone(),
                                 committee_mse.clone(),
-                                crate::panetiere::client_id_from_pubkey(our_pk),
+                                identity.clone(),
                                 seal_roster.clone(),
                                 seed,
                             ))
@@ -385,9 +407,7 @@ pub async fn spawn_panetiere_committee_scheduler(
                             match bincode::deserialize::<crate::config::AnymoneRoundConfiguration>(
                                 &bytes,
                             ) {
-                                Ok(cfg) => transport.set_topic_policy(
-                                    crate::governance::topic_policy(&cfg.body, &committee),
-                                ),
+                                Ok(cfg) => adopt_transport_policy(&transport, &committee, &cfg),
                                 // The policy keeps the previous config's rosters,
                                 // so the new subnets' topics reject their publishers.
                                 Err(e) => warn!(
@@ -444,13 +464,26 @@ pub async fn spawn_panetiere_committee_scheduler(
                     }
 
                     let now_ms = crate::config::now_unix_ms();
-                    anymone_round = crate::runtime::round_at(0, 0, dur_ms, now_ms).max(anymone_round + 1);
+                    // A member emits nothing for rounds it skips, so they can never
+                    // reach the share threshold; silent otherwise.
+                    let wall_round = crate::runtime::round_at(0, 0, dur_ms, now_ms);
+                    if wall_round > anymone_round + 1 {
+                        warn!(
+                            target: GOV,
+                            from_round = anymone_round,
+                            to_round = wall_round,
+                            skipped = wall_round - (anymone_round + 1),
+                            round_ms = dur_ms,
+                            "committee: round work outran its duration; skipped rounds cannot decode"
+                        );
+                    }
+                    anymone_round = wall_round.max(anymone_round + 1);
                     deadline = crate::runtime::deadline_for(anymone_round, 0, 0, dur_ms, now_ms);
 
                     if !seeded {
                         if let Some(cfg) = pull_config(&transport).await {
                             if core.on_published_config(&cfg) {
-                                transport.set_topic_policy(crate::governance::topic_policy(&cfg.body, &committee));
+                                adopt_transport_policy(&transport, &committee, &cfg);
                                 seeded = true;
                             }
                         }
@@ -469,86 +502,86 @@ pub async fn spawn_panetiere_committee_scheduler(
                     emit(&transport, &topic, our_pk, &mut server_session, &mut client_session, client_out).await;
                 }
 
-                Some(msg) = panetiere_sub.recv() => {
-                    let crate::transport::Inbound { from, payload } = msg;
-                    let mut outs = server_session.on_inbound(from, payload.clone());
-                    if let Some(cs) = client_session.as_mut() {
-                        outs.extend(cs.on_inbound(from, payload));
-                    }
-                    emit(&transport, &topic, our_pk, &mut server_session, &mut client_session, outs).await;
-                }
-
-                Some(msg) = reg_sub.recv() => {
-                    match bincode::deserialize::<Registration>(&msg.payload) {
-                        // An unverifiable registration keeps the relay/service out
-                        // of every proposal, so the config never includes it.
-                        Ok(reg) if !reg.verify() => debug!(
-                            target: GOV,
-                            from = %msg.from,
-                            "committee: registration failed signature verification, ignored"
-                        ),
-                        Ok(reg) => core.on_registration(reg),
-                        Err(e) => debug!(
-                            target: GOV,
-                            from = %msg.from,
-                            error = %e,
-                            "committee: undecodable registration, ignored"
-                        ),
-                    }
-                }
-
-                Some(msg) = faults_sub.recv() => {
-                    match FaultReport::decode(&msg.payload) {
-                        Some(report) => core.on_fault_report(msg.from, report, crate::config::now_unix_ms()),
-                        None => debug!(
-                            target: GOV,
-                            from = %msg.from,
-                            len = msg.payload.len(),
-                            "committee: undecodable fault report, ignored"
-                        ),
-                    }
-                }
-
-                (subnet_id, inbound) = poll_subnets(&mut subnet_subs) => {
-                    if let Some(crate::transport::Inbound { from, payload }) = inbound {
-                        core.on_subnet_message(subnet_id, from, payload);
-                    }
-                }
-
-                Some(msg) = config_sub.recv() => {
-                    match bincode::deserialize::<crate::config::AnymoneRoundConfiguration>(&msg.payload) {
-                        Ok(cfg) => {
-                            if core.on_published_config(&cfg) {
-                                transport.set_topic_policy(crate::governance::topic_policy(&cfg.body, &committee));
-                                seeded = true;
-                            }
+                (src, Some(msg)) = recv_any(&mut inbound) => match src {
+                    Source::Panetiere => {
+                        let crate::transport::Inbound { from, payload } = msg;
+                        let mut outs = server_session.on_inbound(from, payload.clone());
+                        if let Some(cs) = client_session.as_mut() {
+                            outs.extend(cs.on_inbound(from, payload));
                         }
-                        Err(e) => debug!(
-                            target: GOV,
-                            from = %msg.from,
-                            error = %e,
-                            "committee: undecodable config on the governance topic, ignored"
-                        ),
+                        emit(&transport, &topic, our_pk, &mut server_session, &mut client_session, outs).await;
                     }
-                }
 
-                Some(msg) = sigs_sub.recv() => {
-                    match bincode::deserialize::<crate::scheduler_core::CommitteeSig>(&msg.payload) {
-                        Ok(sig) => {
-                            for action in core.on_committee_sig(sig) {
-                                execute!(action);
-                            }
+                    Source::Registration => {
+                        match bincode::deserialize::<Registration>(&msg.payload) {
+                            // An unverifiable registration keeps the relay/service out
+                            // of every proposal, so the config never includes it.
+                            Ok(reg) if !reg.verify() => debug!(
+                                target: GOV,
+                                from = %msg.from,
+                                "committee: registration failed signature verification, ignored"
+                            ),
+                            Ok(reg) => core.on_registration(reg),
+                            Err(e) => debug!(
+                                target: GOV,
+                                from = %msg.from,
+                                error = %e,
+                                "committee: undecodable registration, ignored"
+                            ),
                         }
-                        // A signature we can't read never counts towards the
-                        // threshold, so assembly silently never fires.
-                        Err(e) => debug!(
-                            target: GOV,
-                            from = %msg.from,
-                            error = %e,
-                            "committee: undecodable committee signature, ignored"
-                        ),
                     }
-                }
+
+                    Source::Faults => {
+                        match FaultReport::decode(&msg.payload) {
+                            Some(report) => core.on_fault_report(msg.from, report, crate::config::now_unix_ms()),
+                            None => debug!(
+                                target: GOV,
+                                from = %msg.from,
+                                len = msg.payload.len(),
+                                "committee: undecodable fault report, ignored"
+                            ),
+                        }
+                    }
+
+                    Source::Subnet(subnet_id) => {
+                        core.on_subnet_message(subnet_id, msg.from, msg.payload);
+                    }
+
+                    Source::Config => {
+                        match bincode::deserialize::<crate::config::AnymoneRoundConfiguration>(&msg.payload) {
+                            Ok(cfg) => {
+                                if core.on_published_config(&cfg) {
+                                    adopt_transport_policy(&transport, &committee, &cfg);
+                                    seeded = true;
+                                }
+                            }
+                            Err(e) => debug!(
+                                target: GOV,
+                                from = %msg.from,
+                                error = %e,
+                                "committee: undecodable config on the governance topic, ignored"
+                            ),
+                        }
+                    }
+
+                    Source::Sigs => {
+                        match bincode::deserialize::<crate::scheduler_core::CommitteeSig>(&msg.payload) {
+                            Ok(sig) => {
+                                for action in core.on_committee_sig(sig) {
+                                    execute!(action);
+                                }
+                            }
+                            // A signature we can't read never counts towards the
+                            // threshold, so assembly silently never fires.
+                            Err(e) => debug!(
+                                target: GOV,
+                                from = %msg.from,
+                                error = %e,
+                                "committee: undecodable committee signature, ignored"
+                            ),
+                        }
+                    }
+                },
             }
         }
     })
@@ -559,6 +592,18 @@ async fn pull_config(
 ) -> Option<crate::config::AnymoneRoundConfiguration> {
     let bytes = transport.fetch_config().await?;
     bincode::deserialize(&bytes).ok()
+}
+
+/// Transport admission for a config the committee adopted or published. Every
+/// adoption path funnels through here so policy and peer sets never diverge.
+fn adopt_transport_policy(
+    transport: &Arc<dyn Transport>,
+    committee: &[Pubkey],
+    cfg: &crate::config::AnymoneRoundConfiguration,
+) {
+    transport.set_topic_policy(crate::governance::topic_policy(&cfg.body, committee));
+    let (primary, secondary) = crate::governance::tracked_peers(&cfg.body, committee);
+    transport.track_peers(cfg.body.round, primary, secondary);
 }
 
 /// Send a member's own committee-Panetiere output to peers and feed it back into

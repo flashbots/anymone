@@ -5,17 +5,18 @@
 //! are thin shells over it.
 
 pub mod adcnet;
+pub mod backend;
 pub mod bootstrap;
 pub mod client_pool;
 pub mod committee;
 pub mod config;
+pub mod cw;
 pub mod faults;
 pub mod governance;
 pub mod identity;
 pub mod keys;
 pub mod log_target;
 pub mod noop;
-pub mod p2p;
 pub mod panetiere;
 pub mod panetiere_scheduled;
 pub mod pipe;
@@ -56,9 +57,10 @@ pub use pipe::{max_message_payload, Pipe, PipeIncoming, SendError};
 pub use runtime::{leader_of, subnet_leader_pk, Anymone, AnymonePrep, Event, OpenError};
 pub use scheduler_core::{SchedulerAction, SchedulerCore, SchedulerParams, SignedProposal};
 pub use scheduling::{
-    announce_relay_registration, announce_service_registration, Registration, SchedulerProtocol,
+    announce_relay_registration, announce_relay_registration_at, announce_service_registration,
+    announce_watcher_registration, Registration, SchedulerProtocol,
 };
-pub use session::{LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
+pub use session::{GoodClients, LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
 pub use tee::{NoopProver, TeeProver, TeeVerifier};
 pub use transport::{InMemoryHandle, InMemoryNetwork, Inbound, Subscription, Transport};
 pub use wire::{Frame, RouteTag, ServiceTag, WireError};

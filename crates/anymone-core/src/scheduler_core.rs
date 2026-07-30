@@ -144,7 +144,7 @@ pub(crate) fn expected_active(set: u32) -> u32 {
 
 /// Per-subnet wire budget: a subnet's largest per-round message must stay under this,
 /// with headroom below the gossipsub ceiling.
-const MAX_SUBNET_WIRE: usize = crate::p2p::MAX_TRANSMIT_SIZE * 3 / 4;
+const MAX_SUBNET_WIRE: usize = crate::transport::MAX_TRANSMIT_SIZE * 3 / 4;
 
 /// Capacity ceiling. Subnets split well before this; at this many clients the biggest
 /// message (the ciphertext) is still a few hundred KB, far under [`MAX_SUBNET_WIRE`],
@@ -418,6 +418,8 @@ mod sizing_tests {
                 }),
                 cover_rate: 1.0,
             }],
+            relay_client_addrs: vec![],
+            watchers: vec![],
         };
         assert!(
             !core.validate_body(&body),
@@ -569,6 +571,10 @@ pub struct SchedulerCore {
 
     services: HashMap<ServiceTag, Pubkey>,
     relay_xpubs: HashMap<Pubkey, ExchangePublicKeyWire>,
+    /// Client-facing address per relay that advertised one.
+    relay_client_addrs: HashMap<Pubkey, String>,
+    /// Registered follow-only nodes; secondary peers, never in a subnet roster.
+    watchers: HashSet<Pubkey>,
 
     // Liveness observer for the current public subnet (protocol-specific).
     /// Per-subnet liveness observers (one per public subnet), keyed by id. They
@@ -638,6 +644,8 @@ impl SchedulerCore {
             escalation: std::collections::BTreeMap::new(),
             sched_mode: std::collections::BTreeMap::new(),
             services: HashMap::new(),
+            relay_client_addrs: HashMap::new(),
+            watchers: HashSet::new(),
             relay_xpubs: HashMap::new(),
             observers: std::collections::BTreeMap::new(),
             observer_grace: HashMap::new(),
@@ -667,9 +675,20 @@ impl SchedulerCore {
     /// but a general fault clears only on a clean-round streak (see `tick`).
     pub fn on_registration(&mut self, reg: Registration) {
         match reg {
+            Registration::Watcher { pubkey, .. } => {
+                if self.watchers.insert(pubkey) {
+                    tracing::debug!(
+                        target: GOV,
+                        watcher = %pubkey,
+                        watchers = self.watchers.len(),
+                        "registration: first announcement from a watcher"
+                    );
+                }
+            }
             Registration::Relay {
                 pubkey,
                 exchange_pubkey,
+                client_addr,
                 ..
             } => {
                 if self.integrity_offenders.contains_key(&pubkey) {
@@ -693,6 +712,10 @@ impl SchedulerCore {
                         );
                     }
                     self.relay_xpubs.insert(pubkey, exchange_pubkey);
+                    match client_addr {
+                        Some(addr) => self.relay_client_addrs.insert(pubkey, addr),
+                        None => self.relay_client_addrs.remove(&pubkey),
+                    };
                 }
             }
             Registration::Service {
@@ -1618,7 +1641,7 @@ impl SchedulerCore {
             .then(|| build_subnet_aggregation(self.capacity, &relay_vec))
             .flatten();
         let n = relay_vec.len() as u32;
-        let subnets = protos
+        let subnets: Vec<Subnet> = protos
             .iter()
             .enumerate()
             .map(|(i, proto)| {
@@ -1691,6 +1714,17 @@ impl SchedulerCore {
                 }
             })
             .collect();
+        // Only placed relays, so a flood of registrations can't inflate the body.
+        let placed: HashSet<Pubkey> = subnets.iter().flat_map(|s| s.relays.iter().copied()).collect();
+        let mut relay_client_addrs: Vec<(Pubkey, String)> = self
+            .relay_client_addrs
+            .iter()
+            .filter(|(pk, _)| placed.contains(pk))
+            .map(|(pk, addr)| (*pk, addr.clone()))
+            .collect();
+        relay_client_addrs.sort();
+        let mut watchers: Vec<Pubkey> = self.watchers.iter().copied().collect();
+        watchers.sort();
         AnymoneRoundConfigurationBody {
             round: self.public_round,
             epoch_unix_ms: self
@@ -1699,6 +1733,8 @@ impl SchedulerCore {
             services: service_vec,
             relay_exchange_keys: relay_xk,
             subnets,
+            relay_client_addrs,
+            watchers,
         }
     }
 }

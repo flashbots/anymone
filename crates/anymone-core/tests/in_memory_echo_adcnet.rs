@@ -381,6 +381,8 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
         services: services.clone(),
         relay_exchange_keys: relay_xk.clone(),
         subnets: vec![Subnet::new(0, relay_pks.clone(), proto())],
+        relay_client_addrs: vec![],
+        watchers: vec![],
     })
     .sign_with(&[&committee]);
     // Every subnet carries every service, so growing to two subnets lets
@@ -403,6 +405,8 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
             Subnet::new(0, relay_pks.clone(), resized()),
             Subnet::new(1, relay_pks.clone(), resized()),
         ],
+        relay_client_addrs: vec![],
+        watchers: vec![],
     })
     .sign_with(&[&committee]);
 
@@ -586,6 +590,8 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
                 }),
                 Subnet::new(1, relay_pks.clone(), proto()),
             ],
+            relay_client_addrs: vec![],
+            watchers: vec![],
         })
         .sign_with(&[&committee]);
         net.handle(committee.pubkey())

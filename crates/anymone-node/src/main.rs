@@ -1,6 +1,6 @@
 //! anymone-node — thin binary wrapper around `anymone-core`.
 //!
-//! `run` brings up a real libp2p transport and starts an `Anymone` in one of
+//! `run` brings up a real network transport and starts an `Anymone` in one of
 //! four roles (committee, relay, service, client). `bootnode` runs a discovery
 //! seed that peers dial to find each other. `keygen` mints node identities for
 //! a deployment's config.
@@ -9,15 +9,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use anymone_core::p2p::Libp2pNetwork;
 use anymone_core::transport::Transport;
 use anymone_core::{
-    announce_relay_registration, announce_service_registration,
-    spawn_panetiere_committee_scheduler, Anymone, BootstrapConfig, GovernanceBootstrap, Identity,
-    Misbehavior, ServiceTag,
+    announce_relay_registration_at, announce_service_registration,
+    spawn_panetiere_committee_scheduler, Anymone, BootstrapConfig, GoodClients,
+    GovernanceBootstrap, Identity, Misbehavior, ServiceTag,
 };
 use clap::{Parser, Subcommand, ValueEnum};
-use libp2p::PeerId;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -108,7 +106,7 @@ type AnymoneSlot = Arc<std::sync::RwLock<Option<Arc<Anymone>>>>;
 /// showcase Panetiere's attribution). Other roles get no such route. The knob
 /// only accepts loopback connections; `/state/peers` stays open for scrapes.
 fn spawn_peers_endpoint(
-    net: Arc<Libp2pNetwork>,
+    net: Arc<dyn Transport>,
     role: &'static str,
     port: u16,
     anymone: Option<AnymoneSlot>,
@@ -125,12 +123,10 @@ fn spawn_peers_endpoint(
             move || {
                 let net = net.clone();
                 async move {
-                    let gossip = net.gossip_snapshot().await;
                     Json(serde_json::json!({
                         "pubkey": pubkey,
                         "role": role,
-                        "peers": net.peer_snapshot(),
-                        "gossip": gossip,
+                        "peers": net.peers(),
                     }))
                 }
             }
@@ -238,10 +234,6 @@ fn print_public_material(path: &Path, identity: &Identity) {
     println!("pubkey         {}", identity.pubkey());
     println!("exchange_ecdh  {}", hex::encode(&xpub.ecdh));
     println!("exchange_kem   {}", hex::encode(&xpub.kem));
-    println!(
-        "peer_id        {}",
-        PeerId::from(identity.to_libp2p_keypair().public())
-    );
 }
 
 async fn bootnode(args: BootnodeArgs) -> Result<()> {
@@ -249,15 +241,12 @@ async fn bootnode(args: BootnodeArgs) -> Result<()> {
         .with_context(|| format!("loading {}", args.config.display()))?;
     let identity = Identity::load_or_generate(&bootstrap.identity_path)
         .with_context(|| format!("identity at {}", bootstrap.identity_path.display()))?;
-    let peer_id = PeerId::from(identity.to_libp2p_keypair().public());
-    tracing::info!(%peer_id, listen = %bootstrap.network.listen, "starting bootnode");
+    tracing::info!(pubkey = %identity.pubkey(), "starting bootnode");
 
-    let net = Libp2pNetwork::start(&identity, bootstrap.libp2p_config()?)
-        .await
-        .map_err(|e| anyhow!("libp2p start: {e}"))?;
-    // Join the governance topics so the bootnode is in those meshes; held for
-    // the process lifetime so the subscriptions stay live.
-    let transport: Arc<dyn Transport> = net;
+    let transport =
+        anymone_core::backend::start_node_transport(&identity, &bootstrap, GoodClients::all())?;
+    // Join the governance topics so the bootnode carries them; held for the
+    // process lifetime so the subscriptions stay live.
     let mut _subs = Vec::new();
     for topic in [
         anymone_core::governance::TOPIC_CONFIG,
@@ -279,10 +268,10 @@ async fn run(args: RunArgs) -> Result<()> {
         .with_context(|| format!("identity at {}", bootstrap.identity_path.display()))?;
     tracing::info!(role = ?args.role, pubkey = %identity.pubkey(), "starting node");
 
-    let net = Libp2pNetwork::start(&identity, bootstrap.libp2p_config()?)
-        .await
-        .map_err(|e| anyhow!("libp2p start: {e}"))?;
-    let transport: Arc<dyn Transport> = net.clone();
+    // Demo: every client is accepted. A deployment narrows this to attested
+    // clients, and the stream handshake is where that is enforced.
+    let transport =
+        anymone_core::backend::start_node_transport(&identity, &bootstrap, GoodClients::all())?;
     let gov = GovernanceBootstrap::from_bootstrap_config(&bootstrap);
 
     // Endpoint comes up before Anymone start (which blocks on the first
@@ -292,7 +281,7 @@ async fn run(args: RunArgs) -> Result<()> {
         (args.role == Role::Relay).then(|| Arc::new(std::sync::RwLock::new(None)));
     if let Some(port) = args.peers_port {
         spawn_peers_endpoint(
-            net.clone(),
+            transport.clone(),
             args.role.as_str(),
             port,
             misbehavior_slot.clone(),
@@ -312,7 +301,15 @@ async fn run(args: RunArgs) -> Result<()> {
         }
         Role::Relay => {
             let xk = identity.exchange_keys();
-            let _reannounce = announce_relay_registration(transport.clone(), &identity, xk).await;
+            // Advertising the stream address is what lets clients find a relay
+            // from the signed config without joining the p2p network.
+            let _reannounce = announce_relay_registration_at(
+                transport.clone(),
+                &identity,
+                xk,
+                bootstrap.network.stream_listen.clone(),
+            )
+            .await;
             let anymone = Arc::new(
                 Anymone::prepare(identity, transport, gov)
                     .await

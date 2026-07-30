@@ -1,6 +1,6 @@
 //! Long-lived Ed25519 identity per node.
 //!
-//! The same public key is used for libp2p PeerId derivation, governance
+//! The same public key authenticates the backbone connection, governance
 //! signatures, and fault attribution. The keypair never touches subnet
 //! traffic directly — per-subnet keys are bound to this one via signature.
 //! Key/wire formats live in [`crate::keys`].
@@ -9,7 +9,8 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use libp2p_identity::ed25519;
+use commonware_codec::{DecodeExt, Encode};
+use commonware_cryptography::{ed25519, Signer};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use zeroize::Zeroize;
@@ -21,9 +22,9 @@ pub use crate::keys::{ExchangeIdentity, IdentityError, Pubkey};
 /// Carries an associated [`ExchangeIdentity`] (ADCNet's ECDH key and
 /// Panetiere's ML-KEM sealing key). It is persisted at
 /// `identity_path.with_extension("exchange")` so it survives restarts without
-/// changing the Ed25519 PeerId.
+/// changing the Ed25519 identity.
 pub struct Identity {
-    keypair: ed25519::Keypair,
+    keypair: ed25519::PrivateKey,
     exchange: ExchangeIdentity,
 }
 
@@ -31,21 +32,26 @@ impl Identity {
     pub fn generate() -> Self {
         let mut seed = [0u8; 32];
         OsRng.fill_bytes(&mut seed);
-        let secret = ed25519::SecretKey::try_from_bytes(&mut seed)
-            .expect("32 bytes is a valid Ed25519 secret");
+        let keypair =
+            ed25519::PrivateKey::decode(&seed[..]).expect("32 bytes is a valid Ed25519 seed");
         seed.zeroize();
         Identity {
-            keypair: secret.into(),
+            keypair,
             exchange: ExchangeIdentity::generate(),
         }
     }
 
     pub fn pubkey(&self) -> Pubkey {
-        Pubkey(self.keypair.public().to_bytes())
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(self.keypair.public_key().as_ref());
+        Pubkey(bytes)
     }
 
     pub fn sign(&self, msg: &[u8]) -> Vec<u8> {
-        self.keypair.sign(msg)
+        self.keypair
+            .sign(crate::keys::SIGN_NAMESPACE, msg)
+            .encode()
+            .to_vec()
     }
 
     pub fn exchange(&self) -> &ExchangeIdentity {
@@ -69,8 +75,7 @@ impl Identity {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let bytes = self.keypair.secret().as_ref().to_vec();
-        crate::keys::write_secret(path, &bytes)?;
+        crate::keys::write_secret(path, self.keypair.encode().as_ref())?;
         self.exchange.save(&Self::exchange_path(path))?;
         Ok(())
     }
@@ -80,17 +85,14 @@ impl Identity {
         if bytes.len() != 32 {
             return Err(IdentityError::BadSeedLength(bytes.len()));
         }
-        let secret = ed25519::SecretKey::try_from_bytes(&mut bytes)
+        let keypair = ed25519::PrivateKey::decode(&bytes[..])
             .map_err(|e| IdentityError::Decode(e.to_string()))?;
         bytes.zeroize();
         // The seed exists, so this is a restart, not a first run: a missing
         // `.exchange` file is corruption, not "generate a fresh one" — silently
         // rotating it here would break ECDH with every peer that cached the old key.
         let exchange = ExchangeIdentity::load(&Self::exchange_path(path))?;
-        Ok(Identity {
-            keypair: secret.into(),
-            exchange,
-        })
+        Ok(Identity { keypair, exchange })
     }
 
     pub fn load_or_generate(path: &Path) -> Result<Self, IdentityError> {
@@ -103,33 +105,26 @@ impl Identity {
         }
     }
 
-    /// Reconstruct a libp2p [`Keypair`](libp2p_identity::Keypair) backed by
-    /// the same Ed25519 seed as this identity. The two derive identical
-    /// public keys, so PeerId-from-libp2p matches `Pubkey` from anymone.
-    pub fn to_libp2p_keypair(&self) -> libp2p_identity::Keypair {
-        let mut secret_bytes: Vec<u8> = self.keypair.secret().as_ref().to_vec();
-        let secret = libp2p_identity::ed25519::SecretKey::try_from_bytes(&mut secret_bytes)
-            .expect("valid ed25519 secret");
-        secret_bytes.zeroize();
-        let pair: libp2p_identity::ed25519::Keypair = secret.into();
-        libp2p_identity::Keypair::from(pair)
-    }
-
     /// Build the 64-byte expanded form of the Ed25519 signing key that
     /// `adcnet::crypto::PrivateKey` expects (`[seed (32) || pub (32)]`).
     /// adcnet uses `ed25519_dalek::SigningKey`; we go via the same standard
     /// Ed25519 derivation, so the resulting key signs over identical bytes.
     pub fn to_adcnet_signing_key(&self) -> adcnet::crypto::PrivateKey {
         let mut bytes = Vec::with_capacity(64);
-        bytes.extend_from_slice(self.keypair.secret().as_ref());
-        bytes.extend_from_slice(&self.keypair.public().to_bytes());
+        bytes.extend_from_slice(self.keypair.encode().as_ref());
+        bytes.extend_from_slice(self.keypair.public_key().as_ref());
         adcnet::crypto::PrivateKey::from_bytes(&bytes)
     }
 
     /// The Ed25519 public key in adcnet's `PublicKey` wrapper (32 bytes).
     /// Same bytes as [`Self::pubkey`] but wrapped for ADCNet APIs.
     pub fn to_adcnet_public_key(&self) -> adcnet::crypto::PublicKey {
-        adcnet::crypto::PublicKey::from_bytes(&self.keypair.public().to_bytes())
+        adcnet::crypto::PublicKey::from_bytes(self.keypair.public_key().as_ref())
+    }
+
+    /// The signer the transport authenticates connections with.
+    pub fn to_commonware_signer(&self) -> ed25519::PrivateKey {
+        self.keypair.clone()
     }
 }
 
@@ -143,12 +138,8 @@ impl fmt::Debug for Identity {
 
 impl Clone for Identity {
     fn clone(&self) -> Self {
-        let mut bytes: Vec<u8> = self.keypair.secret().as_ref().to_vec();
-        let secret = ed25519::SecretKey::try_from_bytes(&mut bytes)
-            .expect("existing identity has a valid secret");
-        bytes.zeroize();
         Identity {
-            keypair: secret.into(),
+            keypair: self.keypair.clone(),
             exchange: self.exchange.clone(),
         }
     }

@@ -21,6 +21,10 @@ pub enum Registration {
     Relay {
         pubkey: Pubkey,
         exchange_pubkey: ExchangePublicKeyWire,
+        /// `host:port` clients dial to reach this relay off-network. Signed, so
+        /// a peer can't redirect another relay's clients.
+        #[serde(default)]
+        client_addr: Option<String>,
         signature: Vec<u8>, // must match pubkey
     },
     Service {
@@ -29,15 +33,41 @@ pub enum Registration {
         exchange_pubkey: ExchangePublicKeyWire,
         signature: Vec<u8>, // must match pubkey
     },
+    /// A node that only follows the network (observers, dashboards). Carries no
+    /// exchange key: it never takes part in a protocol round, it just needs to
+    /// be reachable, so the committee lists it as a secondary peer.
+    Watcher {
+        pubkey: Pubkey,
+        signature: Vec<u8>, // must match pubkey
+    },
 }
 
 /// Domain-tagged message a relay signs to register: `"anymone-relay" || pubkey
 /// || ecdh_pubkey || kem_pubkey`.
-fn relay_sign_msg(pubkey: &Pubkey, xk: &ExchangePublicKeyWire) -> Vec<u8> {
+fn relay_sign_msg(
+    pubkey: &Pubkey,
+    xk: &ExchangePublicKeyWire,
+    client_addr: Option<&str>,
+) -> Vec<u8> {
     let mut msg = b"anymone-relay".to_vec();
     msg.extend_from_slice(&pubkey.0);
     msg.extend_from_slice(&xk.ecdh);
     msg.extend_from_slice(&xk.kem);
+    // Tagged, so an absent address can't be confused with an empty one.
+    match client_addr {
+        Some(a) => {
+            msg.push(1);
+            msg.extend_from_slice(a.as_bytes());
+        }
+        None => msg.push(0),
+    }
+    msg
+}
+
+/// `"anymone-watcher" || pubkey`.
+fn watcher_sign_msg(pubkey: &Pubkey) -> Vec<u8> {
+    let mut msg = b"anymone-watcher".to_vec();
+    msg.extend_from_slice(&pubkey.0);
     msg
 }
 
@@ -55,12 +85,35 @@ fn service_sign_msg(tag: &ServiceTag, pubkey: &Pubkey, xk: &ExchangePublicKeyWir
 impl Registration {
     /// Build a relay registration signed by `identity`.
     pub fn relay(identity: &Identity, exchange_pubkey: ExchangePublicKeyWire) -> Self {
+        Self::relay_at(identity, exchange_pubkey, None)
+    }
+
+    /// As [`Self::relay`], advertising an address clients dial to reach it.
+    pub fn relay_at(
+        identity: &Identity,
+        exchange_pubkey: ExchangePublicKeyWire,
+        client_addr: Option<String>,
+    ) -> Self {
         let pubkey = identity.pubkey();
-        let signature = identity.sign(&relay_sign_msg(&pubkey, &exchange_pubkey));
+        let signature = identity.sign(&relay_sign_msg(
+            &pubkey,
+            &exchange_pubkey,
+            client_addr.as_deref(),
+        ));
         Registration::Relay {
             pubkey,
             exchange_pubkey,
+            client_addr,
             signature,
+        }
+    }
+
+    /// Build a watcher registration signed by `identity`.
+    pub fn watcher(identity: &Identity) -> Self {
+        let pubkey = identity.pubkey();
+        Registration::Watcher {
+            pubkey,
+            signature: identity.sign(&watcher_sign_msg(&pubkey)),
         }
     }
 
@@ -92,14 +145,21 @@ impl Registration {
             Registration::Relay {
                 pubkey,
                 exchange_pubkey,
+                client_addr,
                 signature,
-            } => pubkey.verify(&relay_sign_msg(pubkey, exchange_pubkey), signature),
+            } => pubkey.verify(
+                &relay_sign_msg(pubkey, exchange_pubkey, client_addr.as_deref()),
+                signature,
+            ),
             Registration::Service {
                 tag,
                 pubkey,
                 exchange_pubkey,
                 signature,
             } => pubkey.verify(&service_sign_msg(tag, pubkey, exchange_pubkey), signature),
+            Registration::Watcher { pubkey, signature } => {
+                pubkey.verify(&watcher_sign_msg(pubkey), signature)
+            }
         }
     }
 }
@@ -116,10 +176,29 @@ pub async fn announce_relay_registration(
     identity: &Identity,
     exchange_pubkey: ExchangePublicKeyWire,
 ) -> JoinHandle<()> {
+    announce_relay_registration_at(transport, identity, exchange_pubkey, None).await
+}
+
+/// As [`announce_relay_registration`], advertising a client-facing address.
+pub async fn announce_relay_registration_at(
+    transport: Arc<dyn Transport>,
+    identity: &Identity,
+    exchange_pubkey: ExchangePublicKeyWire,
+    client_addr: Option<String>,
+) -> JoinHandle<()> {
     spawn_reannounce(
         transport,
-        Registration::relay(identity, exchange_pubkey).encode(),
+        Registration::relay_at(identity, exchange_pubkey, client_addr).encode(),
     )
+}
+
+/// Re-broadcast a watcher registration for the node's lifetime (see
+/// [`announce_relay_registration`]).
+pub async fn announce_watcher_registration(
+    transport: Arc<dyn Transport>,
+    identity: &Identity,
+) -> JoinHandle<()> {
+    spawn_reannounce(transport, Registration::watcher(identity).encode())
 }
 
 /// Re-broadcast a service registration for the node's lifetime (see
