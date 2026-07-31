@@ -1,13 +1,12 @@
 //! INVESTIGATION SCRATCH (delete or fold after diagnosis): live deployment
 //! shows each client silently skipping ~20% of rounds (canonical set 7-11 of
-//! 12) at cover 1.0 on a single aggregated Panetiere subnet. This reproduces
-//! that topology in-memory: 8 relays (2 aggregator groups), 12 subscribe-only
-//! clients, and an observer counting every leader ClientSet.
+//! 12) at cover 1.0 on a single Panetiere subnet. This reproduces that topology
+//! in-memory: 4 relays, 12 subscribe-only clients, and an observer counting
+//! every leader ClientSet.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use anymone_core::config::{Aggregation, AggregatorGroup};
 use anymone_core::{
     Anymone, AnymoneRoundConfiguration, Identity, InMemoryNetwork, PanetiereConfig,
     PanetiereObserverSession, ProtocolConfig, ServiceEntry, ServiceTag, Session,
@@ -19,7 +18,7 @@ fn room_tag() -> ServiceTag {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "wall-clock rounds vs real crypto: meaningful in --release on a quiet machine only"]
-async fn aggregated_subnet_counts_all_clients_every_round() {
+async fn subnet_counts_all_clients_every_round() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -34,17 +33,6 @@ async fn aggregated_subnet_counts_all_clients_every_round() {
         .iter()
         .map(|i| (i.pubkey(), i.exchange_keys()))
         .collect();
-    let aggregation = Aggregation {
-        replication: 1,
-        groups: vec![
-            AggregatorGroup {
-                aggregators: vec![relay_pks[0]],
-            },
-            AggregatorGroup {
-                aggregators: vec![relay_pks[1]],
-            },
-        ],
-    };
     let cfg = AnymoneRoundConfiguration::singleton_subnet(
         0,
         ProtocolConfig::Panetiere(PanetiereConfig {
@@ -58,7 +46,7 @@ async fn aggregated_subnet_counts_all_clients_every_round() {
                 .unwrap_or(16),
             threshold: 2,
             setup_seed: [7u8; 32],
-            aggregation: Some(aggregation),
+            encoding: anymone_core::config::Encoding::default(),
         }),
         relay_pks.clone(),
         relay_xk,

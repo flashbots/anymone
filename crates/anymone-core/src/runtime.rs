@@ -14,7 +14,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::adcnet::AdcnetWatchSession;
 use crate::config::{AnymoneRoundConfiguration, ProtocolConfig, Round, Subnet, SubnetId};
-use crate::faults::Fault;
+use crate::faults::{Attribution, Fault, FaultKind};
 use crate::governance::{FaultReport, GovernanceBootstrap, GovernanceError, TOPIC_FAULTS};
 use crate::identity::{Identity, Pubkey};
 use crate::log_target::{GOV, SCHED, WIRE};
@@ -856,8 +856,8 @@ pub(crate) fn egress_dest(
                 subnet_broadcast_topic(subnet_id)
             }
         }
-        // In an aggregated subnet a client's contribution goes to its aggregator
-        // group's topic instead of ingress (Panetiere openings still go to ingress).
+        // In an aggregated (ADCNet) subnet a client's contribution goes to its
+        // aggregator group's topic instead of ingress.
         SessionKey::Client => match client_agg_topic {
             Some(t) if is_client(bytes) => t.to_string(),
             _ => subnet_ingress_topic(subnet_id),
@@ -950,6 +950,23 @@ pub(crate) async fn drain_inbound(
     }
 }
 
+/// A leader detects a misbehaving relay twice — its session names the lane, its
+/// fault monitor names the inconsistent share — and the committee counts reports
+/// against `fault_grace`, so one node reports a fault once.
+#[derive(Default)]
+pub(crate) struct ReportedFaults(std::collections::HashSet<(Round, FaultKind, Attribution)>);
+
+const FAULT_REPORT_HISTORY: Round = 16;
+
+impl ReportedFaults {
+    fn first_time(&mut self, round: Round, fault: &Fault) -> bool {
+        self.0
+            .retain(|(seen, _, _)| *seen + FAULT_REPORT_HISTORY >= round);
+        self.0
+            .insert((round, fault.kind, fault.attribution.clone()))
+    }
+}
+
 /// Gossip every observed fault for the committee/auditors and surface it locally
 /// on the events stream. Shared by every protocol's subnet driver; each fault
 /// carries its own round since one tick can span faults from different rounds.
@@ -957,9 +974,13 @@ pub(crate) async fn gossip_faults(
     inner: &AnymoneInner,
     subnet_id: SubnetId,
     reporter: Pubkey,
+    reported: &mut ReportedFaults,
     faults: Vec<(Round, Fault)>,
 ) {
     for (round, fault) in faults {
+        if !reported.first_time(round, &fault) {
+            continue;
+        }
         let report = FaultReport {
             round,
             subnet: subnet_id,
@@ -1090,6 +1111,13 @@ fn subnet_subscription_topics(subnet: &Subnet, me: Pubkey) -> Vec<String> {
             topics.push(broadcast);
         }
     }
+    // A Panetiere relay is also lane `j`: it reads only its own lane's coded
+    // shares and the openings sealed to it, so neither is broadcast to all S.
+    if combines {
+        if let Some(lane) = crate::panetiere::server_index(&subnet.relays, me) {
+            topics.push(subnet_lane_topic(subnet.id, lane));
+        }
+    }
     // An aggregator listens on its group topic for client messages, and joins the
     // shares mesh to publish its group aggregate there.
     if let Some(a) = subnet_aggregation(subnet) {
@@ -1104,11 +1132,10 @@ fn subnet_subscription_topics(subnet: &Subnet, me: Pubkey) -> Vec<String> {
     topics
 }
 
-/// Aggregation config for a subnet, if either protocol enabled it.
+/// Aggregation config for a subnet — ADCNet only; Panetiere shards its ingress
+/// across the relay set instead of aggregating it.
 pub(crate) fn subnet_aggregation(subnet: &Subnet) -> Option<&crate::config::Aggregation> {
     match &subnet.protocol {
-        ProtocolConfig::Panetiere(c) => c.aggregation.as_ref(),
-        ProtocolConfig::ScheduledPanetiere(c) => c.aggregation.as_ref(),
         ProtocolConfig::Adcnet(c) => c.aggregation.as_ref(),
         _ => None,
     }
@@ -1155,10 +1182,17 @@ pub fn subnet_broadcast_topic(id: SubnetId) -> String {
     format!("anymone/subnet/{id}")
 }
 
-/// Leader-ingress topic: high-volume client contributions go here, only the
-/// leader subscribes, so that traffic is never gossiped to everyone else.
+/// Ingress topic: client contributions that every combining relay needs. Under
+/// Panetiere that is only the constant-size RS post — the coded shares and the
+/// sealed openings go to one lane each.
 pub fn subnet_ingress_topic(id: SubnetId) -> String {
     format!("anymone/subnet/{id}/ingress")
+}
+
+/// Per-lane topic: relay `lane` reads the coded ciphertext shares and the
+/// openings sealed to it, and nothing addressed to another lane.
+pub fn subnet_lane_topic(id: SubnetId, lane: u32) -> String {
+    format!("anymone/subnet/{id}/lane/{lane}")
 }
 
 /// Shares topic: every relay broadcasts its decryption share here (low volume).
@@ -1177,8 +1211,8 @@ pub fn subnet_uses_ingress(subnet: &Subnet) -> bool {
     )
 }
 
-/// Per-group topic: an aggregator group's clients post their public
-/// ciphertext+commitment here; the group's aggregators subscribe.
+/// Per-group topic: an ADCNet aggregator group's clients post their blinded
+/// contributions here; the group's aggregators subscribe.
 pub fn subnet_aggregator_topic(id: SubnetId, group: u32) -> String {
     format!("anymone/subnet/{id}/agg/{group}")
 }
@@ -1379,8 +1413,9 @@ pub(crate) fn queue_outbound(
 mod outbox_tests {
     use super::*;
     use crate::config::{AnymoneRoundConfiguration, NoopConfig, ProtocolConfig};
+    use crate::config::ScheduledPanetiereConfig;
     use crate::panetiere_scheduled::{
-        sched_channel_params, setup_joint_pp, ReservationEntries, ScheduledPanetiereClientSession,
+        params_for, ReservationEntries, ScheduledPanetiereClientSession,
     };
 
     fn test_inner(relays: Vec<Pubkey>) -> Arc<AnymoneInner> {
@@ -1422,8 +1457,12 @@ mod outbox_tests {
     fn dropped_client_session_requeues_unsent_payloads() {
         let identity = crate::Identity::generate();
         let inner = test_inner(vec![identity.pubkey()]);
-        let mse = sched_channel_params(2, [3u8; 32]);
-        let pp = setup_joint_pp(&mse, 128, 1, [3u8; 32]);
+        let cfg = ScheduledPanetiereConfig {
+            vector_bytes: 128,
+            estimated_messages: 2,
+            ..Default::default()
+        };
+        let (mse, pp) = params_for(&cfg, 1);
 
         let mut session = ScheduledPanetiereClientSession::new(
             pp,

@@ -684,6 +684,8 @@ mod tests {
             services: vec![],
             relay_exchange_keys: vec![],
             subnets: vec![],
+            relay_client_addrs: vec![],
+            watchers: vec![],
         })
     }
 

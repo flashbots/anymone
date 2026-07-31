@@ -5,17 +5,16 @@
 //! (capacity-driven grow/shrink).
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anymone_core::adcnet::{AdcnetClientSession, AdcnetServerSession};
 use anymone_core::config::{
-    AdcnetConfig, AnymoneRoundConfiguration, AnymoneRoundConfigurationBody, ExchangePublicKeyWire,
-    NoopConfig, ProtocolConfig,
+    AdcnetConfig, AnymoneRoundConfiguration, AnymoneRoundConfigurationBody, Encoding,
+    ExchangePublicKeyWire, NoopConfig, PanetiereConfig, ProtocolConfig,
 };
 use anymone_core::faults::{Attribution, Fault, FaultKind};
 use anymone_core::panetiere::{
-    PanetiereClientSession, PanetiereObserverSession, PanetiereServerSession, SetMode,
+    params_for, PanetiereClientSession, PanetiereObserverSession, PanetiereServerSession, SetMode,
 };
 use anymone_core::scheduler_core::{
     CommitteeSig, SchedulerAction, SchedulerCore, SchedulerParams, SignedProposal,
@@ -25,11 +24,7 @@ use anymone_core::{FaultReport, Identity, Pubkey, Registration, ServiceTag, TOPI
 
 use adcnet::crypto::{ServerId, SharedKey};
 use adcnet::protocol::session::one_round::{IbltMsgParamsOwned, OneRoundConfig};
-use panetiere::channel::ChannelParams;
-use panetiere::mse::{MseEncoding, MseParams};
-use panetiere::protocol::{ProtocolParams, ServerId as PanServerId};
-use rand::SeedableRng;
-use rand_chacha::ChaCha20Rng;
+use panetiere::protocol::ServerId as PanServerId;
 
 fn xkw(id: &Identity) -> ExchangePublicKeyWire {
     id.exchange_keys()
@@ -103,6 +98,7 @@ fn lead_core(committee: &[Identity], threshold: u32) -> SchedulerCore {
             pin: None,
             vector_bytes: 0,
             aggregation: true,
+            encoding: anymone_core::config::Encoding::default(),
         },
     )
 }
@@ -140,6 +136,7 @@ fn lead_core_msg_size(
             pin: None,
             vector_bytes: 0,
             aggregation: true,
+            encoding: anymone_core::config::Encoding::default(),
         },
     )
 }
@@ -198,12 +195,6 @@ fn renegotiates_adcnet_panetiere_adcnet() {
     assert_eq!(proto_name(&body), "panetiere");
     assert_eq!(body.subnets[0].relays.len(), 2);
     assert!(!body.subnets[0].relays.contains(&victim));
-    // No observed traffic ⇒ capacity sits at the floor (≤ 16), so the aggregator
-    // layer stays off.
-    match &body.subnets[0].protocol {
-        ProtocolConfig::Panetiere(c) => assert!(c.aggregation.is_none()),
-        _ => unreachable!(),
-    }
 
     // Victim re-registers → heal → back to optimistic ADCNet with 3 relays.
     core.on_registration(Registration::relay(&relays[1], xkw(&relays[1])));
@@ -237,6 +228,7 @@ fn renegotiates_adcnet_panetiere_adcnet() {
             pin: Some(anymone_core::SchedulerProtocol::Panetiere),
             vector_bytes: 0,
             aggregation: true,
+            encoding: anymone_core::config::Encoding::default(),
         },
     );
     let pinned_relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
@@ -291,6 +283,7 @@ fn renegotiates_adcnet_panetiere_adcnet() {
             pin: Some(anymone_core::SchedulerProtocol::Panetiere),
             vector_bytes: 0,
             aggregation: true,
+            encoding: anymone_core::config::Encoding::default(),
         },
     );
     register_relays_and_service(&mut reporting, &pinned_relays, &pinned_service);
@@ -446,6 +439,7 @@ fn multisig_assembles_via_committee_sig() {
         pin: None,
         vector_bytes: 0,
         aggregation: true,
+        encoding: anymone_core::config::Encoding::default(),
     };
     let mut core = SchedulerCore::new(lead.clone(), pks.clone(), 2, params.clone());
 
@@ -589,6 +583,7 @@ fn non_lead_core_never_stages() {
             pin: None,
             vector_bytes: 0,
             aggregation: true,
+            encoding: anymone_core::config::Encoding::default(),
         },
     );
     assert!(!core.is_lead());
@@ -759,6 +754,7 @@ fn live_core(committee: &[Identity]) -> SchedulerCore {
             pin: None,
             vector_bytes: 0,
             aggregation: true,
+            encoding: anymone_core::config::Encoding::default(),
         },
     )
 }
@@ -803,6 +799,7 @@ fn committee_schedules_second_subnet_when_one_nears_capacity() {
                 pin: None,
                 vector_bytes: 0,
                 aggregation: false,
+                encoding: anymone_core::config::Encoding::default(),
             },
         )
     };
@@ -886,10 +883,6 @@ fn committee_schedules_second_subnet_when_one_nears_capacity() {
     assert!(
         matches!(mixed.subnets[1].protocol, ProtocolConfig::Panetiere(_)),
         "faulted subnet 1 escalates to Panetiere"
-    );
-    assert!(
-        mixed.subnets[1].protocol.aggregation().is_some(),
-        "capacity above threshold should aggregate by default"
     );
 }
 
@@ -1240,16 +1233,16 @@ struct PanetiereSubnet {
 impl PanetiereSubnet {
     fn new(relay_ids: &[Identity], server2_misbehavior: Option<Misbehavior>) -> Self {
         let n = relay_ids.len();
-        let mut setup_rng = ChaCha20Rng::from_seed([7u8; 32]);
         // One real sender per round (the rest of the demo's clients re-home
-        // elsewhere); MSE sized to that.
-        let mse = ChannelParams::from_mse(MseParams::new(4, 1, 32, [0xAA; 32]));
-        let n_polys = mse.n_polys();
-        let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(
-            &mut setup_rng,
-            n,
-            n_polys,
-        ));
+        // elsewhere); the channel is sized to that.
+        let cfg = PanetiereConfig {
+            message_size: 128,
+            estimated_messages: 1,
+            client_set_max: 8,
+            encoding: Encoding::Mse,
+            ..Default::default()
+        };
+        let (mse, pp) = params_for(&cfg, n);
         let server_ids: Vec<PanServerId> = (0..n as u32).map(PanServerId).collect();
 
         let mut sorted = relay_ids.to_vec();
@@ -1283,9 +1276,7 @@ impl PanetiereSubnet {
                     } else {
                         SetMode::SelfDerived
                     },
-                    0,
                     server_pubkeys.clone(),
-                    None,
                 )
             })
             .collect();
@@ -1461,12 +1452,11 @@ fn escalated_panetiere_core(
     core
 }
 
-/// Approach B: the committee acts on a leader's integrity `FaultReport` only when
-/// it comes from the subnet leader AND the committee re-verifies the evidence
-/// itself — so a corrupt-share relay is sidelined, but a lying leader can't frame
-/// an honest one.
+/// Approach B: the committee acts on an integrity `FaultReport` from any relay on
+/// the subnet, but only when it re-verifies the evidence itself — so a
+/// corrupt-share relay is sidelined, and a lying reporter can't frame an honest one.
 #[test]
-fn committee_acts_on_verified_leader_integrity_report() {
+fn committee_acts_on_verified_integrity_report() {
     let committee: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
     let relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
     let service = Identity::generate();
@@ -1545,7 +1535,7 @@ fn committee_acts_on_verified_leader_integrity_report() {
         "a replayed fault report must not refresh the offender's backoff timer"
     );
 
-    // A report from a non-leader is ignored (forced re-propose keeps all 3 relays).
+    // A follower decodes the same round, so its verified report also sidelines.
     let mut core = escalated_panetiere_core(&committee, &relays, &service);
     core.on_fault_report(
         honest_pk,
@@ -1553,6 +1543,22 @@ fn committee_acts_on_verified_leader_integrity_report() {
             round: 5,
             subnet: 0,
             reporter: honest_pk,
+            fault: fault.clone(),
+        },
+        0,
+    );
+    core.set_cover_rate(0.5);
+    let body = staged_body(&core.tick(2, 0)).expect("cover change re-proposes");
+    assert!(!body.subnets[0].relays.contains(&corrupt_pk));
+
+    // A report from outside the subnet's roster is ignored.
+    let mut core = escalated_panetiere_core(&committee, &relays, &service);
+    core.on_fault_report(
+        service.pubkey(),
+        FaultReport {
+            round: 5,
+            subnet: 0,
+            reporter: service.pubkey(),
             fault: fault.clone(),
         },
         0,
@@ -1710,6 +1716,7 @@ fn sustained_traffic_upgrades_to_scheduled_panetiere() {
             pin: Some(anymone_core::scheduling::SchedulerProtocol::ScheduledPanetiere),
             vector_bytes: 0,
             aggregation: true,
+            encoding: anymone_core::config::Encoding::default(),
         },
     );
     register_relays_and_service(&mut pinned, &relays, &service);

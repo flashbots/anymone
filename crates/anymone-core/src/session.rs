@@ -16,8 +16,8 @@ use crate::config::{Aggregation, Round};
 use crate::faults::Fault;
 use crate::identity::Pubkey;
 
-/// A leader's view of an aggregator layer: which pubkeys may sign each group's
-/// aggregate. Shared by both protocols' leaders.
+/// An ADCNet leader's view of the aggregator layer: which pubkeys may sign each
+/// group's aggregate.
 pub struct LeaderAggregation {
     pub roster: HashMap<u32, Vec<Pubkey>>,
 }

@@ -19,8 +19,7 @@ use crate::governance::{FaultReport, TOPIC_FAULTS, TOPIC_REGISTRATION};
 use crate::identity::{Identity, Pubkey};
 use crate::log_target::GOV;
 use crate::panetiere::{
-    channel_params, setup_pp, PanetiereClientSession, PanetiereServerSession, SetMode,
-    COMMITTEE_MSG_BYTES,
+    params_for, PanetiereClientSession, PanetiereServerSession, SetMode, COMMITTEE_MSG_BYTES,
 };
 use crate::scheduler_core::{SchedulerAction, SchedulerCore, SchedulerParams};
 use crate::scheduling::Registration;
@@ -112,8 +111,10 @@ pub struct PanetiereCommitteeConfig {
     /// traffic-driven scheduled upgrade. `None` keeps the default
     /// ADCNet-unless-escalated behavior with the upgrade live.
     pub protocol: Option<String>,
-    /// Whether large Panetiere subnets may route through an aggregator layer.
+    /// Whether large ADCNet subnets may route through an aggregator layer.
     pub aggregation: bool,
+    /// Payload encoding for every Panetiere channel, the committee's included.
+    pub encoding: crate::config::Encoding,
     /// Per-message byte bound of the committee's config-anonymising channel;
     /// must fit the largest proposal it will carry and MATCH across members.
     pub committee_msg_bytes: usize,
@@ -137,6 +138,7 @@ impl Default for PanetiereCommitteeConfig {
             cover_rate: Arc::new(AtomicU32::new(1.0f32.to_bits())),
             protocol: None,
             aggregation: true,
+            encoding: crate::config::Encoding::default(),
             committee_msg_bytes: COMMITTEE_MSG_BYTES,
             vector_bytes: 0,
         }
@@ -170,8 +172,10 @@ pub struct CommitteeParams {
     /// "scheduled-panetiere"); absent or unrecognized keeps the default
     /// ADCNet-unless-escalated ladder. See [`PanetiereCommitteeConfig::protocol`].
     pub protocol: Option<String>,
-    /// Whether large Panetiere subnets may route through an aggregator layer.
+    /// Whether large ADCNet subnets may route through an aggregator layer.
     pub aggregation: bool,
+    /// See [`PanetiereCommitteeConfig::encoding`].
+    pub encoding: crate::config::Encoding,
     /// See [`PanetiereCommitteeConfig::committee_msg_bytes`].
     pub committee_msg_bytes: usize,
     /// See [`PanetiereCommitteeConfig::vector_bytes`].
@@ -195,6 +199,7 @@ impl Default for CommitteeParams {
             min_capacity: crate::scheduler_core::INITIAL_CAPACITY,
             protocol: None,
             aggregation: true,
+            encoding: crate::config::Encoding::default(),
             committee_msg_bytes: COMMITTEE_MSG_BYTES,
             vector_bytes: 0,
         }
@@ -219,6 +224,7 @@ impl CommitteeParams {
             cover_rate: Arc::new(AtomicU32::new(1.0f32.to_bits())),
             protocol: self.protocol,
             aggregation: self.aggregation,
+            encoding: self.encoding,
             committee_msg_bytes: self.committee_msg_bytes,
             vector_bytes: self.vector_bytes,
         }
@@ -279,10 +285,19 @@ pub async fn spawn_panetiere_committee_scheduler(
     }
 
     // Committee-anonymisation Panetiere parameters, derived deterministically.
-    // ρ=3: a malicious member can't overwrite the lead's config in the IBLT.
-    let setup_seed = crate::keys::derive_seed(b"anymone/committee-seed", &committee);
-    let committee_mse = channel_params(3, config.committee_msg_bytes, setup_seed);
-    let pp = setup_pp(&committee_mse, committee.len(), setup_seed);
+    let n = committee.len();
+    let committee_cfg = crate::config::PanetiereConfig {
+        round_duration_ms: config.committee_round_duration.as_millis() as u64,
+        message_size: config.committee_msg_bytes,
+        estimated_messages: n as u32,
+        client_set_min: 1,
+        // Clients here are the members themselves.
+        client_set_max: n as u32,
+        threshold: (n as u32) / 2 + 1,
+        setup_seed: crate::keys::derive_seed(b"anymone/committee-seed", &committee),
+        encoding: config.encoding,
+    };
+    let (committee_mse, pp) = params_for(&committee_cfg, n);
     let mut sorted_committee = committee.clone();
     sorted_committee.sort();
     let our_pk = identity.pubkey();
@@ -332,6 +347,7 @@ pub async fn spawn_panetiere_committee_scheduler(
         min_capacity: config.min_capacity,
         pin,
         aggregation: config.aggregation,
+        encoding: config.encoding,
         vector_bytes: config.vector_bytes,
     };
 
@@ -360,9 +376,7 @@ pub async fn spawn_panetiere_committee_scheduler(
             // Leaderless, all-to-all: every member derives its own set and decodes
             // locally; no announcer, no Decoded on the committee topic.
             SetMode::SelfDerived,
-            0,
             committee_server_pubkeys,
-            None, // committee runs the direct flow, never aggregated
         );
         // Clients here are committee members themselves — bounded by committee size.
         server_session_inner.set_client_set_max(committee.len());

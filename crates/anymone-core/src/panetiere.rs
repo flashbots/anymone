@@ -1,57 +1,73 @@
-//! Panetiere `Session` wrappers.
+//! Panetiere `Session` wrappers, over RS-sharded ingress: the ciphertext never
+//! reaches a shared topic. A client posts a constant-size bulletin entry and
+//! sends relay `j` its own coded share of the ciphertext, so relays double as
+//! erasure-coding lanes and any `k` lane sums reconstruct `Σ ct`.
 //!
-//! Topic layout matches ADCNet: client messages on ingress (every relay reads —
-//! all of them combine), `ServerPublic`s on shares, the leader's `Decoded` on
-//! broadcast. Openings are sealed to their target server: ≥t plaintext openings
-//! reconstruct the client's message.
+//! Topics: the post on ingress (every relay reads — all of them combine), the
+//! coded share and the opening sealed to relay `j` on lane `j`, `ServerPublic`s
+//! (key share + lane sum, one message) on shares, the leader's `Decoded` on
+//! broadcast. ≥t openings reconstruct `Σ sk`, k lane sums reconstruct `Σ ct`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use chipmunk_code::{CsPoly, KahePoly};
-use panetiere::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
-use panetiere::channel::{self, ChannelParams};
+use chipmunk_code::{CsPoly, DgtNTTPoly, HVCPoly, KahePoly};
+use panetiere::bulletin::{
+    dgt_packed_len, RsClientBulletinEntry, RsNodeBulletinEntry, ServerBulletinEntry,
+};
+use panetiere::channel::{self, ChannelError, ChannelParams};
 use panetiere::cs::{Opening, PackedOpening};
 use panetiere::pke;
-use panetiere::protocol::aggregator::run_aggregator_round;
-use panetiere::protocol::client::run_client_round;
-use panetiere::protocol::recipient::{
-    recover_aggregated, recover_direct, CandidateRejection, RecipientError, SetPolicy,
+use panetiere::prony::PronyError;
+use panetiere::protocol::client::run_client_round_rs;
+use panetiere::protocol::server::{
+    run_rs_node_round, run_server_round, unseal_opening, RsNodeInbox, ServerInbox,
 };
-use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
+use panetiere::protocol::verify::{aggregate_and_decrypt_rs, VerifyError};
+use panetiere::share_commitment::{
+    fresh_path_packed_len, lane_post_packed_len, ShareOpening, SharePath,
+};
+use panetiere::sig;
 
 use panetiere::protocol::{
-    message_polys, round_wire_sizes, ClientId, ProtocolParams, ServerId, SessionId,
+    message_polys, round_wire_sizes, ClientId, NodeId, ProtocolParams, ServerId, SessionId,
 };
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::config::{ExchangePublicKeyWire, PanetiereConfig, ProtocolConfig, Round, Subnet};
+use crate::config::{
+    Encoding, ExchangePublicKeyWire, PanetiereConfig, ProtocolConfig, Round, Subnet,
+};
 use crate::faults::{Attribution, Fault, FaultKind, OutputFaultTracker};
 use crate::identity::{Identity, Pubkey};
 use crate::log_target::{PANETIERE, SCHED};
 use crate::runtime::{
-    aggregator_group_of, client_aggregator_topic, deadline_for, egress_dest, gossip_faults,
-    handle_inbound, publish_and_loop_back, recv_any, round_at, route_to_pipe, subnet_aggregation,
-    subnet_leader_pk, AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
+    deadline_for, gossip_faults, handle_inbound, publish_and_loop_back, recv_any,
+    round_at, route_to_pipe, subnet_leader_pk, AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
 };
-use crate::session::{GoodClients, LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
+use crate::session::{GoodClients, Misbehavior, PeerId, RoundOutcome, Session};
 use crate::transport::Subscription;
 
 /// Channel sizing for a subnet carrying up to `rho` real messages of
-/// `message_bytes` each. `prf_key` is domain-separated from the shared
-/// `setup_seed` so all participants agree.
+/// `message_bytes` each. The MSE prf key is domain-separated from the shared
+/// `setup_seed` so all participants agree; Prony needs no key.
 pub(crate) fn channel_params(
     rho: u32,
     message_bytes: usize,
     setup_seed: [u8; 32],
+    encoding: Encoding,
 ) -> ChannelParams {
-    let mut prf_key = setup_seed;
-    prf_key[0] ^= 0x5C;
-    ChannelParams::for_messages(rho, message_bytes, prf_key)
+    match encoding {
+        Encoding::Prony => ChannelParams::prony_for_messages(rho, message_bytes),
+        Encoding::Mse => {
+            let mut prf_key = setup_seed;
+            prf_key[0] ^= 0x5C;
+            ChannelParams::for_messages(rho, message_bytes, prf_key)
+        }
+    }
 }
 
 /// Message-byte bound for the committee's config-anonymising channel. Must fit
@@ -60,37 +76,51 @@ pub(crate) fn channel_params(
 /// `scheduler_core::sizing_tests`, which measured 35940 bytes there.
 ///
 /// A proposal grows ~2 KB per placed relay: its 1184-byte ML-KEM encapsulation
-/// key and 33-byte ECDH point, plus its pubkey in every subnet roster and
-/// aggregator group. Raising `MAX_COMMITTEE_RELAYS` means raising this, and it
-/// must match across members.
+/// key and 33-byte ECDH point, plus its pubkey in every subnet roster. Raising
+/// `MAX_COMMITTEE_RELAYS` means raising this, and it must match across members.
 pub const COMMITTEE_MSG_BYTES: usize = 36864;
 
-/// Per-subnet Panetiere parameters. The KAHE width is exactly one packed
-/// encoding, which `ChannelParams` derives.
-pub(crate) fn setup_pp(
-    params: &ChannelParams,
-    n_servers: usize,
-    setup_seed: [u8; 32],
-) -> Arc<ProtocolParams> {
-    let mut rng = ChaCha20Rng::from_seed(setup_seed);
-    Arc::new(params.protocol_params(&mut rng, n_servers))
+/// Lane code rate: `k = t`, the Shamir threshold, so the lanes and the key
+/// shares tolerate the same failure count `f`. Fix `f`, not `k` — raising `n`
+/// must raise `k` with it or the rate silently degrades.
+pub fn rs_k(n: usize) -> usize {
+    (n / 2 + 1).max(n.saturating_sub(2)).min(n).max(1)
 }
 
-/// `client_id % groups` is never re-drawn, so an even share turns the busiest
-/// bin away every round for as long as that roster lasts.
-pub(crate) const AGGREGATOR_GROUP_SLACK: u32 = 2;
-
-pub(crate) fn aggregator_group_allowance(client_set_max: u32, groups: u32) -> usize {
-    client_set_max
-        .div_ceil(groups.max(1))
-        .saturating_mul(AGGREGATOR_GROUP_SLACK)
-        .max(1) as usize
+/// Channel and RS protocol params together, so nothing can pair a channel with
+/// params sized for a different one. `rho_max` bounds a lane's aggregate over the
+/// whole client set, so it is `client_set_max` and not `estimated_messages`.
+pub fn params_for(cfg: &PanetiereConfig, n_servers: usize) -> (ChannelParams, Arc<ProtocolParams>) {
+    let ch = channel_params(
+        cfg.estimated_messages,
+        cfg.message_size,
+        cfg.setup_seed,
+        cfg.encoding,
+    );
+    let mut rng = ChaCha20Rng::from_seed(cfg.setup_seed);
+    let mut pp = ProtocolParams::setup_rs_mode(
+        &mut rng,
+        n_servers,
+        ch.n_polys(),
+        rs_k(n_servers),
+        n_servers,
+        ch.plaintext_modulus(),
+        cfg.client_set_max.max(1) as usize,
+        cfg.setup_seed,
+    );
+    pp.min_clients = cfg.client_set_min.max(1) as usize;
+    (ch, Arc::new(pp))
 }
 
-/// Every group full: a frozen group sum can't be truncated, so this and not
-/// `client_set_max` is what the announced set can reach.
-pub(crate) fn aggregated_client_set_bound(client_set_max: u32, groups: u32) -> u32 {
-    (aggregator_group_allowance(client_set_max, groups) as u32).saturating_mul(groups.max(1))
+/// Wire length of one lane's `ClientSlice` payload halves, under `pp`'s geometry.
+fn slice_wire_lens(pp: &ProtocolParams) -> (usize, usize) {
+    let Some(scp) = pp.share_comm.as_ref() else {
+        return (0, 0);
+    };
+    (
+        scp.block_len * dgt_packed_len(),
+        fresh_path_packed_len(scp.n_lanes),
+    )
 }
 
 /// Conservative upper bound on the largest per-round wire message a Panetiere
@@ -101,14 +131,41 @@ pub(crate) fn max_wire_estimate(
     estimated_messages: u32,
     client_set_max: u32,
     n_relays: usize,
+    encoding: Encoding,
+) -> usize {
+    let ch = channel_params(estimated_messages, message_size, [0u8; 32], encoding);
+    rs_wire_estimate(
+        ch.n_polys(),
+        estimated_messages as usize * message_size,
+        client_set_max,
+        n_relays,
+    )
+}
+
+/// Largest per-round message under RS ingress. The client post is constant, so
+/// the biggest client-side message is one lane's coded share; the biggest relay
+/// message carries both halves of a `ServerPublic`.
+pub(crate) fn rs_wire_estimate(
+    n_polys: usize,
+    decoded_bytes: usize,
+    client_set_max: u32,
+    n_relays: usize,
 ) -> usize {
     const FRAMING: usize = 512;
-    let ch = channel_params(estimated_messages, message_size, [0u8; 32]);
-    let w = round_wire_sizes(n_relays.max(1), ch.n_polys(), client_set_max);
-    let client_public = w.client_post + FRAMING;
-    let server_public = w.server_entry + client_set_max as usize * 4 + FRAMING;
-    let decoded = estimated_messages as usize * message_size + FRAMING;
-    client_public.max(server_public).max(decoded)
+    let n = n_relays.max(1);
+    let rho = client_set_max.max(1);
+    let block = panetiere::rs::RsParams::new(rs_k(n), n).block_len(n_polys);
+    let w = round_wire_sizes(n, n_polys, rho);
+    let client_public = RsClientBulletinEntry::packed_len() + FRAMING;
+    let slice = block * dgt_packed_len() + fresh_path_packed_len(n) + FRAMING;
+    let server_public = w.server_entry
+        + lane_post_packed_len(block, n, rho as usize)
+        + rho as usize * 4
+        + FRAMING;
+    client_public
+        .max(slice)
+        .max(server_public)
+        .max(decoded_bytes + FRAMING)
 }
 
 /// Panetière `sid` for one round of one subnet. The round must stay in the
@@ -134,11 +191,6 @@ pub(crate) fn server_index(relays: &[Pubkey], pk: Pubkey) -> Option<u32> {
 /// so the decoder merges a round's publics with its openings.
 pub fn client_id_from_pubkey(pk: Pubkey) -> ClientId {
     ClientId(u32::from_be_bytes([pk.0[0], pk.0[1], pk.0[2], pk.0[3]]))
-}
-
-/// Wire length of a `ClientBulletinEntry` under `pp`'s geometry.
-pub(crate) fn entry_wire_len(pp: &Arc<ProtocolParams>) -> usize {
-    ClientBulletinEntry::packed_len(message_polys(pp))
 }
 
 /// Panetiere `(ServerId, pke::PublicKey)` roster for sealing client openings —
@@ -200,8 +252,6 @@ fn server_session(
         .enumerate()
         .map(|(i, pk)| (ServerId(i as u32), pk))
         .collect();
-    // Every relay needs the aggregator roster; only the leader emits the decode.
-    let aggregation = cfg.aggregation.as_ref().map(LeaderAggregation::from_config);
     let mode = if identity_pk == leader_pk {
         SetMode::Leader
     } else {
@@ -213,9 +263,7 @@ fn server_session(
         server_id,
         identity.clone(),
         mode,
-        cfg.client_set_min,
         server_pubkeys,
-        aggregation,
     );
     session.set_client_set_max(cfg.client_set_max as usize);
     session.set_setup_seed(cfg.setup_seed);
@@ -240,10 +288,8 @@ pub(crate) async fn run_subnet(
         _ => unreachable!("panetiere::run_subnet on a non-Panetiere subnet"),
     };
     let identity_pk = inner.identity.pubkey();
-    let mse = channel_params(cfg.estimated_messages, cfg.message_size, cfg.setup_seed);
-    let pp = setup_pp(&mse, subnet.relays.len(), cfg.setup_seed);
+    let (mse, pp) = params_for(&cfg, subnet.relays.len());
     let leader_pk = subnet_leader_pk(&subnet);
-    let client_agg_topic = client_aggregator_topic(&subnet, identity_pk);
 
     let mut sessions: HashMap<SessionKey, Box<dyn Session>> = HashMap::new();
     let mut cover_rate = subnet.cover_rate;
@@ -267,22 +313,6 @@ pub(crate) async fn run_subnet(
             Box::new(PanetiereWatchSession::new(leader_pk)),
         );
     }
-    if let Some(a) = subnet_aggregation(&subnet) {
-        if let Some(group) = aggregator_group_of(a, identity_pk) {
-            let mut agg_session = PanetiereAggregatorSession::new(
-                group,
-                a.groups.len() as u32,
-                inner.identity.clone(),
-            );
-            agg_session.set_client_set_max(aggregator_group_allowance(
-                cfg.client_set_max,
-                a.groups.len() as u32,
-            ));
-            agg_session.set_entry_len(entry_wire_len(&pp));
-            agg_session.set_good_clients(inner.good_clients.clone());
-            sessions.insert(SessionKey::Aggregator, Box::new(agg_session));
-        }
-    }
     let mut fault_monitor: Option<Box<dyn Session>> = if leader_pk == identity_pk {
         let mut roster = subnet.relays.clone();
         roster.sort();
@@ -295,27 +325,10 @@ pub(crate) async fn run_subnet(
         None
     };
 
-    let egress = |key: &SessionKey, bytes: &[u8]| {
-        egress_dest(
-            subnet.id,
-            true,
-            is_shares_topic_msg,
-            is_client_public,
-            client_agg_topic.as_deref(),
-            key,
-            bytes,
-        )
-    };
+    let egress = |_key: &SessionKey, bytes: &[u8]| crate::panetiere::egress(subnet.id, bytes);
 
     let dur_ms = (subnet.protocol.round_duration().as_millis() as u64).max(1);
-    // Aggregated subnets get a third checkpoint between mid and end (2/3, 1/3);
-    // direct subnets keep mid at 1/2 with commit coinciding with (a no-op at) end.
-    let aggregated_subnet = subnet_aggregation(&subnet).is_some();
-    let (mid_offset_ms, commit_offset_ms) = if aggregated_subnet {
-        (2 * dur_ms / 3, dur_ms / 3)
-    } else {
-        (dur_ms / 2, 0)
-    };
+    let (mid_offset_ms, commit_offset_ms) = (dur_ms / 2, 0);
 
     if armed
         && !crate::runtime::arm_until_cutover(
@@ -342,7 +355,6 @@ pub(crate) async fn run_subnet(
         round,
         relay = subnet.relays.contains(&identity_pk),
         leader = leader_pk == identity_pk,
-        aggregated = aggregated_subnet,
         dur_ms,
         "panetiere worker: start"
     );
@@ -391,6 +403,7 @@ pub(crate) async fn run_subnet(
         .await;
     }
 
+    let mut reported = crate::runtime::ReportedFaults::default();
     loop {
         tokio::select! {
             biased;
@@ -472,7 +485,7 @@ pub(crate) async fn run_subnet(
                     .map(|f| (evidence_round(&f.evidence).unwrap_or(round), f))
                     .collect();
                 if round >= spawn_round + crate::runtime::RECONFIG_FAULT_GRACE {
-                    gossip_faults(&inner, subnet.id, identity_pk, faults).await;
+                    gossip_faults(&inner, subnet.id, identity_pk, &mut reported, faults).await;
                 }
 
                 if final_round.is_some_and(|f| round >= f) {
@@ -566,11 +579,27 @@ pub(crate) enum PanetiereWire {
     ClientPublic {
         round: u64,
         client_id: u32,
-        /// Bit-packed `ClientBulletinEntry` (ciphertext + commitment).
+        /// Bit-packed `RsClientBulletinEntry`: the key-share commitment, the root
+        /// over the `n` coded shares, and the client's P-256 signature over both.
+        /// Constant size in the message length — the point of the mode.
         #[serde(with = "serde_bytes")]
         entry: Vec<u8>,
         /// `client_id` must derive from this. Carried in-message because a relay
         /// forwards client wire, so the transport peer isn't the origin.
+        signer: Pubkey,
+        #[serde(with = "serde_bytes")]
+        signature: Vec<u8>,
+    },
+    /// One coded ciphertext share for lane `lane`, with that lane's opening of
+    /// the client's share-commitment root. Rides the lane's own topic.
+    ClientSlice {
+        round: u64,
+        client_id: u32,
+        lane: u32,
+        #[serde(with = "serde_bytes")]
+        share: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        path: Vec<u8>,
         signer: Pubkey,
         #[serde(with = "serde_bytes")]
         signature: Vec<u8>,
@@ -588,6 +617,10 @@ pub(crate) enum PanetiereWire {
         #[serde(with = "serde_bytes")]
         signature: Vec<u8>,
     },
+    /// Relay `server_id`'s whole contribution for the round, over exactly
+    /// `clients`: the summed Shamir key share, and — since every relay is also
+    /// lane `server_id` — that lane's summed ciphertext share. Both are
+    /// all-or-nothing over the same set, so they travel and verify together.
     ServerPublic {
         round: u64,
         server_id: u32,
@@ -598,6 +631,14 @@ pub(crate) enum PanetiereWire {
         /// Bit-packed κ_kahe CsPoly shares (count = the packed `mu_cs`).
         #[serde(with = "serde_bytes")]
         agg_share: Vec<u8>,
+        /// Positional sum of this lane's coded shares — what RS reconstruction
+        /// consumes in place of a bulletin full of ciphertexts.
+        #[serde(with = "serde_bytes")]
+        share_sum: Vec<u8>,
+        /// The summed share-commitment opening proving `share_sum` against
+        /// `Σ share_root` at this lane's position.
+        #[serde(with = "serde_bytes")]
+        lane_open: Vec<u8>,
         /// By `roster[server_id]` over [`server_public_signing_bytes`] —
         /// attribution binds to the key, not the self-declared slot.
         #[serde(with = "serde_bytes")]
@@ -606,19 +647,6 @@ pub(crate) enum PanetiereWire {
     /// Decoded round result, published on broadcast by the subnet leader only
     /// (every relay decodes; one publishes).
     Decoded { round: u64, payloads: Vec<Vec<u8>> },
-    /// One aggregator group's summed public ciphertext+commitment, signed.
-    /// Replicas in a group emit identical bytes (1-of-n liveness).
-    GroupAggregate {
-        round: u64,
-        group: u32,
-        clients: Vec<u32>,
-        /// Bit-packed `ClientBulletinEntry` (Σ ctxt + Σ comm over the group).
-        #[serde(with = "serde_bytes")]
-        entry: Vec<u8>,
-        signer: Pubkey,
-        #[serde(with = "serde_bytes")]
-        signature: Vec<u8>,
-    },
     /// Leader-announced canonical client set for `round` (public subnets). Relays
     /// share over exactly this set; one authoritative set per round.
     ClientSet {
@@ -643,8 +671,8 @@ impl PanetiereWire {
             PanetiereWire::ClientPublic { round, .. }
             | PanetiereWire::Opening { round, .. }
             | PanetiereWire::ServerPublic { round, .. }
+            | PanetiereWire::ClientSlice { round, .. }
             | PanetiereWire::Decoded { round, .. }
-            | PanetiereWire::GroupAggregate { round, .. }
             | PanetiereWire::ClientSet { round, .. }
             | PanetiereWire::Reservations { round, .. } => *round,
         }
@@ -693,17 +721,22 @@ pub(crate) async fn drain_inbound_upto(
 
 /// Bytes a relay signs over its `ServerPublic` (and every consumer verifies
 /// against `roster[server_id]`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn server_public_signing_bytes(
     round: u64,
     server_id: u32,
     clients: &[u32],
     agg_open: &[u8],
     agg_share: &[u8],
+    share_sum: &[u8],
+    lane_open: &[u8],
 ) -> Vec<u8> {
     let mut m = b"anymone/panetiere/server-public".to_vec();
     m.extend_from_slice(
-        &bincode::serialize(&(round, server_id, clients, agg_open, agg_share))
-            .expect("serialise signing bytes"),
+        &bincode::serialize(&(
+            round, server_id, clients, agg_open, agg_share, share_sum, lane_open,
+        ))
+        .expect("serialise signing bytes"),
     );
     m
 }
@@ -730,17 +763,56 @@ pub(crate) fn client_opening_signing_bytes(
     m
 }
 
-/// Bytes an aggregator signs over (and the leader verifies): the round, group,
-/// sorted client ids, and the packed aggregate entry.
-fn group_aggregate_signing_bytes(round: u64, group: u32, clients: &[u32], entry: &[u8]) -> Vec<u8> {
-    let mut m = Vec::with_capacity(12 + clients.len() * 4 + entry.len());
-    m.extend_from_slice(&round.to_le_bytes());
-    m.extend_from_slice(&group.to_le_bytes());
-    for c in clients {
-        m.extend_from_slice(&c.to_le_bytes());
-    }
-    m.extend_from_slice(entry);
+pub(crate) fn client_slice_signing_bytes(
+    round: u64,
+    client_id: u32,
+    lane: u32,
+    share: &[u8],
+    path: &[u8],
+) -> Vec<u8> {
+    let mut m = b"anymone/panetiere/client-slice".to_vec();
+    m.extend_from_slice(
+        &bincode::serialize(&(round, client_id, lane, share, path))
+            .expect("serialise signing bytes"),
+    );
     m
+}
+
+/// One lane's slice message, signed by the client's node identity. Shared by
+/// both flows: the RS emission is identical, only the plaintext layout differs.
+pub(crate) fn client_slice_wire(
+    round: Round,
+    client_id: u32,
+    lane: u32,
+    share: &[DgtNTTPoly],
+    path: &SharePath,
+    identity: &Identity,
+) -> PanetiereWire {
+    let mut share_bytes = Vec::new();
+    panetiere::rs::pack_share(share, &mut share_bytes);
+    let share = share_bytes;
+    // Straight from `commit_shares`, so the digits are ζ-bounded by construction.
+    let path = path.to_bytes().expect("fresh path digits within ζ");
+    PanetiereWire::ClientSlice {
+        round,
+        client_id,
+        lane,
+        signature: identity.sign(&client_slice_signing_bytes(
+            round, client_id, lane, &share, &path,
+        )),
+        share,
+        path,
+        signer: identity.pubkey(),
+    }
+}
+
+/// Per-session P-256 key for the RS bulletin post, domain-separated from the
+/// protocol seed. Never persisted: the post binds `(sid, client_id)` and the
+/// Ed25519 wire signature already ties it to this node's identity.
+pub(crate) fn derive_post_key(rng_seed: [u8; 32]) -> sig::SigningKey {
+    let mut post_seed = rng_seed;
+    post_seed[0] ^= 0x2A;
+    sig::SigningKey::generate(&mut ChaCha20Rng::from_seed(post_seed))
 }
 
 #[cfg(feature = "wire-debug")]
@@ -762,18 +834,12 @@ pub(crate) fn describe(bytes: &[u8]) -> Option<String> {
             "Panetiere ServerPublic sid={server_id} clients={}",
             clients.len()
         )),
+        PanetiereWire::ClientSlice {
+            client_id, lane, ..
+        } => Some(format!("Panetiere ClientSlice cid={client_id} -> lane={lane}")),
         PanetiereWire::Decoded { round, payloads } => Some(format!(
             "Panetiere Decoded round={round} payloads={}",
             payloads.len()
-        )),
-        PanetiereWire::GroupAggregate {
-            round,
-            group,
-            clients,
-            ..
-        } => Some(format!(
-            "Panetiere GroupAggregate round={round} group={group} clients={}",
-            clients.len()
         )),
         PanetiereWire::ClientSet {
             round,
@@ -790,20 +856,26 @@ pub(crate) fn describe(bytes: &[u8]) -> Option<String> {
     }
 }
 
-/// Egress routing only: both relay shares and the leader's `ClientSet` ride the
-/// shares topic (every relay subscribes to it; none subscribe to broadcast).
-pub(crate) fn is_shares_topic_msg(bytes: &[u8]) -> bool {
-    matches!(
-        bincode::deserialize::<PanetiereWire>(bytes),
-        Ok(PanetiereWire::ServerPublic { .. } | PanetiereWire::ClientSet { .. })
-    )
-}
-
-pub(crate) fn is_client_public(bytes: &[u8]) -> bool {
-    matches!(
-        bincode::deserialize::<PanetiereWire>(bytes),
-        Ok(PanetiereWire::ClientPublic { .. })
-    )
+/// Topic for one outbound message, by its own content. Relay shares and the
+/// leader's `ClientSet` ride shares; a client's constant-size post rides
+/// ingress; its coded share and its sealed opening ride the one lane each is
+/// addressed to, so neither is gossiped to all S relays.
+pub(crate) fn egress(subnet_id: crate::config::SubnetId, bytes: &[u8]) -> String {
+    use crate::runtime::{
+        subnet_broadcast_topic, subnet_ingress_topic, subnet_lane_topic, subnet_shares_topic,
+    };
+    match bincode::deserialize::<PanetiereWire>(bytes) {
+        Ok(PanetiereWire::ServerPublic { .. } | PanetiereWire::ClientSet { .. }) => {
+            subnet_shares_topic(subnet_id)
+        }
+        Ok(PanetiereWire::ClientPublic { .. }) => subnet_ingress_topic(subnet_id),
+        Ok(PanetiereWire::ClientSlice { lane, .. }) => subnet_lane_topic(subnet_id, lane),
+        Ok(PanetiereWire::Opening { target_server, .. }) => {
+            subnet_lane_topic(subnet_id, target_server)
+        }
+        // `Decoded`, `Reservations`, and anything undecodable.
+        _ => subnet_broadcast_topic(subnet_id),
+    }
 }
 
 /// Non-participating liveness/anonymity observer for a Panetiere subnet. Feeds
@@ -838,8 +910,8 @@ pub(crate) fn evidence_round(evidence: &[u8]) -> Option<Round> {
         PanetiereWire::ClientPublic { round, .. }
         | PanetiereWire::Opening { round, .. }
         | PanetiereWire::ServerPublic { round, .. }
+        | PanetiereWire::ClientSlice { round, .. }
         | PanetiereWire::Decoded { round, .. }
-        | PanetiereWire::GroupAggregate { round, .. }
         | PanetiereWire::ClientSet { round, .. }
         | PanetiereWire::Reservations { round, .. } => Some(round),
     }
@@ -859,11 +931,21 @@ pub(crate) fn integrity_culprit_from_evidence(
             clients,
             agg_open,
             agg_share,
+            share_sum,
+            lane_open,
             signature,
         } => {
             let culprit = *roster.get(server_id as usize)?;
             if !culprit.verify(
-                &server_public_signing_bytes(round, server_id, &clients, &agg_open, &agg_share),
+                &server_public_signing_bytes(
+                    round,
+                    server_id,
+                    &clients,
+                    &agg_open,
+                    &agg_share,
+                    &share_sum,
+                    &lane_open,
+                ),
                 &signature,
             ) {
                 return None;
@@ -1064,6 +1146,8 @@ impl Session for PanetiereObserverSession {
                     clients,
                     agg_open,
                     agg_share,
+                    share_sum,
+                    lane_open,
                     signature,
                 } => {
                     // Liveness credit and attribution bind to the slot owner's key.
@@ -1080,7 +1164,8 @@ impl Session for PanetiereObserverSession {
                     if from != expected
                         || !expected.verify(
                             &server_public_signing_bytes(
-                                *round, *server_id, clients, agg_open, agg_share,
+                                *round, *server_id, clients, agg_open, agg_share, share_sum,
+                                lane_open,
                             ),
                             signature,
                         )
@@ -1160,8 +1245,9 @@ impl Session for PanetiereObserverSession {
                         "panetiere observer: leader-only message from a non-leader, ignored"
                     );
                 }
-                PanetiereWire::ClientPublic { .. } | PanetiereWire::Opening { .. } => {}
-                PanetiereWire::GroupAggregate { .. } => {}
+                PanetiereWire::ClientPublic { .. }
+                | PanetiereWire::Opening { .. }
+                | PanetiereWire::ClientSlice { .. } => {}
             }
         }
         Vec::new()
@@ -1196,6 +1282,10 @@ pub struct PanetiereClientSession {
     /// Unpredictable stream for per-insert MSE randomness `r` (a predictable `r`
     /// would let an adversary craft a colliding insert).
     r_rng: ChaCha20Rng,
+    /// Signs the RS bulletin post. Per-session and never persisted: the post
+    /// binds `(sid, client_id)` and the Ed25519 wire signature already ties it
+    /// to this node's identity, so no cross-round continuity is needed.
+    post_key: sig::SigningKey,
     /// Subnet's `setup_seed`; with the round it forms the `sid` openings bind to.
     setup_seed: [u8; 32],
 }
@@ -1215,6 +1305,7 @@ impl PanetiereClientSession {
         cover_seed[0] ^= 0xA5;
         let mut r_seed = rng_seed;
         r_seed[0] ^= 0x3C;
+        let post_key = derive_post_key(rng_seed);
         PanetiereClientSession {
             pp,
             mse,
@@ -1226,6 +1317,7 @@ impl PanetiereClientSession {
             cover_rate: 1.0,
             cover_rng: ChaCha20Rng::from_seed(cover_seed),
             r_rng: ChaCha20Rng::from_seed(r_seed),
+            post_key,
             setup_seed: [0u8; 32],
         }
     }
@@ -1274,8 +1366,15 @@ impl Session for PanetiereClientSession {
         seed[24..32].copy_from_slice(&round.to_le_bytes());
         let mut rng = ChaCha20Rng::from_seed(seed);
         let sid = session_id(&self.setup_seed, round);
-        let round_out =
-            run_client_round(&mut rng, &self.pp, &sid, self.client_id, msg, &self.servers);
+        let round_out = run_client_round_rs(
+            &mut rng,
+            &self.pp,
+            &sid,
+            self.client_id,
+            msg,
+            &self.servers,
+            &self.post_key,
+        );
         tracing::trace!(
             target: PANETIERE,
             round,
@@ -1284,10 +1383,10 @@ impl Session for PanetiereClientSession {
             "panetiere client: emitting"
         );
 
-        let mut out: Vec<Vec<u8>> = Vec::with_capacity(1 + self.servers.len());
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(1 + 2 * self.servers.len());
 
         let cid = round_out.client_id.0;
-        let entry = round_out.encrypted_message.to_bytes();
+        let entry = round_out.bulletin.to_bytes();
         let pub_msg = PanetiereWire::ClientPublic {
             round,
             client_id: cid,
@@ -1298,6 +1397,17 @@ impl Session for PanetiereClientSession {
             signer: self.identity.pubkey(),
         };
         out.push(bincode::serialize(&pub_msg).expect("serialise client public"));
+
+        // Lane j's coded ciphertext share and its opening of the share root.
+        for (lane, (share, path)) in round_out
+            .rs_shares
+            .iter()
+            .zip(round_out.share_paths.iter())
+            .enumerate()
+        {
+            let slice = client_slice_wire(round, cid, lane as u32, share, path, &self.identity);
+            out.push(bincode::serialize(&slice).expect("serialise client slice"));
+        }
 
         for (server_id, sealed) in round_out.sealed_openings {
             let opening_msg = PanetiereWire::Opening {
@@ -1374,13 +1484,15 @@ impl Session for PanetiereClientSession {
 /// stable across rounds) and mix openings, losing traffic.
 #[derive(Default)]
 struct PanetiereRoundState {
-    publics: HashMap<ClientId, ClientBulletinEntry>,
+    publics: HashMap<ClientId, RsClientBulletinEntry>,
     inbox_items: Vec<(ClientId, Opening)>,
+    /// Our lane's coded share from each client, with that lane's opening.
+    lane_items: Vec<(ClientId, Vec<DgtNTTPoly>, SharePath)>,
     peer_server_publics: HashMap<ServerId, ServerBulletinEntry>,
+    /// Peer lane sums for the round, with the raw wire kept as fault evidence.
+    peer_lane_sums: HashMap<NodeId, (RsNodeBulletinEntry, Vec<u8>)>,
     emitted_my_public: bool,
     decoded: bool,
-    /// Leader-only (aggregated flow): the agreed summed entry per group.
-    group_aggregates: HashMap<u32, GroupAgg>,
     /// First pubkey to claim each `ClientId` this round. Binds client input to
     /// its gossipsub-authenticated origin and blocks a second signer from
     /// grinding a colliding 4-byte id to clobber another client's slot.
@@ -1425,12 +1537,6 @@ fn admit_client(
     }
 }
 
-#[derive(Clone)]
-struct GroupAgg {
-    clients: Vec<ClientId>,
-    entry: ClientBulletinEntry,
-}
-
 /// Server-side session across Panetiere rounds. Lifecycle, per round `r`:
 /// 1. `on_inbound`: file each message into the bucket for *its* stamped round —
 ///    `ClientPublic`s and the openings addressed to us, plus peer `ServerPublic`s.
@@ -1455,8 +1561,6 @@ pub struct PanetiereServerSession {
     server_id: ServerId,
     identity: Identity,
     mode: SetMode,
-    /// Anonymity floor: never decode a canonical set smaller than this.
-    min_clients: usize,
     server_pubkeys: HashMap<ServerId, Pubkey>,
     /// Per-round buckets, ordered so decode and GC walk oldest-first.
     rounds: std::collections::BTreeMap<Round, PanetiereRoundState>,
@@ -1464,11 +1568,6 @@ pub struct PanetiereServerSession {
     client_set_by_round: std::collections::BTreeMap<Round, Vec<ClientId>>,
     announced_rounds: HashSet<Round>,
     misbehavior: Option<Misbehavior>,
-    /// Set on every relay of an aggregated subnet. Drives two things: canonical
-    /// is the openings we hold (clients send `ClientPublic`s to aggregators, not
-    /// relays), and decode re-sums the signed group aggregates instead of
-    /// individual `ClientPublic`s.
-    aggregation: Option<LeaderAggregation>,
     /// Own round clock, from `begin_round`; bounds accepted wire rounds.
     cur_round: Option<Round>,
     /// First round this session ticked; earlier rounds were only partially
@@ -1477,13 +1576,6 @@ pub struct PanetiereServerSession {
     /// Upper bound on distinct clients admitted per round (also the canonical
     /// set size ceiling); unbounded until [`Self::set_client_set_max`] is called.
     client_set_max: usize,
-    /// Exact wire length of a `ClientBulletinEntry` under this session's
-    /// geometry. A stale-config client's entry has a different width and, once
-    /// summed, panics the KAHE math — reject it at ingestion instead.
-    entry_len: usize,
-    /// Per-round override of `entry_len`. Scheduled subnets size each round's
-    /// message vector to that round's granted reservations; empty otherwise.
-    round_entry_len: std::collections::BTreeMap<Round, usize>,
     /// Subnet's `setup_seed`; with the round it forms the `sid` openings bind to.
     setup_seed: [u8; 32],
     good_clients: GoodClients,
@@ -1507,29 +1599,22 @@ impl PanetiereServerSession {
         server_id: ServerId,
         identity: Identity,
         mode: SetMode,
-        min_clients: u32,
         server_pubkeys: HashMap<ServerId, Pubkey>,
-        aggregation: Option<LeaderAggregation>,
     ) -> Self {
-        let entry_len = entry_wire_len(&pp);
         PanetiereServerSession {
             pp,
             mse,
             server_id,
             identity,
             mode,
-            min_clients: min_clients as usize,
             server_pubkeys,
             rounds: std::collections::BTreeMap::new(),
             client_set_by_round: std::collections::BTreeMap::new(),
             announced_rounds: HashSet::new(),
             misbehavior: None,
-            aggregation,
             cur_round: None,
             first_round: None,
             client_set_max: usize::MAX,
-            entry_len,
-            round_entry_len: std::collections::BTreeMap::new(),
             setup_seed: [0u8; 32],
             good_clients: GoodClients::all(),
         }
@@ -1586,69 +1671,25 @@ impl PanetiereServerSession {
         self.client_set_max = max;
     }
 
-    /// Geometry default for rounds with no per-round width.
-    pub(crate) fn set_entry_len(&mut self, len: usize) {
-        self.entry_len = len;
-    }
-
-    pub(crate) fn set_round_entry_len(&mut self, round: Round, len: usize) {
-        self.round_entry_len.insert(round, len);
-    }
-
-    fn entry_len_for(&self, round: Round) -> usize {
-        self.round_entry_len
-            .get(&round)
-            .copied()
-            .unwrap_or(self.entry_len)
-    }
-
-    /// Largest set this subnet can announce: an aggregated one is the union of
-    /// group aggregates, which overshoots `client_set_max` by the group slack.
-    fn canonical_bound(&self) -> usize {
-        match &self.aggregation {
-            Some(a) => {
-                aggregated_client_set_bound(self.client_set_max as u32, a.roster.len() as u32)
-                    as usize
-            }
-            None => self.client_set_max,
-        }
-    }
-
     /// Leader-only: announce the one canonical set per settled round, once.
-    /// Called from `end_round` (direct flow) or checkpoint 2 (aggregated).
     pub(crate) fn announce_settled(&mut self, round: Round) -> Vec<Vec<u8>> {
-        let aggregated = self.aggregation.is_some();
         let mut outbound = Vec::new();
         let mut announce: Vec<(Round, Vec<ClientId>, u32)> = Vec::new();
         for (&r, state) in self.rounds.iter() {
-            let empty = if aggregated {
-                state.group_aggregates.is_empty()
-            } else {
-                state.inbox_items.is_empty()
-            };
             // The predecessor worker announced pre-spawn rounds from full state.
             let partial = self.first_round.is_some_and(|f| r < f);
-            if r > round || partial || self.announced_rounds.contains(&r) || empty {
+            if r > round || partial || self.announced_rounds.contains(&r) || state.inbox_items.is_empty()
+            {
                 continue;
             }
-            let mut canonical: Vec<ClientId> = if aggregated {
-                // Frozen sums can't be truncated here; each group is capped at
-                // `client_set_max / group_count` by its aggregator instead.
-                state
-                    .group_aggregates
-                    .values()
-                    .flat_map(|g| g.clients.iter().copied())
-                    .collect()
-            } else {
-                // Safe to truncate: every relay admits 2× the cap in openings,
-                // so any cap-sized subset the leader picks is servable.
-                state
-                    .inbox_items
-                    .iter()
-                    .filter_map(|(cid, _)| state.publics.get(cid).map(|_| *cid))
-                    .take(self.client_set_max)
-                    .collect()
-            };
+            // Safe to truncate: every relay admits 2× the cap in openings,
+            // so any cap-sized subset the leader picks is servable.
+            let mut canonical: Vec<ClientId> = state
+                .inbox_items
+                .iter()
+                .filter_map(|(cid, _)| state.publics.get(cid).map(|_| *cid))
+                .take(self.client_set_max)
+                .collect();
             canonical.sort();
             canonical.dedup();
             // Admitted + capacity-rejected: uncensored, unlike the capped set.
@@ -1656,17 +1697,15 @@ impl PanetiereServerSession {
             tracing::trace!(
                 target: PANETIERE,
                 round = r,
-                aggregated,
                 publics = state.publics.len(),
                 inbox = state.inbox_items.len(),
-                groups = state.group_aggregates.len(),
                 announced = canonical.len(),
                 demand,
                 "panetiere leader: canonical set"
             );
             // Openings without a matching public (or vice versa) are clients the
             // leader saw but can't announce, so they're excluded from the round.
-            if !aggregated && canonical.len() < state.inbox_items.len() {
+            if canonical.len() < state.inbox_items.len() {
                 tracing::debug!(
                     target: PANETIERE,
                     round = r,
@@ -1681,10 +1720,8 @@ impl PanetiereServerSession {
                 tracing::debug!(
                     target: PANETIERE,
                     round = r,
-                    aggregated,
                     publics = state.publics.len(),
                     inbox = state.inbox_items.len(),
-                    groups = state.group_aggregates.len(),
                     "panetiere leader: nothing to announce for a non-empty round"
                 );
             } else {
@@ -1710,31 +1747,18 @@ impl PanetiereServerSession {
 /// Render the recipient's rejection reasons at the level each deserves. A round
 /// below the share threshold is the normal state for the round that just ended —
 /// peers report during the next one — so that case is trace, not debug.
-fn log_decode_failure(round: Round, aggregated: bool, e: &RecipientError) {
+fn log_decode_failure(round: Round, e: &VerifyError) {
     match e {
-        RecipientError::BelowShareThreshold { have, need } => tracing::trace!(
-            target: PANETIERE,
-            round,
-            shares = have,
-            need,
-            "panetiere decode: below the share threshold, not yet decodable"
-        ),
-        RecipientError::NoCandidate(rs) => {
-            for CandidateRejection {
-                canonical_len,
-                reason,
-            } in rs
-            {
-                tracing::debug!(
-                    target: PANETIERE,
-                    round,
-                    aggregated,
-                    canonical = canonical_len,
-                    ?reason,
-                    "panetiere decode: candidate client set rejected"
-                );
-            }
+        // Expected early in a round: peers report during the next one.
+        VerifyError::NoServers | VerifyError::NotEnoughNodes | VerifyError::BadServerCoverage => {
+            tracing::trace!(
+                target: PANETIERE,
+                round,
+                ?e,
+                "panetiere decode: below the share threshold, not yet decodable"
+            )
         }
+        _ => tracing::debug!(target: PANETIERE, round, ?e, "panetiere decode: round rejected"),
     }
 }
 
@@ -1742,26 +1766,109 @@ fn collect_outputs(state: &PanetiereRoundState) -> Vec<ServerBulletinEntry> {
     state.peer_server_publics.values().cloned().collect()
 }
 
-/// Group aggregates for `canonical`, partitioned by `client_id % group_count` —
-/// our aggregator topology, so the partition stays here. The recipient only
-/// checks that the groups jointly cover the set.
-fn group_aggregates_for(
-    agg: &LeaderAggregation,
+/// One RS decode attempt over `set`, excluding attributable culprits and
+/// retrying until the thresholds can't be met. There is no recipient wrapper for
+/// RS mode, so the exclusion loop that `recover_*` owns for the broadcast flow
+/// lives here. Lane liars are named as faults; servers are left to the leader's
+/// fault monitor, which sees the same wire.
+fn recover_rs(
+    pp: &Arc<ProtocolParams>,
+    sid: &SessionId,
+    round: Round,
     state: &PanetiereRoundState,
-    canonical: &[ClientId],
-) -> Vec<(Vec<ClientId>, ClientBulletinEntry)> {
-    let group_count = (agg.roster.len() as u32).max(1);
-    let mut wanted: HashSet<u32> = HashSet::new();
-    for c in canonical {
-        wanted.insert(c.0 % group_count);
-    }
-    state
-        .group_aggregates
+    set: &[ClientId],
+    lane_culprits: &mut Vec<NodeId>,
+) -> Option<Vec<KahePoly>> {
+    let rs_k = pp.rs.as_ref().map(|rs| rs.k)?;
+    // Posts made over a different set can't contribute: upstream hard-errors
+    // rather than mixing sets, so they are filtered, not excluded as culprits.
+    let mut servers: Vec<ServerBulletinEntry> = state
+        .peer_server_publics
+        .values()
+        .filter(|sp| sp.clients == set)
+        .cloned()
+        .collect();
+    let mut lanes: Vec<RsNodeBulletinEntry> = state
+        .peer_lane_sums
+        .values()
+        .map(|(l, _)| l)
+        .filter(|l| l.clients == set)
+        .cloned()
+        .collect();
+    let entries: Vec<(ClientId, RsClientBulletinEntry)> = set
         .iter()
-        .filter(|(g, _)| wanted.contains(g))
-        .map(|(_, g)| (g.clients.clone(), g.entry.clone()))
-        .collect()
+        .filter_map(|c| state.publics.get(c).map(|e| (*c, e.clone())))
+        .collect();
+    if entries.len() != set.len() {
+        tracing::trace!(
+            target: PANETIERE,
+            round,
+            have = entries.len(),
+            need = set.len(),
+            "panetiere decode: posts missing for the canonical set"
+        );
+        return None;
+    }
+    loop {
+        if servers.len() < pp.shamir.t || lanes.len() < rs_k {
+            tracing::trace!(
+                target: PANETIERE,
+                round,
+                servers = servers.len(),
+                need_servers = pp.shamir.t,
+                lanes = lanes.len(),
+                need_lanes = rs_k,
+                "panetiere decode: below threshold, not yet decodable"
+            );
+            return None;
+        }
+        match aggregate_and_decrypt_rs(pp, sid, set, &entries, &servers, &lanes) {
+            Ok((plain, _)) => return Some(plain),
+            Err(VerifyError::InvalidServerOpening(i)) | Err(VerifyError::ShareOpeningMismatch(i)) => {
+                tracing::debug!(
+                    target: PANETIERE,
+                    round,
+                    server = servers.get(i).map(|s| s.server_id.0),
+                    "panetiere decode: excluding a server that failed its opening"
+                );
+                servers.remove(i);
+            }
+            Err(VerifyError::LaneOpeningFailed(ids)) => {
+                tracing::warn!(
+                    target: PANETIERE,
+                    round,
+                    lanes = ?ids.iter().map(|n| n.0).collect::<Vec<_>>(),
+                    "panetiere decode: lane sum did not open; excluding the lane"
+                );
+                lane_culprits.extend(ids.iter().copied());
+                lanes.retain(|l| !ids.contains(&l.node_id));
+            }
+            Err(e) => {
+                log_decode_failure(round, &e);
+                return None;
+            }
+        }
+    }
 }
+
+/// Candidate canonical sets for a leaderless decode: every distinct set the
+/// server shares cover, largest first (ties broken by the set itself, so the
+/// order is a function of the inputs).
+fn candidate_sets(outputs: &[ServerBulletinEntry]) -> Vec<Vec<ClientId>> {
+    let mut sets: Vec<Vec<ClientId>> = outputs
+        .iter()
+        .map(|sp| {
+            let mut c = sp.clients.clone();
+            c.sort();
+            c.dedup();
+            c
+        })
+        .collect();
+    sets.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    sets.dedup();
+    sets
+}
+
 
 impl Session for PanetiereServerSession {
     fn begin_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
@@ -1770,20 +1877,6 @@ impl Session for PanetiereServerSession {
         }
         self.cur_round = Some(round);
         Vec::new()
-    }
-
-    /// k=2: freeze the canonical set for the aggregated flow, ahead of `end_round`.
-    fn checkpoint(&mut self, round: Round, k: u8, _now: Instant) -> Vec<Vec<u8>> {
-        if k != 2 {
-            return Vec::new();
-        }
-        let is_leader = self.mode == SetMode::Leader;
-        let withholding = self.misbehavior == Some(Misbehavior::Withhold);
-        if is_leader && !withholding && self.aggregation.is_some() {
-            self.announce_settled(round)
-        } else {
-            Vec::new()
-        }
     }
 
     fn on_inbound(&mut self, from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
@@ -1819,8 +1912,8 @@ impl Session for PanetiereServerSession {
         }
         // Rounds before this session's first tick belong to the predecessor
         // worker, which drains and decodes them under its own config; wire
-        // produced under a different config (e.g. another aggregator group
-        // count) must never be validated against this one.
+        // produced under a different config (e.g. a different client-set cap)
+        // must never be validated against this one.
         if self.first_round.is_some_and(|f| msg.round() < f) {
             tracing::trace!(
                 target: PANETIERE,
@@ -1838,7 +1931,7 @@ impl Session for PanetiereServerSession {
                 signer,
                 signature,
             } => {
-                let expected = self.entry_len_for(round);
+                let expected = RsClientBulletinEntry::packed_len();
                 if entry.len() != expected {
                     tracing::debug!(
                         target: PANETIERE,
@@ -1861,7 +1954,9 @@ impl Session for PanetiereServerSession {
                     return Vec::new();
                 }
                 let cid = ClientId(client_id);
-                let max = self.client_set_max;
+                // 2×, like the openings: every lane needs the root of every
+                // canonical member, whichever cap-sized set the leader picks.
+                let max = self.client_set_max.saturating_mul(2);
                 let bucket = self.rounds.entry(round).or_default();
                 match admit_client(&mut bucket.owners, cid, signer, max) {
                     Admit::Admitted => {}
@@ -1892,9 +1987,29 @@ impl Session for PanetiereServerSession {
                         return Vec::new();
                     }
                 }
-                match ClientBulletinEntry::from_bytes(&entry) {
-                    Some(entry) => {
-                        bucket.publics.insert(cid, entry);
+                match RsClientBulletinEntry::from_bytes(&entry) {
+                    Some(parsed) => {
+                        // Verify the client's own P-256 signature at ingest, so a
+                        // forged post can never reach decode as a `BadSignature`.
+                        let sid = session_id(&self.setup_seed, round);
+                        let signed = RsClientBulletinEntry::signing_bytes(
+                            &sid,
+                            cid,
+                            &parsed.comm,
+                            &parsed.share_root,
+                        );
+                        let ok = sig::VerifyingKey::from_sec1_bytes(&parsed.pubkey)
+                            .is_ok_and(|vk| vk.verify(&signed, &parsed.sig).is_ok());
+                        if !ok {
+                            tracing::debug!(
+                                target: PANETIERE,
+                                round,
+                                client_id,
+                                "panetiere server: RS post signature invalid, dropped"
+                            );
+                            return Vec::new();
+                        }
+                        bucket.publics.insert(cid, parsed);
                     }
                     // Right length, wrong contents: the client holds this round's
                     // slot but has no usable public, so the round can't decode.
@@ -1944,7 +2059,7 @@ impl Session for PanetiereServerSession {
                     // Admission is arrival-ordered and differs per relay, while
                     // the canonical set is frozen elsewhere; 2× headroom keeps
                     // every canonical member's opening servable.
-                    let max = self.canonical_bound().saturating_mul(2);
+                    let max = self.client_set_max.saturating_mul(2);
                     let bucket = self.rounds.entry(round).or_default();
                     match admit_client(&mut bucket.owners, cid, signer, max) {
                         Admit::Admitted => {}
@@ -2005,12 +2120,87 @@ impl Session for PanetiereServerSession {
                     bucket.inbox_items.push((cid, opening));
                 }
             }
+            PanetiereWire::ClientSlice {
+                round,
+                client_id,
+                lane,
+                share,
+                path,
+                signer,
+                signature,
+            } => {
+                if lane != self.server_id.0 {
+                    return Vec::new();
+                }
+                if !self.accept_client(
+                    round,
+                    client_id,
+                    signer,
+                    &signature,
+                    &client_slice_signing_bytes(round, client_id, lane, &share, &path),
+                    "slice",
+                ) {
+                    return Vec::new();
+                }
+                // A stale-geometry client's share can't sum with the rest, so it
+                // is rejected here rather than poisoning the lane's sum.
+                let (share_len, path_len) = slice_wire_lens(&self.pp);
+                if share.len() != share_len || path.len() != path_len {
+                    tracing::debug!(
+                        target: PANETIERE,
+                        round,
+                        client_id,
+                        lane,
+                        got = share.len(),
+                        expected = share_len,
+                        "panetiere server: wrong-geometry slice dropped"
+                    );
+                    return Vec::new();
+                }
+                let cid = ClientId(client_id);
+                let max = self.client_set_max.saturating_mul(2);
+                let bucket = self.rounds.entry(round).or_default();
+                match admit_client(&mut bucket.owners, cid, signer, max) {
+                    Admit::Admitted => {}
+                    Admit::AtCapacity => {
+                        if bucket.rejected.len() < max.saturating_mul(4) {
+                            bucket.rejected.insert(cid);
+                        }
+                        return Vec::new();
+                    }
+                    Admit::NotOwner => {
+                        tracing::debug!(
+                            target: PANETIERE,
+                            round,
+                            client_id,
+                            signer = %signer,
+                            "panetiere server: slice rejected, client id not owned by the signer"
+                        );
+                        return Vec::new();
+                    }
+                }
+                if bucket.lane_items.iter().any(|(c, _, _)| *c == cid) {
+                    return Vec::new();
+                }
+                let Some(scp) = self.pp.share_comm.as_ref() else {
+                    return Vec::new();
+                };
+                let Some(share) = panetiere::rs::unpack_share(&share, scp.block_len) else {
+                    return Vec::new();
+                };
+                let Some(path) = SharePath::from_bytes(scp, lane as usize, &path) else {
+                    return Vec::new();
+                };
+                bucket.lane_items.push((cid, share, path));
+            }
             PanetiereWire::ServerPublic {
                 round,
                 server_id,
                 clients,
                 agg_open,
                 agg_share,
+                share_sum,
+                lane_open,
                 signature,
             } => {
                 // Attribution binds to the slot owner's key. Every rejection here
@@ -2028,7 +2218,13 @@ impl Session for PanetiereServerSession {
                 if from != expected
                     || !expected.verify(
                         &server_public_signing_bytes(
-                            round, server_id, &clients, &agg_open, &agg_share,
+                            round,
+                            server_id,
+                            &clients,
+                            &agg_open,
+                            &agg_share,
+                            &share_sum,
+                            &lane_open,
                         ),
                         &signature,
                     )
@@ -2063,31 +2259,60 @@ impl Session for PanetiereServerSession {
                     );
                     return Vec::new();
                 };
-                match panetiere::cs::unpack_cs_shares(&agg_share, n_shares)
+                let Some(cs_share) = panetiere::cs::unpack_cs_shares(&agg_share, n_shares)
                     .filter(|s| s.len() == 1)
                     .map(|s| s[0])
-                {
-                    Some(agg_share) => {
-                        let bucket = self.rounds.entry(round).or_default();
-                        bucket.peer_server_publics.insert(
-                            ServerId(server_id),
-                            ServerBulletinEntry {
-                                server_id: ServerId(server_id),
-                                clients: clients.into_iter().map(ClientId).collect(),
-                                agg_open,
-                                agg_share,
-                            },
-                        );
-                    }
-                    None => tracing::debug!(
+                else {
+                    tracing::debug!(
                         target: PANETIERE,
                         round,
                         server_id,
                         len = agg_share.len(),
                         n_shares,
                         "panetiere server: share body failed to unpack, dropped"
+                    );
+                    return Vec::new();
+                };
+                // The lane half of the same message: this relay's summed coded
+                // share plus the opening that proves it.
+                let scp = self.pp.share_comm.as_ref().expect("RS mode params");
+                let lane = server_id as usize;
+                let parsed_lane = panetiere::rs::unpack_share(&share_sum, scp.block_len)
+                    .zip(ShareOpening::from_bytes(scp, lane, &lane_open));
+                let Some((lane_share_sum, lane_opening)) = parsed_lane else {
+                    tracing::debug!(
+                        target: PANETIERE,
+                        round,
+                        server_id,
+                        share_len = share_sum.len(),
+                        open_len = lane_open.len(),
+                        "panetiere server: lane sum failed to unpack, share dropped"
+                    );
+                    return Vec::new();
+                };
+                let client_ids: Vec<ClientId> = clients.into_iter().map(ClientId).collect();
+                let bucket = self.rounds.entry(round).or_default();
+                bucket.peer_server_publics.insert(
+                    ServerId(server_id),
+                    ServerBulletinEntry {
+                        server_id: ServerId(server_id),
+                        clients: client_ids.clone(),
+                        agg_open,
+                        agg_share: cs_share,
+                    },
+                );
+                bucket.peer_lane_sums.insert(
+                    NodeId(server_id),
+                    (
+                        RsNodeBulletinEntry {
+                            node_id: NodeId(server_id),
+                            clients: client_ids,
+                            share_sum: lane_share_sum,
+                            agg_open: lane_opening,
+                        },
+                        payload,
                     ),
-                }
+                );
             }
             // Servers decode themselves; `Decoded` is for watchers.
             PanetiereWire::Decoded { .. } => {}
@@ -2123,126 +2348,23 @@ impl Session for PanetiereServerSession {
                     }
                 }
             }
-            PanetiereWire::GroupAggregate {
-                round,
-                group,
-                clients,
-                entry,
-                signer,
-                signature,
-            } => {
-                let Some(agg) = self.aggregation.as_ref() else {
-                    tracing::debug!(
-                        target: PANETIERE,
-                        round,
-                        group,
-                        "panetiere server: group aggregate on a non-aggregated subnet, dropped"
-                    );
-                    return Vec::new();
-                };
-                let Some(roster) = agg.roster.get(&group) else {
-                    tracing::debug!(
-                        target: PANETIERE,
-                        round,
-                        group,
-                        groups = agg.roster.len(),
-                        "panetiere server: group aggregate for an unknown group, dropped"
-                    );
-                    return Vec::new();
-                };
-                if !roster.contains(&signer)
-                    || !signer.verify(
-                        &group_aggregate_signing_bytes(round, group, &clients, &entry),
-                        &signature,
-                    )
-                {
-                    tracing::debug!(
-                        target: PANETIERE,
-                        round,
-                        group,
-                        signer = %signer,
-                        in_roster = roster.contains(&signer),
-                        "panetiere server: group aggregate failed aggregator authentication, dropped"
-                    );
-                    return Vec::new();
-                }
-                // A client outside the group's partition would poison the frozen
-                // canonical set: decode expects it in another group's aggregate,
-                // which can never match, so the round would stay undecodable.
-                let group_count = (agg.roster.len() as u32).max(1);
-                if clients.iter().any(|c| c % group_count != group) {
-                    tracing::debug!(
-                        target: PANETIERE,
-                        round,
-                        group,
-                        group_count,
-                        "panetiere: aggregate with out-of-group client"
-                    );
-                    return Vec::new();
-                }
-                if clients.len() > self.client_set_max {
-                    tracing::debug!(
-                        target: PANETIERE,
-                        round,
-                        group,
-                        n = clients.len(),
-                        max = self.client_set_max,
-                        "panetiere: oversized group aggregate"
-                    );
-                    return Vec::new();
-                }
-                let expected = self.entry_len_for(round);
-                if entry.len() != expected {
-                    tracing::debug!(
-                        target: PANETIERE,
-                        round,
-                        group,
-                        len = entry.len(),
-                        expected,
-                        "panetiere: wrong-geometry group aggregate dropped"
-                    );
-                    return Vec::new();
-                }
-                let Some(parsed) = ClientBulletinEntry::from_bytes(&entry) else {
-                    tracing::debug!(
-                        target: PANETIERE,
-                        round,
-                        group,
-                        len = entry.len(),
-                        "panetiere: unparseable group aggregate entry dropped"
-                    );
-                    return Vec::new();
-                };
-                // 1-of-n: replicas emit identical bytes, so the first valid
-                // aggregate per group stands; later replicas are redundant.
-                self.rounds
-                    .entry(round)
-                    .or_default()
-                    .group_aggregates
-                    .entry(group)
-                    .or_insert(GroupAgg {
-                        clients: clients.into_iter().map(ClientId).collect(),
-                        entry: parsed,
-                    });
-            }
         }
         Vec::new()
     }
 
     fn end_round(&mut self, round: Round, _now: Instant) -> RoundOutcome {
-        let aggregated = self.aggregation.is_some();
         let is_leader = self.mode == SetMode::Leader;
         let withholding = self.misbehavior == Some(Misbehavior::Withhold);
 
         let mut outbound: Vec<Vec<u8>> = Vec::new();
-        // Aggregated flow announces at checkpoint 2 instead.
-        if is_leader && !withholding && !aggregated {
+        if is_leader && !withholding {
             outbound.extend(self.announce_settled(round));
         }
         outbound.extend(self.emit_server_publics(round));
 
         let mut decoded: Vec<Vec<u8>> = Vec::new();
-        for (r, plain) in self.decode_settled() {
+        let (settled, decode_faults) = self.decode_settled();
+        for (r, plain) in settled {
             // Peel every client's element out of the summed plaintext. A
             // cover-only round peels to nothing; a stall means the structure was
             // over-subscribed and the round's payloads are gone, which must not
@@ -2252,12 +2374,28 @@ impl Session for PanetiereServerSession {
                     .into_iter()
                     .filter(|b| b.iter().any(|x| *x != 0))
                     .collect(),
+                // Oversubscription is the application outrunning its sizing, not
+                // a relay fault; the sketch reports the true contributor count,
+                // which is the demand figure the capacity should be sized to.
+                Err(ChannelError::SketchFailed(PronyError::CapacityExceeded {
+                    count,
+                    capacity,
+                })) => {
+                    tracing::error!(
+                        target: PANETIERE,
+                        round = r,
+                        contributors = count,
+                        capacity,
+                        "panetiere: channel oversubscribed; this round's messages are lost"
+                    );
+                    Vec::new()
+                }
                 Err(e) => {
                     tracing::warn!(
                         target: PANETIERE,
                         round = r,
                         ?e,
-                        "panetiere: payload peel failed; this round's messages are lost"
+                        "panetiere: payload decode failed; this round's messages are lost"
                     );
                     Vec::new()
                 }
@@ -2279,7 +2417,7 @@ impl Session for PanetiereServerSession {
         RoundOutcome {
             outbound,
             decoded,
-            faults: Vec::new(),
+            faults: decode_faults,
         }
     }
 
@@ -2301,7 +2439,6 @@ impl PanetiereServerSession {
     pub(crate) fn emit_server_publics(&mut self, round: Round) -> Vec<Vec<u8>> {
         let withholding = self.misbehavior == Some(Misbehavior::Withhold);
         let corrupt_share = self.misbehavior == Some(Misbehavior::CorruptShare);
-        let aggregated = self.aggregation.is_some();
         let self_derived = self.mode == SetMode::SelfDerived;
 
         let mut outbound = Vec::new();
@@ -2318,22 +2455,13 @@ impl PanetiereServerSession {
                 continue;
             }
             // Public subnets share over the leader's announced set; the
-            // leaderless committee derives its own (public + opening it holds,
-            // or openings alone in the aggregated flow).
+            // leaderless committee derives its own (public + opening it holds).
             let canonical: Vec<ClientId> = if self_derived {
-                let mut c: Vec<ClientId> = if aggregated {
-                    state
-                        .group_aggregates
-                        .values()
-                        .flat_map(|g| g.clients.iter().copied())
-                        .collect()
-                } else {
-                    state
-                        .inbox_items
-                        .iter()
-                        .filter_map(|(cid, _)| state.publics.get(cid).map(|_| *cid))
-                        .collect()
-                };
+                let mut c: Vec<ClientId> = state
+                    .inbox_items
+                    .iter()
+                    .filter_map(|(cid, _)| state.publics.get(cid).map(|_| *cid))
+                    .collect();
                 c.sort();
                 c.dedup();
                 c
@@ -2361,11 +2489,12 @@ impl PanetiereServerSession {
                 );
                 continue;
             }
-            // run_server_round is all-or-nothing: skip a round we can't fully
-            // cover rather than share over a different set than the leader's.
+            // Both halves are all-or-nothing over the same set: skip a round we
+            // can't fully cover rather than share over a different set than the
+            // leader's. The lane needs every member's slice AND its signed root.
+            let present: HashSet<ClientId> =
+                state.inbox_items.iter().map(|(cid, _)| *cid).collect();
             if !self_derived {
-                let present: HashSet<ClientId> =
-                    state.inbox_items.iter().map(|(cid, _)| *cid).collect();
                 let missing = canonical.iter().filter(|c| !present.contains(c)).count();
                 if missing > 0 {
                     tracing::debug!(
@@ -2378,6 +2507,24 @@ impl PanetiereServerSession {
                     );
                     continue;
                 }
+            }
+            let have_slices: HashSet<ClientId> =
+                state.lane_items.iter().map(|(cid, _, _)| *cid).collect();
+            let missing_lane = canonical
+                .iter()
+                .filter(|c| !have_slices.contains(c) || !state.publics.contains_key(c))
+                .count();
+            if missing_lane > 0 {
+                tracing::debug!(
+                    target: PANETIERE,
+                    round = r,
+                    missing = missing_lane,
+                    canonical = canonical.len(),
+                    slices = have_slices.len(),
+                    publics = state.publics.len(),
+                    "panetiere server: lane slices incomplete for canonical set; share deferred"
+                );
+                continue;
             }
             let inbox = ServerInbox {
                 server_id: sid,
@@ -2397,6 +2544,52 @@ impl PanetiereServerSession {
                     }
                     let clients: Vec<u32> = sp.clients.iter().map(|c| c.0).collect();
                     let agg_open = packed.to_bytes();
+                    // The lane half over the same canonical set. A client whose
+                    // share disagrees with its own signed root is named here and
+                    // costs this lane the round; `k = t` absorbs up to f of those.
+                    let scp = self.pp.share_comm.as_ref().expect("RS mode params");
+                    let roots: Vec<(ClientId, HVCPoly)> = sp
+                        .clients
+                        .iter()
+                        .map(|c| (*c, state.publics[c].share_root))
+                        .collect();
+                    let lane_inbox = RsNodeInbox {
+                        node_id: NodeId(sid.0),
+                        items: std::mem::take(&mut state.lane_items),
+                    };
+                    let lane = match run_rs_node_round(scp, &lane_inbox, &sp.clients, &roots) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            tracing::warn!(
+                                target: PANETIERE,
+                                round = r,
+                                node_id = sid.0,
+                                canonical = sp.clients.len(),
+                                ?e,
+                                "panetiere lane: run_rs_node_round failed; no share for this round"
+                            );
+                            continue;
+                        }
+                    };
+                    let mut share_sum = Vec::new();
+                    panetiere::rs::pack_share(&lane.share_sum, &mut share_sum);
+                    if corrupt_share {
+                        if let Some(b) = share_sum.first_mut() {
+                            *b ^= 0x01;
+                        }
+                    }
+                    // Packing gates on β_agg, the same bound the aggregated
+                    // opening has to verify under: unpackable means unverifiable.
+                    let Some(lane_open) = lane.agg_open.to_bytes(scp) else {
+                        tracing::warn!(
+                            target: PANETIERE,
+                            round = r,
+                            node_id = sid.0,
+                            canonical = sp.clients.len(),
+                            "panetiere lane: aggregated opening past the digit bound; no share for this round"
+                        );
+                        continue;
+                    };
                     // Sign what we publish — a corrupted share stays attributable.
                     let signature = identity.sign(&server_public_signing_bytes(
                         r,
@@ -2404,6 +2597,8 @@ impl PanetiereServerSession {
                         &clients,
                         &agg_open,
                         &agg_share,
+                        &share_sum,
+                        &lane_open,
                     ));
                     let wire = PanetiereWire::ServerPublic {
                         round: r,
@@ -2411,6 +2606,8 @@ impl PanetiereServerSession {
                         clients,
                         agg_open,
                         agg_share,
+                        share_sum,
+                        lane_open,
                         signature,
                     };
                     // Cache our own honest public so try_decode sees it as a peer entry.
@@ -2421,6 +2618,7 @@ impl PanetiereServerSession {
                         clients = sp.clients.len(),
                         "panetiere server: emitting share"
                     );
+                    state.peer_lane_sums.insert(NodeId(sid.0), (lane, Vec::new()));
                     state.peer_server_publics.insert(sp.server_id, sp);
                     outbound.push(bincode::serialize(&wire).expect("serialise server public"));
                     state.emitted_my_public = true;
@@ -2446,14 +2644,11 @@ impl PanetiereServerSession {
     /// round, so the round just ended usually isn't decodable yet; an earlier
     /// one is. Returns raw plaintext (pre-MSE-peel) per decoded round; marks
     /// buckets decoded and frees their crypto state.
-    pub(crate) fn decode_settled(&mut self) -> Vec<(Round, Vec<KahePoly>)> {
+    pub(crate) fn decode_settled(&mut self) -> (Vec<(Round, Vec<KahePoly>)>, Vec<Fault>) {
         let self_derived = self.mode == SetMode::SelfDerived;
-        // One number for the set bound, so the announced, accepted and served
-        // sets cannot drift apart. Hoisted: `rounds` is borrowed below.
-        let max_clients = self.canonical_bound();
-        let min_clients = self.min_clients;
-        let aggregated = self.aggregation.is_some();
+        let max_clients = self.client_set_max;
         let mut out = Vec::new();
+        let mut faults = Vec::new();
         for (r, state) in self.rounds.iter_mut() {
             if state.decoded {
                 continue;
@@ -2463,49 +2658,37 @@ impl PanetiereServerSession {
             } else {
                 self.client_set_by_round.get(r).cloned()
             };
-            let policy = match anchor.as_deref() {
-                Some(set) => SetPolicy::anchored(set, min_clients, max_clients),
-                None => SetPolicy::majority(min_clients, max_clients),
+            // No announced set (leaderless committee): try each set the posts
+            // agree on, largest first.
+            let candidates: Vec<Vec<ClientId>> = match anchor {
+                Some(set) => vec![set],
+                None => candidate_sets(&collect_outputs(state)),
             };
-            // Culprits excluded to reach decode are reported by the leader's
-            // fault monitor (from the same wire evidence), not duplicated here.
-            let decoded_round = match self.aggregation.as_ref() {
-                Some(agg) => {
-                    // Needs a canonical set to know which groups to gather; with no
-                    // anchor, fall back to what the shares agree on.
-                    let set = anchor.clone().or_else(|| {
-                        state
-                            .peer_server_publics
-                            .values()
-                            .next()
-                            .map(|sp| sp.clients.clone())
-                    });
-                    match set {
-                        Some(set) => {
-                            let groups = group_aggregates_for(agg, state, &set);
-                            recover_aggregated(&self.pp, &policy, &groups, &collect_outputs(state))
-                        }
-                        None => Err(RecipientError::BelowShareThreshold {
-                            have: 0,
-                            need: self.pp.shamir.t,
-                        }),
+            let sid = session_id(&self.setup_seed, *r);
+            let mut plain = None;
+            let mut culprits: Vec<NodeId> = Vec::new();
+            for set in candidates {
+                if set.len() > max_clients {
+                    continue;
+                }
+                if let Some(p) = recover_rs(&self.pp, &sid, *r, state, &set, &mut culprits) {
+                    plain = Some(p);
+                    break;
+                }
+            }
+            // A lane that fails its own opening is named from the wire it signed.
+            for id in culprits {
+                if let Some((_, evidence)) = state.peer_lane_sums.get(&id) {
+                    if let Some(pk) = self.server_pubkeys.get(&ServerId(id.0)) {
+                        faults.push(Fault {
+                            kind: FaultKind::Integrity,
+                            attribution: Attribution::Peers(vec![*pk]),
+                            evidence: evidence.clone(),
+                        });
                     }
                 }
-                None => recover_direct(
-                    &self.pp,
-                    &policy,
-                    |cid| state.publics.get(&cid).cloned(),
-                    &collect_outputs(state),
-                ),
-            };
-            let decoded_round = match decoded_round {
-                Ok(rec) => Some(rec.plaintext),
-                Err(e) => {
-                    log_decode_failure(*r, aggregated, &e);
-                    None
-                }
-            };
-            if let Some(plain) = decoded_round {
+            }
+            if let Some(plain) = plain {
                 out.push((*r, plain));
                 state.decoded = true;
                 // Free the heavy crypto state; keep the (now-empty) bucket
@@ -2513,10 +2696,12 @@ impl PanetiereServerSession {
                 // here and is skipped rather than re-decoding into a duplicate.
                 state.publics.clear();
                 state.inbox_items.clear();
+                state.lane_items.clear();
                 state.peer_server_publics.clear();
+                state.peer_lane_sums.clear();
             }
         }
-        out
+        (out, faults)
     }
 
     /// Age out buckets (decoded or stalled) past the retention window so
@@ -2542,242 +2727,6 @@ impl PanetiereServerSession {
         self.rounds.retain(|r, _| *r >= cutoff);
         self.client_set_by_round.retain(|r, _| *r >= cutoff);
         self.announced_rounds.retain(|r| *r >= cutoff);
-        self.round_entry_len.retain(|r, _| *r >= cutoff);
-    }
-}
-
-/// Aggregator-side session: collects its group's `ClientPublic`s, sums their
-/// ciphertexts+commitments at `end_round`, and emits one signed `GroupAggregate`.
-/// Holds only public data — no openings.
-pub struct PanetiereAggregatorSession {
-    group: u32,
-    group_count: u32,
-    identity: Identity,
-    rounds: std::collections::BTreeMap<Round, HashMap<ClientId, ClientBulletinEntry>>,
-    /// Per round: first pubkey to claim each `ClientId` (see [`admit_client`]).
-    owners: std::collections::BTreeMap<Round, HashMap<ClientId, Pubkey>>,
-    emitted: HashSet<Round>,
-    /// Own round clock, from `begin_round`; bounds accepted wire rounds.
-    cur_round: Option<Round>,
-    /// First round this session ticked; earlier rounds were only partially
-    /// observed and must never be emitted.
-    first_round: Option<Round>,
-    /// Upper bound on distinct clients admitted per round; unbounded until
-    /// [`Self::set_client_set_max`] is called.
-    client_set_max: usize,
-    good_clients: GoodClients,
-    /// Expected `ClientBulletinEntry` wire length; wrong-geometry entries
-    /// (stale-config clients) panic the KAHE sum if admitted.
-    entry_len: usize,
-    /// Per-round override of `entry_len`, as on [`PanetiereServerSession`].
-    round_entry_len: std::collections::BTreeMap<Round, usize>,
-}
-
-impl PanetiereAggregatorSession {
-    pub fn new(group: u32, group_count: u32, identity: Identity) -> Self {
-        PanetiereAggregatorSession {
-            group,
-            group_count,
-            identity,
-            rounds: std::collections::BTreeMap::new(),
-            owners: std::collections::BTreeMap::new(),
-            emitted: HashSet::new(),
-            cur_round: None,
-            first_round: None,
-            client_set_max: usize::MAX,
-            good_clients: GoodClients::all(),
-            entry_len: usize::MAX,
-            round_entry_len: std::collections::BTreeMap::new(),
-        }
-    }
-
-    /// See [`PanetiereServerSession::set_client_set_max`].
-    pub(crate) fn set_client_set_max(&mut self, max: usize) {
-        self.client_set_max = max;
-    }
-
-    pub fn set_good_clients(&mut self, good_clients: GoodClients) {
-        self.good_clients = good_clients;
-    }
-
-    /// Expected entry length under the subnet's geometry
-    /// (`ClientBulletinEntry::packed_len(message_polys(&pp))`).
-    pub(crate) fn set_entry_len(&mut self, len: usize) {
-        self.entry_len = len;
-    }
-
-    pub(crate) fn set_round_entry_len(&mut self, round: Round, len: usize) {
-        self.round_entry_len.insert(round, len);
-    }
-
-    fn entry_len_for(&self, round: Round) -> usize {
-        self.round_entry_len
-            .get(&round)
-            .copied()
-            .unwrap_or(self.entry_len)
-    }
-}
-
-impl Session for PanetiereAggregatorSession {
-    fn begin_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
-        if self.first_round.is_none() {
-            self.first_round = Some(round);
-        }
-        self.cur_round = Some(round);
-        Vec::new()
-    }
-
-    fn on_inbound(&mut self, _from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
-        if let Ok(PanetiereWire::ClientPublic {
-            round,
-            client_id,
-            entry,
-            signer,
-            signature,
-        }) = bincode::deserialize::<PanetiereWire>(&payload)
-        {
-            if !round_in_window(round, self.cur_round) {
-                tracing::debug!(
-                    target: PANETIERE,
-                    round,
-                    client_id,
-                    cur = ?self.cur_round,
-                    "panetiere aggregator: public outside round window, dropped"
-                );
-                return Vec::new();
-            }
-            if client_id % self.group_count != self.group {
-                tracing::trace!(
-                    target: PANETIERE,
-                    round,
-                    client_id,
-                    group = self.group,
-                    "panetiere aggregator: public for another group, ignored"
-                );
-            } else {
-                let expected = self.entry_len_for(round);
-                if expected != usize::MAX && entry.len() != expected {
-                    tracing::debug!(
-                        target: PANETIERE,
-                        round,
-                        client_id,
-                        len = entry.len(),
-                        expected,
-                        "panetiere aggregator: wrong-geometry public dropped"
-                    );
-                    return Vec::new();
-                }
-                if !signer.verify(
-                    &client_public_signing_bytes(round, client_id, &entry),
-                    &signature,
-                ) || !self.good_clients.allows(&signer)
-                {
-                    tracing::debug!(
-                        target: PANETIERE,
-                        round,
-                        client_id,
-                        signer = %signer,
-                        "panetiere aggregator: unsigned or unaccepted client public dropped"
-                    );
-                    return Vec::new();
-                }
-                let cid = ClientId(client_id);
-                let max = self.client_set_max;
-                let admit = admit_client(self.owners.entry(round).or_default(), cid, signer, max);
-                if admit != Admit::Admitted {
-                    tracing::debug!(
-                        target: PANETIERE,
-                        round,
-                        client_id,
-                        max,
-                        at_capacity = admit == Admit::AtCapacity,
-                        "panetiere aggregator: public admission rejected"
-                    );
-                    return Vec::new();
-                }
-                match ClientBulletinEntry::from_bytes(&entry) {
-                    Some(entry) => {
-                        self.rounds.entry(round).or_default().insert(cid, entry);
-                    }
-                    // Holds the group slot but contributes nothing summable, so
-                    // the group aggregate omits it and the leader's set won't match.
-                    None => tracing::debug!(
-                        target: PANETIERE,
-                        round,
-                        client_id,
-                        len = entry.len(),
-                        "panetiere aggregator: unparseable client public dropped"
-                    ),
-                }
-            }
-        }
-        Vec::new()
-    }
-
-    /// k=1: emit the group's batch mid-round, so the leader can announce the
-    /// set and decode within the round rather than a round late. Revisits every
-    /// retained un-emitted round (like `emit_server_publics`) — a missed tick
-    /// must not strand the group's publics; a round-late aggregate still decodes.
-    fn checkpoint(&mut self, round: Round, k: u8, _now: Instant) -> Vec<Vec<u8>> {
-        if k != 1 {
-            return Vec::new();
-        }
-        let mut outbound = Vec::new();
-        let due: Vec<Round> = self
-            .rounds
-            .keys()
-            .copied()
-            .filter(|r| {
-                *r <= round
-                    && !self.emitted.contains(r)
-                    && !self.first_round.is_some_and(|f| *r < f)
-            })
-            .collect();
-        for r in due {
-            let Some(entries) = self.rounds.get(&r).filter(|e| !e.is_empty()) else {
-                continue;
-            };
-            let items: Vec<(ClientId, ClientBulletinEntry)> =
-                entries.iter().map(|(c, e)| (*c, e.clone())).collect();
-            let agg = run_aggregator_round(&items);
-            let clients: Vec<u32> = agg.clients.iter().map(|c| c.0).collect();
-            let entry = ClientBulletinEntry {
-                ctxt: agg.summed_ctxt,
-                comm: agg.summed_comm,
-            }
-            .to_bytes();
-            let signature = self.identity.sign(&group_aggregate_signing_bytes(
-                r, self.group, &clients, &entry,
-            ));
-            tracing::trace!(
-                target: PANETIERE,
-                round = r,
-                group = self.group,
-                of = self.group_count,
-                clients = clients.len(),
-                "panetiere aggregator: emit group aggregate"
-            );
-            let wire = PanetiereWire::GroupAggregate {
-                round: r,
-                group: self.group,
-                clients,
-                entry,
-                signer: self.identity.pubkey(),
-                signature,
-            };
-            outbound.push(bincode::serialize(&wire).expect("serialise group aggregate"));
-            self.emitted.insert(r);
-        }
-        outbound
-    }
-
-    fn end_round(&mut self, round: Round, _now: Instant) -> RoundOutcome {
-        let cutoff = round.saturating_sub(PANETIERE_ROUND_RETENTION);
-        self.rounds.retain(|r, _| *r >= cutoff);
-        self.owners.retain(|r, _| *r >= cutoff);
-        self.emitted.retain(|r| *r >= cutoff);
-        self.round_entry_len.retain(|r, _| *r >= cutoff);
-        RoundOutcome::default()
     }
 }
 
@@ -2861,11 +2810,13 @@ mod observer_tests {
                 clients: vec![10],
                 agg_open: agg_open.clone(),
                 agg_share: Vec::new(),
+                share_sum: Vec::new(),
+                lane_open: Vec::new(),
                 signature,
             })
             .unwrap()
         };
-        let signing = server_public_signing_bytes(9, 1, &[10], &agg_open, &[]);
+        let signing = server_public_signing_bytes(9, 1, &[10], &agg_open, &[], &[], &[]);
         obs.on_inbound(other, sp(leader_id.sign(&signing)));
         assert_eq!(
             obs.share_frontier(),
@@ -2883,13 +2834,16 @@ mod observer_tests {
 
         // A far-future round must be dropped once the observer's clock advances.
         obs.begin_round(9, Instant::now());
-        let far_signing = server_public_signing_bytes(u64::MAX, 1, &[10], &agg_open, &[]);
+        let far_signing =
+            server_public_signing_bytes(u64::MAX, 1, &[10], &agg_open, &[], &[], &[]);
         let far = bincode::serialize(&PanetiereWire::ServerPublic {
             round: u64::MAX,
             server_id: 1,
             clients: vec![10],
             agg_open: agg_open.clone(),
             agg_share: Vec::new(),
+            share_sum: Vec::new(),
+            lane_open: Vec::new(),
             signature: other_id.sign(&far_signing),
         })
         .unwrap();
@@ -2904,34 +2858,79 @@ mod observer_tests {
     #[test]
     fn wire_estimate_covers_real_messages() {
         let (msg_size, est_msgs, cset, n_relays) = (256usize, 4u32, 40u32, 3usize);
-        let est = max_wire_estimate(msg_size, est_msgs, cset, n_relays);
+        for encoding in [Encoding::Prony, Encoding::Mse] {
+            let cfg = PanetiereConfig {
+                message_size: msg_size,
+                estimated_messages: est_msgs,
+                client_set_max: cset,
+                encoding,
+                ..Default::default()
+            };
+            let est = max_wire_estimate(msg_size, est_msgs, cset, n_relays, encoding);
 
-        let mse = channel_params(est_msgs, msg_size, [1u8; 32]);
-        let pp = setup_pp(&mse, n_relays, [1u8; 32]);
-        let servers: Vec<(ServerId, pke::PublicKey)> = (0..n_relays as u32)
-            .map(|i| {
-                (
-                    ServerId(i),
-                    pke::PrivateKey::generate(&mut rand::rngs::OsRng).public(),
-                )
-            })
-            .collect();
-        let mut c =
-            PanetiereClientSession::new(pp.clone(), mse, Identity::generate(), servers, [2u8; 32]);
-        let client_public = c
-            .begin_round(0, Instant::now())
-            .iter()
-            .map(|m| m.len())
-            .max()
-            .unwrap();
-        assert!(
-            est >= client_public,
-            "estimate {est} < real ClientPublic {client_public}"
-        );
-        assert!(
-            est >= pp.cs.aggregated_server_crypto_len(cset),
-            "estimate omits the ServerPublic crypto term"
-        );
+            let (mse, pp) = params_for(&cfg, n_relays);
+            let servers: Vec<(ServerId, pke::PublicKey)> = (0..n_relays as u32)
+                .map(|i| {
+                    (
+                        ServerId(i),
+                        pke::PrivateKey::generate(&mut rand::rngs::OsRng).public(),
+                    )
+                })
+                .collect();
+            let mut c = PanetiereClientSession::new(
+                pp.clone(),
+                mse,
+                Identity::generate(),
+                servers,
+                [2u8; 32],
+            );
+            let client_public = c
+                .begin_round(0, Instant::now())
+                .iter()
+                .map(|m| m.len())
+                .max()
+                .unwrap();
+            assert!(
+                est >= client_public,
+                "{encoding:?}: estimate {est} < real ClientPublic {client_public}"
+            );
+            assert!(
+                est >= pp.cs.aggregated_server_crypto_len(cset),
+                "{encoding:?}: estimate omits the ServerPublic crypto term"
+            );
+        }
+    }
+
+    /// The modulus mismatch this guards is silent: a Prony channel over a
+    /// power-of-two plaintext modulus decodes to noise, not an error.
+    #[test]
+    fn protocol_params_match_encoding() {
+        for (encoding, modulus) in [
+            (Encoding::Prony, panetiere::prony::PRONY_PRIME),
+            (Encoding::Mse, panetiere::kahe::T_MODULUS_DEFAULT),
+        ] {
+            let cfg = PanetiereConfig {
+                message_size: 256,
+                estimated_messages: 64,
+                client_set_max: 64,
+                encoding,
+                ..Default::default()
+            };
+            let (ch, pp) = params_for(&cfg, 5);
+            assert_eq!(
+                message_polys(&pp),
+                ch.n_polys(),
+                "{encoding:?}: KAHE width must be exactly one packed encoding"
+            );
+            assert_eq!(
+                pp.kahe.t_modulus, modulus,
+                "{encoding:?}: plaintext modulus must come from the encoding"
+            );
+        }
+        // The whole point of the sketch: ~3x narrower at the same capacity.
+        let prony = channel_params(300, 4096, [3u8; 32], Encoding::Prony).n_polys();
+        let mse = channel_params(300, 4096, [3u8; 32], Encoding::Mse).n_polys();
+        assert!(prony * 2 < mse, "prony {prony} polys vs mse {mse}");
     }
 }
 
@@ -2963,13 +2962,13 @@ mod concurrent_decode_tests {
             .map(|(i, id)| (ServerId(i as u32), id.exchange().pke().public()))
             .collect();
 
-        let mse = channel_params(active as u32, 64, [7u8; 32]);
-        let n_polys = mse.n_polys();
-        assert_eq!(
-            n_polys, 1,
-            "sanity: a 64-byte payload should pack into exactly one poly"
-        );
-        let pp = setup_pp(&mse, n_servers, [7u8; 32]);
+        let cfg = PanetiereConfig {
+            message_size: 64,
+            estimated_messages: active as u32,
+            client_set_max: total as u32,
+            ..Default::default()
+        };
+        let (mse, pp) = params_for(&cfg, n_servers);
 
         let client_ids: Vec<Identity> = (0..total).map(|_| Identity::generate()).collect();
         let client_pks: Vec<Pubkey> = client_ids.iter().map(|id| id.pubkey()).collect();
@@ -3005,9 +3004,7 @@ mod concurrent_decode_tests {
                     ServerId(i as u32),
                     server_ids[i].clone(),
                     mode,
-                    0,
                     server_pubkeys.clone(),
-                    None,
                 )
             })
             .collect();
@@ -3117,24 +3114,18 @@ mod concurrent_decode_tests {
             );
         }
 
-        // Stage 4: decode — distinguishes a verify/anchor rejection from an MSE peel stall.
+        // Stage 4: decode — distinguishes a verify/anchor rejection from a
+        // payload decode failure.
         let anchor: Vec<ClientId> = announced.iter().map(|&c| ClientId(c)).collect();
+        // No session sets a setup seed here, so every sid is the default's.
+        let sid = session_id(&[0u8; 32], 0);
         for (si, s) in servers.iter().enumerate() {
             let state = s.rounds.get(&0).unwrap();
-            let policy = SetPolicy::anchored(&anchor, 0, usize::MAX);
-            let rec = recover_direct(
-                &pp,
-                &policy,
-                |cid| state.publics.get(&cid).cloned(),
-                &collect_outputs(state),
-            )
-            .unwrap_or_else(|e| panic!("server {si}: recover_direct rejected the round: {e:?}"));
-            assert!(
-                rec.culprits.is_empty(),
-                "server {si}: unexpected culprits {:?}",
-                rec.culprits
-            );
-            let recovered_msgs: Vec<Vec<u8>> = channel::decode_messages(&mse, &rec.plaintext, None)
+            let mut culprits = Vec::new();
+            let plain = recover_rs(&pp, &sid, 0, state, &anchor, &mut culprits)
+                .unwrap_or_else(|| panic!("server {si}: RS recovery rejected the round"));
+            assert!(culprits.is_empty(), "server {si}: unexpected lane culprits");
+            let recovered_msgs: Vec<Vec<u8>> = channel::decode_messages(&mse, &plain, None)
                 .unwrap_or_else(|e| panic!("server {si}: payload peel failed: {e:?}"))
                 .into_iter()
                 .filter(|b| b.iter().any(|x| *x != 0))

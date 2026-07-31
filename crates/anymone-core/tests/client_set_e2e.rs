@@ -3,14 +3,14 @@
 //! malicious clients, and a loud halt — never an exclusion — past `n − k`
 //! censoring servers.
 
-use chipmunk_code::{KahePoly, N};
+use chipmunk_code::{HVCPoly, KahePoly, N};
 use panetiere::bulletin::{RsClientBulletinEntry, RsNodeBulletinEntry, ServerBulletinEntry};
 use panetiere::kahe::T_MODULUS_DEFAULT;
 use panetiere::pke;
 use anymone_core::client_set::{
     build_evidence, fragment_signing_bytes, plurality_set, relay_rounds, relay_signing_bytes,
-    run_client_round_set, Certificate, ClientSetRound, Evidence, Fragment, Relay, RelayItem,
-    SetRound, SetServer,
+    run_client_round_set, Bundle, Certificate, ClientSetRound, Evidence, Fragment, Relay,
+    RelayItem, SetRound, SetServer,
 };
 use panetiere::protocol::server::{run_rs_node_round, run_server_round};
 use panetiere::protocol::verify::{aggregate_and_decrypt_rs, VerifyError};
@@ -193,9 +193,18 @@ impl Round {
             .iter()
             .map(|sr| run_server_round(&sr.inbox, &sr.set).expect("openings for the set"))
             .collect();
+        let scp = self.pp.share_comm.as_ref().expect("share-commitment params");
+        let roots: Vec<(ClientId, HVCPoly)> = self
+            .entries
+            .iter()
+            .map(|(cid, e)| (*cid, e.share_root))
+            .collect();
         let lanes = sets
             .iter()
-            .map(|sr| run_rs_node_round(&sr.lane_inbox, &sr.set).expect("shares for the set"))
+            .map(|sr| {
+                run_rs_node_round(scp, &sr.lane_inbox, &sr.set, &roots)
+                    .expect("shares for the set")
+            })
             .collect();
         (servers, lanes)
     }
@@ -720,6 +729,63 @@ fn fragment_quorum_is_agreed_and_bounded() {
             let (e, frags) =
                 build_evidence(&r.pp, &SESSION, cr, certs[i].clone(), &r.client_sig[i]);
             if cr.client_id == claimant {
+                // Every wire form survives a round trip, is exactly the size its
+                // `packed_len` advertises, and refuses a truncated encoding.
+                let scp = r.pp.share_comm.as_ref().expect("RS mode params");
+                let bundle = &cr.bundles[skipped[0]];
+                let packed = bundle.pack(scp).expect("fresh path packs");
+                assert_eq!(
+                    packed.len(),
+                    Bundle::packed_len(scp, bundle.envelope.len())
+                );
+                let (back, used) =
+                    Bundle::unpack(scp, cr.client_id, &packed).expect("bundle round trip");
+                assert_eq!(used, packed.len());
+                assert_eq!(back.lane, bundle.lane);
+                assert_eq!(back.share, bundle.share);
+                assert_eq!(back.path.nodes, bundle.path.nodes);
+                assert_eq!(back.envelope, bundle.envelope);
+                assert!(Bundle::unpack(scp, cr.client_id, &packed[..packed.len() - 1]).is_none());
+
+                let e_bytes = e.pack();
+                assert_eq!(
+                    e_bytes.len(),
+                    Evidence::packed_len(e.certs.len(), e.missing.len())
+                );
+                assert_eq!(Evidence::unpack(&e_bytes).expect("evidence round trip"), e);
+                assert!(Evidence::unpack(&e_bytes[..e_bytes.len() - 1]).is_none());
+
+                let f_bytes = frags[0].pack();
+                let f_back = Fragment::unpack(&f_bytes).expect("fragment round trip");
+                assert_eq!(f_back.idx, frags[0].idx);
+                assert_eq!(f_back.data, frags[0].data);
+                assert_eq!(f_back.sig, frags[0].sig);
+                assert!(Fragment::unpack(&f_bytes[..f_bytes.len() - 1]).is_none());
+
+                // Both relay variants, chain included.
+                let chain = vec![(ServerId(1), [7u8; 64]), (ServerId(4), [9u8; 64])];
+                for item in [
+                    RelayItem::Evidence(e.clone()),
+                    RelayItem::Fragment(frags[0].clone()),
+                ] {
+                    let relay = Relay {
+                        item,
+                        chain: chain.clone(),
+                    };
+                    let bytes = relay.pack();
+                    let rb = Relay::unpack(&bytes).expect("relay round trip");
+                    assert_eq!(rb.chain, chain);
+                    match (&rb.item, &relay.item) {
+                        (RelayItem::Evidence(a), RelayItem::Evidence(b)) => assert_eq!(a, b),
+                        (RelayItem::Fragment(a), RelayItem::Fragment(b)) => {
+                            assert_eq!(a.idx, b.idx);
+                            assert_eq!(a.data, b.data);
+                        }
+                        _ => panic!("relay item variant changed across the wire"),
+                    }
+                    assert!(Relay::unpack(&bytes[..bytes.len() - 1]).is_none());
+                }
+
                 let mut give: Vec<Fragment> = frags[..keep].to_vec();
                 let data = frags[0].data.clone();
                 let sig = r.client_sig[i]

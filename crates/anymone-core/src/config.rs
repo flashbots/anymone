@@ -156,8 +156,6 @@ impl ProtocolConfig {
 
     pub fn aggregation(&self) -> Option<&Aggregation> {
         match self {
-            ProtocolConfig::Panetiere(c) => c.aggregation.as_ref(),
-            ProtocolConfig::ScheduledPanetiere(c) => c.aggregation.as_ref(),
             ProtocolConfig::Adcnet(c) => c.aggregation.as_ref(),
             _ => None,
         }
@@ -184,6 +182,13 @@ impl Default for NoopConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Encoding {
+    #[default]
+    Prony,
+    Mse,
+}
+
 /// Panetiere subnet config. `setup_seed` must be identical across every node
 /// in the subnet — it deterministically drives `ProtocolParams::setup` so all
 /// participants agree on the public KAHE / CS / Shamir parameters.
@@ -197,10 +202,24 @@ pub struct PanetiereConfig {
     pub threshold: u32,
     #[serde(with = "serde_bytes_array")]
     pub setup_seed: [u8; 32],
-    /// Aggregation `None` = direct flow (every client posts its own ciphertext+commitment to
-    /// ingress topic).
+    /// Fixes the KAHE width and plaintext modulus, so it must match subnet-wide.
     #[serde(default)]
-    pub aggregation: Option<Aggregation>,
+    pub encoding: Encoding,
+}
+
+impl Default for PanetiereConfig {
+    fn default() -> Self {
+        PanetiereConfig {
+            round_duration_ms: 1000,
+            message_size: 1024,
+            estimated_messages: 4,
+            client_set_min: 0,
+            client_set_max: 8,
+            threshold: 2,
+            setup_seed: [0u8; 32],
+            encoding: Encoding::default(),
+        }
+    }
 }
 
 /// Scheduled Panetiere subnet config. Each round's ciphertext carries a tiny
@@ -222,13 +241,26 @@ pub struct ScheduledPanetiereConfig {
     pub threshold: u32,
     #[serde(with = "serde_bytes_array")]
     pub setup_seed: [u8; 32],
-    #[serde(default)]
-    pub aggregation: Option<Aggregation>,
 }
 
-/// Aggregator groups (Panetiere: sums clients' ciphertexts+commitments; ADCNet:
-/// sums clients' blinded contributions). Each group is a `replication`-of-n
-/// committee; clients map to `hash(client) % groups.len()`.
+impl Default for ScheduledPanetiereConfig {
+    fn default() -> Self {
+        ScheduledPanetiereConfig {
+            round_duration_ms: 1000,
+            message_size: 1024,
+            vector_bytes: 8192,
+            estimated_messages: 4,
+            client_set_min: 0,
+            client_set_max: 8,
+            threshold: 2,
+            setup_seed: [0u8; 32],
+        }
+    }
+}
+
+/// ADCNet aggregator groups: each sums its clients' blinded contributions. Each
+/// group is a `replication`-of-n committee; clients map to
+/// `hash(client) % groups.len()`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Aggregation {
     pub replication: u32,

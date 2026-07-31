@@ -12,7 +12,7 @@ pub struct Fault {
     pub evidence: Vec<u8>,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FaultKind {
     Decryption,
     Integrity,
@@ -20,7 +20,7 @@ pub enum FaultKind {
     Censorship,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Attribution {
     None,
     Peers(Vec<PeerId>),

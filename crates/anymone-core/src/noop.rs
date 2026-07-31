@@ -184,6 +184,7 @@ pub(crate) async fn run_subnet(
         }
     }
 
+    let mut reported = crate::runtime::ReportedFaults::default();
     loop {
         tokio::select! {
             biased;
@@ -211,7 +212,7 @@ pub(crate) async fn run_subnet(
                     });
                 }
                 if round >= spawn_round + crate::runtime::RECONFIG_FAULT_GRACE {
-                    gossip_faults(&inner, subnet.id, identity_pk, faults.into_iter().map(|f| (round, f)).collect()).await;
+                    gossip_faults(&inner, subnet.id, identity_pk, &mut reported, faults.into_iter().map(|f| (round, f)).collect()).await;
                 }
 
                 if final_round.is_some_and(|f| round >= f) {

@@ -61,7 +61,7 @@ async fn fault_for(mode: Misbehavior, panetiere: bool, want: FaultKind) -> Repor
             client_set_max: 8,
             threshold: 2,
             setup_seed: [7u8; 32],
-            aggregation: None,
+            encoding: anymone_core::config::Encoding::default(),
         })
     } else {
         ProtocolConfig::Adcnet(AdcnetConfig {
@@ -211,7 +211,12 @@ async fn fault_for(mode: Misbehavior, panetiere: bool, want: FaultKind) -> Repor
         loop {
             let msg = faults_sub.recv().await.expect("faults topic closed");
             if let Some(r) = FaultReport::decode(&msg.payload) {
-                if r.round == report.round && r.fault.kind == report.fault.kind {
+                // Any relay may report the fault it decoded; what must not happen
+                // is one node reporting it twice.
+                if r.round == report.round
+                    && r.fault.kind == report.fault.kind
+                    && r.reporter == report.reporter
+                {
                     dup_count += 1;
                 }
             }
@@ -293,6 +298,6 @@ async fn panetiere_corrupt_share_is_attributed_integrity() {
     );
     assert_eq!(
         r.dup_count, 0,
-        "only one source should report the fault for a given round"
+        "a node must report a given round's fault once, however many of its checks caught it"
     );
 }

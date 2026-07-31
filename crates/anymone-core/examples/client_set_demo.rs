@@ -10,12 +10,13 @@
 //! excluded unanimously and never halt the round; more than `n − k` censoring
 //! servers halt it loudly at recovery.
 
+use chipmunk_code::HVCPoly;
 use panetiere::bulletin::{RsClientBulletinEntry, RsNodeBulletinEntry, ServerBulletinEntry};
 use panetiere::channel::{self, ChannelParams};
 use panetiere::kahe::T_MODULUS_DEFAULT;
 use panetiere::pke;
 use anymone_core::client_set::{
-    build_evidence, plurality_set, relay_rounds, run_client_round_set, Certificate,
+    build_evidence, plurality_set, relay_rounds, run_client_round_set, Bundle, Certificate,
     ClientSetRound, Relay, SetRound, SetServer,
 };
 use panetiere::protocol::server::{run_rs_node_round, run_server_round};
@@ -218,9 +219,18 @@ impl Demo {
             .iter()
             .map(|sr| run_server_round(&sr.inbox, &sr.set).expect("openings for the set"))
             .collect();
+        let scp = self.pp.share_comm.as_ref().expect("share-commitment params");
+        let roots: Vec<(ClientId, HVCPoly)> = self
+            .entries
+            .iter()
+            .map(|(cid, e)| (*cid, e.share_root))
+            .collect();
         let lanes_out: Vec<RsNodeBulletinEntry> = published
             .iter()
-            .map(|sr| run_rs_node_round(&sr.lane_inbox, &sr.set).expect("shares for the set"))
+            .map(|sr| {
+                run_rs_node_round(scp, &sr.lane_inbox, &sr.set, &roots)
+                    .expect("shares for the set")
+            })
             .collect();
 
         let anchor = plurality_set(&servers_out);
@@ -326,10 +336,12 @@ fn main() {
         S - K + 1,
     );
     let bundle = &d.rounds[0].bundles[0];
+    let scp = d.pp.share_comm.as_ref().expect("RS mode params");
+    let bundle_len = Bundle::packed_len(scp, bundle.envelope.len());
     println!(
         "  per-server bundle {} B ({} B share + {} B envelope); receipts 96 B; no replication",
-        bundle.wire_len(),
-        bundle.wire_len() - bundle.envelope.len(),
+        bundle_len,
+        bundle_len - bundle.envelope.len(),
         bundle.envelope.len(),
     );
 

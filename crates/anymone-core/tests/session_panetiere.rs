@@ -3,27 +3,21 @@
 //! config-anonymising round-trip, and a many-round no-stall run.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::Instant;
 
 use anymone_core::config::{
     now_unix_ms, AdcnetConfig, Aggregation, AggregatorGroup, AnymoneRoundConfigurationBody,
-    ProtocolConfig, Subnet,
+    Encoding, PanetiereConfig, ProtocolConfig, Subnet,
 };
 use anymone_core::faults::{Attribution, FaultKind};
 use anymone_core::panetiere::{
-    PanetiereClientSession, PanetiereObserverSession, PanetiereServerSession, SetMode,
+    params_for, PanetiereClientSession, PanetiereObserverSession, PanetiereServerSession, SetMode,
 };
 use anymone_core::session::{Misbehavior, Session};
 use anymone_core::{Identity, Pubkey, ServiceEntry, ServiceTag};
 
-use panetiere::channel::ChannelParams;
-use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::pke;
-use panetiere::protocol::ProtocolParams;
 use panetiere::protocol::ServerId;
-use rand::{RngCore, SeedableRng};
-use rand_chacha::ChaCha20Rng;
 
 /// Per-server identities (sorted by pubkey, matching the runtime's slot order)
 /// plus the client's view of their exchange pubkeys.
@@ -47,33 +41,23 @@ fn server_pubkeys(server_pks: &[Pubkey]) -> HashMap<ServerId, Pubkey> {
         .collect()
 }
 
-/// MSE channel params (γ=4, δ≈3 buckets/insert, ξ for `msg_bytes`) plus a KAHE
-/// `pp` whose message width holds exactly one MSE pack — what the wrapper builds.
-fn channel(
-    rng: &mut ChaCha20Rng,
-    n_servers: usize,
-    rho: usize,
-    msg_bytes: usize,
-) -> (ChannelParams, Arc<ProtocolParams>) {
-    let delta = (3 * rho.max(1)).div_ceil(4);
-    let xi = msg_bytes.div_ceil(4).max(1);
-    // Draw the PRF key from the test's own RNG rather than a fixed constant —
-    // one magic key reused everywhere can coincidentally peel-stall at a tight delta.
-    let mut prf_key = [0u8; 32];
-    rng.fill_bytes(&mut prf_key);
-    let mse = ChannelParams::from_mse(MseParams::new(4, delta, xi, prf_key));
-    let n_polys = mse.n_polys();
-    let pp = Arc::new(ProtocolParams::setup_with_kahe_dims(
-        rng, n_servers, n_polys,
-    ));
-    (mse, pp)
+/// A subnet carrying `set_max` clients, `rho` of them sending `msg_bytes` each.
+/// MSE, not the default sketch: peeling degrades gracefully, so a decode failure
+/// here means the session wiring broke, not that a round hit capacity.
+fn subnet(rho: usize, msg_bytes: usize, set_max: usize) -> PanetiereConfig {
+    PanetiereConfig {
+        message_size: msg_bytes,
+        estimated_messages: rho as u32,
+        client_set_max: set_max as u32,
+        encoding: Encoding::Mse,
+        ..Default::default()
+    }
 }
 
 #[test]
 fn panetiere_session_happy_path() {
-    let mut setup_rng = ChaCha20Rng::from_seed([7u8; 32]);
     let n_servers = 3;
-    let (mse, pp) = channel(&mut setup_rng, n_servers, 1, 64);
+    let (mse, pp) = params_for(&subnet(1, 64, 1), n_servers);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_identity = Identity::generate();
     let client_pk = client_identity.pubkey();
@@ -94,9 +78,7 @@ fn panetiere_session_happy_path() {
                 *sid,
                 ids[sid.0 as usize].clone(),
                 SetMode::SelfDerived,
-                0,
                 server_pubkeys(&server_pks),
-                None,
             )
         })
         .collect();
@@ -108,8 +90,16 @@ fn panetiere_session_happy_path() {
     let client_out = client.begin_round(0, now);
     assert_eq!(
         client_out.len(),
-        1 + n_servers,
-        "expected 1 ClientPublic + {n_servers} Openings"
+        1 + 2 * n_servers,
+        "expected 1 ClientPublic + {n_servers} ClientSlices + {n_servers} Openings"
+    );
+    // The ciphertext leaves as coded shares, so the bulletin post no longer
+    // carries it: it is the smallest thing the client emits, not the largest.
+    let slice_len = client_out[1].len();
+    assert!(
+        client_out[0].len() < slice_len,
+        "RS post {} should be smaller than a coded share {slice_len}",
+        client_out[0].len()
     );
 
     for s in servers.iter_mut() {
@@ -160,9 +150,7 @@ fn panetiere_session_happy_path() {
                 *sid,
                 ids[sid.0 as usize].clone(),
                 SetMode::SelfDerived,
-                0,
                 server_pubkeys(&server_pks),
-                None,
             )
         })
         .collect();
@@ -194,14 +182,11 @@ fn panetiere_session_happy_path() {
 /// as the committee does to anonymise its config proposal. Returns the decoded
 /// bytes (with trailing zero padding).
 fn committee_panetiere_roundtrip(payload: &[u8]) -> Vec<u8> {
-    let mut setup_rng = ChaCha20Rng::from_seed([7u8; 32]);
     let n_servers = 3;
     // ρ=3, at the committee's own message bound.
-    let (mse, pp) = channel(
-        &mut setup_rng,
+    let (mse, pp) = params_for(
+        &subnet(3, anymone_core::panetiere::COMMITTEE_MSG_BYTES, 3),
         n_servers,
-        3,
-        anymone_core::panetiere::COMMITTEE_MSG_BYTES,
     );
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_identity = Identity::generate();
@@ -223,9 +208,7 @@ fn committee_panetiere_roundtrip(payload: &[u8]) -> Vec<u8> {
                 *sid,
                 ids[sid.0 as usize].clone(),
                 SetMode::SelfDerived,
-                0,
                 server_pubkeys(&server_pks),
-                None,
             )
         })
         .collect();
@@ -266,9 +249,8 @@ fn committee_panetiere_roundtrip(payload: &[u8]) -> Vec<u8> {
 #[test]
 fn panetiere_back_to_back_rounds_lose_nothing() {
     const N_ROUNDS: u64 = 12;
-    let mut setup_rng = ChaCha20Rng::from_seed([7u8; 32]);
     let n_servers = 3usize;
-    let (mse, pp) = channel(&mut setup_rng, n_servers, 1, 64);
+    let (mse, pp) = params_for(&subnet(1, 64, 1), n_servers);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_identity = Identity::generate();
     let client_pk = client_identity.pubkey();
@@ -289,9 +271,7 @@ fn panetiere_back_to_back_rounds_lose_nothing() {
                 *sid,
                 ids[sid.0 as usize].clone(),
                 SetMode::SelfDerived,
-                0,
                 server_pubkeys(&server_pks),
-                None,
             )
         })
         .collect();
@@ -348,9 +328,8 @@ fn panetiere_back_to_back_rounds_lose_nothing() {
 /// fault to the culprit, carrying the offending wire bytes as evidence.
 #[test]
 fn panetiere_corrupt_share_attributes_integrity() {
-    let mut setup_rng = ChaCha20Rng::from_seed([7u8; 32]);
     let n_servers = 3;
-    let (mse, pp) = channel(&mut setup_rng, n_servers, 1, 64);
+    let (mse, pp) = params_for(&subnet(1, 64, 1), n_servers);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_identity = Identity::generate();
     let client_pk = client_identity.pubkey();
@@ -377,9 +356,7 @@ fn panetiere_corrupt_share_attributes_integrity() {
                 } else {
                     SetMode::SelfDerived
                 },
-                0,
                 server_pubkeys(&server_pks),
-                None,
             )
         })
         .collect();
@@ -430,6 +407,19 @@ fn panetiere_corrupt_share_attributes_integrity() {
         !fault.evidence.is_empty(),
         "evidence is the offending ServerPublic bytes"
     );
+
+    // The same relay's lane sum no longer opens against the signed roots, so
+    // reconstruction names it too and finishes on the k honest lanes.
+    let lane_fault = leader
+        .faults
+        .iter()
+        .find(|f| f.kind == FaultKind::Integrity)
+        .expect("the lying lane is named by the RS reconstruction");
+    assert_eq!(
+        lane_fault.attribution,
+        Attribution::Peers(vec![server_pks[2]])
+    );
+    assert!(!lane_fault.evidence.is_empty());
 }
 
 /// Several clients sending DISTINCT real messages in the SAME round, plus cover
@@ -437,12 +427,14 @@ fn panetiere_corrupt_share_attributes_integrity() {
 /// plaintext (a single summed buffer would lose all but one). Cover adds nothing.
 #[test]
 fn panetiere_concurrent_clients_all_decode() {
-    let mut setup_rng = ChaCha20Rng::from_seed([7u8; 32]);
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
     let n_servers = 3;
     let active = 4usize;
     let cover = 2usize;
     let total = active + cover;
-    let (mse, pp) = channel(&mut setup_rng, n_servers, active, 64);
+    let (mse, pp) = params_for(&subnet(active, 64, total), n_servers);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_identities: Vec<Identity> = (0..total).map(|_| Identity::generate()).collect();
     let client_pks: Vec<Pubkey> = client_identities.iter().map(|id| id.pubkey()).collect();
@@ -472,9 +464,7 @@ fn panetiere_concurrent_clients_all_decode() {
                 } else {
                     SetMode::SelfDerived
                 },
-                0,
                 server_pubkeys(&server_pks),
-                None,
             )
         })
         .collect();
@@ -536,10 +526,16 @@ fn panetiere_concurrent_clients_all_decode() {
 /// client set. `run` returns how many payloads were decoded across all relays.
 #[test]
 fn panetiere_followers_use_leader_set_with_min_floor() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
     fn run(min_clients: u32, n_clients: usize, client_set_max: usize) -> usize {
-        let mut setup_rng = ChaCha20Rng::from_seed([11u8; 32]);
         let n_servers = 3;
-        let (mse, pp) = channel(&mut setup_rng, n_servers, n_clients, 64);
+        let cfg = PanetiereConfig {
+            client_set_min: min_clients,
+            ..subnet(n_clients, 64, n_clients)
+        };
+        let (mse, pp) = params_for(&cfg, n_servers);
         let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
         let client_identities: Vec<Identity> =
             (0..n_clients).map(|_| Identity::generate()).collect();
@@ -575,9 +571,7 @@ fn panetiere_followers_use_leader_set_with_min_floor() {
                     *sid,
                     ids[sid.0 as usize].clone(),
                     mode,
-                    min_clients,
                     server_pubkeys(&server_pks),
-                    None,
                 );
                 s.set_client_set_max(client_set_max);
                 s
@@ -704,9 +698,8 @@ fn committee_panetiere_carries_multi_subnet_config() {
 #[test]
 fn panetiere_fixed_seed_multiround_no_stall() {
     const N_MSGS: usize = 10;
-    let mut setup_rng = ChaCha20Rng::from_seed([7u8; 32]);
     let n_servers = 3usize;
-    let (mse, pp) = channel(&mut setup_rng, n_servers, 1, 64);
+    let (mse, pp) = params_for(&subnet(1, 64, 1), n_servers);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_identity = Identity::generate();
     let client_pk = client_identity.pubkey();
@@ -727,9 +720,7 @@ fn panetiere_fixed_seed_multiround_no_stall() {
                 *sid,
                 ids[sid.0 as usize].clone(),
                 SetMode::SelfDerived,
-                0,
                 server_pubkeys(&server_pks),
-                None,
             )
         })
         .collect();

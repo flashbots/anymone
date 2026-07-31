@@ -95,7 +95,7 @@ async fn rest_submit_and_read_back_by_round() {
             client_set_max: 8,
             threshold: 2,
             setup_seed: [7u8; 32],
-            aggregation: None,
+            encoding: anymone_core::config::Encoding::default(),
         }),
         relay_pks,
         relays

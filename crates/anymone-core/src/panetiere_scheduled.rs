@@ -8,21 +8,19 @@
 //! the slot allocation (`codec::beacon`/`allocate`).
 //!
 //! Reuses the one-round flow's bucket/signature/decode machinery
-//! (`PanetiereServerSession`, `PanetiereWire`, `PanetiereAggregatorSession`,
-//! `PanetiereWatchSession`) — only the plaintext layout and checkpoint
-//! cadence differ.
+//! (`PanetiereServerSession`, `PanetiereWire`, `PanetiereWatchSession`) — only
+//! the plaintext layout and checkpoint cadence differ.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
 use chipmunk_code::KahePoly;
-use panetiere::bulletin::ClientBulletinEntry;
 use panetiere::channel::ChannelParams;
 use panetiere::codec;
 use panetiere::mse::MseEncoding;
 use panetiere::pke;
-use panetiere::protocol::client::run_client_round;
+use panetiere::protocol::client::run_client_round_rs;
 use panetiere::protocol::{message_polys, ClientId, ProtocolParams, ServerId};
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
@@ -34,18 +32,15 @@ use crate::config::{
 use crate::identity::{Identity, Pubkey};
 use crate::log_target::{PANETIERE, SCHED};
 use crate::panetiere::{
-    drain_inbound_upto, server_index, wire_round_past, PanetiereAggregatorSession,
-    PanetiereObserverSession, PanetiereServerSession, PanetiereWatchSession, PanetiereWire, SetMode,
+    client_slice_wire, derive_post_key, drain_inbound_upto, server_index, wire_round_past, PanetiereObserverSession,
+    PanetiereServerSession, PanetiereWatchSession, PanetiereWire, SetMode,
     PANETIERE_ROUND_RETENTION,
 };
 use crate::runtime::{
-    aggregator_group_of, client_aggregator_topic, deadline_for, egress_dest, gossip_faults,
-    handle_inbound, publish_and_loop_back, recv_any, round_at, route_to_pipe, subnet_aggregation,
-    subnet_leader_pk, AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
+    deadline_for, gossip_faults, handle_inbound, publish_and_loop_back, recv_any,
+    round_at, route_to_pipe, subnet_leader_pk, AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
 };
-use crate::session::{
-    GoodClients, LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session,
-};
+use crate::session::{GoodClients, Misbehavior, PeerId, RoundOutcome, Session};
 use crate::transport::Subscription;
 
 /// `(rand, size)` per reservation: two `Z_t` symbols carrying the `u16`s
@@ -100,18 +95,28 @@ fn allocation(entries: &[(u16, u16)], cap: usize) -> (Vec<Option<usize>>, usize)
     (offs, msg_polys(used))
 }
 
-/// Joint params: `mu_kahe` covers the reservation MSE plus the message vector.
-pub(crate) fn setup_joint_pp(
-    sched_mse: &ChannelParams,
-    vector_bytes: usize,
+/// Reservation channel and joint params: `mu_kahe` covers the reservation MSE
+/// plus the message vector. No encoding knob — the reservation cells are sums
+/// mod `T_MODULUS_DEFAULT`, which a smaller prime could not carry.
+pub fn params_for(
+    cfg: &ScheduledPanetiereConfig,
     n_servers: usize,
-    setup_seed: [u8; 32],
-) -> Arc<ProtocolParams> {
-    let mut rng = ChaCha20Rng::from_seed(setup_seed);
-    let mu_kahe = sched_mse.n_polys() + msg_polys(vector_bytes);
-    Arc::new(ProtocolParams::setup_with_kahe_dims(
-        &mut rng, n_servers, mu_kahe,
-    ))
+) -> (ChannelParams, Arc<ProtocolParams>) {
+    let sched_mse = sched_channel_params(cfg.estimated_messages, cfg.setup_seed);
+    let mut rng = ChaCha20Rng::from_seed(cfg.setup_seed);
+    let mu_kahe = sched_mse.n_polys() + msg_polys(cfg.vector_bytes);
+    let mut pp = ProtocolParams::setup_rs_mode(
+        &mut rng,
+        n_servers,
+        mu_kahe,
+        crate::panetiere::rs_k(n_servers),
+        n_servers,
+        sched_mse.plaintext_modulus(),
+        cfg.client_set_max.max(1) as usize,
+        cfg.setup_seed,
+    );
+    pp.min_clients = cfg.client_set_min.max(1) as usize;
+    (sched_mse, Arc::new(pp))
 }
 
 /// Conservative upper bound on the largest per-round wire message a scheduled
@@ -126,18 +131,8 @@ pub(crate) fn max_wire_estimate(
     const FRAMING: usize = 512;
     let sched_mse = sched_channel_params(estimated_messages, [0u8; 32]);
     let n_polys = sched_mse.n_polys() + msg_polys(vector_bytes);
-    // CS params depend only on n_servers; a tiny KAHE width skips sampling the
-    // (large, unused-for-sizing) KAHE CRS — same trick as `panetiere::setup_pp`.
-    let mut rng = ChaCha20Rng::from_seed([0u8; 32]);
-    let pp = ProtocolParams::setup_with_kahe_dims(&mut rng, n_relays.max(1), 1);
-    let client_public = ClientBulletinEntry::packed_len(n_polys) + FRAMING;
-    let server_public =
-        pp.cs.aggregated_server_crypto_len(client_set_max) + client_set_max as usize * 4 + FRAMING;
-    let decoded = vector_bytes + FRAMING;
     let reservations = 4 * estimated_messages as usize + FRAMING;
-    client_public
-        .max(server_public)
-        .max(decoded)
+    crate::panetiere::rs_wire_estimate(n_polys, vector_bytes, client_set_max, n_relays)
         .max(reservations)
 }
 
@@ -215,7 +210,6 @@ fn server_session(
         .enumerate()
         .map(|(i, pk)| (ServerId(i as u32), pk))
         .collect();
-    let aggregation = cfg.aggregation.as_ref().map(LeaderAggregation::from_config);
     let mode = if identity_pk == leader_pk {
         SetMode::Leader
     } else {
@@ -229,9 +223,7 @@ fn server_session(
         identity.clone(),
         mode,
         leader_pk,
-        cfg.client_set_min,
         server_pubkeys,
-        aggregation,
         entries,
     );
     session.set_client_set_max(cfg.client_set_max as usize);
@@ -265,6 +257,8 @@ pub struct ScheduledPanetiereClientSession {
     cover_rate: f32,
     cover_rng: ChaCha20Rng,
     rand_rng: ChaCha20Rng,
+    /// Signs the RS bulletin post; see [`derive_post_key`].
+    post_key: panetiere::sig::SigningKey,
     /// Subnet's `setup_seed`; with the round it forms the `sid` openings bind to.
     setup_seed: [u8; 32],
 }
@@ -304,6 +298,7 @@ impl ScheduledPanetiereClientSession {
             cover_rate: 1.0,
             cover_rng: ChaCha20Rng::from_seed(cover_seed),
             rand_rng: ChaCha20Rng::from_seed(rand_seed),
+            post_key: derive_post_key(rng_seed),
             setup_seed: [0u8; 32],
         }
     }
@@ -561,7 +556,12 @@ impl Session for ScheduledPanetiereClientSession {
             self.staged.push(Vec::new());
         }
 
-        let mut sched = MseEncoding::new(self.sched_mse.mse().clone());
+        let mut sched = MseEncoding::new(
+            self.sched_mse
+                .mse()
+                .expect("scheduled channel is the peeling encoding")
+                .clone(),
+        );
         let mut reservations = Vec::new();
         for data in std::mem::take(&mut self.staged) {
             let len = data.len();
@@ -603,23 +603,27 @@ impl Session for ScheduledPanetiereClientSession {
             plaintext.len() <= message_polys(&self.pp),
             "joint pp must cover sched + the widest message vector"
         );
+        // Constant-size posts make a narrow ciphertext pointless, and the coded
+        // shares are a fixed block width, so every round rides the full width.
+        plaintext.resize(message_polys(&self.pp), KahePoly::default());
 
         let mut seed = self.rng_seed;
         seed[24..32].copy_from_slice(&round.to_le_bytes());
         let mut rng = ChaCha20Rng::from_seed(seed);
         let sid = crate::panetiere::session_id(&self.setup_seed, round);
-        let round_out = run_client_round(
+        let round_out = run_client_round_rs(
             &mut rng,
             &self.pp,
             &sid,
             self.client_id,
             plaintext,
             &self.servers,
+            &self.post_key,
         );
 
-        let mut out: Vec<Vec<u8>> = Vec::with_capacity(1 + self.servers.len());
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(1 + 2 * self.servers.len());
         let cid = round_out.client_id.0;
-        let entry = round_out.encrypted_message.to_bytes();
+        let entry = round_out.bulletin.to_bytes();
         out.push(
             bincode::serialize(&PanetiereWire::ClientPublic {
                 round,
@@ -632,6 +636,24 @@ impl Session for ScheduledPanetiereClientSession {
             })
             .expect("serialise client public"),
         );
+        for (lane, (share, path)) in round_out
+            .rs_shares
+            .iter()
+            .zip(round_out.share_paths.iter())
+            .enumerate()
+        {
+            out.push(
+                bincode::serialize(&client_slice_wire(
+                    round,
+                    cid,
+                    lane as u32,
+                    share,
+                    path,
+                    &self.identity,
+                ))
+                .expect("serialise client slice"),
+            );
+        }
         for (server_id, sealed) in round_out.sealed_openings {
             out.push(
                 bincode::serialize(&PanetiereWire::Opening {
@@ -699,26 +721,21 @@ impl ScheduledPanetiereServerSession {
         identity: Identity,
         mode: SetMode,
         leader_pk: Pubkey,
-        min_clients: u32,
         server_pubkeys: HashMap<ServerId, Pubkey>,
-        aggregation: Option<LeaderAggregation>,
         entries_by_round: ReservationEntries,
     ) -> Self {
         let is_leader = mode == SetMode::Leader;
         let sched_polys = sched_mse.n_polys();
         // inner.mse is unused: this wrapper never calls inner's own end_round.
-        let mut inner = PanetiereServerSession::new(
+        let inner = PanetiereServerSession::new(
             pp,
             sched_mse.clone(),
             server_id,
             identity,
             mode,
-            min_clients,
             server_pubkeys,
-            aggregation,
         );
-        inner.set_entry_len(ClientBulletinEntry::packed_len(sched_polys));
-        let mut session = ScheduledPanetiereServerSession {
+        ScheduledPanetiereServerSession {
             inner,
             sched_mse,
             sched_polys,
@@ -730,9 +747,7 @@ impl ScheduledPanetiereServerSession {
             pending_msg: BTreeMap::new(),
             cur_round: None,
             first_round: None,
-        };
-        session.sync_entry_lens();
-        session
+        }
     }
 
     /// See [`crate::panetiere::PanetiereServerSession::set_client_set_max`].
@@ -752,34 +767,12 @@ impl ScheduledPanetiereServerSession {
         self.inner.set_good_clients(good_clients);
     }
 
-    /// Entry width for every round the store can place. Re-scanned rather than
-    /// pushed on decode: a successor worker inherits entries its predecessor
-    /// deposited and so never "learns" them.
-    fn sync_entry_lens(&mut self) {
-        let widths: Vec<(Round, usize)> = {
-            let map = self.entries_by_round.lock().unwrap();
-            map.iter()
-                .map(|(rd, e)| {
-                    (
-                        rd + RESERVATION_TO_MSG_GAP,
-                        ClientBulletinEntry::packed_len(
-                            self.sched_polys + allocation(e, self.vector_bytes).1,
-                        ),
-                    )
-                })
-                .collect()
-        };
-        for (round, len) in widths {
-            self.inner.set_round_entry_len(round, len);
-        }
-    }
 }
 
 impl Session for ScheduledPanetiereServerSession {
     fn begin_round(&mut self, round: Round, now: Instant) -> Vec<Vec<u8>> {
         self.cur_round = Some(round);
         self.first_round.get_or_insert(round);
-        self.sync_entry_lens();
         self.inner.begin_round(round, now)
     }
 
@@ -794,7 +787,6 @@ impl Session for ScheduledPanetiereServerSession {
                         .unwrap()
                         .entry(round)
                         .or_insert(entries);
-                    self.sync_entry_lens();
                 } else {
                     // Without this round's entries we can't place any message
                     // vector fulfilling it, so those payloads never surface.
@@ -814,7 +806,6 @@ impl Session for ScheduledPanetiereServerSession {
     fn checkpoint(&mut self, round: Round, k: u8, _now: Instant) -> Vec<Vec<u8>> {
         // A leader never receives its own `Reservations` over the wire, so on a
         // cutover boundary this is its only re-read before the round's entries.
-        self.sync_entry_lens();
         if k == 3 && self.is_leader {
             self.inner.announce_settled(round)
         } else {
@@ -827,10 +818,13 @@ impl Session for ScheduledPanetiereServerSession {
         let mut decoded = Vec::new();
 
         let mut entries_map = self.entries_by_round.lock().unwrap();
-        for (rd, plain) in self.inner.decode_settled() {
+        let (settled, _) = self.inner.decode_settled();
+        for (rd, plain) in settled {
             let n = self.sched_polys.min(plain.len());
             let entries: Vec<(u16, u16)> = match MseEncoding::unpack(
-                self.sched_mse.mse(),
+                self.sched_mse
+                    .mse()
+                    .expect("scheduled channel is the peeling encoding"),
                 &plain[..n],
             )
             .decode()
@@ -940,7 +934,6 @@ impl Session for ScheduledPanetiereServerSession {
         entries_map.retain(|r, _| *r >= cutoff);
         self.pending_msg.retain(|r, _| *r >= cutoff);
         drop(entries_map);
-        self.sync_entry_lens();
 
         RoundOutcome {
             outbound,
@@ -954,105 +947,10 @@ impl Session for ScheduledPanetiereServerSession {
     }
 }
 
-/// Shifts [`PanetiereAggregatorSession`]'s hardcoded k==1 to k==2 (k==1 is
-/// the scheduled cadence's client-submit checkpoint), and tracks each round's
-/// message-vector width: `run_aggregator_round` sums its group's ciphertexts,
-/// and summing ragged ones panics.
-pub(crate) struct ScheduledAggregatorSession {
-    inner: PanetiereAggregatorSession,
-    sched_polys: usize,
-    vector_bytes: usize,
-    entries_by_round: ReservationEntries,
-    leader_pk: PeerId,
-    cur_round: Option<Round>,
-}
-
-impl ScheduledAggregatorSession {
-    pub(crate) fn new(
-        mut inner: PanetiereAggregatorSession,
-        sched_polys: usize,
-        vector_bytes: usize,
-        entries_by_round: ReservationEntries,
-        leader_pk: Pubkey,
-    ) -> Self {
-        inner.set_entry_len(ClientBulletinEntry::packed_len(sched_polys));
-        let mut session = ScheduledAggregatorSession {
-            inner,
-            sched_polys,
-            vector_bytes,
-            entries_by_round,
-            leader_pk,
-            cur_round: None,
-        };
-        session.sync_entry_lens();
-        session
-    }
-
-    /// See [`ScheduledPanetiereServerSession::sync_entry_lens`]; a ragged group
-    /// panics `run_aggregator_round`'s ciphertext sum.
-    fn sync_entry_lens(&mut self) {
-        let widths: Vec<(Round, usize)> = {
-            let map = self.entries_by_round.lock().unwrap();
-            map.iter()
-                .map(|(rd, e)| {
-                    (
-                        rd + RESERVATION_TO_MSG_GAP,
-                        ClientBulletinEntry::packed_len(
-                            self.sched_polys + allocation(e, self.vector_bytes).1,
-                        ),
-                    )
-                })
-                .collect()
-        };
-        for (round, len) in widths {
-            self.inner.set_round_entry_len(round, len);
-        }
-    }
-}
-
-impl Session for ScheduledAggregatorSession {
-    fn begin_round(&mut self, round: Round, now: Instant) -> Vec<Vec<u8>> {
-        self.cur_round = Some(round);
-        self.sync_entry_lens();
-        self.inner.begin_round(round, now)
-    }
-
-    fn on_inbound(&mut self, from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
-        if from == self.leader_pk {
-            if let Ok(PanetiereWire::Reservations { round, entries }) =
-                bincode::deserialize::<PanetiereWire>(&payload)
-            {
-                if crate::panetiere::round_in_window(round, self.cur_round) {
-                    self.entries_by_round
-                        .lock()
-                        .unwrap()
-                        .entry(round)
-                        .or_insert(entries);
-                    self.sync_entry_lens();
-                }
-            }
-        }
-        self.inner.on_inbound(from, payload)
-    }
-
-    fn checkpoint(&mut self, round: Round, k: u8, now: Instant) -> Vec<Vec<u8>> {
-        self.sync_entry_lens();
-        if k == 2 {
-            self.inner.checkpoint(round, 1, now)
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn end_round(&mut self, round: Round, now: Instant) -> RoundOutcome {
-        self.inner.end_round(round, now)
-    }
-}
-
 /// Self-contained scheduled-Panetiere subnet driver, mirroring
 /// `panetiere::run_subnet`'s structure with a quarter-round checkpoint
-/// cadence: k=1 client submit, k=2 aggregate (aggregated only), k=3 leader
-/// announce, end_round shares + decode + broadcast.
+/// cadence: k=1 client submit, k=3 leader announce, end_round shares + decode
+/// + broadcast.
 pub(crate) async fn run_subnet(
     subnet: Subnet,
     relay_xk: Vec<(Pubkey, ExchangePublicKeyWire)>,
@@ -1068,15 +966,8 @@ pub(crate) async fn run_subnet(
         _ => unreachable!("panetiere_scheduled::run_subnet on a non-ScheduledPanetiere subnet"),
     };
     let identity_pk = inner.identity.pubkey();
-    let sched_mse = sched_channel_params(cfg.estimated_messages, cfg.setup_seed);
-    let pp = setup_joint_pp(
-        &sched_mse,
-        cfg.vector_bytes,
-        subnet.relays.len(),
-        cfg.setup_seed,
-    );
+    let (sched_mse, pp) = params_for(&cfg, subnet.relays.len());
     let leader_pk = subnet_leader_pk(&subnet);
-    let client_agg_topic = client_aggregator_topic(&subnet, identity_pk);
 
     let mut sessions: HashMap<SessionKey, Box<dyn Session>> = HashMap::new();
     let mut cover_rate = subnet.cover_rate;
@@ -1102,30 +993,6 @@ pub(crate) async fn run_subnet(
             Box::new(PanetiereWatchSession::new(leader_pk)),
         );
     }
-    if let Some(a) = subnet_aggregation(&subnet) {
-        if let Some(group) = aggregator_group_of(a, identity_pk) {
-            let mut agg_session = PanetiereAggregatorSession::new(
-                group,
-                a.groups.len() as u32,
-                inner.identity.clone(),
-            );
-            agg_session.set_client_set_max(crate::panetiere::aggregator_group_allowance(
-                cfg.client_set_max,
-                a.groups.len() as u32,
-            ));
-            agg_session.set_good_clients(inner.good_clients.clone());
-            sessions.insert(
-                SessionKey::Aggregator,
-                Box::new(ScheduledAggregatorSession::new(
-                    agg_session,
-                    sched_mse.n_polys(),
-                    cfg.vector_bytes,
-                    inner.sched_reservation_entries(subnet.id),
-                    leader_pk,
-                )),
-            );
-        }
-    }
     let mut fault_monitor: Option<Box<dyn Session>> = if leader_pk == identity_pk {
         let mut roster = subnet.relays.clone();
         roster.sort();
@@ -1138,17 +1005,7 @@ pub(crate) async fn run_subnet(
         None
     };
 
-    let egress = |key: &SessionKey, bytes: &[u8]| {
-        egress_dest(
-            subnet.id,
-            true,
-            crate::panetiere::is_shares_topic_msg,
-            crate::panetiere::is_client_public,
-            client_agg_topic.as_deref(),
-            key,
-            bytes,
-        )
-    };
+    let egress = |_key: &SessionKey, bytes: &[u8]| crate::panetiere::egress(subnet.id, bytes);
 
     let dur_ms = (subnet.protocol.round_duration().as_millis() as u64).max(4);
     let (k1_ms, k2_ms, k3_ms) = (dur_ms / 4, dur_ms / 2, 3 * dur_ms / 4);
@@ -1233,6 +1090,7 @@ pub(crate) async fn run_subnet(
         .await;
     }
 
+    let mut reported = crate::runtime::ReportedFaults::default();
     loop {
         tokio::select! {
             biased;
@@ -1330,7 +1188,7 @@ pub(crate) async fn run_subnet(
                     .map(|f| (crate::panetiere::evidence_round(&f.evidence).unwrap_or(round), f))
                     .collect();
                 if round >= spawn_round + crate::runtime::RECONFIG_FAULT_GRACE {
-                    gossip_faults(&inner, subnet.id, identity_pk, faults).await;
+                    gossip_faults(&inner, subnet.id, identity_pk, &mut reported, faults).await;
                 }
 
                 if final_round.is_some_and(|f| round >= f) {
@@ -1441,8 +1299,13 @@ mod sizing_tests {
         let (vector_bytes, rho, cset, n_relays) = (256usize, 4u32, 40u32, 3usize);
         let est = max_wire_estimate(vector_bytes, rho, cset, n_relays);
 
-        let sched_mse = sched_channel_params(rho, [1u8; 32]);
-        let pp = setup_joint_pp(&sched_mse, vector_bytes, n_relays, [1u8; 32]);
+        let cfg = ScheduledPanetiereConfig {
+            vector_bytes,
+            estimated_messages: rho,
+            client_set_max: cset,
+            ..Default::default()
+        };
+        let (sched_mse, pp) = params_for(&cfg, n_relays);
         let servers: Vec<(ServerId, pke::PublicKey)> = (0..n_relays as u32)
             .map(|i| {
                 (

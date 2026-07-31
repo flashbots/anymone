@@ -74,7 +74,7 @@ pub const INTEGRITY_BACKOFF_MS: u64 = 6 * 60 * 1000;
 /// de-escalates. Overridable via [`SchedulerParams::escalation_grace`]; keep it
 /// above the observer's `fault_threshold` so a recurring cause re-trips first.
 pub const ESCALATION_GRACE: u32 = 5;
-/// Predicted client set above which Panetiere routes public ciphertexts+commitments
+/// Predicted client set above which ADCNet routes clients' blinded contributions
 /// through an aggregator layer (lessening the leader/broadcast fan-in).
 const AGGREGATION_THRESHOLD: u32 = 16;
 /// Max distance between a `FaultReport.round` and its subnet's `share_frontier`.
@@ -110,32 +110,6 @@ fn size_capacity(clients: usize) -> u32 {
     (plus.max(mult) as u32).max(MIN_CAPACITY)
 }
 
-/// Busiest aggregator group when `clients` hash into `groups` by
-/// `client_id % groups`: half again the even split.
-fn busiest_group(clients: u32, groups: u32) -> u32 {
-    (clients.div_ceil(groups.max(1)) * 3).div_ceil(2)
-}
-
-/// Raise `desired` until every group's allowance covers its busiest bin. The
-/// allowance already carries [`crate::panetiere::AGGREGATOR_GROUP_SLACK`] over
-/// the even split, so this only bites when the load itself outgrows capacity —
-/// growing capacity past a threshold adds a group and divides the share back
-/// down, so solve rather than scale.
-fn capacity_for_group_balance(desired: u32, clients: u32, n_relays: usize) -> u32 {
-    let mut capacity = desired;
-    while capacity < MAX_SUBNET_CLIENTS {
-        let Some(groups) = aggregator_group_count(capacity, n_relays) else {
-            break;
-        };
-        let busiest = busiest_group(clients, groups);
-        if crate::panetiere::aggregator_group_allowance(capacity, groups) >= busiest as usize {
-            break;
-        }
-        capacity = (busiest * groups).max(capacity + 1);
-    }
-    capacity.min(MAX_SUBNET_CLIENTS)
-}
-
 /// IBLT/MSE decode capacity for an anonymity set of `set`: ~half its members
 /// send real messages, the rest cover — and cover vanishes from the IBLT/sum.
 pub(crate) fn expected_active(set: u32) -> u32 {
@@ -151,16 +125,6 @@ const MAX_SUBNET_WIRE: usize = crate::transport::MAX_TRANSMIT_SIZE * 3 / 4;
 /// so a fixed cap avoids sizing a subnet whose message would blow the p2p limit.
 const MAX_SUBNET_CLIENTS: u32 = 300;
 
-fn announced_set_bound(client_set_max: u32, aggregation: &Option<Aggregation>) -> u32 {
-    match aggregation {
-        Some(a) => crate::panetiere::aggregated_client_set_bound(
-            client_set_max,
-            a.groups.len().max(1) as u32,
-        ),
-        None => client_set_max,
-    }
-}
-
 /// Largest per-round wire message the given subnet protocol broadcasts, via each
 /// protocol's own packing-accurate estimator. Never-proposed protocols report 0
 /// (validate_body rejects them by variant).
@@ -175,13 +139,14 @@ fn subnet_max_wire(p: &ProtocolConfig, n_relays: usize) -> usize {
         ProtocolConfig::Panetiere(c) => crate::panetiere::max_wire_estimate(
             c.message_size,
             c.estimated_messages,
-            announced_set_bound(c.client_set_max, &c.aggregation),
+            c.client_set_max,
             n_relays,
+            c.encoding,
         ),
         ProtocolConfig::ScheduledPanetiere(c) => crate::panetiere_scheduled::max_wire_estimate(
             c.vector_bytes,
             c.estimated_messages,
-            announced_set_bound(c.client_set_max, &c.aggregation),
+            c.client_set_max,
             n_relays,
         ),
         ProtocolConfig::Noop(c) => crate::noop::max_wire_estimate(
@@ -232,10 +197,7 @@ fn validate_structure(body: &AnymoneRoundConfigurationBody) -> bool {
             ProtocolConfig::Panetiere(c) => {
                 let n = s.relays.len() as u32;
                 let threshold_ok = c.threshold >= n / 2 + 1 && c.threshold <= n.max(1);
-                if c.client_set_max < MIN_CAPACITY
-                    || !threshold_ok
-                    || !aggregation_structural_ok(&c.aggregation)
-                {
+                if c.client_set_max < MIN_CAPACITY || !threshold_ok {
                     return false;
                 }
             }
@@ -244,7 +206,6 @@ fn validate_structure(body: &AnymoneRoundConfigurationBody) -> bool {
                 let threshold_ok = c.threshold >= n / 2 + 1 && c.threshold <= n.max(1);
                 if c.client_set_max < MIN_CAPACITY
                     || !threshold_ok
-                    || !aggregation_structural_ok(&c.aggregation)
                     || c.message_size == 0
                     || c.message_size > u16::MAX as usize
                     || c.vector_bytes == 0
@@ -263,46 +224,20 @@ fn validate_structure(body: &AnymoneRoundConfigurationBody) -> bool {
 mod sizing_tests {
     use super::*;
 
-    /// A group turning clients away costs whole rounds of output, so every
-    /// group's admission cap must clear its busiest bin at the sized capacity.
-    #[test]
-    fn capacity_covers_the_busiest_aggregator_group() {
-        for n_relays in [4usize, 8, 16] {
-            for clients in 1u32..120 {
-                let capacity =
-                    capacity_for_group_balance(size_capacity(clients as usize), clients, n_relays);
-                let Some(groups) = aggregator_group_count(capacity, n_relays) else {
-                    continue;
-                };
-                let allowance = crate::panetiere::aggregator_group_allowance(capacity, groups);
-                assert!(
-                    allowance >= busiest_group(clients, groups) as usize,
-                    "{clients} clients over {n_relays} relays: capacity {capacity} gives \
-                     {groups} groups an allowance of {allowance} but the busiest holds {}",
-                    busiest_group(clients, groups)
-                );
-                assert!(capacity <= MAX_SUBNET_CLIENTS);
-            }
-        }
-        // The slack lives in the allowance, so group balance alone no longer
-        // inflates capacity — 31 clients used to have to grow it past 41.
-        let desired = size_capacity(31);
-        assert_eq!(capacity_for_group_balance(desired, 31, 8), desired);
-        // Measured live: 43 clients hashed 14/19/10 over 3 groups at capacity 36,
-        // and an even share of 12 bounced the busiest bin every round.
-        assert!(crate::panetiere::aggregator_group_allowance(36, 3) >= 19);
-    }
-
     #[test]
     fn reference_capacity_fits_budget() {
         // At the capacity ceiling the biggest message stays well under the wire budget.
         let msg = 256usize;
         let est = expected_active(MAX_SUBNET_CLIENTS);
         for n_relays in [5usize, 8] {
-            let worst =
-                crate::adcnet::max_wire_estimate(msg, est, MAX_SUBNET_CLIENTS, n_relays).max(
-                    crate::panetiere::max_wire_estimate(msg, est, MAX_SUBNET_CLIENTS, n_relays),
-                );
+            let worst = crate::adcnet::max_wire_estimate(msg, est, MAX_SUBNET_CLIENTS, n_relays)
+                .max(crate::panetiere::max_wire_estimate(
+                    msg,
+                    est,
+                    MAX_SUBNET_CLIENTS,
+                    n_relays,
+                    crate::config::Encoding::Mse,
+                ));
             assert!(
                 worst <= MAX_SUBNET_WIRE,
                 "reference message {worst} at {n_relays} relays exceeds budget"
@@ -336,6 +271,7 @@ mod sizing_tests {
                     vector_bytes: 0,
                     pin: None,
                     aggregation: true,
+                    encoding: crate::config::Encoding::default(),
                 },
             );
             for _ in 0..n_relays {
@@ -400,6 +336,7 @@ mod sizing_tests {
                 vector_bytes: 0,
                 pin: None,
                 aggregation: true,
+                encoding: crate::config::Encoding::default(),
             },
         );
         let body = AnymoneRoundConfigurationBody {
@@ -501,9 +438,11 @@ pub struct SchedulerParams {
     /// Freeze every subnet onto one protocol, bypassing both the escalation
     /// ladder and the traffic-driven scheduled upgrade.
     pub pin: Option<SchedulerProtocol>,
-    /// Whether the committee may route large Panetiere subnets through an
+    /// Whether the committee may route large ADCNet subnets through an
     /// aggregator layer above [`AGGREGATION_THRESHOLD`].
     pub aggregation: bool,
+    /// Payload encoding every proposed Panetiere subnet carries.
+    pub encoding: crate::config::Encoding,
 }
 
 /// One public subnet's escalation state: `general` (unattributable fault, heals
@@ -808,10 +747,11 @@ impl SchedulerCore {
         }
     }
 
-    /// Ingest an integrity `FaultReport` gossiped on `TOPIC_FAULTS`. Accepted only
-    /// from the subnet's leader and only when we can re-verify the evidence
-    /// ourselves — it must be signed by the very relay it attributes — so a lying
-    /// leader can't frame an honest one. Liveness stays the observer's job.
+    /// Ingest an integrity `FaultReport` gossiped on `TOPIC_FAULTS`. Every relay
+    /// on the subnet decodes, so any of them may report; the evidence must be
+    /// signed by the very relay it attributes, so a lying reporter can't frame an
+    /// honest one, and `seen_integrity_faults` applies the first report per
+    /// (subnet, round, culprit). Liveness stays the observer's job.
     ///
     /// `report.round` is a subnet round on a different clock than the
     /// committee's `tick` round, so freshness is checked against the subnet's
@@ -835,12 +775,12 @@ impl SchedulerCore {
                 return;
             }
         };
-        if from != roster[(report.subnet as usize) % roster.len()] {
+        if !roster.contains(&from) {
             tracing::debug!(
                 target: GOV,
                 subnet = report.subnet,
                 reporter = %from,
-                "fault report from a non-leader, ignored"
+                "fault report from outside the subnet's roster, ignored"
             );
             return;
         }
@@ -862,8 +802,8 @@ impl SchedulerCore {
                 return;
             }
         }
-        // The leader claims an integrity fault we can't re-derive from its own
-        // evidence: either the evidence is malformed or the leader is lying.
+        // An integrity fault we can't re-derive from the reporter's own evidence:
+        // either the evidence is malformed or the reporter is lying.
         let Some(culprit) =
             crate::panetiere::integrity_culprit_from_evidence(&report.fault.evidence, &roster)
         else {
@@ -1069,11 +1009,9 @@ impl SchedulerCore {
         // `min_capacity` is a hard floor — set it above the expected load to
         // keep the subnet from resizing at all during a demo.
         let observed = busiest.max(load.div_ceil(self.subnet_count.max(1) as u32));
-        let desired = capacity_for_group_balance(
-            size_capacity(observed as usize).max(self.params.min_capacity),
-            observed,
-            self.registered.len(),
-        );
+        let desired = size_capacity(observed as usize)
+            .max(self.params.min_capacity)
+            .min(MAX_SUBNET_CLIENTS);
         if observed >= self.capacity {
             // Overflowing right now (clients being rejected): grow immediately.
             self.capacity = desired.max(self.capacity);
@@ -1488,8 +1426,7 @@ impl SchedulerCore {
             let keys_ok = match &s.protocol {
                 ProtocolConfig::Noop(_) => true,
                 ProtocolConfig::Adcnet(c) => self.aggregation_valid(&c.aggregation),
-                ProtocolConfig::Panetiere(c) => self.aggregation_valid(&c.aggregation),
-                ProtocolConfig::ScheduledPanetiere(c) => self.aggregation_valid(&c.aggregation),
+                ProtocolConfig::Panetiere(_) | ProtocolConfig::ScheduledPanetiere(_) => true,
                 // Rejected by validate_structure already.
                 ProtocolConfig::ScheduledAdcnet(_) | ProtocolConfig::Nym(_) => false,
             };
@@ -1654,7 +1591,7 @@ impl SchedulerCore {
                         client_set_max: self.capacity,
                         threshold: (n / 2 + 1).max(n.saturating_sub(2)),
                         setup_seed: crate::keys::derive_seed(b"anymone/subnet-seed", &relay_vec),
-                        aggregation: aggregation.clone(),
+                        encoding: self.params.encoding,
                     }),
                     SchedulerProtocol::ScheduledPanetiere => {
                         let vector_bytes = Some(self.params.vector_bytes)
@@ -1687,7 +1624,6 @@ impl SchedulerCore {
                                     b"anymone/subnet-seed",
                                     &relay_vec,
                                 ),
-                                aggregation: aggregation.clone(),
                             },
                         )
                     }

@@ -21,13 +21,14 @@ use chipmunk_code::{DgtNTTPoly, N};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
-use panetiere::bulletin::{RsClientBulletinEntry, ServerBulletinEntry};
+use panetiere::bulletin::{dgt_packed_len, RsClientBulletinEntry, ServerBulletinEntry};
 use panetiere::kahe::{Kahe, KaheScheme};
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round_rs;
 use panetiere::protocol::server::{unseal_opening, RsNodeInbox, ServerInbox};
 use panetiere::protocol::{ClientId, NodeId, ProtocolParams, ServerId, SessionId};
-use panetiere::rs::{Rs, RsParams, Share};
+use panetiere::rs::{pack_share, unpack_share, Rs, RsParams, Share};
+use panetiere::share_commitment::{fresh_path_packed_len, ShareCommitmentParams, SharePath};
 use panetiere::sig;
 
 fn code(pp: &ProtocolParams) -> &RsParams {
@@ -60,20 +61,33 @@ fn hash_share(share: &[DgtNTTPoly]) -> [u8; 32] {
     h.finalize().into()
 }
 
+fn hash_path(path: &SharePath) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update((path.lane_index as u32).to_le_bytes());
+    for p in path.nodes.iter() {
+        for c in p.coeffs() {
+            h.update(c.to_le_bytes());
+        }
+    }
+    h.finalize().into()
+}
+
 pub fn bundle_signing_bytes(
     sid: &SessionId,
     client_id: ClientId,
     lane: usize,
     share: &[DgtNTTPoly],
+    path: &SharePath,
     envelope: &[u8],
 ) -> Vec<u8> {
-    const DOMAIN: &[u8] = b"panetiere/client-set/bundle/v2";
-    let mut out = Vec::with_capacity(DOMAIN.len() + 32 + 8 + 64);
+    const DOMAIN: &[u8] = b"panetiere/client-set/bundle/v3";
+    let mut out = Vec::with_capacity(DOMAIN.len() + 32 + 8 + 96);
     out.extend_from_slice(DOMAIN);
     out.extend_from_slice(&sid.0);
     out.extend_from_slice(&client_id.0.to_le_bytes());
     out.extend_from_slice(&(lane as u32).to_le_bytes());
     out.extend_from_slice(&hash_share(share));
+    out.extend_from_slice(&hash_path(path));
     out.extend_from_slice(&sha(&[envelope]));
     out
 }
@@ -83,19 +97,29 @@ pub struct Bundle {
     pub client_id: ClientId,
     pub lane: usize,
     pub share: Share,
+    /// Lane `lane`'s opening of the client's share commitment; the lane needs it
+    /// to prove its summed share against `Σ share_root`.
+    pub path: SharePath,
     pub envelope: Vec<u8>,
     pub pubkey: [u8; sig::PUBKEY_LEN],
     pub sig: [u8; sig::SIG_LEN],
 }
 
 impl Bundle {
-    pub fn wire_len(&self) -> usize {
-        self.share.len() * N * 8 + self.envelope.len() + sig::PUBKEY_LEN + sig::SIG_LEN + 8
+    /// Exact packed size under `scp`'s geometry — the share and path lengths are
+    /// fixed by it, so only the envelope varies.
+    pub fn packed_len(scp: &ShareCommitmentParams, envelope_len: usize) -> usize {
+        8 + scp.block_len * dgt_packed_len()
+            + fresh_path_packed_len(scp.n_lanes)
+            + envelope_len
+            + sig::PUBKEY_LEN
+            + sig::SIG_LEN
     }
 
     fn hash(&self) -> [u8; 32] {
         sha(&[
             &hash_share(&self.share),
+            &hash_path(&self.path),
             &self.envelope,
             &self.pubkey,
             &self.sig,
@@ -103,55 +127,59 @@ impl Bundle {
     }
 
     fn verify(&self, sid: &SessionId, n_lanes: usize) -> bool {
-        if self.lane >= n_lanes {
+        if self.lane >= n_lanes || self.path.lane_index != self.lane {
             return false;
         }
         let Ok(vk) = sig::VerifyingKey::from_sec1_bytes(&self.pubkey) else {
             return false;
         };
         vk.verify(
-            &bundle_signing_bytes(sid, self.client_id, self.lane, &self.share, &self.envelope),
+            &bundle_signing_bytes(
+                sid,
+                self.client_id,
+                self.lane,
+                &self.share,
+                &self.path,
+                &self.envelope,
+            ),
             &self.sig,
         )
         .is_ok()
     }
 
-    fn pack(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+    /// `None` when the path digits are past ζ, which `SharePath::from_bytes`
+    /// would refuse anyway.
+    pub fn pack(&self, scp: &ShareCommitmentParams) -> Option<Vec<u8>> {
+        let mut out = Vec::with_capacity(Self::packed_len(scp, self.envelope.len()));
         out.extend_from_slice(&(self.lane as u32).to_le_bytes());
-        out.extend_from_slice(&(self.share.len() as u32).to_le_bytes());
-        for p in &self.share {
-            for c in p.coeffs() {
-                out.extend_from_slice(&c.to_le_bytes());
-            }
-        }
+        pack_share(&self.share, &mut out);
+        out.extend_from_slice(&self.path.to_bytes()?);
         out.extend_from_slice(&(self.envelope.len() as u32).to_le_bytes());
         out.extend_from_slice(&self.envelope);
         out.extend_from_slice(&self.pubkey);
         out.extend_from_slice(&self.sig);
-        out
+        Some(out)
     }
 
-    fn unpack(client_id: ClientId, bytes: &[u8]) -> Option<(Self, usize)> {
+    /// Reads one bundle from the front of `bytes`, returning it and the length
+    /// consumed. Every field but the envelope is fixed-width under `scp`, so a
+    /// fabricated blob cannot inflate an allocation.
+    pub fn unpack(
+        scp: &ShareCommitmentParams,
+        client_id: ClientId,
+        bytes: &[u8],
+    ) -> Option<(Self, usize)> {
         let word = |at: usize| -> Option<usize> {
             Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as usize)
         };
         let lane = word(0)?;
-        let n_polys = word(4)?;
-        // Bound the allocation by the bytes actually present.
-        if n_polys > bytes.len().saturating_sub(8) / (N * 8) {
-            return None;
-        }
-        let mut at = 8;
-        let mut share = Vec::with_capacity(n_polys);
-        for _ in 0..n_polys {
-            let mut coeffs = [0u64; N];
-            for c in coeffs.iter_mut() {
-                *c = u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?);
-                at += 8;
-            }
-            share.push(DgtNTTPoly::from_raw(&coeffs));
-        }
+        let mut at = 4;
+        let share_len = scp.block_len * dgt_packed_len();
+        let share = unpack_share(bytes.get(at..at + share_len)?, scp.block_len)?;
+        at += share_len;
+        let path_len = fresh_path_packed_len(scp.n_lanes);
+        let path = SharePath::from_bytes(scp, lane, bytes.get(at..at + path_len)?)?;
+        at += path_len;
         let env_len = word(at)?;
         at += 4;
         let envelope = bytes.get(at..at + env_len)?.to_vec();
@@ -165,6 +193,7 @@ impl Bundle {
                 client_id,
                 lane,
                 share,
+                path,
                 envelope,
                 pubkey,
                 sig,
@@ -228,6 +257,43 @@ pub fn fragment_signing_bytes(
     out
 }
 
+impl Fragment {
+    pub fn pack(&self) -> Vec<u8> {
+        let mut out =
+            Vec::with_capacity(12 + self.data.len() * dgt_packed_len() + sig::SIG_LEN);
+        out.extend_from_slice(&self.client_id.0.to_le_bytes());
+        out.extend_from_slice(&(self.idx as u32).to_le_bytes());
+        out.extend_from_slice(&(self.data.len() as u32).to_le_bytes());
+        pack_share(&self.data, &mut out);
+        out.extend_from_slice(&self.sig);
+        out
+    }
+
+    /// Consumes `bytes` exactly; the poly count is bounded by the bytes present
+    /// before anything is allocated.
+    pub fn unpack(bytes: &[u8]) -> Option<Self> {
+        let word = |at: usize| -> Option<usize> {
+            Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as usize)
+        };
+        let client_id = ClientId(word(0)? as u32);
+        let idx = word(4)?;
+        let n_polys = word(8)?;
+        let body = 12 + n_polys * dgt_packed_len();
+        if n_polys > bytes.len().saturating_sub(12) / dgt_packed_len()
+            || bytes.len() != body + sig::SIG_LEN
+        {
+            return None;
+        }
+        let data = unpack_share(bytes.get(12..body)?, n_polys)?;
+        Some(Fragment {
+            client_id,
+            idx,
+            data,
+            sig: bytes.get(body..)?.try_into().ok()?,
+        })
+    }
+}
+
 fn fragment_item_hash(sid: &SessionId, f: &Fragment) -> [u8; 32] {
     sha(&[
         b"panetiere/client-set/fragment-id/v1",
@@ -237,7 +303,7 @@ fn fragment_item_hash(sid: &SessionId, f: &Fragment) -> [u8; 32] {
 
 /// The client's inclusion ticket: certificates for the lanes that answered,
 /// erasure-coded bundles for the lanes that did not.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Evidence {
     pub client_id: ClientId,
     pub certs: Vec<Certificate>,
@@ -278,6 +344,83 @@ impl Evidence {
             &self.pubkey,
         ])
     }
+
+    /// One certificate on the wire: the client id is the package's, so only the
+    /// certifier, the hash it bound, and its signature travel.
+    const CERT_LEN: usize = 4 + 32 + sig::SIG_LEN;
+
+    pub fn packed_len(n_certs: usize, n_missing: usize) -> usize {
+        20 + sig::PUBKEY_LEN + sig::SIG_LEN + 4 * n_missing + n_certs * Self::CERT_LEN
+    }
+
+    pub fn pack(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::packed_len(self.certs.len(), self.missing.len()));
+        out.extend_from_slice(&self.client_id.0.to_le_bytes());
+        out.extend_from_slice(&(self.blob_len as u64).to_le_bytes());
+        out.extend_from_slice(&self.pubkey);
+        out.extend_from_slice(&self.sig);
+        out.extend_from_slice(&(self.missing.len() as u32).to_le_bytes());
+        for m in &self.missing {
+            out.extend_from_slice(&(*m as u32).to_le_bytes());
+        }
+        out.extend_from_slice(&(self.certs.len() as u32).to_le_bytes());
+        for c in &self.certs {
+            out.extend_from_slice(&c.server_id.0.to_le_bytes());
+            out.extend_from_slice(&c.bundle_hash);
+            out.extend_from_slice(&c.sig);
+        }
+        out
+    }
+
+    /// Consumes `bytes` exactly. Both counts are checked against the bytes
+    /// present before allocating, so a fabricated package cannot inflate either.
+    pub fn unpack(bytes: &[u8]) -> Option<Self> {
+        let word = |at: usize| -> Option<usize> {
+            Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as usize)
+        };
+        let client_id = ClientId(word(0)? as u32);
+        let blob_len = u64::from_le_bytes(bytes.get(4..12)?.try_into().ok()?) as usize;
+        let pubkey: [u8; sig::PUBKEY_LEN] = bytes.get(12..12 + sig::PUBKEY_LEN)?.try_into().ok()?;
+        let mut at = 12 + sig::PUBKEY_LEN;
+        let sig: [u8; sig::SIG_LEN] = bytes.get(at..at + sig::SIG_LEN)?.try_into().ok()?;
+        at += sig::SIG_LEN;
+        let n_missing = word(at)?;
+        at += 4;
+        if n_missing > bytes.len().saturating_sub(at) / 4 {
+            return None;
+        }
+        let mut missing = Vec::with_capacity(n_missing);
+        for _ in 0..n_missing {
+            missing.push(word(at)?);
+            at += 4;
+        }
+        let n_certs = word(at)?;
+        at += 4;
+        if n_certs > bytes.len().saturating_sub(at) / Self::CERT_LEN {
+            return None;
+        }
+        let mut certs = Vec::with_capacity(n_certs);
+        for _ in 0..n_certs {
+            certs.push(Certificate {
+                client_id,
+                server_id: ServerId(word(at)? as u32),
+                bundle_hash: bytes.get(at + 4..at + 36)?.try_into().ok()?,
+                sig: bytes.get(at + 36..at + Self::CERT_LEN)?.try_into().ok()?,
+            });
+            at += Self::CERT_LEN;
+        }
+        if at != bytes.len() {
+            return None;
+        }
+        Some(Evidence {
+            client_id,
+            certs,
+            missing,
+            blob_len,
+            pubkey,
+            sig,
+        })
+    }
 }
 
 pub fn relay_signing_bytes(sid: &SessionId, item_hash: &[u8; 32]) -> Vec<u8> {
@@ -310,6 +453,60 @@ impl RelayItem {
 pub struct Relay {
     pub item: RelayItem,
     pub chain: Vec<(ServerId, [u8; sig::SIG_LEN])>,
+}
+
+impl Relay {
+    const CHAIN_ENTRY: usize = 4 + sig::SIG_LEN;
+
+    pub fn pack(&self) -> Vec<u8> {
+        let (tag, item) = match &self.item {
+            RelayItem::Evidence(e) => (0u8, e.pack()),
+            RelayItem::Fragment(f) => (1u8, f.pack()),
+        };
+        let mut out =
+            Vec::with_capacity(9 + item.len() + self.chain.len() * Self::CHAIN_ENTRY);
+        out.push(tag);
+        out.extend_from_slice(&(item.len() as u32).to_le_bytes());
+        out.extend_from_slice(&item);
+        out.extend_from_slice(&(self.chain.len() as u32).to_le_bytes());
+        for (s, sg) in &self.chain {
+            out.extend_from_slice(&s.0.to_le_bytes());
+            out.extend_from_slice(sg);
+        }
+        out
+    }
+
+    pub fn unpack(bytes: &[u8]) -> Option<Self> {
+        let word = |at: usize| -> Option<usize> {
+            Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as usize)
+        };
+        let tag = *bytes.first()?;
+        let item_len = word(1)?;
+        let body = bytes.get(5..5 + item_len)?;
+        let item = match tag {
+            0 => RelayItem::Evidence(Evidence::unpack(body)?),
+            1 => RelayItem::Fragment(Fragment::unpack(body)?),
+            _ => return None,
+        };
+        let mut at = 5 + item_len;
+        let n_chain = word(at)?;
+        at += 4;
+        if n_chain > bytes.len().saturating_sub(at) / Self::CHAIN_ENTRY {
+            return None;
+        }
+        let mut chain = Vec::with_capacity(n_chain);
+        for _ in 0..n_chain {
+            chain.push((
+                ServerId(word(at)? as u32),
+                bytes.get(at + 4..at + Self::CHAIN_ENTRY)?.try_into().ok()?,
+            ));
+            at += Self::CHAIN_ENTRY;
+        }
+        if at != bytes.len() {
+            return None;
+        }
+        Some(Relay { item, chain })
+    }
 }
 
 const BYTES_PER_COEFF: usize = 7;
@@ -371,13 +568,16 @@ pub fn run_client_round_set<R: rand::CryptoRng + rand::Rng>(
     let bundles = (0..rs.n)
         .map(|lane| {
             let share = round.rs_shares[lane].clone();
+            let path = round.share_paths[lane].clone();
             let envelope = round.sealed_openings[lane].1.clone();
-            let sig =
-                signing_key.sign(&bundle_signing_bytes(sid, client_id, lane, &share, &envelope));
+            let sig = signing_key.sign(&bundle_signing_bytes(
+                sid, client_id, lane, &share, &path, &envelope,
+            ));
             Bundle {
                 client_id,
                 lane,
                 share,
+                path,
                 envelope,
                 pubkey,
                 sig,
@@ -410,9 +610,14 @@ pub fn build_evidence(
         "too few certifiers to code around the gap"
     );
 
+    let scp = pp.share_comm.as_ref().expect("RS mode params");
     let blob: Vec<u8> = missing
         .iter()
-        .flat_map(|&l| round.bundles[l].pack())
+        .flat_map(|&l| {
+            round.bundles[l]
+                .pack(scp)
+                .expect("own fresh path digits within ζ")
+        })
         .collect();
     let fragments = if missing.is_empty() {
         Vec::new()
@@ -816,7 +1021,7 @@ impl SetServer {
             if let Some(opening) = unseal_opening(key, sid, *cid, self.server_id, &b.envelope) {
                 out.inbox.items.push((*cid, opening));
             }
-            out.lane_inbox.items.push((*cid, b.share));
+            out.lane_inbox.items.push((*cid, b.share, b.path));
         }
         out
     }
@@ -848,10 +1053,11 @@ impl SetServer {
             .collect();
         let blob = polys_to_blob(&Rs::reconstruct(&params, n_polys, &samples).ok()?, e.blob_len);
 
+        let scp = pp.share_comm.as_ref()?;
         let mut out = Vec::with_capacity(e.missing.len());
         let mut at = 0;
         for &lane in &e.missing {
-            let (b, used) = Bundle::unpack(e.client_id, &blob[at..])?;
+            let (b, used) = Bundle::unpack(scp, e.client_id, blob.get(at..)?)?;
             if b.lane != lane || b.pubkey != e.pubkey || !b.verify(sid, self.n_lanes) {
                 return None;
             }
