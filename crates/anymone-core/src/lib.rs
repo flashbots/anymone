@@ -8,6 +8,7 @@ pub mod adcnet;
 pub mod backend;
 pub mod bootstrap;
 pub mod client_pool;
+pub mod client_set;
 pub mod committee;
 pub mod config;
 pub mod cw;

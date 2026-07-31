@@ -39,6 +39,11 @@ test-util = []
 # build can't dump decoded traffic even if the env var is set; opt in per binary.
 wire-debug = []
 
+# Crypto-heavy (~20 s debug); run explicitly with --test client_set_e2e.
+[[test]]
+name = "client_set_e2e"
+test = false
+
 [dev-dependencies]
 serial_test = "3"
 tempfile = "3"
