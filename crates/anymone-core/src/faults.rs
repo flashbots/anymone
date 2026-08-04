@@ -88,6 +88,17 @@ impl OutputFaultTracker {
         }
     }
 
+    /// Rounds below `round` were unobservable — the caller's clock jumped past
+    /// them — so judge only from `round` on: restart stall detection at the new
+    /// frontier and drop any failure streak built across the gap.
+    pub fn fast_forward(&mut self, round: u64) {
+        let through = round.saturating_sub(1);
+        self.evaluated_through = Some(self.evaluated_through.map_or(through, |e| e.max(through)));
+        self.fail_run.clear();
+        self.reported = false;
+        self.share_at_last_output = None;
+    }
+
     fn output_frozen(&self) -> bool {
         match (self.max_share_round, self.share_at_last_output) {
             (Some(s), Some(base)) => s.saturating_sub(base) > self.stall_margin,

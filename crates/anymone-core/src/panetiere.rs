@@ -1110,6 +1110,14 @@ impl PanetiereObserverSession {
 
 impl Session for PanetiereObserverSession {
     fn begin_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
+        // A jump past the acceptance window means the gap was unobservable —
+        // judging it would fault a subnet that was merely out of sight.
+        if self
+            .cur_round
+            .is_some_and(|c| round > c.saturating_add(PANETIERE_ROUND_WINDOW))
+        {
+            self.tracker.fast_forward(round);
+        }
         self.cur_round = Some(round);
         Vec::new()
     }
@@ -2852,6 +2860,36 @@ mod observer_tests {
             obs.share_frontier(),
             Some(9),
             "far-future round must be dropped by the round-window clamp"
+        );
+
+        // A clock jump past the window (a committee catching up to a subnet
+        // that ran ahead) must accept traffic at the new round and not fault
+        // the unobservable gap.
+        let share_at = |r: u64| {
+            let signing = server_public_signing_bytes(r, 1, &[10], &agg_open, &[], &[], &[]);
+            bincode::serialize(&PanetiereWire::ServerPublic {
+                round: r,
+                server_id: 1,
+                clients: vec![10],
+                agg_open: agg_open.clone(),
+                agg_share: Vec::new(),
+                share_sum: Vec::new(),
+                lane_open: Vec::new(),
+                signature: other_id.sign(&signing),
+            })
+            .unwrap()
+        };
+        obs.on_inbound(other, share_at(10));
+        obs.begin_round(2000, Instant::now());
+        obs.on_inbound(other, share_at(2000));
+        assert_eq!(
+            obs.share_frontier(),
+            Some(2000),
+            "traffic at the jumped-to round must be accepted"
+        );
+        assert!(
+            obs.end_round(2000, Instant::now()).faults.is_empty(),
+            "rounds the observer's clock jumped past are unobservable, not faults"
         );
     }
 

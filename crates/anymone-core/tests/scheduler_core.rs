@@ -333,6 +333,8 @@ fn unattributable_fault_escalates_without_dropping() {
     let esc = staged_proposal(&core.tick(1, 0)).expect("escalation proposal");
     assert_eq!(proto_name(&esc.body), "panetiere");
     assert_eq!(esc.body.subnets[0].relays.len(), 3);
+    let epoch = esc.body.epoch_unix_ms;
+    let round_ms = esc.body.subnets[0].protocol.round_duration().as_millis() as u64;
     enact(&mut core, &committee, esc);
 
     // A relay re-announcing must NOT de-escalate: the general fault names no
@@ -350,15 +352,24 @@ fn unattributable_fault_escalates_without_dropping() {
         );
     }
 
-    // Real signed Panetiere traffic for the grace period does heal it.
+    // Real signed Panetiere traffic for the grace period does heal it — even
+    // when the subnet runs far ahead of the last round the observer accepted.
+    // Traffic alone can't move the observer's clock past its acceptance
+    // window; the tick's wall clock must catch it up.
     let mut net = PanetiereSubnet::new(&relays, None);
+    let (wire, _, _) = net.round(0);
+    for (from, bytes) in wire {
+        core.on_subnet_message(0, from, bytes);
+    }
+    core.tick(10, epoch);
     let mut healed = None;
-    for r in 0..6u64 {
-        let (wire, _, _) = net.round(r);
+    let base = 5_000u64;
+    for r in 0..8u64 {
+        let (wire, _, _) = net.round(base + r);
         for (from, bytes) in wire {
             core.on_subnet_message(0, from, bytes);
         }
-        if let Some(b) = staged_body(&core.tick(10 + r, 0)) {
+        if let Some(b) = staged_body(&core.tick(11 + r, epoch + (base + r) * round_ms)) {
             healed = Some(proto_name(&b));
         }
     }

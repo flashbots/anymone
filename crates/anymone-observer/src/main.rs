@@ -498,13 +498,11 @@ async fn watch_subnet(subnet: Subnet, transport: Arc<dyn Transport>, obs: Shared
     let mut raw_bytes: u64 = 0;
     let mut goodput_bytes: u64 = 0;
 
-    // The observer/watch sessions track rounds from wire `on_inbound`; their tick
-    // round arg is unused, so 0 is passed (and never displayed).
+    // The observer sessions track rounds from wire `on_inbound` alone — a real
+    // `begin_round` would clamp their acceptance window to a clock this task
+    // doesn't keep. The watch session ignores its round arg, so 0 is passed.
     let now = Instant::now();
     watch.begin_round(0, now);
-    if let Some(o) = adcnet_obs.as_mut() {
-        o.begin_round(0, now);
-    }
 
     loop {
         tokio::select! {
@@ -625,7 +623,6 @@ async fn watch_subnet(subnet: Subnet, transport: Arc<dyn Transport>, obs: Shared
 
                 deadline += dur;
                 watch.begin_round(0, now);
-                if let Some(o) = adcnet_obs.as_mut() { o.begin_round(0, now); }
             }
             Some(msg) = sub.recv() => {
                 let anymone_core::Inbound { from, payload } = msg;

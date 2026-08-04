@@ -521,6 +521,9 @@ pub struct SchedulerCore {
     observers: std::collections::BTreeMap<SubnetId, PublicObserver>,
     /// Remaining grace ticks per freshly rebuilt observer ([`OBSERVER_FAULT_GRACE`]).
     observer_grace: HashMap<SubnetId, u32>,
+    /// Per-subnet round duration from the adopted body, for deriving each
+    /// subnet's wall-clock round at tick.
+    subnet_round_ms: std::collections::BTreeMap<SubnetId, u64>,
     /// Signature of the current public-subnet set (id + sorted roster + proto);
     /// observers are rebuilt only when this changes, so fault state survives the
     /// committee's periodic config re-broadcasts.
@@ -588,6 +591,7 @@ impl SchedulerCore {
             relay_xpubs: HashMap::new(),
             observers: std::collections::BTreeMap::new(),
             observer_grace: HashMap::new(),
+            subnet_round_ms: std::collections::BTreeMap::new(),
             current_subnets_sig: Vec::new(),
             subnet_count: 1,
             shrink_streak: 0,
@@ -846,8 +850,17 @@ impl SchedulerCore {
     /// if we're the lead and the proposal content changed — stage a new config.
     pub fn tick(&mut self, round: Round, now_unix_ms: u64) -> Vec<SchedulerAction> {
         self.cur_round = round;
-        for obs in self.observers.values_mut() {
-            obs.refresh_clock();
+        for (id, obs) in self.observers.iter_mut() {
+            // The subnet's wall-clock round (global genesis clock, unforgeable):
+            // traffic can only move an observer's clock by its acceptance window
+            // per tick, so a committee ticking slower than window×round_duration
+            // would wedge behind a live subnet for good.
+            let wall = self
+                .epoch_unix_ms
+                .zip(self.subnet_round_ms.get(id).copied())
+                .filter(|(_, d)| *d > 0)
+                .map(|(e, d)| crate::runtime::round_at(0, e, d, now_unix_ms));
+            obs.refresh_clock(wall);
         }
         // Bound seen_integrity_faults: drop entries far behind their subnet's frontier.
         let frontiers: HashMap<SubnetId, Round> = self
@@ -1276,6 +1289,11 @@ impl SchedulerCore {
 
     fn learn_config(&mut self, body: &AnymoneRoundConfigurationBody) {
         self.epoch_unix_ms = Some(body.epoch_unix_ms);
+        self.subnet_round_ms = body
+            .subnets
+            .iter()
+            .map(|s| (s.id, s.protocol.round_duration().as_millis() as u64))
+            .collect();
         // One observer per public subnet, rebuilt only when the subnet set
         // (ids + rosters + protocols) actually changes — so fault-tracking state
         // survives the committee's periodic re-broadcasts of the same config.
@@ -1816,18 +1834,19 @@ impl PublicObserver {
         }
     }
 
-    /// Advance the observer's round clamp to the highest subnet round observed
-    /// so far, since nothing else here ever calls its `begin_round`.
-    fn refresh_clock(&mut self) {
+    /// Advance the observer's round clamp to the subnet's wall-clock round —
+    /// never behind the highest wire round already accepted — since nothing
+    /// else here ever calls its `begin_round`.
+    fn refresh_clock(&mut self, wall_round: Option<Round>) {
         let now = std::time::Instant::now();
         match self {
             PublicObserver::Adcnet(o) => {
-                if let Some(r) = o.observed_round() {
+                if let Some(r) = o.observed_round().into_iter().chain(wall_round).max() {
                     o.begin_round(r, now);
                 }
             }
             PublicObserver::Panetiere(o) => {
-                if let Some(r) = o.round() {
+                if let Some(r) = o.round().into_iter().chain(wall_round).max() {
                     o.begin_round(r, now);
                 }
             }

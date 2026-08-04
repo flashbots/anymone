@@ -629,9 +629,9 @@ impl AdcnetObserverSession {
 }
 
 impl AdcnetObserverSession {
-    // The observer has no scheduler tick of its own — `begin_round` is never
-    // fed a real round, so the window clock instead tracks the highest
-    // accepted wire round seen so far.
+    // The window clock tracks the highest accepted wire round; the committee
+    // additionally lifts it to the wall-clock subnet round via `begin_round`,
+    // since traffic acceptance alone can't advance it past the slack.
     fn advance_cur_round(&mut self, round: u64) {
         let round = round as u32;
         self.cur_round = Some(self.cur_round.map_or(round, |cur| cur.max(round)));
@@ -639,7 +639,16 @@ impl AdcnetObserverSession {
 }
 
 impl Session for AdcnetObserverSession {
-    fn begin_round(&mut self, _round: Round, _now: Instant) -> Vec<Vec<u8>> {
+    fn begin_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
+        // A jump past the acceptance slack means the gap was unobservable —
+        // judging it would fault a subnet that was merely out of sight.
+        if self
+            .cur_round
+            .is_some_and(|c| round as u32 > c.saturating_add(FUTURE_ROUND_SLACK))
+        {
+            self.tracker.fast_forward(round);
+        }
+        self.advance_cur_round(round);
         Vec::new()
     }
 
