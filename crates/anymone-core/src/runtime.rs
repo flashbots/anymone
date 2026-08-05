@@ -759,6 +759,9 @@ async fn apply_config(
             .transport
             .set_topic_policy(crate::governance::topic_policy(&config.body, committee));
     }
+    inner
+        .transport
+        .set_publish_targets(publish_targets(&config.body));
     let _ = inner.events.send(Event::ConfigUpdated {
         round: config.body.round,
     });
@@ -1055,6 +1058,25 @@ pub(crate) async fn arm_until_cutover(
     }
 }
 
+/// Submissions a censoring relay could otherwise swallow on the way in.
+fn publish_targets(
+    body: &crate::config::AnymoneRoundConfigurationBody,
+) -> crate::transport::PublishTargets {
+    let mut targets = crate::transport::PublishTargets::new();
+    for subnet in &body.subnets {
+        if subnet.relays.is_empty() {
+            continue;
+        }
+        let mut sorted = subnet.relays.clone();
+        sorted.sort();
+        targets.insert(subnet_ingress_topic(subnet.id), sorted.clone());
+        for (lane, pk) in sorted.iter().enumerate() {
+            targets.insert(subnet_lane_topic(subnet.id, lane as u32), vec![*pk]);
+        }
+    }
+    targets
+}
+
 /// A non-empty roster and a protocol with runtime wiring.
 pub fn subnet_runnable(subnet: &Subnet) -> bool {
     !subnet.relays.is_empty()
@@ -1104,8 +1126,12 @@ fn subnet_subscription_topics(subnet: &Subnet, me: Pubkey) -> Vec<String> {
     };
     // Scheduled Panetiere relays combine over ingress+shares like the one-round
     // flow, but also need the leader's `Reservations` broadcast — for their own
-    // (possibly co-located) client session and as a follower fallback.
-    if combines && matches!(subnet.protocol, ProtocolConfig::ScheduledPanetiere(_)) {
+    // (possibly co-located) client session and as a follower fallback. Under
+    // consensus set formation a co-located client needs the receipts, which
+    // ride broadcast for the same reason.
+    let broadcast_too = matches!(subnet.protocol, ProtocolConfig::ScheduledPanetiere(_))
+        || subnet.protocol.set_formation() == crate::config::SetFormation::Consensus;
+    if combines && broadcast_too {
         let broadcast = subnet_broadcast_topic(subnet.id);
         if !topics.contains(&broadcast) {
             topics.push(broadcast);

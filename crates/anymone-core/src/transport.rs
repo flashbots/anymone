@@ -13,6 +13,9 @@ use crate::log_target::P2P;
 /// Pubkeys allowed to publish on each bound topic; a topic absent from the map is open.
 pub type TopicPolicy = HashMap<String, HashSet<Pubkey>>;
 
+/// Peers each topic's publishes must be delivered to directly.
+pub type PublishTargets = HashMap<String, Vec<Pubkey>>;
+
 /// Largest message any backend carries; the committee sizes subnets under it
 /// (`scheduler_core::MAX_SUBNET_WIRE`).
 pub const MAX_TRANSMIT_SIZE: usize = 16 * 1024 * 1024;
@@ -103,6 +106,11 @@ pub trait Transport: Send + Sync + 'static {
 
     /// Adopt a roster-bound topic policy; default no-op for backends that don't enforce admission.
     fn set_topic_policy(&self, _policy: TopicPolicy) {}
+
+    /// Peers each topic's publishes must reach directly; absent topics keep the
+    /// backend's own routing. Submitting through one server and trusting gossip
+    /// hands that server a veto.
+    fn set_publish_targets(&self, _targets: PublishTargets) {}
 
     /// Maintain connections to these peers; default no-op.
     async fn ensure_peers(&self, _peers: Vec<Pubkey>) {}

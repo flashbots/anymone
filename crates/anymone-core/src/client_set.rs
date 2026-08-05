@@ -116,7 +116,8 @@ impl Bundle {
             + sig::SIG_LEN
     }
 
-    fn hash(&self) -> [u8; 32] {
+    /// What a certificate binds.
+    pub fn hash(&self) -> [u8; 32] {
         sha(&[
             &hash_share(&self.share),
             &hash_path(&self.path),
@@ -203,32 +204,111 @@ impl Bundle {
     }
 }
 
+/// One lane's record that it holds client `client_id`'s bundle for the round.
+/// `pk_c` is the boot key the bundle was signed under: two boots of one host
+/// report different keys for the same client, which is how the matrix catches
+/// them.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Certificate {
+pub struct Receipt {
     pub client_id: ClientId,
-    pub server_id: ServerId,
+    pub pk_c: [u8; sig::PUBKEY_LEN],
     pub bundle_hash: [u8; 32],
+}
+
+impl Receipt {
+    pub const PACKED_LEN: usize = 4 + sig::PUBKEY_LEN + 32;
+
+    fn pack_into(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.client_id.0.to_le_bytes());
+        out.extend_from_slice(&self.pk_c);
+        out.extend_from_slice(&self.bundle_hash);
+    }
+
+    fn unpack(bytes: &[u8]) -> Option<Self> {
+        Some(Receipt {
+            client_id: ClientId(u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?)),
+            pk_c: bytes.get(4..4 + sig::PUBKEY_LEN)?.try_into().ok()?,
+            bundle_hash: bytes
+                .get(4 + sig::PUBKEY_LEN..Self::PACKED_LEN)?
+                .try_into()
+                .ok()?,
+        })
+    }
+}
+
+/// Everything lane `server_id` accepted this round, signed once. This is the
+/// only thing relays agree on: the set is a function of the batches.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReceiptBatch {
+    pub server_id: ServerId,
+    pub receipts: Vec<Receipt>,
     pub sig: [u8; sig::SIG_LEN],
 }
 
-/// Certificates sign the boot pubkey: certs from two boots can never validate
-/// inside one package, so mixed-run evidence dies uniformly at every server.
-pub fn cert_signing_bytes(
+pub fn batch_signing_bytes(
     sid: &SessionId,
-    client_id: ClientId,
     server_id: ServerId,
-    client_pubkey: &[u8; sig::PUBKEY_LEN],
-    bundle_hash: &[u8; 32],
+    receipts: &[Receipt],
 ) -> Vec<u8> {
-    const DOMAIN: &[u8] = b"panetiere/client-set/cert/v2";
-    let mut out = Vec::with_capacity(DOMAIN.len() + 32 + 8 + sig::PUBKEY_LEN + 32);
+    const DOMAIN: &[u8] = b"panetiere/client-set/batch/v1";
+    let mut out =
+        Vec::with_capacity(DOMAIN.len() + 40 + receipts.len() * Receipt::PACKED_LEN);
     out.extend_from_slice(DOMAIN);
     out.extend_from_slice(&sid.0);
-    out.extend_from_slice(&client_id.0.to_le_bytes());
     out.extend_from_slice(&server_id.0.to_le_bytes());
-    out.extend_from_slice(client_pubkey);
-    out.extend_from_slice(bundle_hash);
+    out.extend_from_slice(&(receipts.len() as u32).to_le_bytes());
+    for r in receipts {
+        r.pack_into(&mut out);
+    }
     out
+}
+
+impl ReceiptBatch {
+    pub fn packed_len(n_receipts: usize) -> usize {
+        8 + sig::SIG_LEN + n_receipts * Receipt::PACKED_LEN
+    }
+
+    pub fn pack(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::packed_len(self.receipts.len()));
+        out.extend_from_slice(&self.server_id.0.to_le_bytes());
+        out.extend_from_slice(&self.sig);
+        out.extend_from_slice(&(self.receipts.len() as u32).to_le_bytes());
+        for r in &self.receipts {
+            r.pack_into(&mut out);
+        }
+        out
+    }
+
+    pub fn unpack(bytes: &[u8]) -> Option<Self> {
+        let server_id = ServerId(u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?));
+        let sig: [u8; sig::SIG_LEN] = bytes.get(4..4 + sig::SIG_LEN)?.try_into().ok()?;
+        let mut at = 4 + sig::SIG_LEN;
+        let n = u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as usize;
+        at += 4;
+        if n > bytes.len().saturating_sub(at) / Receipt::PACKED_LEN {
+            return None;
+        }
+        let mut receipts = Vec::with_capacity(n);
+        for _ in 0..n {
+            receipts.push(Receipt::unpack(bytes.get(at..at + Receipt::PACKED_LEN)?)?);
+            at += Receipt::PACKED_LEN;
+        }
+        (at == bytes.len()).then_some(ReceiptBatch {
+            server_id,
+            receipts,
+            sig,
+        })
+    }
+
+    fn verify(&self, sid: &SessionId, pks: &[sig::VerifyingKey]) -> bool {
+        pks.get(self.server_id.0 as usize).is_some_and(|vk| {
+            vk.verify(
+                &batch_signing_bytes(sid, self.server_id, &self.receipts),
+                &self.sig,
+            )
+            .is_ok()
+        })
+    }
 }
 
 /// One coded piece of the uncertified lanes' bundles, client-signed so relays
@@ -301,128 +381,6 @@ fn fragment_item_hash(sid: &SessionId, f: &Fragment) -> [u8; 32] {
     ])
 }
 
-/// The client's inclusion ticket: certificates for the lanes that answered,
-/// erasure-coded bundles for the lanes that did not.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Evidence {
-    pub client_id: ClientId,
-    pub certs: Vec<Certificate>,
-    /// Lanes without a certificate, sorted; what the fragments encode.
-    pub missing: Vec<usize>,
-    pub blob_len: usize,
-    pub pubkey: [u8; sig::PUBKEY_LEN],
-    pub sig: [u8; sig::SIG_LEN],
-}
-
-pub fn evidence_signing_bytes(
-    sid: &SessionId,
-    client_id: ClientId,
-    missing: &[usize],
-    blob_len: usize,
-) -> Vec<u8> {
-    const DOMAIN: &[u8] = b"panetiere/client-set/evidence/v2";
-    let mut out = Vec::with_capacity(DOMAIN.len() + 32 + 16 + 4 * missing.len());
-    out.extend_from_slice(DOMAIN);
-    out.extend_from_slice(&sid.0);
-    out.extend_from_slice(&client_id.0.to_le_bytes());
-    out.extend_from_slice(&(blob_len as u64).to_le_bytes());
-    out.extend_from_slice(&(missing.len() as u32).to_le_bytes());
-    for m in missing {
-        out.extend_from_slice(&(*m as u32).to_le_bytes());
-    }
-    out
-}
-
-impl Evidence {
-    /// Boot-scoped identity: the signed content plus the boot pubkey, no
-    /// signature bytes — ECDSA malleability would otherwise let any relayer
-    /// mint a "distinct" package and frame the client as an equivocator.
-    pub fn identity(&self, sid: &SessionId) -> [u8; 32] {
-        sha(&[
-            b"panetiere/client-set/evidence-id/v1",
-            &evidence_signing_bytes(sid, self.client_id, &self.missing, self.blob_len),
-            &self.pubkey,
-        ])
-    }
-
-    /// One certificate on the wire: the client id is the package's, so only the
-    /// certifier, the hash it bound, and its signature travel.
-    const CERT_LEN: usize = 4 + 32 + sig::SIG_LEN;
-
-    pub fn packed_len(n_certs: usize, n_missing: usize) -> usize {
-        20 + sig::PUBKEY_LEN + sig::SIG_LEN + 4 * n_missing + n_certs * Self::CERT_LEN
-    }
-
-    pub fn pack(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(Self::packed_len(self.certs.len(), self.missing.len()));
-        out.extend_from_slice(&self.client_id.0.to_le_bytes());
-        out.extend_from_slice(&(self.blob_len as u64).to_le_bytes());
-        out.extend_from_slice(&self.pubkey);
-        out.extend_from_slice(&self.sig);
-        out.extend_from_slice(&(self.missing.len() as u32).to_le_bytes());
-        for m in &self.missing {
-            out.extend_from_slice(&(*m as u32).to_le_bytes());
-        }
-        out.extend_from_slice(&(self.certs.len() as u32).to_le_bytes());
-        for c in &self.certs {
-            out.extend_from_slice(&c.server_id.0.to_le_bytes());
-            out.extend_from_slice(&c.bundle_hash);
-            out.extend_from_slice(&c.sig);
-        }
-        out
-    }
-
-    /// Consumes `bytes` exactly. Both counts are checked against the bytes
-    /// present before allocating, so a fabricated package cannot inflate either.
-    pub fn unpack(bytes: &[u8]) -> Option<Self> {
-        let word = |at: usize| -> Option<usize> {
-            Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as usize)
-        };
-        let client_id = ClientId(word(0)? as u32);
-        let blob_len = u64::from_le_bytes(bytes.get(4..12)?.try_into().ok()?) as usize;
-        let pubkey: [u8; sig::PUBKEY_LEN] = bytes.get(12..12 + sig::PUBKEY_LEN)?.try_into().ok()?;
-        let mut at = 12 + sig::PUBKEY_LEN;
-        let sig: [u8; sig::SIG_LEN] = bytes.get(at..at + sig::SIG_LEN)?.try_into().ok()?;
-        at += sig::SIG_LEN;
-        let n_missing = word(at)?;
-        at += 4;
-        if n_missing > bytes.len().saturating_sub(at) / 4 {
-            return None;
-        }
-        let mut missing = Vec::with_capacity(n_missing);
-        for _ in 0..n_missing {
-            missing.push(word(at)?);
-            at += 4;
-        }
-        let n_certs = word(at)?;
-        at += 4;
-        if n_certs > bytes.len().saturating_sub(at) / Self::CERT_LEN {
-            return None;
-        }
-        let mut certs = Vec::with_capacity(n_certs);
-        for _ in 0..n_certs {
-            certs.push(Certificate {
-                client_id,
-                server_id: ServerId(word(at)? as u32),
-                bundle_hash: bytes.get(at + 4..at + 36)?.try_into().ok()?,
-                sig: bytes.get(at + 36..at + Self::CERT_LEN)?.try_into().ok()?,
-            });
-            at += Self::CERT_LEN;
-        }
-        if at != bytes.len() {
-            return None;
-        }
-        Some(Evidence {
-            client_id,
-            certs,
-            missing,
-            blob_len,
-            pubkey,
-            sig,
-        })
-    }
-}
-
 pub fn relay_signing_bytes(sid: &SessionId, item_hash: &[u8; 32]) -> Vec<u8> {
     const DOMAIN: &[u8] = b"panetiere/client-set/relay/v1";
     let mut out = Vec::with_capacity(DOMAIN.len() + 64);
@@ -434,14 +392,19 @@ pub fn relay_signing_bytes(sid: &SessionId, item_hash: &[u8; 32]) -> Vec<u8> {
 
 #[derive(Clone)]
 pub enum RelayItem {
-    Evidence(Evidence),
+    Batch(ReceiptBatch),
     Fragment(Fragment),
 }
 
 impl RelayItem {
     fn hash(&self, sid: &SessionId) -> [u8; 32] {
         match self {
-            RelayItem::Evidence(e) => e.identity(sid),
+            // Signature-free, so a re-signed batch is the same item and dedupes
+            // rather than counting twice.
+            RelayItem::Batch(b) => sha(&[
+                b"panetiere/client-set/batch-id/v1",
+                &batch_signing_bytes(sid, b.server_id, &b.receipts),
+            ]),
             RelayItem::Fragment(f) => fragment_item_hash(sid, f),
         }
     }
@@ -460,7 +423,7 @@ impl Relay {
 
     pub fn pack(&self) -> Vec<u8> {
         let (tag, item) = match &self.item {
-            RelayItem::Evidence(e) => (0u8, e.pack()),
+            RelayItem::Batch(b) => (0u8, b.pack()),
             RelayItem::Fragment(f) => (1u8, f.pack()),
         };
         let mut out =
@@ -484,7 +447,7 @@ impl Relay {
         let item_len = word(1)?;
         let body = bytes.get(5..5 + item_len)?;
         let item = match tag {
-            0 => RelayItem::Evidence(Evidence::unpack(body)?),
+            0 => RelayItem::Batch(ReceiptBatch::unpack(body)?),
             1 => RelayItem::Fragment(Fragment::unpack(body)?),
             _ => return None,
         };
@@ -540,9 +503,10 @@ fn polys_to_blob(polys: &[DgtNTTPoly], blob_len: usize) -> Vec<u8> {
     out
 }
 
-fn fragment_params(pp: &ProtocolParams, n_responders: usize) -> RsParams {
+/// One share per lane, any `n − k` of which rebuild.
+fn fragment_params(pp: &ProtocolParams) -> RsParams {
     let rs = code(pp);
-    RsParams::new(rs.n - rs.k, n_responders)
+    RsParams::new(rs.n - rs.k, rs.n)
 }
 
 pub struct ClientSetRound {
@@ -592,24 +556,26 @@ pub fn run_client_round_set<R: rand::CryptoRng + rand::Rng>(
     }
 }
 
-/// Certificates in hand, package the uncertified lanes: one fragment per
-/// certifying server, any `n − k` of which rebuild every withheld bundle.
-pub fn build_evidence(
+/// Code the lanes that never acked, one fragment per lane that did. Sending
+/// these to the *other* servers is the point: they check the bundle's own TEE
+/// signature, so they can hand it to the lane that denies holding it and, if it
+/// still refuses, conclude the client was censored rather than absent.
+///
+/// One fragment per lane, indexed by lane; the caller sends fragment `j` to
+/// lane `j` for the lanes that acked.
+pub fn build_fragments(
     pp: &ProtocolParams,
     sid: &SessionId,
     round: &ClientSetRound,
-    certs: Vec<Certificate>,
+    covered: &[usize],
     signing_key: &sig::SigningKey,
-) -> (Evidence, Vec<Fragment>) {
+) -> Vec<Fragment> {
     let rs = code(pp);
     let cid = round.client_id;
-    let certified: Vec<usize> = certs.iter().map(|c| c.server_id.0 as usize).collect();
-    let missing: Vec<usize> = (0..rs.n).filter(|l| !certified.contains(l)).collect();
-    assert!(
-        missing.is_empty() || certs.len() >= rs.n - rs.k,
-        "too few certifiers to code around the gap"
-    );
-
+    let missing: Vec<usize> = (0..rs.n).filter(|l| !covered.contains(l)).collect();
+    if missing.is_empty() || covered.len() < rs.n - rs.k {
+        return Vec::new();
+    }
     let scp = pp.share_comm.as_ref().expect("RS mode params");
     let blob: Vec<u8> = missing
         .iter()
@@ -619,51 +585,23 @@ pub fn build_evidence(
                 .expect("own fresh path digits within ζ")
         })
         .collect();
-    let fragments = if missing.is_empty() {
-        Vec::new()
-    } else {
-        Rs::encode(&fragment_params(pp, certs.len()), &blob_to_polys(&blob))
-            .into_iter()
-            .enumerate()
-            .map(|(idx, data)| {
-                let sig = signing_key.sign(&fragment_signing_bytes(sid, cid, idx, &data));
-                Fragment {
-                    client_id: cid,
-                    idx,
-                    data,
-                    sig,
-                }
-            })
-            .collect()
-    };
-
-    let evidence = Evidence {
-        client_id: cid,
-        certs,
-        missing: missing.clone(),
-        blob_len: blob.len(),
-        pubkey: signing_key.verifying_key().to_sec1_bytes(),
-        sig: signing_key.sign(&evidence_signing_bytes(sid, cid, &missing, blob.len())),
-    };
-    (evidence, fragments)
+    Rs::encode(&fragment_params(pp), &blob_to_polys(&blob))
+        .into_iter()
+        .enumerate()
+        .map(|(idx, data)| {
+            let sig = signing_key.sign(&fragment_signing_bytes(sid, cid, idx, &data));
+            Fragment {
+                client_id: cid,
+                idx,
+                data,
+                sig,
+            }
+        })
+        .collect()
 }
 
-/// Two distinct packages already prove a conflict; a third adds nothing, so
-/// storage stops there. Same bound for bundles against a rebooting host.
-const MAX_EVIDENCE: usize = 2;
+/// Bundles kept per client, against a host that reboots to grind hashes.
 const MAX_BUNDLES: usize = 4;
-
-struct Accepted {
-    evidence: Evidence,
-    fragments: BTreeMap<usize, Fragment>,
-}
-
-struct Entry {
-    /// Every certified bundle, keyed by the hash its certificate binds.
-    bundles: BTreeMap<[u8; 32], Bundle>,
-    /// Accepted packages by identity; more than one is a boot conflict.
-    evidence: BTreeMap<[u8; 32], Accepted>,
-}
 
 pub struct SetServer {
     server_id: ServerId,
@@ -676,16 +614,23 @@ pub struct SetServer {
     /// Item hashes accepted — each was validated, chain-signed and forwarded
     /// exactly once.
     accepted: BTreeSet<[u8; 32]>,
-    pool: BTreeMap<ClientId, Entry>,
+    /// This lane's own bundles, keyed by the hash its receipt binds.
+    held: BTreeMap<ClientId, BTreeMap<[u8; 32], Bundle>>,
+    /// The agreed matrix: one batch per lane that published one.
+    batches: BTreeMap<ServerId, ReceiptBatch>,
+    fragments: BTreeMap<ClientId, BTreeMap<usize, Fragment>>,
+    /// Boot keys seen in signed bulletins; more than one is a reboot.
+    bulletins: BTreeMap<ClientId, BTreeSet<[u8; sig::PUBKEY_LEN]>>,
 }
 
 pub struct SetRound {
     pub set: Vec<ClientId>,
     pub inbox: ServerInbox,
     pub lane_inbox: RsNodeInbox,
-    /// Rejected on evidence grounds — uniform, since the pool is agreed.
+    /// Left out: no lane reported it, or it cost more abstentions than the
+    /// round can absorb.
     pub excluded: Vec<ClientId>,
-    /// Excluded because two boots both finished a package.
+    /// Excluded because two boots reported different keys for one client.
     pub conflicted: Vec<ClientId>,
     /// Included with this lane's bundle rebuilt from fragments.
     pub repaired: Vec<ClientId>,
@@ -709,207 +654,192 @@ impl SetServer {
             server_pks,
             relaying: false,
             accepted: BTreeSet::new(),
-            pool: BTreeMap::new(),
+            held: BTreeMap::new(),
+            batches: BTreeMap::new(),
+            fragments: BTreeMap::new(),
+            bulletins: BTreeMap::new(),
         }
     }
 
-    /// Accept a direct delivery and issue the receipt the client will show
-    /// everyone else. A censoring server withholds exactly this.
-    pub fn receive(&mut self, sid: &SessionId, b: &Bundle) -> Option<Certificate> {
+    /// Take a bundle and record a receipt for it. A censoring lane simply omits
+    /// the client from the batch it publishes later.
+    pub fn receive(&mut self, sid: &SessionId, b: &Bundle) -> bool {
         if self.relaying || b.lane != self.server_id.0 as usize || !b.verify(sid, self.n_lanes) {
-            return None;
+            return false;
         }
         let hash = b.hash();
-        let bundles = &mut self.entry(b.client_id).bundles;
-        if bundles.len() >= MAX_BUNDLES && !bundles.contains_key(&hash) {
-            return None;
-        }
-        bundles.insert(hash, b.clone());
-        Some(Certificate {
-            client_id: b.client_id,
-            server_id: self.server_id,
-            bundle_hash: hash,
-            sig: self.signer.sign(&cert_signing_bytes(
-                sid,
-                b.client_id,
-                self.server_id,
-                &b.pubkey,
-                &hash,
-            )),
-        })
-    }
-
-    /// Take a client-direct evidence package before the relay opens.
-    /// Certificates and fragments carry their own signatures, checked in one
-    /// parallel batch; a package already stored is recognized and skipped.
-    pub fn submit(&mut self, sid: &SessionId, e: &Evidence, fragments: &[Fragment]) -> bool {
-        if self.relaying || !self.accept_evidence(sid, e) {
+        let held = self.held.entry(b.client_id).or_default();
+        if held.len() >= MAX_BUNDLES && !held.contains_key(&hash) {
             return false;
         }
-        self.accept_fragments(sid, e.client_id, fragments);
+        held.insert(hash, b.clone());
         true
     }
 
-    fn accept_evidence(&mut self, sid: &SessionId, e: &Evidence) -> bool {
-        let id = e.identity(sid);
-        if self.accepted.contains(&id) {
-            return true;
-        }
-        if !self.evidence_ok(sid, e) {
-            return false;
-        }
-        let entry = self.entry(e.client_id);
-        if entry.evidence.len() >= MAX_EVIDENCE {
-            return false;
-        }
-        entry.evidence.insert(
-            id,
-            Accepted {
-                evidence: e.clone(),
-                fragments: BTreeMap::new(),
-            },
-        );
-        self.accepted.insert(id);
-        true
-    }
-
-    /// Store the fragments that verify under an accepted package's boot key,
-    /// deduped by index; returns the fresh ones for forwarding.
-    fn accept_fragments(
-        &mut self,
-        sid: &SessionId,
-        cid: ClientId,
-        fragments: &[Fragment],
-    ) -> Vec<Fragment> {
-        let Some(entry) = self.pool.get_mut(&cid) else {
-            return Vec::new();
-        };
-        let mut jobs: Vec<([u8; 32], &Fragment, sig::VerifyingKey)> = Vec::new();
-        for f in fragments {
-            if f.client_id != cid {
-                continue;
-            }
-            for (id, acc) in &entry.evidence {
-                if f.idx >= acc.evidence.certs.len() || acc.fragments.contains_key(&f.idx) {
-                    continue;
-                }
-                let Ok(vk) = sig::VerifyingKey::from_sec1_bytes(&acc.evidence.pubkey) else {
-                    continue;
-                };
-                jobs.push((*id, f, vk));
-            }
-        }
-        let ok: Vec<([u8; 32], Fragment)> = jobs
-            .into_par_iter()
-            .filter_map(|(id, f, vk)| {
-                vk.verify(
-                    &fragment_signing_bytes(sid, f.client_id, f.idx, &f.data),
-                    &f.sig,
-                )
-                .ok()
-                .map(|_| (id, f.clone()))
+    /// This lane's record of the round, signed once.
+    pub fn batch(&self, sid: &SessionId) -> ReceiptBatch {
+        let receipts: Vec<Receipt> = self
+            .held
+            .iter()
+            .filter_map(|(cid, bundles)| {
+                // One boot per client is servable; a host that sent two leaves
+                // this lane reporting whichever it kept, and the mismatch with
+                // its peers is what the matrix catches.
+                let (hash, b) = bundles.iter().next()?;
+                Some(Receipt {
+                    client_id: *cid,
+                    pk_c: b.pubkey,
+                    bundle_hash: *hash,
+                })
             })
             .collect();
-        let mut fresh = Vec::new();
-        for (id, f) in ok {
-            let acc = entry.evidence.get_mut(&id).expect("job came from this map");
-            let hash = fragment_item_hash(sid, &f);
-            if acc.fragments.insert(f.idx, f.clone()).is_none() && self.accepted.insert(hash) {
-                fresh.push(f);
-            }
+        ReceiptBatch {
+            sig: self
+                .signer
+                .sign(&batch_signing_bytes(sid, self.server_id, &receipts)),
+            server_id: self.server_id,
+            receipts,
         }
+    }
+
+    /// Take repair fragments straight from the client and chain-sign the fresh
+    /// ones for forwarding. Unlike bundles these are accepted after the batch is
+    /// out: the client only learns it needs to repair by reading that batch.
+    pub fn submit(&mut self, sid: &SessionId, fragments: &[Fragment]) -> Vec<Relay> {
+        let fresh = self.accept_fragments(sid, fragments);
         fresh
-    }
-
-    fn evidence_ok(&self, sid: &SessionId, e: &Evidence) -> bool {
-        let Ok(vk) = sig::VerifyingKey::from_sec1_bytes(&e.pubkey) else {
-            return false;
-        };
-        if vk
-            .verify(
-                &evidence_signing_bytes(sid, e.client_id, &e.missing, e.blob_len),
-                &e.sig,
-            )
-            .is_err()
-        {
-            return false;
-        }
-        // Below n − k certifiers the fragment code cannot exist; such a
-        // package can only be fabricated, and would panic the RS params.
-        if e.certs.len() < self.n_lanes - self.k {
-            return false;
-        }
-        // Exact sorted coverage: every lane once, no duplicate server ids.
-        // Load-bearing — it pins the fragment count and idx range per package.
-        let mut covered: Vec<usize> = e
-            .certs
-            .iter()
-            .map(|c| c.server_id.0 as usize)
-            .chain(e.missing.iter().copied())
-            .collect();
-        covered.sort_unstable();
-        if covered != (0..self.n_lanes).collect::<Vec<_>>() {
-            return false;
-        }
-        e.certs.par_iter().all(|c| {
-            c.client_id == e.client_id
-                && self.server_pks[c.server_id.0 as usize]
-                    .verify(
-                        &cert_signing_bytes(sid, c.client_id, c.server_id, &e.pubkey, &c.bundle_hash),
-                        &c.sig,
-                    )
-                    .is_ok()
-        })
-    }
-
-    /// Close the client window and open the relay: everything accepted so far
-    /// goes out under this server's first chain signature.
-    pub fn echo(&mut self, sid: &SessionId) -> Vec<Relay> {
-        self.relaying = true;
-        let mut items = Vec::new();
-        for entry in self.pool.values() {
-            for acc in entry.evidence.values() {
-                items.push(RelayItem::Evidence(acc.evidence.clone()));
-                for f in acc.fragments.values() {
-                    items.push(RelayItem::Fragment(f.clone()));
-                }
-            }
-        }
-        items
             .into_iter()
-            .map(|item| {
-                let hash = item.hash(sid);
+            .map(|f| {
+                let hash = fragment_item_hash(sid, &f);
                 let sig = self.signer.sign(&relay_signing_bytes(sid, &hash));
                 Relay {
-                    item,
+                    item: RelayItem::Fragment(f),
                     chain: vec![(self.server_id, sig)],
                 }
             })
             .collect()
     }
 
-    /// One Dolev–Strong round, processed as a batch with evidence ahead of
-    /// fragments so a fragment never waits on its own package. An item is
-    /// accepted iff it validates and its chain holds at least `round` distinct
-    /// valid server signatures; fresh acceptances come back chain-extended for
-    /// the next round's broadcast. Rejection is stateless — a variant that
-    /// fails here never poisons its identity for a later valid copy.
-    pub fn absorb(&mut self, sid: &SessionId, round: usize, incoming: &[Relay]) -> Vec<Relay> {
-        let (evidence, fragments): (Vec<&Relay>, Vec<&Relay>) = incoming
+    fn accept_batch(&mut self, sid: &SessionId, b: &ReceiptBatch) -> bool {
+        if !b.verify(sid, &self.server_pks) {
+            return false;
+        }
+        // One batch per lane per round; a second is a lane trying to show two
+        // faces, and the first is the one its peers already chained.
+        self.batches.entry(b.server_id).or_insert_with(|| b.clone());
+        true
+    }
+
+    /// Store fragments whose signature matches the key the matrix reports for
+    /// their client, deduped by index; returns the fresh ones for forwarding.
+    /// Verification is stateless, so one that arrives before its client's
+    /// receipts is dropped and re-accepted from a later copy.
+    fn accept_fragments(&mut self, sid: &SessionId, fragments: &[Fragment]) -> Vec<Fragment> {
+        let jobs: Vec<(&Fragment, sig::VerifyingKey)> = fragments
             .iter()
-            .partition(|r| matches!(r.item, RelayItem::Evidence(_)));
+            .filter(|f| {
+                f.idx < self.n_lanes
+                    && !self
+                        .fragments
+                        .get(&f.client_id)
+                        .is_some_and(|held| held.contains_key(&f.idx))
+            })
+            .filter_map(|f| {
+                let pk = self.reported_key(f.client_id)?;
+                Some((f, sig::VerifyingKey::from_sec1_bytes(&pk).ok()?))
+            })
+            .collect();
+        let ok: Vec<Fragment> = jobs
+            .into_par_iter()
+            .filter(|(f, vk)| {
+                vk.verify(
+                    &fragment_signing_bytes(sid, f.client_id, f.idx, &f.data),
+                    &f.sig,
+                )
+                .is_ok()
+            })
+            .map(|(f, _)| f.clone())
+            .collect();
+        let mut fresh = Vec::new();
+        for f in ok {
+            let hash = fragment_item_hash(sid, &f);
+            if self
+                .fragments
+                .entry(f.client_id)
+                .or_default()
+                .insert(f.idx, f.clone())
+                .is_none()
+                && self.accepted.insert(hash)
+            {
+                fresh.push(f);
+            }
+        }
+        fresh
+    }
+
+    /// The boot key `cid` posted, from its own signed bulletin — a lane naming
+    /// any other key is discarded rather than believed, so one of them cannot
+    /// evict a client by claiming a conflict. Two bulletins is a real reboot.
+    fn reported_key(&self, cid: ClientId) -> Option<[u8; sig::PUBKEY_LEN]> {
+        let posted = self.bulletins.get(&cid)?;
+        (posted.len() == 1).then(|| *posted.iter().next().expect("checked above"))
+    }
+
+    /// A boot key `cid` signed a bulletin under. Every lane reads these off
+    /// ingress, so they are not a lane's word for anything.
+    pub fn note_bulletin(&mut self, cid: ClientId, pk: [u8; sig::PUBKEY_LEN]) {
+        self.bulletins.entry(cid).or_default().insert(pk);
+    }
+
+    /// Close the client window and open the relay: everything accepted so far
+    /// goes out under this server's first chain signature.
+    pub fn originate(&mut self, sid: &SessionId) -> Vec<Relay> {
+        self.relaying = true;
+        // Its own row is part of the matrix it will finalize over, and marking
+        // it accepted stops a peer's echo coming back around.
+        let own = self.batch(sid);
+        self.batches.insert(self.server_id, own.clone());
+        let mut items = vec![RelayItem::Batch(own)];
+        for held in self.fragments.values() {
+            items.extend(held.values().cloned().map(RelayItem::Fragment));
+        }
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            let hash = item.hash(sid);
+            self.accepted.insert(hash);
+            let sig = self.signer.sign(&relay_signing_bytes(sid, &hash));
+            out.push(Relay {
+                item,
+                chain: vec![(self.server_id, sig)],
+            });
+        }
+        out
+    }
+
+    /// One Dolev–Strong round, processed as a batch with the receipt batches
+    /// ahead of the fragments so a fragment never waits on the matrix that
+    /// names its key. An item is accepted iff it validates and its chain holds
+    /// at least `round` distinct valid server signatures; fresh acceptances come
+    /// back chain-extended for the next round. Rejection is stateless — a copy
+    /// that fails here never poisons the item for a later one.
+    pub fn absorb(&mut self, sid: &SessionId, round: usize, incoming: &[Relay]) -> Vec<Relay> {
+        let (batches, fragments): (Vec<&Relay>, Vec<&Relay>) = incoming
+            .iter()
+            .partition(|r| matches!(r.item, RelayItem::Batch(_)));
         let mut out = Vec::new();
-        for r in evidence.into_iter().chain(fragments) {
+        for r in batches.into_iter().chain(fragments) {
             let hash = r.item.hash(sid);
             if self.accepted.contains(&hash) || self.chain_len(sid, &hash, &r.chain) < round {
                 continue;
             }
             match &r.item {
-                RelayItem::Evidence(e) => {
-                    self.accept_evidence(sid, e);
+                RelayItem::Batch(b) => {
+                    if self.accept_batch(sid, b) {
+                        self.accepted.insert(hash);
+                    }
                 }
                 RelayItem::Fragment(f) => {
-                    self.accept_fragments(sid, f.client_id, std::slice::from_ref(f));
+                    self.accept_fragments(sid, std::slice::from_ref(f));
                 }
             }
             if self.accepted.contains(&hash) {
@@ -971,107 +901,154 @@ impl SetServer {
             repaired: Vec::new(),
         };
 
-        for (cid, entry) in &self.pool {
-            let mut packages = entry.evidence.values();
-            let acc = match (packages.next(), packages.next()) {
-                (Some(acc), None) => acc,
-                (None, _) => {
-                    out.excluded.push(*cid);
-                    continue;
-                }
-                (Some(_), Some(_)) => {
-                    out.conflicted.push(*cid);
-                    out.excluded.push(*cid);
-                    continue;
-                }
-            };
-            let e = &acc.evidence;
-            let rebuilt = if e.missing.is_empty() {
-                None
-            } else {
-                // Every server rebuilds and checks the coded lanes; the
-                // fragment pool is agreed, so the verdict is uniform.
-                match self.rebuild(pp, sid, e, &acc.fragments) {
-                    Some(bundles) => Some(bundles),
-                    None => {
-                        out.excluded.push(*cid);
-                        continue;
-                    }
-                }
-            };
-            out.set.push(*cid);
+        // Every client any lane reported, in id order so the budget below is
+        // spent identically everywhere.
+        let mut clients: Vec<ClientId> = self
+            .batches
+            .values()
+            .flat_map(|b| b.receipts.iter().map(|r| r.client_id))
+            .collect();
+        clients.sort_unstable();
+        clients.dedup();
 
-            let mine_coded = e.missing.contains(&me);
-            let bundle = if mine_coded {
-                rebuilt.and_then(|bs| bs.into_iter().find(|b| b.lane == me))
-            } else {
-                // A valid certificate under my key means I issued it and hold
-                // the matching bundle.
-                e.certs
-                    .iter()
-                    .find(|c| c.server_id == self.server_id)
-                    .and_then(|c| entry.bundles.get(&c.bundle_hash).cloned())
-            };
-            let Some(b) = bundle else {
+        // Lanes already unable to serve someone in the set. A lane short of one
+        // member publishes nothing for anyone, so this is the round's budget.
+        let mut abstaining: BTreeSet<usize> = BTreeSet::new();
+        let mut rebuilt_for: BTreeMap<ClientId, Bundle> = BTreeMap::new();
+        let mut admitted: Vec<(ClientId, Vec<usize>)> = Vec::new();
+
+        for cid in clients {
+            let Some(pk_c) = self.reported_key(cid) else {
+                // Two bulletins is a reboot; none means no lane can serve it.
+                if self.bulletins.get(&cid).is_some_and(|p| p.len() > 1) {
+                    out.conflicted.push(cid);
+                }
+                out.excluded.push(cid);
                 continue;
             };
-            if mine_coded {
-                out.repaired.push(*cid);
+            let covered = self.covered(cid, &pk_c);
+            let missing: Vec<usize> = (0..self.n_lanes).filter(|l| !covered.contains(l)).collect();
+            if missing.is_empty() {
+                admitted.push((cid, Vec::new()));
+                continue;
             }
-            if let Some(opening) = unseal_opening(key, sid, *cid, self.server_id, &b.envelope) {
-                out.inbox.items.push((*cid, opening));
+            match self.rebuild(pp, sid, cid, &pk_c, &covered, &missing) {
+                Some(bundles) => {
+                    if let Some(mine) = bundles.into_iter().find(|b| b.lane == me) {
+                        rebuilt_for.insert(cid, mine);
+                    }
+                    admitted.push((cid, Vec::new()));
+                }
+                // Unrepaired: the lanes without it must sit the round out, and
+                // only so many can.
+                None => {
+                    let mut cost = abstaining.clone();
+                    cost.extend(missing.iter().copied());
+                    if cost.len() <= self.n_lanes - self.k {
+                        abstaining = cost;
+                        admitted.push((cid, missing));
+                    } else {
+                        out.excluded.push(cid);
+                    }
+                }
             }
-            out.lane_inbox.items.push((*cid, b.share, b.path));
+        }
+
+        for (cid, unrepaired) in admitted {
+            out.set.push(cid);
+            let bundle = match rebuilt_for.remove(&cid) {
+                Some(b) => {
+                    out.repaired.push(cid);
+                    Some(b)
+                }
+                None => self.own_bundle(cid),
+            };
+            // No bundle means this lane is one of `unrepaired`'s abstainers, or
+            // could not open what it holds; either way it contributes nothing
+            // and the publication path will defer.
+            let Some(b) = bundle else {
+                debug_assert!(unrepaired.contains(&me) || !unrepaired.is_empty());
+                continue;
+            };
+            if let Some(opening) = unseal_opening(key, sid, cid, self.server_id, &b.envelope) {
+                out.inbox.items.push((cid, opening));
+            }
+            out.lane_inbox.items.push((cid, b.share, b.path));
         }
         out
     }
 
-    /// Reconstruct the coded lanes; every rebuilt bundle must verify under the
-    /// package's boot key. Sample selection is `BTreeMap` order, first k —
-    /// deterministic, so every server decodes the same blob.
+    /// Lanes that reported `cid` under the key it actually posted, sorted.
+    fn covered(&self, cid: ClientId, pk_c: &[u8; sig::PUBKEY_LEN]) -> Vec<usize> {
+        let mut lanes: Vec<usize> = self
+            .batches
+            .values()
+            .filter(|b| {
+                b.receipts
+                    .iter()
+                    .any(|r| r.client_id == cid && r.pk_c == *pk_c)
+            })
+            .map(|b| b.server_id.0 as usize)
+            .collect();
+        lanes.sort_unstable();
+        lanes
+    }
+
+    /// The bundle this lane holds for `cid`, matching the hash it reported.
+    fn own_bundle(&self, cid: ClientId) -> Option<Bundle> {
+        let hash = self
+            .batches
+            .get(&self.server_id)?
+            .receipts
+            .iter()
+            .find(|r| r.client_id == cid)?
+            .bundle_hash;
+        self.held.get(&cid)?.get(&hash).cloned()
+    }
+
+    /// Reconstruct the lanes no one reported; each rebuilt bundle must verify
+    /// under the key the matrix agreed on. Sample selection is `BTreeMap` order,
+    /// first k — deterministic over an agreed fragment set, so every server
+    /// decodes the same blob. Trailing padding is ignored: each bundle is
+    /// fixed-width under `scp`, so `unpack` reads exactly what it needs.
     fn rebuild(
         &self,
         pp: &ProtocolParams,
         sid: &SessionId,
-        e: &Evidence,
-        fragments: &BTreeMap<usize, Fragment>,
+        cid: ClientId,
+        pk_c: &[u8; sig::PUBKEY_LEN],
+        covered: &[usize],
+        missing: &[usize],
     ) -> Option<Vec<Bundle>> {
-        let params = fragment_params(pp, e.certs.len());
-        if fragments.len() < params.k {
+        if covered.len() < self.n_lanes - self.k {
             return None;
         }
-        let n_polys = e.blob_len.div_ceil(BYTES_PER_COEFF).max(1).div_ceil(N);
-        // The blob cannot outgrow what k real fragments encode; a bigger
-        // blob_len is fabricated and only angles for a huge allocation.
-        if n_polys > params.k * fragments.values().next()?.data.len() {
+        let params = fragment_params(pp);
+        let held = self.fragments.get(&cid)?;
+        if held.len() < params.k {
             return None;
         }
-        let samples: Vec<(usize, &[DgtNTTPoly])> = fragments
+        let samples: Vec<(usize, &[DgtNTTPoly])> = held
             .values()
             .map(|f| (f.idx, f.data.as_slice()))
             .take(params.k)
             .collect();
-        let blob = polys_to_blob(&Rs::reconstruct(&params, n_polys, &samples).ok()?, e.blob_len);
+        let n_polys = params.k * samples.first()?.1.len();
+        let recovered = Rs::reconstruct(&params, n_polys, &samples).ok()?;
+        let blob = polys_to_blob(&recovered, recovered.len() * N * BYTES_PER_COEFF);
 
         let scp = pp.share_comm.as_ref()?;
-        let mut out = Vec::with_capacity(e.missing.len());
+        let mut out = Vec::with_capacity(missing.len());
         let mut at = 0;
-        for &lane in &e.missing {
-            let (b, used) = Bundle::unpack(scp, e.client_id, blob.get(at..)?)?;
-            if b.lane != lane || b.pubkey != e.pubkey || !b.verify(sid, self.n_lanes) {
+        for &lane in missing {
+            let (b, used) = Bundle::unpack(scp, cid, blob.get(at..)?)?;
+            if b.lane != lane || b.pubkey != *pk_c || !b.verify(sid, self.n_lanes) {
                 return None;
             }
             at += used;
             out.push(b);
         }
         Some(out)
-    }
-
-    fn entry(&mut self, cid: ClientId) -> &mut Entry {
-        self.pool.entry(cid).or_insert_with(|| Entry {
-            bundles: BTreeMap::new(),
-            evidence: BTreeMap::new(),
-        })
     }
 }
 

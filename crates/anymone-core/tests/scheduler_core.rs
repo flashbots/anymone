@@ -99,6 +99,7 @@ fn lead_core(committee: &[Identity], threshold: u32) -> SchedulerCore {
             vector_bytes: 0,
             aggregation: true,
             encoding: anymone_core::config::Encoding::default(),
+            set_formation: anymone_core::config::SetFormation::Leader,
         },
     )
 }
@@ -137,6 +138,7 @@ fn lead_core_msg_size(
             vector_bytes: 0,
             aggregation: true,
             encoding: anymone_core::config::Encoding::default(),
+            set_formation: anymone_core::config::SetFormation::Leader,
         },
     )
 }
@@ -229,6 +231,7 @@ fn renegotiates_adcnet_panetiere_adcnet() {
             vector_bytes: 0,
             aggregation: true,
             encoding: anymone_core::config::Encoding::default(),
+            set_formation: anymone_core::config::SetFormation::Leader,
         },
     );
     let pinned_relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
@@ -284,6 +287,7 @@ fn renegotiates_adcnet_panetiere_adcnet() {
             vector_bytes: 0,
             aggregation: true,
             encoding: anymone_core::config::Encoding::default(),
+            set_formation: anymone_core::config::SetFormation::Leader,
         },
     );
     register_relays_and_service(&mut reporting, &pinned_relays, &pinned_service);
@@ -451,6 +455,7 @@ fn multisig_assembles_via_committee_sig() {
         vector_bytes: 0,
         aggregation: true,
         encoding: anymone_core::config::Encoding::default(),
+        set_formation: anymone_core::config::SetFormation::Leader,
     };
     let mut core = SchedulerCore::new(lead.clone(), pks.clone(), 2, params.clone());
 
@@ -595,6 +600,7 @@ fn non_lead_core_never_stages() {
             vector_bytes: 0,
             aggregation: true,
             encoding: anymone_core::config::Encoding::default(),
+            set_formation: anymone_core::config::SetFormation::Leader,
         },
     );
     assert!(!core.is_lead());
@@ -766,6 +772,7 @@ fn live_core(committee: &[Identity]) -> SchedulerCore {
             vector_bytes: 0,
             aggregation: true,
             encoding: anymone_core::config::Encoding::default(),
+            set_formation: anymone_core::config::SetFormation::Leader,
         },
     )
 }
@@ -811,6 +818,7 @@ fn committee_schedules_second_subnet_when_one_nears_capacity() {
                 vector_bytes: 0,
                 aggregation: false,
                 encoding: anymone_core::config::Encoding::default(),
+                set_formation: anymone_core::config::SetFormation::Leader,
             },
         )
     };
@@ -1728,6 +1736,7 @@ fn sustained_traffic_upgrades_to_scheduled_panetiere() {
             vector_bytes: 0,
             aggregation: true,
             encoding: anymone_core::config::Encoding::default(),
+            set_formation: anymone_core::config::SetFormation::Leader,
         },
     );
     register_relays_and_service(&mut pinned, &relays, &service);

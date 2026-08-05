@@ -160,6 +160,16 @@ impl ProtocolConfig {
             _ => None,
         }
     }
+
+    /// How the subnet fixes its canonical client set; only the Panetiere family
+    /// offers a choice.
+    pub fn set_formation(&self) -> SetFormation {
+        match self {
+            ProtocolConfig::Panetiere(c) => c.set_formation,
+            ProtocolConfig::ScheduledPanetiere(c) => c.set_formation,
+            _ => SetFormation::Leader,
+        }
+    }
 }
 
 /// Trivial protocol: every client message becomes part of the round output.
@@ -189,6 +199,17 @@ pub enum Encoding {
     Mse,
 }
 
+/// How a Panetiere subnet fixes the round's canonical client set.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SetFormation {
+    /// The subnet leader derives the set and announces it; relays adopt it.
+    #[default]
+    Leader,
+    /// Receipts and coded evidence agreed over Dolev–Strong rounds, so every
+    /// relay derives the same set. Needs a round long enough for the phases.
+    Consensus,
+}
+
 /// Panetiere subnet config. `setup_seed` must be identical across every node
 /// in the subnet — it deterministically drives `ProtocolParams::setup` so all
 /// participants agree on the public KAHE / CS / Shamir parameters.
@@ -205,6 +226,8 @@ pub struct PanetiereConfig {
     /// Fixes the KAHE width and plaintext modulus, so it must match subnet-wide.
     #[serde(default)]
     pub encoding: Encoding,
+    #[serde(default)]
+    pub set_formation: SetFormation,
 }
 
 impl Default for PanetiereConfig {
@@ -218,6 +241,7 @@ impl Default for PanetiereConfig {
             threshold: 2,
             setup_seed: [0u8; 32],
             encoding: Encoding::default(),
+            set_formation: SetFormation::default(),
         }
     }
 }
@@ -241,6 +265,8 @@ pub struct ScheduledPanetiereConfig {
     pub threshold: u32,
     #[serde(with = "serde_bytes_array")]
     pub setup_seed: [u8; 32],
+    #[serde(default)]
+    pub set_formation: SetFormation,
 }
 
 impl Default for ScheduledPanetiereConfig {
@@ -254,6 +280,7 @@ impl Default for ScheduledPanetiereConfig {
             client_set_max: 8,
             threshold: 2,
             setup_seed: [0u8; 32],
+            set_formation: SetFormation::default(),
         }
     }
 }

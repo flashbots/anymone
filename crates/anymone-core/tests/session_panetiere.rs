@@ -771,3 +771,201 @@ fn panetiere_fixed_seed_multiround_no_stall() {
         );
     }
 }
+
+/// Consensus set formation end to end, over the checkpoint grid the driver
+/// fires: bundles, batched receipts, evidence, echo, the Dolev–Strong rounds,
+/// then a set every relay fixes for itself. Also covers the two attacks the
+/// mode exists for — evidence handed to only one relay, and a host that boots
+/// twice — asserting the verdict is the same at every relay either way.
+#[test]
+fn consensus_set_formation_agrees_and_excludes_a_double_boot() {
+    const N: usize = 5;
+    const HONEST: usize = 0;
+    const LONE: usize = 1;
+    const TWICE: usize = 2;
+    let cfg = PanetiereConfig {
+        set_formation: anymone_core::config::SetFormation::Consensus,
+        ..subnet(4, 64, 8)
+    };
+    let (mse, pp) = params_for(&cfg, N);
+    let (ids, server_pks, xpubs) = server_env(N);
+    let set_pks: Vec<panetiere::sig::VerifyingKey> = ids
+        .iter()
+        .map(|i| i.exchange().set_verifying_key())
+        .collect();
+    let publisher = server_pks[0];
+    let now = Instant::now();
+
+    let mut servers: Vec<PanetiereServerSession> = (0..N)
+        .map(|i| {
+            let mut s = PanetiereServerSession::new(
+                pp.clone(),
+                mse.clone(),
+                ServerId(i as u32),
+                ids[i].clone(),
+                SetMode::Consensus { publisher },
+                server_pubkeys(&server_pks),
+            );
+            s.set_client_set_max(8);
+            s.set_consensus_keys(ids[i].exchange().set_signing_key().clone(), set_pks.clone());
+            s
+        })
+        .collect();
+
+    // `TWICE`'s host runs the boot twice: two sessions, two ephemeral post
+    // keys, both claiming the same client id.
+    let client_ids: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
+    let mut clients: Vec<PanetiereClientSession> = (0..4)
+        .map(|i| {
+            let identity = client_ids[i.min(2)].clone();
+            let mut c = PanetiereClientSession::new(
+                pp.clone(),
+                mse.clone(),
+                identity,
+                xpubs.clone(),
+                [70 + i as u8; 32],
+            );
+            c.set_consensus(set_pks.clone());
+            c
+        })
+        .collect();
+    let payloads: Vec<Vec<u8>> = (0..3).map(|i| format!("consensus-{i}").into_bytes()).collect();
+    for (i, p) in payloads.iter().enumerate() {
+        clients[i].stage(p.clone());
+    }
+    clients[3].stage(b"second-boot".to_vec());
+
+    // Submission: every relay sees every bundle, so the receipts are complete.
+    for (i, c) in clients.iter_mut().enumerate() {
+        let from = client_ids[i.min(2)].pubkey();
+        for m in c.begin_round(0, now) {
+            for s in servers.iter_mut() {
+                s.on_inbound(from, m.clone());
+            }
+        }
+    }
+
+    // Receipts back to their own client only.
+    let certs: Vec<Vec<Vec<u8>>> = servers
+        .iter_mut()
+        .map(|s| s.checkpoint(0, 2, now))
+        .collect();
+    for (j, batch) in certs.iter().enumerate() {
+        for m in batch {
+            for c in clients.iter_mut() {
+                c.on_inbound(server_pks[j], m.clone());
+            }
+        }
+    }
+
+    // Evidence: the honest client reaches every certifier, `LONE` reaches one
+    // relay only, and both of `TWICE`'s boots reach disjoint halves.
+    for (i, c) in clients.iter_mut().enumerate() {
+        let from = client_ids[i.min(2)].pubkey();
+        for (p, m) in c.checkpoint(0, 3, now).into_iter().enumerate() {
+            match i {
+                LONE => {
+                    if p == 0 {
+                        servers[0].on_inbound(from, m);
+                    }
+                }
+                TWICE => {
+                    if p < N / 2 {
+                        servers[p].on_inbound(from, m);
+                    }
+                }
+                3 => {
+                    if p >= N / 2 {
+                        servers[p].on_inbound(from, m);
+                    }
+                }
+                _ => {
+                    for s in servers.iter_mut() {
+                        s.on_inbound(from, m.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Each lane publishes its batch, then the relay rounds carry it.
+    let mut bus: Vec<(Pubkey, Vec<u8>)> = Vec::new();
+    for (j, s) in servers.iter_mut().enumerate() {
+        for m in s.checkpoint(0, 2, now) {
+            bus.push((server_pks[j], m));
+        }
+    }
+    for ds in 1..=anymone_core::client_set::relay_rounds(&pp) {
+        let batch = std::mem::take(&mut bus);
+        for (j, s) in servers.iter_mut().enumerate() {
+            for (from, m) in &batch {
+                if *from != server_pks[j] {
+                    s.on_inbound(*from, m.clone());
+                }
+            }
+            for m in s.checkpoint(0, 3 + ds as u8, now) {
+                bus.push((server_pks[j], m));
+            }
+        }
+    }
+
+    // Sets are fixed inside `end_round` and published as shares; one observer
+    // per relay reads back the set that relay actually shared over.
+    let outs: Vec<Vec<Vec<u8>>> = servers
+        .iter_mut()
+        .map(|s| s.end_round(0, now).outbound)
+        .collect();
+    let sets: Vec<Vec<u32>> = outs
+        .iter()
+        .enumerate()
+        .map(|(j, out)| {
+            let mut obs = PanetiereObserverSession::new(server_pks.clone(), None, 2);
+            for m in out {
+                obs.on_inbound(server_pks[j], m.clone());
+            }
+            let (_, clients) = obs
+                .latest_clients()
+                .unwrap_or_else(|| panic!("relay {j} published no share"));
+            let mut c = clients.to_vec();
+            c.sort();
+            c
+        })
+        .collect();
+    assert!(
+        sets.windows(2).all(|w| w[0] == w[1]),
+        "relays disagreed on the consensus set: {sets:?}"
+    );
+    let set = &sets[0];
+    let cid = |i: usize| anymone_core::panetiere::client_id_from_pubkey(client_ids[i].pubkey()).0;
+    assert!(
+        set.contains(&cid(HONEST)),
+        "the client every relay saw must be in"
+    );
+    assert!(
+        set.contains(&cid(LONE)),
+        "evidence handed to one relay must still reach every set"
+    );
+    assert!(
+        !set.contains(&cid(TWICE)),
+        "a host that finished two boots must be excluded"
+    );
+
+    // Decode lands a round later, off the peers' shares.
+    for (i, out) in outs.iter().enumerate() {
+        for (j, s) in servers.iter_mut().enumerate() {
+            if i == j {
+                continue;
+            }
+            for m in out {
+                s.on_inbound(server_pks[i], m.clone());
+            }
+        }
+    }
+    let decoded: Vec<Vec<u8>> = servers[0].end_round(1, now).decoded;
+    for (i, p) in payloads.iter().enumerate().take(2) {
+        assert!(
+            decoded.iter().any(|d| d.windows(p.len()).any(|w| w == &p[..])),
+            "payload {i} not decoded from the consensus set"
+        );
+    }
+}

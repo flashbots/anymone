@@ -27,14 +27,16 @@ use rand_chacha::ChaCha20Rng;
 use tokio::sync::mpsc;
 
 use crate::config::{
-    ExchangePublicKeyWire, ProtocolConfig, Round, ScheduledPanetiereConfig, Subnet, SubnetId,
+    ExchangePublicKeyWire, ProtocolConfig, Round, ScheduledPanetiereConfig, SetFormation, Subnet,
+    SubnetId,
 };
 use crate::identity::{Identity, Pubkey};
 use crate::log_target::{PANETIERE, SCHED};
 use crate::panetiere::{
-    client_slice_wire, derive_post_key, drain_inbound_upto, server_index, wire_round_past, PanetiereObserverSession,
-    PanetiereServerSession, PanetiereWatchSession, PanetiereWire, SetMode,
-    PANETIERE_ROUND_RETENTION,
+    bundle_wire, checkpoint_deadline, checkpoint_schedule, client_slice_wire, derive_post_key,
+    drain_inbound_upto, fragment_wire, server_index, set_roster, verify_batch, wire_round_past,
+    ClientSetState, PanetiereObserverSession, PanetiereServerSession, PanetiereWatchSession,
+    PanetiereWire, SetMode, PANETIERE_ROUND_RETENTION,
 };
 use crate::runtime::{
     deadline_for, gossip_faults, handle_inbound, publish_and_loop_back, recv_any,
@@ -127,6 +129,7 @@ pub(crate) fn max_wire_estimate(
     estimated_messages: u32,
     client_set_max: u32,
     n_relays: usize,
+    set_formation: SetFormation,
 ) -> usize {
     const FRAMING: usize = 512;
     let sched_mse = sched_channel_params(estimated_messages, [0u8; 32]);
@@ -134,6 +137,12 @@ pub(crate) fn max_wire_estimate(
     let reservations = 4 * estimated_messages as usize + FRAMING;
     crate::panetiere::rs_wire_estimate(n_polys, vector_bytes, client_set_max, n_relays)
         .max(reservations)
+        .max(crate::panetiere::consensus_wire_estimate(
+            n_polys,
+            client_set_max,
+            n_relays,
+            set_formation,
+        ))
 }
 
 /// Scheduled-Panetiere `(ServerId, pke::PublicKey)` roster for sealing client
@@ -160,6 +169,7 @@ fn client_session(
     entries_by_round: ReservationEntries,
     node: Weak<AnymoneInner>,
     setup_seed: [u8; 32],
+    consensus: bool,
 ) -> Box<dyn Session> {
     let servers = seal_roster(relay_xk, subnet);
     if servers.len() != subnet.relays.len() {
@@ -184,6 +194,17 @@ fn client_session(
     );
     session.set_node(node);
     session.set_setup_seed(setup_seed);
+    if consensus {
+        match set_roster(relay_xk, subnet) {
+            Some(pks) => session.set_consensus(pks),
+            None => tracing::error!(
+                target: PANETIERE,
+                subnet = subnet.id,
+                "scheduled panetiere client: consensus set formation needs every relay's \
+                 client-set key; this client cannot submit"
+            ),
+        }
+    }
     Box::new(session)
 }
 
@@ -193,6 +214,7 @@ fn server_session(
     sched_mse: &ChannelParams,
     vector_bytes: usize,
     cfg: &ScheduledPanetiereConfig,
+    relay_xk: &[(Pubkey, ExchangePublicKeyWire)],
     subnet: &Subnet,
     identity: &Identity,
     leader_pk: Pubkey,
@@ -210,7 +232,12 @@ fn server_session(
         .enumerate()
         .map(|(i, pk)| (ServerId(i as u32), pk))
         .collect();
-    let mode = if identity_pk == leader_pk {
+    let consensus = cfg.set_formation == SetFormation::Consensus;
+    let mode = if consensus {
+        SetMode::Consensus {
+            publisher: leader_pk,
+        }
+    } else if identity_pk == leader_pk {
         SetMode::Leader
     } else {
         SetMode::Follower { leader: leader_pk }
@@ -230,6 +257,19 @@ fn server_session(
     session.set_subnet(subnet.id);
     session.set_setup_seed(cfg.setup_seed);
     session.set_good_clients(good_clients);
+    if consensus {
+        match set_roster(relay_xk, subnet) {
+            Some(pks) => {
+                session.set_consensus_keys(identity.exchange().set_signing_key().clone(), pks)
+            }
+            None => tracing::error!(
+                target: PANETIERE,
+                subnet = subnet.id,
+                "scheduled panetiere server: consensus set formation needs every relay's \
+                 client-set key; this relay forms no set"
+            ),
+        }
+    }
     Box::new(session)
 }
 
@@ -261,6 +301,10 @@ pub struct ScheduledPanetiereClientSession {
     post_key: panetiere::sig::SigningKey,
     /// Subnet's `setup_seed`; with the round it forms the `sid` openings bind to.
     setup_seed: [u8; 32],
+    /// Consensus set formation: the roster receipts verify under, and the
+    /// rounds whose bundles are still collecting them.
+    set_pks: Option<Vec<panetiere::sig::VerifyingKey>>,
+    set_rounds: BTreeMap<Round, ClientSetState>,
 }
 
 impl ScheduledPanetiereClientSession {
@@ -300,6 +344,8 @@ impl ScheduledPanetiereClientSession {
             rand_rng: ChaCha20Rng::from_seed(rand_seed),
             post_key: derive_post_key(rng_seed),
             setup_seed: [0u8; 32],
+            set_pks: None,
+            set_rounds: BTreeMap::new(),
         }
     }
 
@@ -309,6 +355,11 @@ impl ScheduledPanetiereClientSession {
 
     pub(crate) fn set_setup_seed(&mut self, setup_seed: [u8; 32]) {
         self.setup_seed = setup_seed;
+    }
+
+    /// See [`crate::panetiere::PanetiereClientSession::set_consensus`].
+    pub fn set_consensus(&mut self, set_pks: Vec<panetiere::sig::VerifyingKey>) {
+        self.set_pks = Some(set_pks);
     }
 }
 
@@ -396,6 +447,21 @@ impl Session for ScheduledPanetiereClientSession {
     }
 
     fn on_inbound(&mut self, from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
+        if let Some(set_pks) = self.set_pks.as_ref() {
+            if let Ok(PanetiereWire::SetBatch { round, data }) =
+                bincode::deserialize::<PanetiereWire>(&payload)
+            {
+                let sid = crate::panetiere::session_id(&self.setup_seed, round);
+                if let (Some(state), Some(batch)) = (
+                    self.set_rounds.get_mut(&round),
+                    crate::client_set::ReceiptBatch::unpack(&data)
+                        .filter(|b| verify_batch(&sid, b, set_pks)),
+                ) {
+                    state.note_batch(&batch, self.client_id);
+                }
+                return Vec::new();
+            }
+        }
         if from != self.leader_pk {
             return Vec::new();
         }
@@ -462,6 +528,20 @@ impl Session for ScheduledPanetiereClientSession {
     }
 
     fn checkpoint(&mut self, round: Round, k: u8, _now: Instant) -> Vec<Vec<u8>> {
+        if self.set_pks.is_some() && k == crate::panetiere::K_REPAIR {
+            let Some(state) = self.set_rounds.get_mut(&round) else {
+                return Vec::new();
+            };
+            let sid = crate::panetiere::session_id(&self.setup_seed, round);
+            return fragment_wire(
+                &self.pp,
+                &sid,
+                round,
+                state,
+                &self.post_key,
+                &self.identity,
+            );
+        }
         if k != 1 {
             return Vec::new();
         }
@@ -611,6 +691,23 @@ impl Session for ScheduledPanetiereClientSession {
         seed[24..32].copy_from_slice(&round.to_le_bytes());
         let mut rng = ChaCha20Rng::from_seed(seed);
         let sid = crate::panetiere::session_id(&self.setup_seed, round);
+        if self.set_pks.is_some() {
+            let round_out = crate::client_set::run_client_round_set(
+                &mut rng,
+                &self.pp,
+                &sid,
+                self.client_id,
+                plaintext,
+                &self.servers,
+                &self.post_key,
+            );
+            let out = bundle_wire(&self.pp, round, &round_out, &self.identity);
+            self.set_rounds
+                .insert(round, ClientSetState::new(round_out));
+            self.set_rounds
+                .retain(|r, _| *r + PANETIERE_ROUND_RETENTION >= round);
+            return out;
+        }
         let round_out = run_client_round_rs(
             &mut rng,
             &self.pp,
@@ -698,6 +795,10 @@ pub struct ScheduledPanetiereServerSession {
     sched_polys: usize,
     vector_bytes: usize,
     is_leader: bool,
+    /// Consensus set formation: the inner session owns the whole cadence, and
+    /// `Reservations` come from the publisher, not a set-announcing leader.
+    consensus: bool,
+    publishes: bool,
     leader_pk: PeerId,
     /// Labels this session's logs; a node relays several subnets at once.
     subnet: SubnetId,
@@ -725,6 +826,12 @@ impl ScheduledPanetiereServerSession {
         entries_by_round: ReservationEntries,
     ) -> Self {
         let is_leader = mode == SetMode::Leader;
+        let consensus = matches!(mode, SetMode::Consensus { .. });
+        let publishes = match mode {
+            SetMode::Leader => true,
+            SetMode::Consensus { publisher } => publisher == identity.pubkey(),
+            SetMode::Follower { .. } | SetMode::SelfDerived => false,
+        };
         let sched_polys = sched_mse.n_polys();
         // inner.mse is unused: this wrapper never calls inner's own end_round.
         let inner = PanetiereServerSession::new(
@@ -741,6 +848,8 @@ impl ScheduledPanetiereServerSession {
             sched_polys,
             vector_bytes,
             is_leader,
+            consensus,
+            publishes,
             leader_pk,
             subnet: 0,
             entries_by_round,
@@ -767,6 +876,14 @@ impl ScheduledPanetiereServerSession {
         self.inner.set_good_clients(good_clients);
     }
 
+    /// See [`crate::panetiere::PanetiereServerSession::set_consensus_keys`].
+    pub fn set_consensus_keys(
+        &mut self,
+        signer: panetiere::sig::SigningKey,
+        pks: Vec<panetiere::sig::VerifyingKey>,
+    ) {
+        self.inner.set_consensus_keys(signer, pks);
+    }
 }
 
 impl Session for ScheduledPanetiereServerSession {
@@ -803,7 +920,12 @@ impl Session for ScheduledPanetiereServerSession {
         self.inner.on_inbound(from, payload)
     }
 
-    fn checkpoint(&mut self, round: Round, k: u8, _now: Instant) -> Vec<Vec<u8>> {
+    fn checkpoint(&mut self, round: Round, k: u8, now: Instant) -> Vec<Vec<u8>> {
+        // Consensus has no announcement to make: the whole cadence — receipts,
+        // echo, then the Dolev–Strong rounds — belongs to the inner session.
+        if self.consensus {
+            return self.inner.checkpoint(round, k, now);
+        }
         // A leader never receives its own `Reservations` over the wire, so on a
         // cutover boundary this is its only re-read before the round's entries.
         if k == 3 && self.is_leader {
@@ -814,6 +936,9 @@ impl Session for ScheduledPanetiereServerSession {
     }
 
     fn end_round(&mut self, round: Round, _now: Instant) -> RoundOutcome {
+        if self.consensus {
+            self.inner.fix_consensus_sets(round);
+        }
         let mut outbound = self.inner.emit_server_publics(round);
         let mut decoded = Vec::new();
 
@@ -849,7 +974,7 @@ impl Session for ScheduledPanetiereServerSession {
                     Vec::new()
                 }
             };
-            if self.is_leader {
+            if self.publishes {
                 let wire = PanetiereWire::Reservations {
                     round: rd,
                     entries: entries.clone(),
@@ -903,7 +1028,7 @@ impl Session for ScheduledPanetiereServerSession {
                 }
             };
             if !msgs.is_empty() {
-                if self.is_leader {
+                if self.publishes {
                     let wire = PanetiereWire::Decoded {
                         round: rd,
                         payloads: msgs.clone(),
@@ -972,6 +1097,7 @@ pub(crate) async fn run_subnet(
     let mut sessions: HashMap<SessionKey, Box<dyn Session>> = HashMap::new();
     let mut cover_rate = subnet.cover_rate;
 
+    let consensus = cfg.set_formation == SetFormation::Consensus;
     if subnet.relays.contains(&identity_pk) {
         sessions.insert(
             SessionKey::Server,
@@ -980,6 +1106,7 @@ pub(crate) async fn run_subnet(
                 &sched_mse,
                 cfg.vector_bytes,
                 &cfg,
+                &relay_xk,
                 &subnet,
                 &inner.identity,
                 leader_pk,
@@ -996,9 +1123,11 @@ pub(crate) async fn run_subnet(
     let mut fault_monitor: Option<Box<dyn Session>> = if leader_pk == identity_pk {
         let mut roster = subnet.relays.clone();
         roster.sort();
+        // Consensus announces no set; the observer reads membership off shares.
+        let observed_leader = (!consensus).then_some(leader_pk);
         Some(Box::new(PanetiereObserverSession::new(
             roster,
-            Some(leader_pk),
+            observed_leader,
             FAULT_THRESHOLD,
         )))
     } else {
@@ -1008,7 +1137,11 @@ pub(crate) async fn run_subnet(
     let egress = |_key: &SessionKey, bytes: &[u8]| crate::panetiere::egress(subnet.id, bytes);
 
     let dur_ms = (subnet.protocol.round_duration().as_millis() as u64).max(4);
-    let (k1_ms, k2_ms, k3_ms) = (dur_ms / 4, dur_ms / 2, 3 * dur_ms / 4);
+    let schedule = checkpoint_schedule(
+        dur_ms,
+        true,
+        consensus.then(|| crate::client_set::relay_rounds(&pp)),
+    );
 
     if armed
         && !crate::runtime::arm_until_cutover(
@@ -1040,12 +1173,8 @@ pub(crate) async fn run_subnet(
         "scheduled panetiere worker: start"
     );
     let mut deadline = deadline_for(round, base_round, epoch_unix_ms, dur_ms, now_ms);
-    let mut k1_deadline = deadline - std::time::Duration::from_millis(dur_ms - k1_ms);
-    let mut k2_deadline = deadline - std::time::Duration::from_millis(dur_ms - k2_ms);
-    let mut k3_deadline = deadline - std::time::Duration::from_millis(dur_ms - k3_ms);
-    let mut k1_done = false;
-    let mut k2_done = false;
-    let mut k3_done = false;
+    let mut cp = 0usize;
+    let mut cp_deadline = checkpoint_deadline(deadline, dur_ms, &schedule, cp);
 
     if let Some(m) = fault_monitor.as_mut() {
         m.begin_round(round, Instant::now());
@@ -1062,6 +1191,7 @@ pub(crate) async fn run_subnet(
             inner.sched_reservation_entries(subnet.id),
             Arc::downgrade(&inner),
             cfg.setup_seed,
+            consensus,
         )
     });
     let misbehavior = inner.misbehavior();
@@ -1095,46 +1225,16 @@ pub(crate) async fn run_subnet(
         tokio::select! {
             biased;
 
-            _ = tokio::time::sleep_until(k1_deadline), if !k1_done => {
-                k1_done = true;
+            _ = tokio::time::sleep_until(cp_deadline), if cp < schedule.len() => {
+                let k = schedule[cp].0;
+                cp += 1;
+                cp_deadline = checkpoint_deadline(deadline, dur_ms, &schedule, cp);
                 drain_inbound_upto(&mut subscriptions, &mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, drain_cap).await;
                 let outs: Vec<(SessionKey, Vec<u8>)> = sessions
                     .iter_mut()
                     .flat_map(|(key, s)| {
                         let key = *key;
-                        s.checkpoint(round, 1, Instant::now()).into_iter().map(move |out| (key, out))
-                    })
-                    .collect();
-                for (key, out) in outs {
-                    publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
-                        .await;
-                }
-            }
-
-            _ = tokio::time::sleep_until(k2_deadline), if !k2_done => {
-                k2_done = true;
-                drain_inbound_upto(&mut subscriptions, &mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, drain_cap).await;
-                let outs: Vec<(SessionKey, Vec<u8>)> = sessions
-                    .iter_mut()
-                    .flat_map(|(key, s)| {
-                        let key = *key;
-                        s.checkpoint(round, 2, Instant::now()).into_iter().map(move |out| (key, out))
-                    })
-                    .collect();
-                for (key, out) in outs {
-                    publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
-                        .await;
-                }
-            }
-
-            _ = tokio::time::sleep_until(k3_deadline), if !k3_done => {
-                k3_done = true;
-                drain_inbound_upto(&mut subscriptions, &mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, drain_cap).await;
-                let outs: Vec<(SessionKey, Vec<u8>)> = sessions
-                    .iter_mut()
-                    .flat_map(|(key, s)| {
-                        let key = *key;
-                        s.checkpoint(round, 3, Instant::now()).into_iter().map(move |out| (key, out))
+                        s.checkpoint(round, k, Instant::now()).into_iter().map(move |out| (key, out))
                     })
                     .collect();
                 for (key, out) in outs {
@@ -1229,12 +1329,8 @@ pub(crate) async fn run_subnet(
                 }
                 round = next;
                 deadline = deadline_for(round, base_round, epoch_unix_ms, dur_ms, now_ms);
-                k1_deadline = deadline - std::time::Duration::from_millis(dur_ms - k1_ms);
-                k2_deadline = deadline - std::time::Duration::from_millis(dur_ms - k2_ms);
-                k3_deadline = deadline - std::time::Duration::from_millis(dur_ms - k3_ms);
-                k1_done = false;
-                k2_done = false;
-                k3_done = false;
+                cp = 0;
+                cp_deadline = checkpoint_deadline(deadline, dur_ms, &schedule, cp);
                 if drain_cap.is_none() {
                     if let Some(m) = fault_monitor.as_mut() {
                         m.begin_round(round, Instant::now());
@@ -1251,6 +1347,7 @@ pub(crate) async fn run_subnet(
                             inner.sched_reservation_entries(subnet.id),
                             Arc::downgrade(&inner),
                             cfg.setup_seed,
+                            consensus,
                         )
                     });
                     let misbehavior = inner.misbehavior();
@@ -1297,7 +1394,7 @@ mod sizing_tests {
     #[test]
     fn wire_estimate_covers_real_messages() {
         let (vector_bytes, rho, cset, n_relays) = (256usize, 4u32, 40u32, 3usize);
-        let est = max_wire_estimate(vector_bytes, rho, cset, n_relays);
+        let est = max_wire_estimate(vector_bytes, rho, cset, n_relays, SetFormation::Consensus);
 
         let cfg = ScheduledPanetiereConfig {
             vector_bytes,

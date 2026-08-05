@@ -43,7 +43,7 @@ pub enum Registration {
 }
 
 /// Domain-tagged message a relay signs to register: `"anymone-relay" || pubkey
-/// || ecdh_pubkey || kem_pubkey`.
+/// || ecdh_pubkey || kem_pubkey || set_sig_pubkey`.
 fn relay_sign_msg(
     pubkey: &Pubkey,
     xk: &ExchangePublicKeyWire,
@@ -53,6 +53,7 @@ fn relay_sign_msg(
     msg.extend_from_slice(&pubkey.0);
     msg.extend_from_slice(&xk.ecdh);
     msg.extend_from_slice(&xk.kem);
+    msg.extend_from_slice(&xk.set_sig);
     // Tagged, so an absent address can't be confused with an empty one.
     match client_addr {
         Some(a) => {
@@ -79,6 +80,7 @@ fn service_sign_msg(tag: &ServiceTag, pubkey: &Pubkey, xk: &ExchangePublicKeyWir
     msg.extend_from_slice(&pubkey.0);
     msg.extend_from_slice(&xk.ecdh);
     msg.extend_from_slice(&xk.kem);
+    msg.extend_from_slice(&xk.set_sig);
     msg
 }
 

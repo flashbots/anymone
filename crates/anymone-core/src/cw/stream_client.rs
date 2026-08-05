@@ -44,6 +44,7 @@ pub struct StreamClientNetwork {
     cmds: mpsc::UnboundedSender<Cmd>,
     topics: Mutex<HashMap<String, broadcast::Sender<Inbound>>>,
     identity: Pubkey,
+    targets: Arc<Mutex<crate::transport::PublishTargets>>,
 }
 
 impl StreamClientNetwork {
@@ -52,10 +53,12 @@ impl StreamClientNetwork {
         let signer = identity.to_commonware_signer();
         let me = identity.pubkey();
         let (frame_tx, frame_rx) = mpsc::unbounded_channel();
+        let targets: Arc<Mutex<crate::transport::PublishTargets>> = Arc::default();
         let net = Arc::new(StreamClientNetwork {
             cmds: cmd_tx,
             topics: Mutex::new(HashMap::new()),
             identity: me,
+            targets: targets.clone(),
         });
         // Frames arrive on the commonware thread and fan out on this one.
         let sink = net.clone();
@@ -74,7 +77,7 @@ impl StreamClientNetwork {
                     .join(format!("anymone-cwc-{}", hex::encode(&me.0[..8])));
                 let rt = cw_tokio::Config::default().with_storage_directory(dir);
                 cw_tokio::Runner::new(rt)
-                    .start(|context| run(context, signer, cfg, cmd_rx, frame_tx));
+                    .start(|context| run(context, signer, cfg, cmd_rx, frame_tx, targets));
             })
             .expect("spawn commonware client thread");
         net
@@ -110,6 +113,10 @@ impl Transport for StreamClientNetwork {
             topic: topic.to_string(),
             bytes,
         });
+    }
+
+    fn set_publish_targets(&self, targets: crate::transport::PublishTargets) {
+        *self.targets.lock().unwrap() = targets;
     }
 
     /// A client serves no config; only nodes answer pulls.
@@ -157,6 +164,7 @@ pub fn stream_client_spawner(
 /// One server connection's outbound half, plus whether it is currently up —
 /// queueing a submission onto a dead connection loses it silently.
 struct Conn {
+    peer: Pubkey,
     tx: mpsc::UnboundedSender<StreamMsg>,
     up: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -171,6 +179,7 @@ async fn run(
     cfg: StreamClientConfig,
     mut cmds: mpsc::UnboundedReceiver<Cmd>,
     frames: Frames,
+    targets: Arc<Mutex<crate::transport::PublishTargets>>,
 ) {
     let mut conns: Vec<Conn> = Vec::new();
     let mut subscribed: Vec<String> = Vec::new();
@@ -181,6 +190,7 @@ async fn run(
         let (out_tx, out_rx) = mpsc::unbounded_channel();
         let up = Arc::new(std::sync::atomic::AtomicBool::new(false));
         conns.push(Conn {
+            peer: *pk,
             tx: out_tx,
             up: up.clone(),
         });
@@ -213,6 +223,7 @@ async fn run(
                 }
             }
             Cmd::Publish { topic, bytes } => {
+                let named_topic = topic.clone();
                 let msg = if topic == crate::governance::TOPIC_REGISTRATION {
                     StreamMsg::Register(bytes)
                 } else {
@@ -221,10 +232,16 @@ async fn run(
                         payload: bytes,
                     }
                 };
-                // One server is enough; more would duplicate the contribution
-                // and a duplicate is dropped as a replay. Prefer a connection
-                // that is actually up, but queue on the first if none is yet —
-                // it drains once the dial completes.
+                let named = targets.lock().unwrap().get(&named_topic).cloned();
+                if let Some(peers) = named {
+                    for c in conns.iter().filter(|c| peers.contains(&c.peer)) {
+                        let _ = c.tx.send(msg.clone());
+                    }
+                    continue;
+                }
+                // Unnamed topics ride one server and gossip. Prefer a connection
+                // that is up, but queue on the first if none is yet — it drains
+                // once the dial completes.
                 let target = conns
                     .iter()
                     .find(|c| c.up.load(std::sync::atomic::Ordering::Relaxed))

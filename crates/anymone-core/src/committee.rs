@@ -118,6 +118,10 @@ pub struct PanetiereCommitteeConfig {
     /// Per-message byte bound of the committee's config-anonymising channel;
     /// must fit the largest proposal it will carry and MATCH across members.
     pub committee_msg_bytes: usize,
+    /// Whether proposed Panetiere subnets form their client set by consensus
+    /// (receipts, coded evidence, Dolev–Strong rounds) instead of a leader's
+    /// announcement. Needs a round long enough for the extra phases.
+    pub consensus_set: bool,
 }
 
 impl Default for PanetiereCommitteeConfig {
@@ -141,6 +145,7 @@ impl Default for PanetiereCommitteeConfig {
             encoding: crate::config::Encoding::default(),
             committee_msg_bytes: COMMITTEE_MSG_BYTES,
             vector_bytes: 0,
+            consensus_set: false,
         }
     }
 }
@@ -180,6 +185,8 @@ pub struct CommitteeParams {
     pub committee_msg_bytes: usize,
     /// See [`PanetiereCommitteeConfig::vector_bytes`].
     pub vector_bytes: usize,
+    /// See [`PanetiereCommitteeConfig::consensus_set`].
+    pub consensus_set: bool,
 }
 
 impl Default for CommitteeParams {
@@ -202,6 +209,7 @@ impl Default for CommitteeParams {
             encoding: crate::config::Encoding::default(),
             committee_msg_bytes: COMMITTEE_MSG_BYTES,
             vector_bytes: 0,
+            consensus_set: false,
         }
     }
 }
@@ -227,6 +235,7 @@ impl CommitteeParams {
             encoding: self.encoding,
             committee_msg_bytes: self.committee_msg_bytes,
             vector_bytes: self.vector_bytes,
+            consensus_set: self.consensus_set,
         }
     }
 }
@@ -296,6 +305,9 @@ pub async fn spawn_panetiere_committee_scheduler(
         threshold: (n as u32) / 2 + 1,
         setup_seed: crate::keys::derive_seed(b"anymone/committee-seed", &committee),
         encoding: config.encoding,
+        // The committee's own channel is leaderless already, and its client set
+        // is the membership — there is nothing for consensus formation to add.
+        set_formation: crate::config::SetFormation::Leader,
     };
     let (committee_mse, pp) = params_for(&committee_cfg, n);
     let mut sorted_committee = committee.clone();
@@ -349,6 +361,11 @@ pub async fn spawn_panetiere_committee_scheduler(
         aggregation: config.aggregation,
         encoding: config.encoding,
         vector_bytes: config.vector_bytes,
+        set_formation: if config.consensus_set {
+            crate::config::SetFormation::Consensus
+        } else {
+            crate::config::SetFormation::Leader
+        },
     };
 
     tokio::spawn(async move {

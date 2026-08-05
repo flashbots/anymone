@@ -154,6 +154,171 @@ fn direct_round(
     decoded
 }
 
+/// The scheduled cadence under consensus set formation: submit at k=1,
+/// receipts at k=2, evidence at k=3, advertisements at k=4, echo at k=5, then
+/// one exchange per Dolev–Strong round before `end_round` fixes the set.
+fn consensus_round(
+    round: u64,
+    now: Instant,
+    ds_rounds: usize,
+    clients: &mut [ScheduledPanetiereClientSession],
+    client_pks: &[Pubkey],
+    servers: &mut [ScheduledPanetiereServerSession],
+    server_pks: &[Pubkey],
+) -> Vec<Vec<Vec<u8>>> {
+    for s in servers.iter_mut() {
+        s.begin_round(round, now);
+    }
+    for (i, c) in clients.iter_mut().enumerate() {
+        c.begin_round(round, now);
+        for m in c.checkpoint(round, 1, now) {
+            for s in servers.iter_mut() {
+                s.on_inbound(client_pks[i], m.clone());
+            }
+        }
+    }
+    // k=2: every lane publishes its batch, on broadcast for the clients and
+    // chain-signed for its peers.
+    let mut bus: Vec<(Pubkey, Vec<u8>)> = Vec::new();
+    for j in 0..servers.len() {
+        for m in servers[j].checkpoint(round, 2, now) {
+            for c in clients.iter_mut() {
+                c.on_inbound(server_pks[j], m.clone());
+            }
+            bus.push((server_pks[j], m));
+        }
+    }
+    // k=3: a client short of the budget repairs.
+    for (i, c) in clients.iter_mut().enumerate() {
+        for m in c.checkpoint(round, 3, now) {
+            for (j, s) in servers.iter_mut().enumerate() {
+                for out in s.on_inbound(client_pks[i], m.clone()) {
+                    bus.push((server_pks[j], out));
+                }
+            }
+        }
+    }
+    for ds in 1..=ds_rounds {
+        let batch = std::mem::take(&mut bus);
+        for (j, s) in servers.iter_mut().enumerate() {
+            for (from, m) in &batch {
+                if *from != server_pks[j] {
+                    s.on_inbound(*from, m.clone());
+                }
+            }
+            for m in s.checkpoint(round, 3 + ds as u8, now) {
+                bus.push((server_pks[j], m));
+            }
+        }
+    }
+    let mut all_outbound: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut decoded = vec![Vec::new(); servers.len()];
+    for (i, s) in servers.iter_mut().enumerate() {
+        let outcome = s.end_round(round, now);
+        decoded[i] = outcome.decoded;
+        all_outbound.extend(outcome.outbound.into_iter().map(|m| (i, m)));
+    }
+    for (i, m) in &all_outbound {
+        for (j, s) in servers.iter_mut().enumerate() {
+            if j != *i {
+                s.on_inbound(server_pks[*i], m.clone());
+            }
+        }
+        for c in clients.iter_mut() {
+            c.on_inbound(server_pks[*i], m.clone());
+        }
+    }
+    decoded
+}
+
+/// Reservations still pipeline when the set is formed by consensus: the
+/// machinery is orthogonal, so a payload reserved at `R` is delivered at
+/// `R + GAP` with receipts and evidence carrying the submission instead of a
+/// leader's announcement.
+#[test]
+fn scheduled_consensus_flow_pipelines_reservations() {
+    let n_servers = 5;
+    let vector_bytes = 128usize;
+    let cfg = ScheduledPanetiereConfig {
+        set_formation: anymone_core::config::SetFormation::Consensus,
+        ..subnet(2, vector_bytes, 8)
+    };
+    let (sched_mse, pp) = params_for(&cfg, n_servers);
+    let ds_rounds = anymone_core::client_set::relay_rounds(&pp);
+    let (ids, server_pks, xpubs) = server_env(n_servers);
+    let set_pks: Vec<panetiere::sig::VerifyingKey> = ids
+        .iter()
+        .map(|i| i.exchange().set_verifying_key())
+        .collect();
+    let entries = fresh_entries(n_servers);
+
+    let mut servers: Vec<ScheduledPanetiereServerSession> = (0..n_servers)
+        .map(|i| {
+            let mut s = ScheduledPanetiereServerSession::new(
+                pp.clone(),
+                sched_mse.clone(),
+                vector_bytes,
+                ServerId(i as u32),
+                ids[i].clone(),
+                SetMode::Consensus {
+                    publisher: server_pks[0],
+                },
+                server_pks[0],
+                server_pubkeys(&server_pks),
+                entries[i].clone(),
+            );
+            s.set_consensus_keys(ids[i].exchange().set_signing_key().clone(), set_pks.clone());
+            s
+        })
+        .collect();
+
+    let payload = b"scheduled under consensus".to_vec();
+    let client_identities: Vec<Identity> = (0..2).map(|_| Identity::generate()).collect();
+    let client_pks: Vec<Pubkey> = client_identities.iter().map(|id| id.pubkey()).collect();
+    let mut clients: Vec<ScheduledPanetiereClientSession> = (0..2usize)
+        .map(|i| {
+            let mut seed = [0u8; 32];
+            seed[..4].copy_from_slice(&(i as u32).to_le_bytes());
+            let mut c = ScheduledPanetiereClientSession::new(
+                pp.clone(),
+                sched_mse.clone(),
+                vector_bytes,
+                client_identities[i].clone(),
+                xpubs.clone(),
+                server_pks[0],
+                seed,
+                ReservationEntries::default(),
+            );
+            c.set_consensus(set_pks.clone());
+            c
+        })
+        .collect();
+    clients[0].stage(payload.clone());
+
+    let now = Instant::now();
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    for round in 0..(GAP + 4) {
+        let decoded = consensus_round(
+            round,
+            now,
+            ds_rounds,
+            &mut clients,
+            &client_pks,
+            &mut servers,
+            &server_pks,
+        );
+        for d in decoded.into_iter().flatten() {
+            seen.push(d);
+        }
+    }
+    assert!(
+        seen.iter()
+            .any(|d| d.windows(payload.len()).any(|w| w == &payload[..])),
+        "a payload reserved under consensus set formation never arrived; got {} decodes",
+        seen.len()
+    );
+}
+
 #[test]
 fn scheduled_direct_flow_pipelines_reservations() {
     let n_servers = 3;

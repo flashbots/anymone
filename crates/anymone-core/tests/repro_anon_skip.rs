@@ -47,6 +47,7 @@ async fn subnet_counts_all_clients_every_round() {
             threshold: 2,
             setup_seed: [7u8; 32],
             encoding: anymone_core::config::Encoding::default(),
+            ..Default::default()
         }),
         relay_pks.clone(),
         relay_xk,

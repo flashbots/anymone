@@ -142,12 +142,14 @@ fn subnet_max_wire(p: &ProtocolConfig, n_relays: usize) -> usize {
             c.client_set_max,
             n_relays,
             c.encoding,
+            c.set_formation,
         ),
         ProtocolConfig::ScheduledPanetiere(c) => crate::panetiere_scheduled::max_wire_estimate(
             c.vector_bytes,
             c.estimated_messages,
             c.client_set_max,
             n_relays,
+            c.set_formation,
         ),
         ProtocolConfig::Noop(c) => crate::noop::max_wire_estimate(
             c.message_size,
@@ -157,6 +159,25 @@ fn subnet_max_wire(p: &ProtocolConfig, n_relays: usize) -> usize {
         ),
         ProtocolConfig::ScheduledAdcnet(_) | ProtocolConfig::Nym(_) => 0,
     }
+}
+
+/// Consensus set formation spends the round on `CONSENSUS_PHASES` plus one
+/// Dolev–Strong round per tolerated relay, each needing a gossip hop to land.
+/// A round too short for the grid would cut the relay rounds off mid-agreement,
+/// so the config is rejected instead.
+const CONSENSUS_PHASE_MS: u64 = 150;
+
+fn consensus_cadence_fits(
+    round_duration_ms: u64,
+    set_formation: crate::config::SetFormation,
+    n_relays: usize,
+) -> bool {
+    if set_formation != crate::config::SetFormation::Consensus {
+        return true;
+    }
+    let n = n_relays.max(1);
+    let phases = crate::panetiere::CONSENSUS_PHASES + (n - crate::panetiere::rs_k(n) + 1);
+    round_duration_ms >= (phases as u64 + 1) * CONSENSUS_PHASE_MS
 }
 
 /// Shape checks independent of local state; an empty `groups`/zero `replication`
@@ -197,7 +218,10 @@ fn validate_structure(body: &AnymoneRoundConfigurationBody) -> bool {
             ProtocolConfig::Panetiere(c) => {
                 let n = s.relays.len() as u32;
                 let threshold_ok = c.threshold >= n / 2 + 1 && c.threshold <= n.max(1);
-                if c.client_set_max < MIN_CAPACITY || !threshold_ok {
+                if c.client_set_max < MIN_CAPACITY
+                    || !threshold_ok
+                    || !consensus_cadence_fits(c.round_duration_ms, c.set_formation, s.relays.len())
+                {
                     return false;
                 }
             }
@@ -209,6 +233,7 @@ fn validate_structure(body: &AnymoneRoundConfigurationBody) -> bool {
                     || c.message_size == 0
                     || c.message_size > u16::MAX as usize
                     || c.vector_bytes == 0
+                    || !consensus_cadence_fits(c.round_duration_ms, c.set_formation, s.relays.len())
                 {
                     return false;
                 }
@@ -237,6 +262,7 @@ mod sizing_tests {
                     MAX_SUBNET_CLIENTS,
                     n_relays,
                     crate::config::Encoding::Mse,
+                    crate::config::SetFormation::Consensus,
                 ));
             assert!(
                 worst <= MAX_SUBNET_WIRE,
@@ -272,6 +298,7 @@ mod sizing_tests {
                     pin: None,
                     aggregation: true,
                     encoding: crate::config::Encoding::default(),
+                    set_formation: crate::config::SetFormation::Leader,
                 },
             );
             for _ in 0..n_relays {
@@ -337,6 +364,7 @@ mod sizing_tests {
                 pin: None,
                 aggregation: true,
                 encoding: crate::config::Encoding::default(),
+                set_formation: crate::config::SetFormation::Leader,
             },
         );
         let body = AnymoneRoundConfigurationBody {
@@ -443,6 +471,8 @@ pub struct SchedulerParams {
     pub aggregation: bool,
     /// Payload encoding every proposed Panetiere subnet carries.
     pub encoding: crate::config::Encoding,
+    /// How proposed Panetiere subnets fix their canonical client set.
+    pub set_formation: crate::config::SetFormation,
 }
 
 /// One public subnet's escalation state: `general` (unattributable fault, heals
@@ -1084,6 +1114,7 @@ impl SchedulerCore {
                 &protos,
                 &vector_bytes,
                 self.params.pin,
+                self.params.set_formation,
                 &self.registered,
                 &self.services,
                 self.capacity,
@@ -1610,6 +1641,7 @@ impl SchedulerCore {
                         threshold: (n / 2 + 1).max(n.saturating_sub(2)),
                         setup_seed: crate::keys::derive_seed(b"anymone/subnet-seed", &relay_vec),
                         encoding: self.params.encoding,
+                        set_formation: self.params.set_formation,
                     }),
                     SchedulerProtocol::ScheduledPanetiere => {
                         let vector_bytes = Some(self.params.vector_bytes)
@@ -1642,6 +1674,7 @@ impl SchedulerCore {
                                     b"anymone/subnet-seed",
                                     &relay_vec,
                                 ),
+                                set_formation: self.params.set_formation,
                             },
                         )
                     }
@@ -1697,10 +1730,12 @@ impl SchedulerCore {
 /// sorted service tags. The lead stages a new config only when this changes.
 /// Clients aren't part of the fingerprint — they're permissionless and never
 /// appear in the config (they key-exchange directly with relays on the subnet).
+#[allow(clippy::too_many_arguments)]
 fn content_key(
     protos: &[SchedulerProtocol],
     vector_bytes: &[usize],
     pin: Option<SchedulerProtocol>,
+    set_formation: crate::config::SetFormation,
     relays: &HashSet<Pubkey>,
     services: &HashMap<ServiceTag, Pubkey>,
     capacity: u32,
@@ -1727,6 +1762,10 @@ fn content_key(
         Some(SchedulerProtocol::Panetiere) => 2,
         Some(SchedulerProtocol::ScheduledPanetiere) => 3,
         Some(SchedulerProtocol::Noop) => 4,
+    });
+    key.push(match set_formation {
+        crate::config::SetFormation::Leader => 0,
+        crate::config::SetFormation::Consensus => 1,
     });
     key.extend_from_slice(&capacity.to_le_bytes());
     // Quantize so a change in the committee's cover target re-proposes a config.

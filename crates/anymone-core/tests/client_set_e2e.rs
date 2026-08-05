@@ -1,17 +1,16 @@
-//! Canonical client-set selection end-to-end: receipts on delivery, evidence
-//! packages that route around withheld receipts, unanimous verdicts on
-//! malicious clients, and a loud halt — never an exclusion — past `n − k`
-//! censoring servers.
+//! Canonical client-set selection end to end: lanes publish what they took,
+//! Dolev–Strong agrees the matrix, and every honest lane fixes the same set —
+//! absorbing small gaps as abstentions, repairing large ones from fragments,
+//! and excluding a host that booted twice.
 
+use anymone_core::client_set::{
+    batch_signing_bytes, build_fragments, plurality_set, relay_rounds, run_client_round_set,
+    ClientSetRound, ReceiptBatch, Relay, RelayItem, SetRound, SetServer,
+};
 use chipmunk_code::{HVCPoly, KahePoly, N};
 use panetiere::bulletin::{RsClientBulletinEntry, RsNodeBulletinEntry, ServerBulletinEntry};
 use panetiere::kahe::T_MODULUS_DEFAULT;
 use panetiere::pke;
-use anymone_core::client_set::{
-    build_evidence, fragment_signing_bytes, plurality_set, relay_rounds, relay_signing_bytes,
-    run_client_round_set, Bundle, Certificate, ClientSetRound, Evidence, Fragment, Relay,
-    RelayItem, SetRound, SetServer,
-};
 use panetiere::protocol::server::{run_rs_node_round, run_server_round};
 use panetiere::protocol::verify::{aggregate_and_decrypt_rs, VerifyError};
 use panetiere::protocol::{ClientId, ProtocolParams, ServerId, SessionId};
@@ -22,7 +21,7 @@ use rand_chacha::ChaCha20Rng;
 const SESSION: SessionId = SessionId([0x91; 32]);
 /// Servers, each also a lane — the bundle carries both duties.
 const S: usize = 8;
-/// k = t: two censors absorbed, three halt the round.
+/// k = t: two lanes may abstain, three halt the round.
 const K: usize = 6;
 const RHO: usize = 8;
 const PAYLOAD_POLYS: usize = 4;
@@ -62,6 +61,26 @@ struct Round {
     rho: usize,
 }
 
+/// One client's outcome across every publishing lane.
+struct Outcome {
+    sets: Vec<Option<SetRound>>,
+}
+
+impl Outcome {
+    fn published(&self) -> impl Iterator<Item = &SetRound> {
+        self.sets.iter().flatten()
+    }
+
+    fn agreed_set(&self) -> Vec<ClientId> {
+        let sets: Vec<&Vec<ClientId>> = self.published().map(|sr| &sr.set).collect();
+        assert!(
+            sets.windows(2).all(|w| w[0] == w[1]),
+            "lanes disagreed on the set: {sets:?}"
+        );
+        sets.first().map(|s| (*s).clone()).unwrap_or_default()
+    }
+}
+
 impl Round {
     fn build() -> Self {
         Self::build_dims(S, K, RHO)
@@ -82,9 +101,7 @@ impl Round {
         let server_keys: Vec<pke::PrivateKey> =
             (0..s).map(|_| pke::PrivateKey::generate(&mut rng)).collect();
         let server_sig: Vec<SigningKey> = (0..s).map(|_| SigningKey::generate(&mut rng)).collect();
-        let servers: Vec<(ServerId, pke::PublicKey)> = (0..s)
-            .map(|i| (ServerId(i as u32), server_keys[i].public()))
-            .collect();
+        let servers = roster(&server_keys);
 
         let mut client_sig = Vec::with_capacity(rho);
         let mut rounds = Vec::with_capacity(rho);
@@ -115,9 +132,12 @@ impl Round {
         }
     }
 
+    fn set_pks(&self) -> Vec<sig::VerifyingKey> {
+        self.server_sig.iter().map(|k| k.verifying_key()).collect()
+    }
+
     fn servers(&self) -> Vec<SetServer> {
-        let pks: Vec<sig::VerifyingKey> =
-            self.server_sig.iter().map(|k| k.verifying_key()).collect();
+        let pks = self.set_pks();
         (0..self.s)
             .map(|j| {
                 SetServer::new(
@@ -130,93 +150,127 @@ impl Round {
             .collect()
     }
 
-    /// One full formation: delivery with per-lane receipt withholding, evidence
-    /// from every opted-in client to its certifiers, the relay rounds, then
-    /// set fixing at the publishing servers.
+    /// One full formation on the real cadence: bundles, each lane's batch,
+    /// client repair, then the Dolev–Strong rounds and set fixing.
+    ///
+    /// `deliver` decides whether a client's bundle reaches a lane — a lane that
+    /// never takes it simply omits the client from its batch, which is exactly
+    /// what a censoring lane does. `repairs` decides whether the client answers
+    /// the gap with fragments.
     fn run_round(
         &self,
         deliver: impl Fn(ClientId, usize) -> bool,
-        withhold_cert: impl Fn(ClientId, usize) -> bool,
-        with_evidence: impl Fn(ClientId) -> bool,
+        repairs: impl Fn(ClientId) -> bool,
         publishes: &[bool],
-    ) -> Vec<Option<SetRound>> {
+    ) -> Outcome {
         assert_eq!(publishes.len(), self.s);
         let mut servers = self.servers();
-        let certs = self.deliver(&mut servers, deliver, withhold_cert);
-
-        for (i, r) in self.rounds.iter().enumerate() {
-            if !with_evidence(r.client_id) {
-                continue;
-            }
-            let (e, frags) =
-                build_evidence(&self.pp, &SESSION, r, certs[i].clone(), &self.client_sig[i]);
-            for (fi, c) in e.certs.iter().enumerate() {
-                let own = frags.get(fi).map(|f| vec![f.clone()]).unwrap_or_default();
-                assert!(servers[c.server_id.0 as usize].submit(&SESSION, &e, &own));
-            }
+        self.deliver(&mut servers, deliver);
+        let bus = self.exchange(&mut servers, repairs);
+        self.settle(&mut servers, bus);
+        Outcome {
+            sets: servers
+                .iter()
+                .enumerate()
+                .map(|(j, s)| {
+                    publishes[j].then(|| s.finalize(&self.pp, &self.server_keys[j], &SESSION))
+                })
+                .collect(),
         }
-
-        relay_all(&mut servers, &self.pp);
-
-        servers
-            .iter()
-            .enumerate()
-            .map(|(j, s)| publishes[j].then(|| s.finalize(&self.pp, &self.server_keys[j], &SESSION)))
-            .collect()
     }
 
-    fn deliver(
-        &self,
-        servers: &mut [SetServer],
-        deliver: impl Fn(ClientId, usize) -> bool,
-        withhold_cert: impl Fn(ClientId, usize) -> bool,
-    ) -> Vec<Vec<Certificate>> {
-        let mut certs: Vec<Vec<Certificate>> = vec![Vec::new(); self.rho];
+    fn deliver(&self, servers: &mut [SetServer], deliver: impl Fn(ClientId, usize) -> bool) {
+        // Every lane reads every bulletin off ingress; the boot key comes from
+        // there, never from a lane's word for it.
+        for (cid, entry) in &self.entries {
+            for s in servers.iter_mut() {
+                s.note_bulletin(*cid, entry.pubkey);
+            }
+        }
         for r in &self.rounds {
             for lane in 0..self.s {
-                if !deliver(r.client_id, lane) {
-                    continue;
-                }
-                let cert = servers[lane]
-                    .receive(&SESSION, &r.bundles[lane])
-                    .expect("valid bundle");
-                if !withhold_cert(r.client_id, lane) {
-                    certs[r.client_id.0 as usize].push(cert);
+                if deliver(r.client_id, lane) {
+                    assert!(
+                        servers[lane].receive(&SESSION, &r.bundles[lane]),
+                        "lane {lane} rejected a valid bundle"
+                    );
                 }
             }
         }
-        certs
     }
 
-    fn publish(&self, sets: &[SetRound]) -> (Vec<ServerBulletinEntry>, Vec<RsNodeBulletinEntry>) {
-        let servers = sets
-            .iter()
-            .map(|sr| run_server_round(&sr.inbox, &sr.set).expect("openings for the set"))
-            .collect();
+    /// Publish every lane's batch, then let each client read the matrix off
+    /// those batches and repair if a lane is missing. Returns the relay items
+    /// waiting for the first Dolev–Strong round, tagged with their origin.
+    fn exchange(
+        &self,
+        servers: &mut [SetServer],
+        repairs: impl Fn(ClientId) -> bool,
+    ) -> Vec<(usize, Relay)> {
+        let batches: Vec<ReceiptBatch> = servers.iter().map(|s| s.batch(&SESSION)).collect();
+        let mut bus: Vec<(usize, Relay)> = Vec::new();
+        for (j, s) in servers.iter_mut().enumerate() {
+            bus.extend(s.originate(&SESSION).into_iter().map(|r| (j, r)));
+        }
+        for (i, r) in self.rounds.iter().enumerate() {
+            let covered = covered_lanes(&batches, r.client_id);
+            if covered.len() == self.s || !repairs(r.client_id) {
+                continue;
+            }
+            let frags = build_fragments(&self.pp, &SESSION, r, &covered, &self.client_sig[i]);
+            for (lane, f) in covered.iter().zip(frags) {
+                let out = servers[*lane].submit(&SESSION, std::slice::from_ref(&f));
+                bus.extend(out.into_iter().map(|rel| (*lane, rel)));
+            }
+        }
+        bus
+    }
+
+    /// `relay_rounds` exchanges, each delivering the previous round's fresh
+    /// acceptances to every other lane.
+    fn settle(&self, servers: &mut [SetServer], mut bus: Vec<(usize, Relay)>) {
+        for round in 1..=relay_rounds(&self.pp) {
+            let batch = std::mem::take(&mut bus);
+            for (j, s) in servers.iter_mut().enumerate() {
+                let incoming: Vec<Relay> = batch
+                    .iter()
+                    .filter(|(from, _)| *from != j)
+                    .map(|(_, r)| r.clone())
+                    .collect();
+                bus.extend(
+                    s.absorb(&SESSION, round, &incoming)
+                        .into_iter()
+                        .map(|r| (j, r)),
+                );
+            }
+        }
+    }
+
+    fn publish(&self, sets: &[&SetRound]) -> (Vec<ServerBulletinEntry>, Vec<RsNodeBulletinEntry>) {
         let scp = self.pp.share_comm.as_ref().expect("share-commitment params");
         let roots: Vec<(ClientId, HVCPoly)> = self
             .entries
             .iter()
             .map(|(cid, e)| (*cid, e.share_root))
             .collect();
+        // A lane short of a canonical member publishes nothing at all — that is
+        // the abstention the set rule budgets for, so it is skipped, not fatal.
+        let servers = sets
+            .iter()
+            .filter_map(|sr| run_server_round(&sr.inbox, &sr.set).ok())
+            .collect();
         let lanes = sets
             .iter()
-            .map(|sr| {
-                run_rs_node_round(scp, &sr.lane_inbox, &sr.set, &roots)
-                    .expect("shares for the set")
-            })
+            .filter_map(|sr| run_rs_node_round(scp, &sr.lane_inbox, &sr.set, &roots).ok())
             .collect();
         (servers, lanes)
     }
 
-    /// Anchor on the plurality set, keep only what was published over it, decode.
-    fn recover(&self, sets: &[SetRound]) -> Result<(Vec<ClientId>, Vec<KahePoly>), VerifyError> {
+    fn recover(&self, sets: &[&SetRound]) -> Result<(Vec<ClientId>, Vec<KahePoly>), VerifyError> {
         let (servers, lanes) = self.publish(sets);
         let anchor = plurality_set(&servers);
-        let agreeing: Vec<ServerBulletinEntry> = servers
-            .into_iter()
-            .filter(|sp| sp.clients == anchor)
-            .collect();
+        let agreeing: Vec<ServerBulletinEntry> =
+            servers.into_iter().filter(|sp| sp.clients == anchor).collect();
         let agreeing_lanes: Vec<RsNodeBulletinEntry> =
             lanes.into_iter().filter(|np| np.clients == anchor).collect();
         aggregate_and_decrypt_rs(
@@ -228,15 +282,6 @@ impl Round {
             &agreeing_lanes,
         )
         .map(|(plain, _)| (anchor, plain))
-    }
-
-    fn recover_published(
-        &self,
-        sets: Vec<Option<SetRound>>,
-    ) -> (Vec<SetRound>, Result<(Vec<ClientId>, Vec<KahePoly>), VerifyError>) {
-        let published: Vec<SetRound> = sets.into_iter().flatten().collect();
-        let out = self.recover(&published);
-        (published, out)
     }
 
     fn expected_sum(&self, set: &[ClientId]) -> Vec<KahePoly> {
@@ -253,373 +298,109 @@ impl Round {
     fn all_clients(&self) -> Vec<ClientId> {
         (0..self.rho as u32).map(ClientId).collect()
     }
+}
 
-    fn without(&self, c: ClientId) -> Vec<ClientId> {
-        self.all_clients().into_iter().filter(|x| *x != c).collect()
-    }
+fn roster(keys: &[pke::PrivateKey]) -> Vec<(ServerId, pke::PublicKey)> {
+    keys.iter()
+        .enumerate()
+        .map(|(i, k)| (ServerId(i as u32), k.public()))
+        .collect()
+}
+
+/// The lanes whose batch reports `cid`, sorted — the client's own view of the
+/// matrix, identical to what every lane computes.
+fn covered_lanes(batches: &[ReceiptBatch], cid: ClientId) -> Vec<usize> {
+    let mut lanes: Vec<usize> = batches
+        .iter()
+        .filter(|b| b.receipts.iter().any(|r| r.client_id == cid))
+        .map(|b| b.server_id.0 as usize)
+        .collect();
+    lanes.sort_unstable();
+    lanes
 }
 
 const ALL: [bool; S] = [true; S];
 const EVERY: fn(ClientId, usize) -> bool = |_, _| true;
-const NONE: fn(ClientId, usize) -> bool = |_, _| false;
-
-/// The full Dolev–Strong schedule: every server's fresh acceptances go to
-/// every other server in the next round.
-fn relay_all(servers: &mut [SetServer], pp: &ProtocolParams) {
-    let mut pending: Vec<Vec<Relay>> = servers.iter_mut().map(|s| s.echo(&SESSION)).collect();
-    for round in 1..=relay_rounds(pp) {
-        pending = servers
-            .iter_mut()
-            .enumerate()
-            .map(|(j, s)| {
-                let incoming: Vec<Relay> = pending
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != j)
-                    .flat_map(|(_, batch)| batch.iter().cloned())
-                    .collect();
-                s.absorb(&SESSION, round, &incoming)
-            })
-            .collect();
-    }
-}
-
-/// `(r, s) → (r, n − s)`: the other valid ECDSA signature for the same bytes.
-fn flip_s(sig: &[u8; 64]) -> [u8; 64] {
-    const ORDER: [u8; 32] = [
-        0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63,
-        0x25, 0x51,
-    ];
-    let mut out = *sig;
-    let mut borrow = 0i16;
-    for i in (0..32).rev() {
-        let d = ORDER[i] as i16 - out[32 + i] as i16 - borrow;
-        borrow = i16::from(d < 0);
-        out[32 + i] = (d + 256 * borrow) as u8;
-    }
-    out
-}
+const NEVER: fn(ClientId) -> bool = |_| false;
+const ALWAYS: fn(ClientId) -> bool = |_| true;
 
 #[test]
 fn happy_path_recovers_the_sum_over_every_client() {
     let r = Round::build();
-    let sets = r.run_round(EVERY, NONE, |_| true, &ALL);
-    for sr in sets.iter().flatten() {
+    let out = r.run_round(EVERY, NEVER, &ALL);
+    for sr in out.published() {
         assert_eq!(sr.set, r.all_clients());
-        assert!(sr.repaired.is_empty(), "nothing to repair");
         assert!(sr.excluded.is_empty());
+        assert!(sr.conflicted.is_empty());
+        assert!(sr.repaired.is_empty(), "nothing to repair");
     }
-    let (_, out) = r.recover_published(sets);
-    let (anchor, plain) = out.expect("recover");
+    let published: Vec<&SetRound> = out.published().collect();
+    let (anchor, plain) = r.recover(&published).expect("recover");
     assert_eq!(anchor, r.all_clients());
     assert_eq!(plain, r.expected_sum(&anchor));
 }
 
-/// Withholding the receipt achieves nothing: the victim codes the silent lane
-/// to its certifiers, every server — the censor included — can rebuild it, and
-/// the round completes with the victim in whether the censor publishes or not.
+/// A gap inside the budget needs no repair at all: the victim stays in the set
+/// and the lane that missed it simply abstains, costing only itself.
 #[test]
-fn a_censored_client_routes_around_the_censor() {
+fn a_gap_within_the_budget_is_absorbed() {
     let r = Round::build();
     let victim = ClientId(5);
-    let censor = S - 1;
-    let withhold = |c: ClientId, lane: usize| c == victim && lane == censor;
+    let blind = S - 1;
+    let out = r.run_round(|c, lane| !(c == victim && lane == blind), NEVER, &ALL);
 
-    let sets = r.run_round(EVERY, withhold, |_| true, &ALL);
-    for (j, sr) in sets.iter().flatten().enumerate() {
-        assert_eq!(sr.set, r.all_clients(), "server {j}");
-        let expect = if j == censor { vec![victim] } else { vec![] };
-        assert_eq!(sr.repaired, expect, "server {j}");
+    assert_eq!(out.agreed_set(), r.all_clients(), "the victim stays in");
+    for sr in out.published() {
+        assert!(sr.repaired.is_empty(), "no fragments were sent");
     }
-    let (_, out) = r.recover_published(sets);
-    let (anchor, plain) = out.expect("recover");
-    assert_eq!(anchor, r.all_clients());
-    assert_eq!(plain, r.expected_sum(&anchor));
-
-    // The censor abstaining changes the server count, not the set.
-    let mut publishes = ALL;
-    publishes[censor] = false;
-    let sets = r.run_round(EVERY, withhold, |_| true, &publishes);
-    let (published, out) = r.recover_published(sets);
-    assert_eq!(published.len(), S - 1);
-    let (anchor, _) = out.expect("recover");
-    assert!(anchor.contains(&victim));
-}
-
-/// No evidence, no membership: bundles alone don't admit, so a client that
-/// skips the package is excluded by every server and the round proceeds.
-#[test]
-fn a_client_without_evidence_is_excluded_unanimously() {
-    let r = Round::build();
-    let rogue = ClientId(3);
-    let sets = r.run_round(EVERY, NONE, |c| c != rogue, &ALL);
-    for (j, sr) in sets.iter().flatten().enumerate() {
-        assert_eq!(sr.set, r.without(rogue), "server {j}");
-        assert_eq!(sr.excluded, vec![rogue], "server {j}");
-    }
-    let (_, out) = r.recover_published(sets);
-    let (anchor, plain) = out.expect("the round proceeds");
-    assert_eq!(anchor, r.without(rogue));
-    assert_eq!(plain, r.expected_sum(&anchor));
-}
-
-/// A client claiming censorship that never happened: it skips a server,
-/// codes the "missing" lane, and is included — the skipped server rebuilds its
-/// bundle from the fragments and serves. False accusations are free and inert.
-#[test]
-fn a_false_censorship_claim_changes_nothing() {
-    let r = Round::build();
-    let rogue = ClientId(3);
-    let skipped = 3usize;
-    let sets = r.run_round(
-        |c, lane| !(c == rogue && lane == skipped),
-        NONE,
-        |_| true,
-        &ALL,
-    );
-    for (j, sr) in sets.iter().flatten().enumerate() {
-        assert_eq!(sr.set, r.all_clients(), "server {j}");
-        let expect = if j == skipped { vec![rogue] } else { vec![] };
-        assert_eq!(sr.repaired, expect, "server {j}");
-    }
-    let (_, out) = r.recover_published(sets);
-    let (anchor, plain) = out.expect("recover");
-    assert_eq!(anchor, r.all_clients());
-    assert_eq!(plain, r.expected_sum(&anchor));
-}
-
-/// Complete evidence makes any delivery pattern servable: a client feeding
-/// only `t` servers is still included by all, the unfed servers rebuilding
-/// their bundles from the coded lanes.
-#[test]
-fn skipping_many_lanes_still_includes_and_serves() {
-    let r = Round::build();
-    let rogue = ClientId(3);
-    let fed = r.pp.shamir.t;
-    let sets = r.run_round(|c, lane| c != rogue || lane < fed, NONE, |_| true, &ALL);
-    for (j, sr) in sets.iter().flatten().enumerate() {
-        assert_eq!(sr.set, r.all_clients(), "server {j}");
-        let expect = if j >= fed { vec![rogue] } else { vec![] };
-        assert_eq!(sr.repaired, expect, "server {j}");
-    }
-    let (_, out) = r.recover_published(sets);
-    let (anchor, plain) = out.expect("recover");
-    assert_eq!(anchor, r.all_clients());
-    assert_eq!(plain, r.expected_sum(&anchor));
-}
-
-/// Evidence whose coded lanes rebuild into garbage is rejected by every
-/// server, not just the ones that needed the data — every server rebuilds and
-/// checks whenever a lane is coded.
-#[test]
-fn a_garbage_blob_is_excluded_unanimously() {
-    let r = Round::build();
-    let rogue = ClientId(3);
-    let skipped = 3usize;
-
-    let mut servers = r.servers();
-    let certs = r.deliver(
-        &mut servers,
-        |c, lane| !(c == rogue && lane == skipped),
-        NONE,
+    let blind_lane = out.sets[blind].as_ref().expect("finalized");
+    assert!(
+        !blind_lane.lane_inbox.items.iter().any(|(c, _, _)| *c == victim),
+        "the blind lane cannot serve the victim, so it must abstain"
     );
 
-    for (i, cr) in r.rounds.iter().enumerate() {
-        let round = if cr.client_id == rogue {
-            // The coded copy of the skipped bundle is corrupted; its signature
-            // inside the blob no longer verifies.
-            let mut bundles = cr.bundles.clone();
-            bundles[skipped].envelope[0] ^= 1;
-            &ClientSetRound {
-                client_id: cr.client_id,
-                bulletin: cr.bulletin.clone(),
-                bundles,
-            }
-        } else {
-            cr
-        };
-        let (e, frags) =
-            build_evidence(&r.pp, &SESSION, round, certs[i].clone(), &r.client_sig[i]);
-        for (fi, c) in e.certs.iter().enumerate() {
-            let own = frags.get(fi).map(|f| vec![f.clone()]).unwrap_or_default();
-            assert!(servers[c.server_id.0 as usize].submit(&SESSION, &e, &own));
-        }
-    }
-    relay_all(&mut servers, &r.pp);
-
-    let sets: Vec<SetRound> = servers
-        .iter()
-        .enumerate()
-        .map(|(j, s)| s.finalize(&r.pp, &r.server_keys[j], &SESSION))
-        .collect();
-    for (j, sr) in sets.iter().enumerate() {
-        assert_eq!(sr.set, r.without(rogue), "server {j}");
-        assert_eq!(sr.excluded, vec![rogue], "server {j}");
-    }
-    let (anchor, plain) = r.recover(&sets).expect("the round proceeds");
-    assert_eq!(anchor, r.without(rogue));
-    assert_eq!(plain, r.expected_sum(&anchor));
-}
-
-#[test]
-fn receipts_and_evidence_reject_forgery() {
-    let r = Round::build();
-    let mut servers = r.servers();
-    let good = &r.rounds[0].bundles[0];
-
-    let mut tampered = good.clone();
-    tampered.envelope[0] ^= 1;
-    assert!(servers[0].receive(&SESSION, &tampered).is_none());
-
-    let wrong_lane = &r.rounds[0].bundles[1];
-    assert!(servers[0].receive(&SESSION, wrong_lane).is_none());
-
-    assert!(servers[0].receive(&SessionId([0x00; 32]), good).is_none());
-
-    let certs: Vec<Certificate> = (0..S)
-        .map(|j| {
-            servers[j]
-                .receive(&SESSION, &r.rounds[0].bundles[j])
-                .expect("valid bundle")
-        })
-        .collect();
-    let (e, frags) = build_evidence(&r.pp, &SESSION, &r.rounds[0], certs, &r.client_sig[0]);
-    assert!(frags.is_empty(), "nothing withheld, nothing coded");
-
-    // A certificate reassigned to another server fails its signature check.
-    let mut forged = e.clone();
-    forged.certs[1].server_id = ServerId(2);
-    assert!(!servers[0].submit(&SESSION, &forged, &[]));
-
-    // Evidence that does not cover every lane is rejected outright.
-    let mut short = e.clone();
-    short.certs.pop();
-    assert!(!servers[0].submit(&SESSION, &short, &[]));
-
-    assert!(servers[0].submit(&SESSION, &e, &frags));
-
-    // ECDSA malleability mints no second package: the flipped signature is
-    // the same identity, so it dedupes instead of counting as equivocation.
-    let mut malleated = e.clone();
-    malleated.sig = flip_s(&e.sig);
-    assert_eq!(malleated.identity(&SESSION), e.identity(&SESSION));
-    assert!(servers[0].submit(&SESSION, &malleated, &[]));
-    let sr = servers[0].finalize(&r.pp, &r.server_keys[0], &SESSION);
-    assert!(sr.conflicted.is_empty());
-    assert_eq!(sr.set, vec![ClientId(0)]);
-}
-
-/// Two censors — the full `n − k` budget — abstain after withholding
-/// receipts: the round still completes and still includes their victims.
-#[test]
-fn censors_at_the_budget_cost_only_themselves() {
-    let r = Round::build();
-    let censors = [S - 2, S - 1];
-    let mut publishes = ALL;
-    for j in censors {
-        publishes[j] = false;
-    }
-    let sets = r.run_round(
-        EVERY,
-        |c, lane| censors.contains(&lane) && c == ClientId(lane as u32 - 2),
-        |_| true,
-        &publishes,
-    );
-    let (published, out) = r.recover_published(sets);
-    assert_eq!(published.len(), r.pp.shamir.t, "exactly the threshold remains");
-    let (anchor, plain) = out.expect("recover");
-    assert_eq!(anchor, r.all_clients());
-    assert_eq!(plain, r.expected_sum(&anchor));
-}
-
-/// Past the budget the failure is a loud halt: three abstaining censors leave
-/// fewer than `t` shares and `k` lanes. The victim is still in every honest
-/// set — exclusion is never the outcome.
-#[test]
-fn three_censoring_servers_halt_the_round() {
-    let r = Round::build();
-    let victim = ClientId(4);
-    let censors = [S - 3, S - 2, S - 1];
-    let mut publishes = ALL;
-    for j in censors {
-        publishes[j] = false;
-    }
-    let sets = r.run_round(
-        EVERY,
-        |c, lane| censors.contains(&lane) && c == victim,
-        |_| true,
-        &publishes,
-    );
-    for sr in sets.iter().flatten() {
-        assert_eq!(sr.set, r.all_clients());
-        assert!(sr.set.contains(&victim));
-    }
-    let (published, out) = r.recover_published(sets);
-    assert!(published.len() < r.pp.shamir.t);
-    assert_eq!(out, Err(VerifyError::BadServerCoverage));
-}
-
-/// The paper numbers: at 14-of-16 two censors are absorbed, three halt.
-#[test]
-fn the_budget_at_14_of_16_is_two_censors() {
-    let r = Round::build_dims(16, 14, 6);
-    assert_eq!(r.pp.shamir.t, 14);
-    let victim = ClientId(2);
-
-    let mut publishes = vec![true; 16];
-    publishes[14] = false;
-    publishes[15] = false;
-    let sets = r.run_round(
-        |_, _| true,
-        |c, lane| lane >= 14 && c == victim,
-        |_| true,
-        &publishes,
-    );
-    let (published, out) = r.recover_published(sets);
-    assert_eq!(published.len(), 14);
-    let (anchor, plain) = out.expect("two censors are absorbed");
+    let published: Vec<&SetRound> = out.published().collect();
+    let (anchor, plain) = r.recover(&published).expect("the round still recovers");
     assert!(anchor.contains(&victim));
     assert_eq!(plain, r.expected_sum(&anchor));
-
-    let mut publishes = vec![true; 16];
-    for j in 13..16 {
-        publishes[j] = false;
-    }
-    let sets = r.run_round(
-        |_, _| true,
-        |c, lane| lane >= 13 && c == victim,
-        |_| true,
-        &publishes,
-    );
-    for sr in sets.iter().flatten() {
-        assert!(sr.set.contains(&victim), "the victim is never excluded");
-    }
-    let (published, out) = r.recover_published(sets);
-    assert!(published.len() < r.pp.shamir.t);
-    assert_eq!(out, Err(VerifyError::BadServerCoverage));
 }
 
-/// The relay closes every delivery-timing and double-boot hole: a package
-/// handed to a single server before the cutoff lands everywhere, one injected
-/// in the last round with a short chain lands nowhere, a host that boots twice
-/// and finishes two packages is a conflict everywhere, and a package mixing
-/// two boots' certificates cannot even be formed.
+/// Past the budget the client answers with fragments, and the lanes that never
+/// took the bundle rebuild it rather than abstaining.
 #[test]
-fn relay_agrees_on_late_and_equivocating_packages() {
+fn a_gap_past_the_budget_is_repaired() {
     let r = Round::build();
+    let victim = ClientId(3);
+    let blind = [S - 3, S - 2, S - 1];
+    let deliver = |c: ClientId, lane: usize| !(c == victim && blind.contains(&lane));
+
+    let out = r.run_round(deliver, ALWAYS, &ALL);
+    assert_eq!(out.agreed_set(), r.all_clients());
+    for (j, sr) in out.sets.iter().enumerate() {
+        let sr = sr.as_ref().expect("finalized");
+        let expect = if blind.contains(&j) { vec![victim] } else { vec![] };
+        assert_eq!(sr.repaired, expect, "lane {j}");
+    }
+    let published: Vec<&SetRound> = out.published().collect();
+    let (anchor, plain) = r.recover(&published).expect("recover");
+    assert_eq!(anchor, r.all_clients());
+    assert_eq!(plain, r.expected_sum(&anchor));
+
+    // Without the fragments the same gap exceeds what abstention can absorb.
+    let bare = r.run_round(deliver, NEVER, &ALL);
+    assert!(
+        !bare.agreed_set().contains(&victim),
+        "three blind lanes is past the budget; unrepaired the victim is out"
+    );
+}
+
+/// Two boots of one host report different keys for the same client, and the
+/// disagreement is visible in the matrix at every lane.
+#[test]
+fn a_double_boot_is_excluded_everywhere() {
+    let r = Round::build();
+    let twice = ClientId(2);
     let mut rng = ChaCha20Rng::from_seed([0x77; 32]);
-    let lone = ClientId(2);
-    let late = ClientId(5);
-    let twice = ClientId(4);
-
-    let mut servers = r.servers();
-    let certs = r.deliver(&mut servers, EVERY, NONE);
-
-    // Second boot of `twice`: fresh key, fresh bundles, full cert set.
-    let roster: Vec<(ServerId, pke::PublicKey)> = (0..r.s)
-        .map(|j| (ServerId(j as u32), r.server_keys[j].public()))
-        .collect();
     let sk2 = SigningKey::generate(&mut rng);
     let boot2 = run_client_round_set(
         &mut rng,
@@ -627,207 +408,145 @@ fn relay_agrees_on_late_and_equivocating_packages() {
         &SESSION,
         twice,
         r.messages[twice.0 as usize].clone(),
-        &roster,
+        &roster(&r.server_keys),
         &sk2,
     );
-    let certs2: Vec<Certificate> = (0..r.s)
-        .map(|j| {
-            servers[j]
-                .receive(&SESSION, &boot2.bundles[j])
-                .expect("valid bundle")
-        })
-        .collect();
 
-    // Certificates sign the boot key, so a mixed-run package dies on arrival.
-    let mut mixed = certs[twice.0 as usize].clone();
-    mixed.splice(..r.s / 2, certs2[..r.s / 2].iter().cloned());
-    let (bad, _) = build_evidence(&r.pp, &SESSION, &boot2, mixed, &sk2);
-    assert!(!servers[0].submit(&SESSION, &bad, &[]));
-
-    let (e2, _) = build_evidence(&r.pp, &SESSION, &boot2, certs2, &sk2);
-    let mut late_package: Option<Evidence> = None;
-    for (i, cr) in r.rounds.iter().enumerate() {
-        let (e, frags) = build_evidence(&r.pp, &SESSION, cr, certs[i].clone(), &r.client_sig[i]);
-        assert!(frags.is_empty());
-        if cr.client_id == lone {
-            assert!(servers[0].submit(&SESSION, &e, &[]));
-        } else if cr.client_id == late {
-            late_package = Some(e);
-        } else if cr.client_id == twice {
-            for j in 0..r.s / 2 {
-                assert!(servers[j].submit(&SESSION, &e, &[]));
-            }
-            for j in r.s / 2..r.s {
-                assert!(servers[j].submit(&SESSION, &e2, &[]));
-            }
-        } else {
-            for c in &e.certs {
-                assert!(servers[c.server_id.0 as usize].submit(&SESSION, &e, &[]));
-            }
+    let mut servers = r.servers();
+    for (cid, entry) in &r.entries {
+        for s in servers.iter_mut() {
+            s.note_bulletin(*cid, entry.pubkey);
         }
     }
-
-    // Manual schedule so the final round can carry the injection: one
-    // colluding signature is far short of the required chain.
-    let rounds = relay_rounds(&r.pp);
-    let mut pending: Vec<Vec<Relay>> = servers.iter_mut().map(|s| s.echo(&SESSION)).collect();
-    for round in 1..=rounds {
-        let inject = (round == rounds).then(|| {
-            let e = late_package.clone().expect("held back above");
-            let sig = r.server_sig[r.s - 1]
-                .sign(&relay_signing_bytes(&SESSION, &e.identity(&SESSION)));
-            Relay {
-                item: RelayItem::Evidence(e),
-                chain: vec![(ServerId((r.s - 1) as u32), sig)],
-            }
-        });
-        pending = servers
-            .iter_mut()
-            .enumerate()
-            .map(|(j, s)| {
-                let mut incoming: Vec<Relay> = pending
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != j)
-                    .flat_map(|(_, batch)| batch.iter().cloned())
-                    .collect();
-                if j < r.s / 2 {
-                    incoming.extend(inject.iter().cloned());
-                }
-                s.absorb(&SESSION, round, &incoming)
-            })
-            .collect();
+    // Both boots post a bulletin, which is what makes the reboot visible.
+    for s in servers.iter_mut() {
+        s.note_bulletin(twice, boot2.bulletin.pubkey);
     }
+    // The first half of the lanes take boot one, the rest take boot two.
+    for cr in &r.rounds {
+        for lane in 0..S {
+            if cr.client_id == twice && lane >= S / 2 {
+                continue;
+            }
+            servers[lane].receive(&SESSION, &cr.bundles[lane]);
+        }
+    }
+    for lane in S / 2..S {
+        assert!(servers[lane].receive(&SESSION, &boot2.bundles[lane]));
+    }
+    let bus = r.exchange(&mut servers, NEVER);
+    r.settle(&mut servers, bus);
 
-    let expected: Vec<ClientId> = r
-        .all_clients()
-        .into_iter()
-        .filter(|c| *c != late && *c != twice)
-        .collect();
+    let expected: Vec<ClientId> = r.all_clients().into_iter().filter(|c| *c != twice).collect();
     for (j, s) in servers.iter().enumerate() {
         let sr = s.finalize(&r.pp, &r.server_keys[j], &SESSION);
-        assert_eq!(sr.set, expected, "server {j}");
-        assert!(sr.excluded.contains(&late), "server {j}");
-        assert_eq!(sr.conflicted, vec![twice], "server {j}");
+        assert_eq!(sr.set, expected, "lane {j}");
+        assert_eq!(sr.conflicted, vec![twice], "lane {j}");
     }
 }
 
-/// The fragment pool is part of the agreement: a quorum reached anywhere
-/// reaches everyone, a quorum short anywhere is short everywhere, and a
-/// correctly signed fragment with a fabricated index never counts toward it.
+/// A lane whose batch reaches only one peer is still agreed by everyone: the
+/// peer forwards it chain-extended, and the remaining rounds carry it the rest
+/// of the way.
 #[test]
-fn fragment_quorum_is_agreed_and_bounded() {
+fn a_batch_reaching_one_lane_still_agrees() {
     let r = Round::build();
-    let claimant = ClientId(3);
-    let skipped = [r.s - 2, r.s - 1];
-    let deliver = |c: ClientId, lane: usize| !(c == claimant && skipped.contains(&lane));
+    let mut servers = r.servers();
+    r.deliver(&mut servers, EVERY);
 
-    for (keep, included) in [(1usize, false), (2, true)] {
-        let mut servers = r.servers();
-        let certs = r.deliver(&mut servers, deliver, NONE);
-        for (i, cr) in r.rounds.iter().enumerate() {
-            let (e, frags) =
-                build_evidence(&r.pp, &SESSION, cr, certs[i].clone(), &r.client_sig[i]);
-            if cr.client_id == claimant {
-                // Every wire form survives a round trip, is exactly the size its
-                // `packed_len` advertises, and refuses a truncated encoding.
-                let scp = r.pp.share_comm.as_ref().expect("RS mode params");
-                let bundle = &cr.bundles[skipped[0]];
-                let packed = bundle.pack(scp).expect("fresh path packs");
-                assert_eq!(
-                    packed.len(),
-                    Bundle::packed_len(scp, bundle.envelope.len())
-                );
-                let (back, used) =
-                    Bundle::unpack(scp, cr.client_id, &packed).expect("bundle round trip");
-                assert_eq!(used, packed.len());
-                assert_eq!(back.lane, bundle.lane);
-                assert_eq!(back.share, bundle.share);
-                assert_eq!(back.path.nodes, bundle.path.nodes);
-                assert_eq!(back.envelope, bundle.envelope);
-                assert!(Bundle::unpack(scp, cr.client_id, &packed[..packed.len() - 1]).is_none());
-
-                let e_bytes = e.pack();
-                assert_eq!(
-                    e_bytes.len(),
-                    Evidence::packed_len(e.certs.len(), e.missing.len())
-                );
-                assert_eq!(Evidence::unpack(&e_bytes).expect("evidence round trip"), e);
-                assert!(Evidence::unpack(&e_bytes[..e_bytes.len() - 1]).is_none());
-
-                let f_bytes = frags[0].pack();
-                let f_back = Fragment::unpack(&f_bytes).expect("fragment round trip");
-                assert_eq!(f_back.idx, frags[0].idx);
-                assert_eq!(f_back.data, frags[0].data);
-                assert_eq!(f_back.sig, frags[0].sig);
-                assert!(Fragment::unpack(&f_bytes[..f_bytes.len() - 1]).is_none());
-
-                // Both relay variants, chain included.
-                let chain = vec![(ServerId(1), [7u8; 64]), (ServerId(4), [9u8; 64])];
-                for item in [
-                    RelayItem::Evidence(e.clone()),
-                    RelayItem::Fragment(frags[0].clone()),
-                ] {
-                    let relay = Relay {
-                        item,
-                        chain: chain.clone(),
-                    };
-                    let bytes = relay.pack();
-                    let rb = Relay::unpack(&bytes).expect("relay round trip");
-                    assert_eq!(rb.chain, chain);
-                    match (&rb.item, &relay.item) {
-                        (RelayItem::Evidence(a), RelayItem::Evidence(b)) => assert_eq!(a, b),
-                        (RelayItem::Fragment(a), RelayItem::Fragment(b)) => {
-                            assert_eq!(a.idx, b.idx);
-                            assert_eq!(a.data, b.data);
-                        }
-                        _ => panic!("relay item variant changed across the wire"),
-                    }
-                    assert!(Relay::unpack(&bytes[..bytes.len() - 1]).is_none());
-                }
-
-                let mut give: Vec<Fragment> = frags[..keep].to_vec();
-                let data = frags[0].data.clone();
-                let sig = r.client_sig[i]
-                    .sign(&fragment_signing_bytes(&SESSION, claimant, 99, &data));
-                give.push(Fragment {
-                    client_id: claimant,
-                    idx: 99,
-                    data,
-                    sig,
-                });
-                assert!(servers[e.certs[0].server_id.0 as usize].submit(&SESSION, &e, &give));
-            } else {
-                for (fi, c) in e.certs.iter().enumerate() {
-                    let own = frags.get(fi).map(|f| vec![f.clone()]).unwrap_or_default();
-                    assert!(servers[c.server_id.0 as usize].submit(&SESSION, &e, &own));
-                }
-            }
-        }
-        relay_all(&mut servers, &r.pp);
-        for (j, s) in servers.iter().enumerate() {
-            let sr = s.finalize(&r.pp, &r.server_keys[j], &SESSION);
-            assert_eq!(
-                sr.set.contains(&claimant),
-                included,
-                "server {j}, {keep} fragments"
+    let mut bus: Vec<(usize, Relay)> = Vec::new();
+    for (j, s) in servers.iter_mut().enumerate() {
+        bus.extend(s.originate(&SESSION).into_iter().map(|rel| (j, rel)));
+    }
+    for round in 1..=relay_rounds(&r.pp) {
+        let batch = std::mem::take(&mut bus);
+        for (j, s) in servers.iter_mut().enumerate() {
+            let incoming: Vec<Relay> = batch
+                .iter()
+                .filter(|(from, _)| *from != j)
+                // Lane 0's own broadcast is seen by lane 1 alone; every other
+                // lane can only learn it from lane 1's forward next round.
+                .filter(|(from, _)| !(round == 1 && *from == 0 && j != 1))
+                .map(|(_, rel)| rel.clone())
+                .collect();
+            bus.extend(
+                s.absorb(&SESSION, round, &incoming)
+                    .into_iter()
+                    .map(|rel| (j, rel)),
             );
-            if included && skipped.contains(&j) {
-                assert_eq!(sr.repaired, vec![claimant], "server {j}");
-            }
         }
+    }
+
+    let sets: Vec<Vec<ClientId>> = servers
+        .iter()
+        .enumerate()
+        .map(|(j, s)| s.finalize(&r.pp, &r.server_keys[j], &SESSION).set)
+        .collect();
+    assert!(
+        sets.windows(2).all(|w| w[0] == w[1]),
+        "a batch delivered to one lane must still reach every set: {sets:?}"
+    );
+    assert_eq!(sets[0], r.all_clients());
+}
+
+/// A lane that names a key its victim never posted is ignored, not believed:
+/// the boot key comes from the client's own signed bulletin, so one lane cannot
+/// manufacture a conflict and evict anyone.
+#[test]
+fn a_lane_naming_a_bogus_key_evicts_nobody() {
+    let r = Round::build();
+    let victim = ClientId(4);
+    let liar = 0usize;
+    let mut rng = ChaCha20Rng::from_seed([0x5a; 32]);
+    let bogus = SigningKey::generate(&mut rng)
+        .verifying_key()
+        .to_sec1_bytes();
+
+    let mut servers = r.servers();
+    r.deliver(&mut servers, EVERY);
+
+    let mut bus: Vec<(usize, Relay)> = Vec::new();
+    for (j, s) in servers.iter_mut().enumerate() {
+        for rel in s.originate(&SESSION) {
+            // The liar swaps the victim's key in its own published batch.
+            let rel = match (&rel.item, j == liar) {
+                (RelayItem::Batch(b), true) => {
+                    let mut forged = b.clone();
+                    for receipt in forged.receipts.iter_mut() {
+                        if receipt.client_id == victim {
+                            receipt.pk_c = bogus;
+                        }
+                    }
+                    forged.sig = r.server_sig[liar].sign(&batch_signing_bytes(
+                        &SESSION,
+                        forged.server_id,
+                        &forged.receipts,
+                    ));
+                    Relay {
+                        item: RelayItem::Batch(forged),
+                        chain: rel.chain.clone(),
+                    }
+                }
+                _ => rel,
+            };
+            bus.push((j, rel));
+        }
+    }
+    r.settle(&mut servers, bus);
+
+    for (j, s) in servers.iter().enumerate() {
+        let sr = s.finalize(&r.pp, &r.server_keys[j], &SESSION);
+        assert!(sr.conflicted.is_empty(), "lane {j} was talked into a conflict");
+        assert!(sr.set.contains(&victim), "lane {j} dropped the victim");
     }
 }
 
 #[test]
 fn plurality_prefers_the_most_published_then_the_larger_set() {
     let r = Round::build();
-    let sets: Vec<SetRound> = r
-        .run_round(EVERY, NONE, |_| true, &ALL)
-        .into_iter()
-        .flatten()
-        .collect();
-    let (mut servers, _) = r.publish(&sets);
+    let out = r.run_round(EVERY, NEVER, &ALL);
+    let published: Vec<&SetRound> = out.published().collect();
+    let (mut servers, _) = r.publish(&published);
     let full = r.all_clients();
     let short: Vec<ClientId> = full.iter().copied().take(RHO - 1).collect();
 

@@ -62,6 +62,7 @@ async fn fault_for(mode: Misbehavior, panetiere: bool, want: FaultKind) -> Repor
             threshold: 2,
             setup_seed: [7u8; 32],
             encoding: anymone_core::config::Encoding::default(),
+            ..Default::default()
         })
     } else {
         ProtocolConfig::Adcnet(AdcnetConfig {

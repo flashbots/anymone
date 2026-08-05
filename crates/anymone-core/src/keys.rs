@@ -109,13 +109,16 @@ fn parse_pubkey_str(s: &str) -> Result<Pubkey, String> {
 }
 
 /// The public halves of an [`ExchangeIdentity`], as published in a registration
-/// and carried in a config: the SEC1 P-256 point ADCNet ECDHs against, and the
-/// ML-KEM-768 encapsulation key Panetiere clients seal openings to. Hex strings
+/// and carried in a config: the SEC1 P-256 point ADCNet ECDHs against, the
+/// ML-KEM-768 encapsulation key Panetiere clients seal openings to, and the
+/// P-256 verifying key its client-set receipts are checked under. Hex strings
 /// in human-readable formats, `serde_bytes` in bincode.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ExchangePublicKeyWire {
     pub ecdh: Vec<u8>,
     pub kem: Vec<u8>,
+    /// Compressed SEC1 P-256 point, [`panetiere::sig`]'s format.
+    pub set_sig: Vec<u8>,
 }
 
 impl ExchangePublicKeyWire {
@@ -123,6 +126,7 @@ impl ExchangePublicKeyWire {
         ExchangePublicKeyWire {
             ecdh: id.public().to_sec1_bytes(),
             kem: id.pke().public().to_bytes(),
+            set_sig: id.set_verifying_key().to_sec1_bytes().to_vec(),
         }
     }
 
@@ -133,6 +137,11 @@ impl ExchangePublicKeyWire {
     pub fn to_seal_key(&self) -> Result<panetiere::pke::PublicKey, String> {
         panetiere::pke::PublicKey::from_bytes(&self.kem).map_err(|e| format!("{e:?}"))
     }
+
+    /// The key a client-set certificate from this relay verifies under.
+    pub fn to_set_key(&self) -> Result<panetiere::sig::VerifyingKey, String> {
+        panetiere::sig::VerifyingKey::from_sec1_bytes(&self.set_sig).map_err(|e| format!("{e:?}"))
+    }
 }
 
 /// Human-readable form: one hex string per key.
@@ -140,6 +149,8 @@ impl ExchangePublicKeyWire {
 struct ExchangeKeysHex {
     ecdh: String,
     kem: String,
+    #[serde(default)]
+    set_sig: String,
 }
 
 impl Serialize for ExchangePublicKeyWire {
@@ -148,12 +159,14 @@ impl Serialize for ExchangePublicKeyWire {
             ExchangeKeysHex {
                 ecdh: hex::encode(&self.ecdh),
                 kem: hex::encode(&self.kem),
+                set_sig: hex::encode(&self.set_sig),
             }
             .serialize(s)
         } else {
             (
                 serde_bytes::Bytes::new(&self.ecdh),
                 serde_bytes::Bytes::new(&self.kem),
+                serde_bytes::Bytes::new(&self.set_sig),
             )
                 .serialize(s)
         }
@@ -167,13 +180,18 @@ impl<'de> Deserialize<'de> for ExchangePublicKeyWire {
             Ok(ExchangePublicKeyWire {
                 ecdh: hex::decode(&h.ecdh).map_err(serde::de::Error::custom)?,
                 kem: hex::decode(&h.kem).map_err(serde::de::Error::custom)?,
+                set_sig: hex::decode(&h.set_sig).map_err(serde::de::Error::custom)?,
             })
         } else {
-            let (ecdh, kem): (serde_bytes::ByteBuf, serde_bytes::ByteBuf) =
-                Deserialize::deserialize(d)?;
+            let (ecdh, kem, set_sig): (
+                serde_bytes::ByteBuf,
+                serde_bytes::ByteBuf,
+                serde_bytes::ByteBuf,
+            ) = Deserialize::deserialize(d)?;
             Ok(ExchangePublicKeyWire {
                 ecdh: ecdh.into_vec(),
                 kem: kem.into_vec(),
+                set_sig: set_sig.into_vec(),
             })
         }
     }
@@ -215,6 +233,15 @@ pub fn roster_seal_pubkeys(
     roster_keys(relays, exchange_keys, ExchangePublicKeyWire::to_seal_key)
 }
 
+/// Server roster for client-set consensus: the key each relay's certificates
+/// and Dolev–Strong chain signatures verify under, indexed by `ServerId`.
+pub fn roster_set_pubkeys(
+    relays: &[Pubkey],
+    exchange_keys: &[(Pubkey, ExchangePublicKeyWire)],
+) -> Vec<(usize, panetiere::sig::VerifyingKey)> {
+    roster_keys(relays, exchange_keys, ExchangePublicKeyWire::to_set_key)
+}
+
 /// Version-stable 32-byte seed over `domain` and a sorted roster (SHA-256).
 pub fn derive_seed(domain: &[u8], pubkeys: &[Pubkey]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
@@ -229,25 +256,35 @@ pub fn derive_seed(domain: &[u8], pubkeys: &[Pubkey]) -> [u8; 32] {
 }
 
 /// Long-lived exchange key material: the P-256 keypair the ADCNet ECDH layer
-/// uses, plus the ML-KEM-768 key the Panetiere sealing layer
-/// (`panetiere::pke`) opens envelopes with. The two schemes share no key
-/// material, so the ML-KEM key is derived from the P-256 scalar — one persisted
-/// secret, and both public keys stay stable across restarts. Held alongside the
-/// Ed25519 [`crate::identity::Identity`] and persisted next to it.
+/// uses, the ML-KEM-768 key the Panetiere sealing layer (`panetiere::pke`)
+/// opens envelopes with, and the P-256 signing key this relay issues
+/// client-set receipts under. No two schemes share key material, so both are
+/// derived from the persisted P-256 scalar — one secret on disk, every public
+/// key stable across restarts. Held alongside the Ed25519
+/// [`crate::identity::Identity`] and persisted next to it.
 pub struct ExchangeIdentity {
     key: adcnet::crypto::ExchangePrivateKey,
     pke: panetiere::pke::PrivateKey,
+    set_sig: panetiere::sig::SigningKey,
 }
 
 impl ExchangeIdentity {
     fn from_adcnet_key(key: adcnet::crypto::ExchangePrivateKey) -> Self {
-        use sha2::{Digest, Sha512};
+        use rand::SeedableRng;
+        use sha2::{Digest, Sha256, Sha512};
         let mut h = Sha512::new();
         h.update(b"anymone/exchange/mlkem768/v1");
         h.update(key.to_bytes());
         let pke = panetiere::pke::PrivateKey::from_bytes(&h.finalize())
             .expect("Sha512 output is the 64-byte ML-KEM seed");
-        ExchangeIdentity { key, pke }
+        let mut s = Sha256::new();
+        s.update(b"anymone/client-set/sig/v1");
+        s.update(key.to_bytes());
+        let seed: [u8; 32] = s.finalize().into();
+        let set_sig = panetiere::sig::SigningKey::generate(
+            &mut rand_chacha::ChaCha20Rng::from_seed(seed),
+        );
+        ExchangeIdentity { key, pke, set_sig }
     }
 
     pub fn generate() -> Self {
@@ -265,6 +302,15 @@ impl ExchangeIdentity {
     /// The key sealed envelopes (`panetiere::pke`) are opened with.
     pub fn pke(&self) -> &panetiere::pke::PrivateKey {
         &self.pke
+    }
+
+    /// Signs this relay's client-set receipts and Dolev–Strong chain links.
+    pub fn set_signing_key(&self) -> &panetiere::sig::SigningKey {
+        &self.set_sig
+    }
+
+    pub fn set_verifying_key(&self) -> panetiere::sig::VerifyingKey {
+        self.set_sig.verifying_key()
     }
 
     pub fn save(&self, path: &Path) -> Result<(), IdentityError> {

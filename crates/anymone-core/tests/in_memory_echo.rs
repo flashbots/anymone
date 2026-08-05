@@ -61,6 +61,7 @@ fn panetiere_config(
             threshold: 2,
             setup_seed: [7u8; 32],
             encoding: anymone_core::config::Encoding::default(),
+            ..Default::default()
         }),
         relay_pks,
         relay_xk,
@@ -162,6 +163,34 @@ async fn panetiere_echo_roundtrip() {
     )
     .await;
     assert_eq!(&reply.payload[..15], b"hello panetiere");
+    assert!(reply.round > 0, "delivery round not tracked");
+}
+
+/// The same round-trip with the set formed by consensus rather than announced:
+/// the round has to be long enough to hold the extra checkpoints.
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn panetiere_consensus_echo_roundtrip() {
+    let committee = Identity::generate();
+    let relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
+    let service = Identity::generate();
+    let client = Identity::generate();
+    let mut cfg = panetiere_config(&committee, &relays, service.pubkey());
+    if let ProtocolConfig::Panetiere(c) = &mut cfg.body.subnets[0].protocol {
+        c.set_formation = anymone_core::config::SetFormation::Consensus;
+        c.round_duration_ms = 1200;
+    }
+    let cfg = cfg.sign_with(&[&committee]);
+    let reply = echo_roundtrip(
+        cfg,
+        relays,
+        service,
+        client,
+        b"hello consensus",
+        Duration::from_secs(40),
+    )
+    .await;
+    assert_eq!(&reply.payload[..15], b"hello consensus");
     assert!(reply.round > 0, "delivery round not tracked");
 }
 
