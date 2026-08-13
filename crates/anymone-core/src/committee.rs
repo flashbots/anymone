@@ -24,12 +24,12 @@ use crate::panetiere::{
 use crate::scheduler_core::{SchedulerAction, SchedulerCore, SchedulerParams};
 use crate::scheduling::Registration;
 use crate::session::Session;
-use crate::transport::Transport;
+use crate::transport::{Topic, Transport};
 
 use panetiere::protocol::ServerId;
 
-pub const TOPIC_COMMITTEE_PANETIERE: &str = "anymone/committee/0";
-pub const TOPIC_COMMITTEE_SIGS: &str = "anymone/committee/sigs";
+pub const TOPIC_COMMITTEE_PANETIERE: Topic = Topic::CommitteeBody;
+pub const TOPIC_COMMITTEE_SIGS: Topic = Topic::CommitteeSigs;
 
 /// The committee roster as configured: each member's identity pubkey with its
 /// exchange pubkey. For callers holding the member `Identity`s (tests, the
@@ -282,13 +282,13 @@ pub async fn spawn_panetiere_committee_scheduler(
         inbound.push((
             Source::Subnet(id),
             transport
-                .subscribe(&crate::runtime::subnet_broadcast_topic(id))
+                .subscribe(Topic::Broadcast(id))
                 .await,
         ));
         inbound.push((
             Source::Subnet(id),
             transport
-                .subscribe(&crate::runtime::subnet_shares_topic(id))
+                .subscribe(Topic::Shares(id))
                 .await,
         ));
     }
@@ -369,7 +369,7 @@ pub async fn spawn_panetiere_committee_scheduler(
     };
 
     tokio::spawn(async move {
-        let topic = TOPIC_COMMITTEE_PANETIERE.to_string();
+        let topic = TOPIC_COMMITTEE_PANETIERE;
         let round_duration = config.committee_round_duration;
 
         let mut core = SchedulerCore::new(identity.clone(), committee.clone(), threshold, params);
@@ -448,7 +448,7 @@ pub async fn spawn_panetiere_committee_scheduler(
                                 ),
                             }
                         }
-                        transport.publish(&topic, bytes).await;
+                        transport.publish(topic, bytes).await;
                     }
                 }
             }};
@@ -457,7 +457,7 @@ pub async fn spawn_panetiere_committee_scheduler(
         let init = server_session.begin_round(anymone_round, Instant::now());
         emit(
             &transport,
-            &topic,
+            topic,
             our_pk,
             &mut server_session,
             &mut client_session,
@@ -471,7 +471,7 @@ pub async fn spawn_panetiere_committee_scheduler(
 
                 _ = tokio::time::sleep_until(deadline) => {
                     let outcome = server_session.end_round(anymone_round, Instant::now());
-                    emit(&transport, &topic, our_pk, &mut server_session, &mut client_session, outcome.outbound).await;
+                    emit(&transport, topic, our_pk, &mut server_session, &mut client_session, outcome.outbound).await;
                     for decoded in outcome.decoded {
                         if let Ok(proposal) =
                             bincode::deserialize::<crate::scheduler_core::SignedProposal>(&decoded)
@@ -525,12 +525,12 @@ pub async fn spawn_panetiere_committee_scheduler(
                     }
 
                     let server_out = server_session.begin_round(anymone_round, Instant::now());
-                    emit(&transport, &topic, our_pk, &mut server_session, &mut client_session, server_out).await;
+                    emit(&transport, topic, our_pk, &mut server_session, &mut client_session, server_out).await;
                     let client_out = client_session
                         .as_mut()
                         .map(|cs| cs.begin_round(anymone_round, Instant::now()))
                         .unwrap_or_default();
-                    emit(&transport, &topic, our_pk, &mut server_session, &mut client_session, client_out).await;
+                    emit(&transport, topic, our_pk, &mut server_session, &mut client_session, client_out).await;
                 }
 
                 (src, Some(msg)) = recv_any(&mut inbound) => match src {
@@ -540,7 +540,7 @@ pub async fn spawn_panetiere_committee_scheduler(
                         if let Some(cs) = client_session.as_mut() {
                             outs.extend(cs.on_inbound(from, payload));
                         }
-                        emit(&transport, &topic, our_pk, &mut server_session, &mut client_session, outs).await;
+                        emit(&transport, topic, our_pk, &mut server_session, &mut client_session, outs).await;
                     }
 
                     Source::Registration => {
@@ -632,9 +632,7 @@ fn adopt_transport_policy(
     committee: &[Pubkey],
     cfg: &crate::config::AnymoneRoundConfiguration,
 ) {
-    transport.set_topic_policy(crate::governance::topic_policy(&cfg.body, committee));
-    let (primary, secondary) = crate::governance::tracked_peers(&cfg.body, committee);
-    transport.track_peers(cfg.body.round, primary, secondary);
+    transport.apply(crate::governance::net_view(&cfg.body, committee));
 }
 
 /// Send a member's own committee-Panetiere output to peers and feed it back into
@@ -643,7 +641,7 @@ fn adopt_transport_policy(
 /// shares. Drains the cascade each `on_inbound` produces (finite per round).
 async fn emit(
     transport: &Arc<dyn Transport>,
-    topic: &str,
+    topic: Topic,
     our_pk: Pubkey,
     server_session: &mut Box<dyn Session>,
     client_session: &mut Option<Box<dyn Session>>,

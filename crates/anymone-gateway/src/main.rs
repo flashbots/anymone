@@ -72,20 +72,10 @@ async fn main() -> Result<()> {
 
     let gov = GovernanceBootstrap::from_bootstrap_config(&bootstrap);
     let tag = ServiceTag::from_label(&args.tag);
-    // Registering the tag makes this a service, which belongs on the backbone.
-    // Otherwise it is purely a client of someone else's service.
-    let (transport, spawn) = if args.announce {
-        (
-            anymone_core::backend::start_node_transport(
-                &identity,
-                &bootstrap,
-                anymone_core::GoodClients::all(),
-            )?,
-            anymone_core::backend::virtual_client_spawner(&bootstrap, gov.clone())?,
-        )
-    } else {
-        anymone_core::backend::start_client_transport(&identity, &bootstrap, gov.clone())?
-    };
+    // A service is not an authorized p2p peer: it registers, receives, and
+    // sends entirely over the client plane.
+    let (transport, spawn) =
+        anymone_core::backend::start_client_transport(&identity, &bootstrap, gov.clone())?;
 
     // Announce before starting: `Anymone::start` blocks until the first config
     // is adopted, so registering first lets the committee carry the tag in that

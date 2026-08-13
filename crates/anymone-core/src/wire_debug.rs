@@ -12,26 +12,25 @@
 //! build can't be made to dump decoded plaintext.
 
 #[cfg(feature = "wire-debug")]
-use crate::governance::{TOPIC_CONFIG, TOPIC_FAULTS, TOPIC_REGISTRATION};
-#[cfg(feature = "wire-debug")]
 use crate::identity::Pubkey;
 
-/// Decode `bytes` on `topic` into a short human-readable description.
+/// Decode `bytes` under the `topic` label (a `Topic` display string or an
+/// inbox label) into a short human-readable description.
 #[cfg(feature = "wire-debug")]
 pub fn describe(topic: &str, bytes: &[u8]) -> String {
-    if topic == TOPIC_CONFIG {
+    if topic == "config" {
         return describe_config(bytes);
     }
-    if topic == TOPIC_REGISTRATION {
+    if topic == "registration" {
         return describe_registration(bytes);
     }
-    if topic == TOPIC_FAULTS {
+    if topic == "faults" {
         return "fault".to_string();
     }
-    if topic.starts_with("anymone/subnet/") || topic == crate::committee::TOPIC_COMMITTEE_PANETIERE
-    {
-        // Subnet topics carry whichever protocol the committee scheduled; the
-        // committee's internal topic carries Panetiere. Try both decoders.
+    if topic.starts_with("subnet/") || topic == "committee/body" {
+        // Subnet topics/inboxes carry whichever protocol the committee
+        // scheduled; the committee's internal topic carries Panetiere. Try
+        // both decoders.
         if let Some(d) = crate::adcnet::describe(bytes) {
             return d;
         }
@@ -40,7 +39,7 @@ pub fn describe(topic: &str, bytes: &[u8]) -> String {
         }
         return format!("subnet? {}B", bytes.len());
     }
-    if topic == crate::committee::TOPIC_COMMITTEE_SIGS {
+    if topic == "committee/sigs" {
         return "committee-sig".to_string();
     }
     format!("{}B", bytes.len())

@@ -5,21 +5,31 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::SubnetId;
+use crate::transport::Topic;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum StreamMsg {
     ConfigReq,
     ConfigResp(Option<Vec<u8>>),
-    /// A bincode `Registration`; the node verifies it before republishing, so a
-    /// node still outside every tracked peer set can still be registered.
+    /// A bincode `Registration`; the node verifies it and forwards it to the
+    /// committee, so a process outside every tracked peer set can still be
+    /// registered.
     Register(Vec<u8>),
-    /// Client-origin traffic for a topic the node serves. Its payload carries
-    /// the client's own signature, so forwarding doesn't launder its origin.
-    Submit { topic: String, payload: Vec<u8> },
-    FeedSubscribe { topics: Vec<String> },
-    /// A frame on a subscribed topic. `from` is the node's own key: the stream
-    /// peer is authenticated, so a client can trust it named itself honestly.
+    /// Client data addressed to the receiving node for `subnet`. Its payload
+    /// carries the client's own signature, so delivery doesn't launder its
+    /// origin.
+    Data { subnet: SubnetId, payload: Vec<u8> },
+    /// A client's publish on a client-open topic (a Noop subnet's broadcast,
+    /// where the whole protocol rides the topic). The node republishes it on
+    /// the backbone; bound topics are refused.
+    Submit { topic: Topic, payload: Vec<u8> },
+    FeedSubscribe { topics: Vec<Topic> },
+    /// A frame on a subscribed topic. `from` is the frame's publisher on the
+    /// backbone (the serving node itself, for its own publishes); the stream
+    /// peer is authenticated, so a client can trust it named the origin honestly.
     FeedFrame {
-        topic: String,
+        topic: Topic,
         from: crate::identity::Pubkey,
         payload: Vec<u8>,
     },

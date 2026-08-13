@@ -63,5 +63,7 @@ pub use scheduling::{
 };
 pub use session::{GoodClients, LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
 pub use tee::{NoopProver, TeeProver, TeeVerifier};
-pub use transport::{InMemoryHandle, InMemoryNetwork, Inbound, Subscription, Transport};
+pub use transport::{
+    Dest, InMemoryHandle, InMemoryNetwork, Inbound, NetView, Subscription, Topic, Transport,
+};
 pub use wire::{Frame, RouteTag, ServiceTag, WireError};

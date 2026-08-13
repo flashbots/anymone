@@ -1,6 +1,6 @@
-//! Full echo in the deployed topology: relays and the service on the
-//! authenticated backbone, and the client reaching the network only over a
-//! stream — never a member of any peer set.
+//! Full echo in the deployed topology: relays on the authenticated backbone;
+//! the service and the client reaching the network only over streams — neither
+//! is a member of any peer set.
 
 #![cfg(feature = "test-util")]
 
@@ -11,7 +11,6 @@ use anymone_core::config::{NoopConfig, ProtocolConfig, ServiceEntry};
 use anymone_core::cw::{
     CommonwareConfig, CommonwareNetwork, StreamClientConfig, StreamClientNetwork,
 };
-use anymone_core::transport::Transport;
 use anymone_core::{
     Anymone, AnymoneRoundConfiguration, GoodClients, Identity, Pubkey, ServiceTag,
 };
@@ -25,7 +24,7 @@ fn pick() -> u16 {
 }
 
 /// A backbone node. `genesis_peers` is deliberately empty: membership must come
-/// from the adopted config via `track_peers`, so nothing here can mask a broken
+/// from the adopted config via `Transport::apply`, so nothing here can mask a broken
 /// config-to-peer-set path (a round-0 config once collided with the genesis
 /// index and was discarded, and an all-inclusive genesis set hid it).
 fn backbone(
@@ -38,6 +37,7 @@ fn backbone(
         dialable: addr(port),
         bootstrappers,
         genesis_peers: Vec::new(),
+        committee: Vec::new(),
         local: true,
         stream_listen,
         good_clients: GoodClients::all(),
@@ -71,7 +71,7 @@ async fn e2e_echo_with_client_over_a_stream() {
 
     let mut nets: Vec<(Identity, Arc<CommonwareNetwork>)> =
         vec![(relays[0].clone(), hub_net.clone())];
-    for id in relays.iter().skip(1).chain(std::iter::once(&service)) {
+    for id in relays.iter().skip(1) {
         let net = CommonwareNetwork::start(id, backbone(pick(), dial.clone(), None));
         nets.push((id.clone(), net));
     }
@@ -95,16 +95,22 @@ async fn e2e_echo_with_client_over_a_stream() {
     .sign_with(&[&committee]);
 
     let mut backbone_nodes: Vec<Anymone> = Vec::new();
-    let mut service_anymone = None;
     for (id, net) in &nets {
         let node =
             Anymone::start_with_config(id.clone(), net.clone(), config.clone()).await;
-        if id.pubkey() == service.pubkey() {
-            service_anymone = Some(node.clone());
-        }
         backbone_nodes.push(node);
     }
-    let service_anymone = service_anymone.expect("service is among the nodes");
+
+    // The service is not an authorized p2p peer: it works the same client
+    // plane the client does.
+    let service_net = StreamClientNetwork::start(
+        &service,
+        StreamClientConfig {
+            servers: vec![(relays[0].pubkey(), addr(hub_stream))],
+        },
+    );
+    let service_anymone =
+        Anymone::start_with_config(service.clone(), service_net, config.clone()).await;
 
     let mut svc_pipe = service_anymone.bind(echo_tag).await.unwrap();
     tokio::spawn(async move {

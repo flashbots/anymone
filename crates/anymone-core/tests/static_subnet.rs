@@ -27,7 +27,7 @@ fn echo_tag() -> ServiceTag {
 async fn echo_via_governance_topic() {
     let net = InMemoryNetwork::new();
 
-    let mut committee = Node::fresh(&net);
+    let committee = Node::fresh(&net);
     let mut relays: Vec<Node> = (0..3).map(|_| Node::fresh(&net)).collect();
     let mut service = Node::fresh(&net);
     let mut client = Node::fresh(&net);

@@ -168,11 +168,13 @@ impl Registration {
 
 const REGISTRATION_REANNOUNCE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Re-broadcast a relay registration on `TOPIC_REGISTRATION` every
-/// [`REGISTRATION_REANNOUNCE_INTERVAL`] for the node's lifetime. The single
+/// Re-send a relay registration every [`REGISTRATION_REANNOUNCE_INTERVAL`] for
+/// the node's lifetime — over a stream connection when the transport is
+/// client-plane, addressed to the committee when it is the backbone. The single
 /// announce mechanism: re-announcing is idempotent (the committee dedups relays),
-/// and continuing past placement lets a sidelined relay re-register and heal.
-/// The task ends when the transport — held by the running node — is dropped.
+/// converges every member's registration view (a member that missed one rejects
+/// the lead's proposal), and continuing past placement lets a sidelined relay
+/// re-register and heal. The task ends when the transport is dropped.
 pub async fn announce_relay_registration(
     transport: Arc<dyn Transport>,
     identity: &Identity,

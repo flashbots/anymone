@@ -12,12 +12,11 @@ use anymone_core::config::{
     now_unix_ms, AdcnetConfig, Aggregation, AggregatorGroup, AnymoneRoundConfigurationBody,
     ExchangePublicKeyWire, Subnet,
 };
-use anymone_core::runtime::{subnet_broadcast_topic, subnet_shares_topic};
 use anymone_core::session::Session;
 use anymone_core::transport::Transport;
 use anymone_core::{
     AdcnetObserverSession, Anymone, AnymoneRoundConfiguration, GovernanceBootstrap, Identity,
-    InMemoryNetwork, ProtocolConfig, ServiceEntry, ServiceTag, TOPIC_CONFIG,
+    InMemoryNetwork, ProtocolConfig, ServiceEntry, ServiceTag, Topic, TOPIC_CONFIG,
 };
 use serial_test::serial;
 
@@ -116,7 +115,7 @@ async fn adcnet_echo_roundtrip_in_memory() {
     {
         let mut sub = net
             .handle(Identity::generate().pubkey())
-            .subscribe(&subnet_broadcast_topic(0))
+            .subscribe(Topic::Broadcast(0))
             .await;
         let anon = anon.clone();
         tokio::spawn(async move {
@@ -416,7 +415,7 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
     {
         let mut sub0 = net
             .handle(Identity::generate().pubkey())
-            .subscribe(&subnet_broadcast_topic(0))
+            .subscribe(Topic::Broadcast(0))
             .await;
         let anon0 = anon0.clone();
         let frontier0 = frontier0.clone();
@@ -527,7 +526,7 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
     let subnet1_leader = relay_pks[1 % relay_pks.len()];
     let mut bcast1 = net
         .handle(Identity::generate().pubkey())
-        .subscribe(&subnet_broadcast_topic(1))
+        .subscribe(Topic::Broadcast(1))
         .await;
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
@@ -549,10 +548,10 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
     let outsider = Identity::generate();
     let mut shares1 = net
         .handle(Identity::generate().pubkey())
-        .subscribe(&subnet_shares_topic(1))
+        .subscribe(Topic::Shares(1))
         .await;
     net.handle(outsider.pubkey())
-        .publish(&subnet_shares_topic(1), b"forged share".to_vec())
+        .publish(Topic::Shares(1), b"forged share".to_vec())
         .await;
     let saw_forged = tokio::time::timeout(Duration::from_millis(500), async {
         loop {
@@ -643,7 +642,7 @@ async fn pipe_drop_retires_client_without_further_sends() {
     {
         let mut sub0 = net
             .handle(Identity::generate().pubkey())
-            .subscribe(&subnet_broadcast_topic(0))
+            .subscribe(Topic::Broadcast(0))
             .await;
         let anon_broadcasts = anon_broadcasts.clone();
         let roster = relay_pks.clone();

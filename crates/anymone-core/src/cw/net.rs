@@ -1,29 +1,29 @@
 //! [`Transport`] over commonware-p2p `authenticated::discovery`.
 //!
-//! Anymone publishes on named topics; commonware sends on numeric channels to
-//! authenticated peers. Topics become mux subchannels over three physical
-//! channels so subnet volume can't rate-limit governance. commonware's runtime
-//! owns its own tokio reactor, so the stack lives on a dedicated thread and
-//! talks to anymone over `tokio::sync` channels.
+//! Frames are self-describing (`NetFrame`): topic publishes and directly
+//! addressed subnet sends, on two physical channels so subnet volume can't
+//! rate-limit governance. commonware's runtime owns its own tokio reactor, so
+//! the stack lives on a dedicated thread and talks to anymone over
+//! `tokio::sync` channels.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use commonware_cryptography::ed25519;
 use commonware_p2p::authenticated::discovery;
-use commonware_p2p::utils::mux::{self, Builder as _};
 use commonware_p2p::{Manager, Receiver as _, Recipients, Sender as _, TrackedPeers};
 use commonware_runtime::{tokio as cw_tokio, Quota, Runner as _, Spawner as _, Supervisor as _};
 use commonware_utils::ordered::Set;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+use crate::config::SubnetId;
 use crate::identity::{Identity, Pubkey};
 use crate::log_target::P2P;
 use crate::session::GoodClients;
-use crate::transport::{Inbound, Subscription, TopicPolicy, Transport, MAX_TRANSMIT_SIZE};
+use crate::transport::{Inbound, NetView, Subscription, Topic, Transport, MAX_TRANSMIT_SIZE};
 
 use super::keys;
 use super::stream_server::{self, Feeds, ServerHooks};
@@ -58,12 +58,22 @@ pub struct CommonwareConfig {
     pub bootstrappers: Vec<(Pubkey, SocketAddr)>,
     /// Tracked at index 0, so governance is reachable before any signed config.
     pub genesis_peers: Vec<Pubkey>,
+    /// Registration recipients before any config names watchers.
+    pub committee: Vec<Pubkey>,
     /// Loopback deployments need private IPs and faster discovery.
     pub local: bool,
     /// Where clients dial this node. `None` serves no clients.
     pub stream_listen: Option<SocketAddr>,
     /// Screens client keys at the stream handshake.
     pub good_clients: GoodClients,
+}
+
+/// Everything on the backbone wire outside the RR channel.
+#[derive(Serialize, Deserialize)]
+enum NetFrame {
+    Topic(Topic, #[serde(with = "serde_bytes")] Vec<u8>),
+    /// Addressed to the receiving peer's inbox for this subnet.
+    Direct(SubnetId, #[serde(with = "serde_bytes")] Vec<u8>),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -73,13 +83,13 @@ enum ConfigRr {
 }
 
 enum Cmd {
-    Subscribe {
-        topic: String,
-        tx: broadcast::Sender<Inbound>,
-    },
-    Unsubscribe(String),
     Publish {
-        topic: String,
+        topic: Topic,
+        bytes: Vec<u8>,
+    },
+    Send {
+        to: Pubkey,
+        subnet: SubnetId,
         bytes: Vec<u8>,
     },
     Track {
@@ -90,14 +100,25 @@ enum Cmd {
     FetchConfig(oneshot::Sender<Option<Vec<u8>>>),
 }
 
-/// State both sides read: the front-end sets it, the thread applies it.
+/// Whether `topic` rides the data channel (subnet volume) or control.
+fn is_data_topic(topic: Topic) -> bool {
+    matches!(topic, Topic::Broadcast(_) | Topic::Shares(_))
+}
+
+/// State both sides read: the front-end sets it, the thread and the stream
+/// listener apply it.
 pub(crate) struct Shared {
-    policy: Mutex<TopicPolicy>,
+    /// Pubkeys allowed to publish on each bound topic.
+    senders: Mutex<HashMap<Topic, HashSet<Pubkey>>>,
     served_config: Mutex<Option<Vec<u8>>>,
-    /// Live per-topic fan-out. A second `subscribe` reuses the running pump
-    /// instead of re-registering a subchannel (which panics), and the stream
-    /// server injects client submissions through it.
-    topics: Mutex<HashMap<String, broadcast::Sender<Inbound>>>,
+    /// Live per-topic fan-out to local subscribers.
+    topics: Mutex<HashMap<Topic, broadcast::Sender<Inbound>>>,
+    /// Frames addressed to this node, per subnet.
+    inboxes: Mutex<HashMap<SubnetId, broadcast::Sender<Inbound>>>,
+    /// Where a Registration publish or a forwarded stream `Register` goes.
+    reg_recipients: Mutex<Vec<Pubkey>>,
+    /// Subnets in the current config; gates client stream submissions.
+    subnets: Mutex<HashSet<SubnetId>>,
     /// When each peer was last heard from. There is no connected-peers API, so
     /// observed traffic is the only honest reachability signal.
     last_seen: Mutex<HashMap<Pubkey, std::time::Instant>>,
@@ -105,8 +126,15 @@ pub(crate) struct Shared {
 
 impl Shared {
     /// Hand `payload` to this node's local subscribers of `topic`, if any.
-    pub(crate) fn deliver_local(&self, topic: &str, from: Pubkey, payload: Vec<u8>) {
-        if let Some(tx) = self.topics.lock().unwrap().get(topic) {
+    pub(crate) fn deliver_local(&self, topic: Topic, from: Pubkey, payload: Vec<u8>) {
+        if let Some(tx) = self.topics.lock().unwrap().get(&topic) {
+            let _ = tx.send(Inbound { from, payload });
+        }
+    }
+
+    /// Hand `payload` to this node's inbox for `subnet`, if open.
+    pub(crate) fn deliver_inbox(&self, subnet: SubnetId, from: Pubkey, payload: Vec<u8>) {
+        if let Some(tx) = self.inboxes.lock().unwrap().get(&subnet) {
             let _ = tx.send(Inbound { from, payload });
         }
     }
@@ -115,9 +143,21 @@ impl Shared {
         self.served_config.lock().unwrap().clone()
     }
 
+    pub(crate) fn subnet_known(&self, subnet: SubnetId) -> bool {
+        self.subnets.lock().unwrap().contains(&subnet)
+    }
+
+    /// Sender admission on a bound topic; an unbound topic is open.
+    fn admits(&self, topic: Topic, from: Pubkey) -> bool {
+        match self.senders.lock().unwrap().get(&topic) {
+            Some(roster) => roster.contains(&from),
+            None => true,
+        }
+    }
+
     /// Whether `topic` admits only a fixed roster.
-    pub(crate) fn topic_is_bound(&self, topic: &str) -> bool {
-        self.policy.lock().unwrap().contains_key(topic)
+    pub(crate) fn topic_is_bound(&self, topic: Topic) -> bool {
+        self.senders.lock().unwrap().contains_key(&topic)
     }
 
     fn note_seen(&self, peer: Pubkey) {
@@ -134,25 +174,18 @@ pub struct CommonwareNetwork {
     identity: Pubkey,
 }
 
-fn subchannel(topic: &str) -> u64 {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(topic.as_bytes());
-    u64::from_be_bytes(digest[..8].try_into().expect("32-byte digest"))
-}
-
-fn is_subnet_topic(topic: &str) -> bool {
-    topic.starts_with("anymone/subnet/")
-}
-
 impl CommonwareNetwork {
     pub fn start(identity: &Identity, cfg: CommonwareConfig) -> Arc<Self> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let signer = identity.to_commonware_signer();
         let me = identity.pubkey();
         let shared = Arc::new(Shared {
-            policy: Mutex::new(TopicPolicy::new()),
+            senders: Mutex::new(HashMap::new()),
             served_config: Mutex::new(None),
             topics: Mutex::new(HashMap::new()),
+            inboxes: Mutex::new(HashMap::new()),
+            reg_recipients: Mutex::new(cfg.committee.clone()),
+            subnets: Mutex::new(HashSet::new()),
             last_seen: Mutex::new(HashMap::new()),
         });
         let thread_shared = shared.clone();
@@ -173,7 +206,7 @@ impl CommonwareNetwork {
         })
     }
 
-    fn send(&self, cmd: Cmd) {
+    fn send_cmd(&self, cmd: Cmd) {
         if self.cmds.send(cmd).is_err() {
             tracing::warn!(target: P2P, "commonware thread is gone; command dropped");
         }
@@ -182,45 +215,52 @@ impl CommonwareNetwork {
 
 #[async_trait]
 impl Transport for CommonwareNetwork {
-    async fn subscribe(&self, topic: &str) -> Subscription {
+    async fn subscribe(&self, topic: Topic) -> Subscription {
         let mut topics = self.shared.topics.lock().unwrap();
-        if let Some(tx) = topics.get(topic) {
-            return Subscription::from_broadcast_receiver(tx.subscribe(), topic.to_string());
-        }
-        let (tx, rx) = broadcast::channel(TOPIC_CAPACITY);
-        topics.insert(topic.to_string(), tx.clone());
-        self.send(Cmd::Subscribe {
-            topic: topic.to_string(),
-            tx,
-        });
-        Subscription::from_broadcast_receiver(rx, topic.to_string())
+        let tx = topics
+            .entry(topic)
+            .or_insert_with(|| broadcast::channel(TOPIC_CAPACITY).0);
+        Subscription::from_broadcast_receiver(tx.subscribe(), topic.to_string())
     }
 
-    async fn unsubscribe(&self, topic: &str) {
-        let mut topics = self.shared.topics.lock().unwrap();
-        // A respawned worker re-subscribes the same topics, so only tear the
-        // pump down once nothing local is listening.
-        if topics.get(topic).is_some_and(|tx| tx.receiver_count() == 0) {
-            topics.remove(topic);
-            self.send(Cmd::Unsubscribe(topic.to_string()));
-        }
-    }
-
-    async fn publish(&self, topic: &str, bytes: Vec<u8>) {
-        if let Some(roster) = self.shared.policy.lock().unwrap().get(topic) {
-            if !roster.contains(&self.identity) {
-                tracing::warn!(target: P2P, topic, from = %self.identity, "publish rejected: sender not in topic roster");
-                return;
-            }
-        }
-        if bytes.len() > MAX_TRANSMIT_SIZE {
-            tracing::warn!(target: P2P, topic, len = bytes.len(), limit = MAX_TRANSMIT_SIZE, "publish dropped: over the transmit limit");
+    async fn publish(&self, topic: Topic, bytes: Vec<u8>) {
+        if !self.shared.admits(topic, self.identity) {
+            tracing::warn!(target: P2P, %topic, from = %self.identity, "publish rejected: sender not in topic roster");
             return;
         }
-        crate::wire_debug::trace(topic, &self.identity, &bytes);
-        self.send(Cmd::Publish {
-            topic: topic.to_string(),
-            bytes,
+        if bytes.len() > MAX_TRANSMIT_SIZE {
+            tracing::warn!(target: P2P, %topic, len = bytes.len(), limit = MAX_TRANSMIT_SIZE, "publish dropped: over the transmit limit");
+            return;
+        }
+        crate::wire_debug::trace(&topic.to_string(), &self.identity, &bytes);
+        self.send_cmd(Cmd::Publish { topic, bytes });
+    }
+
+    async fn send(&self, to: Pubkey, subnet: SubnetId, bytes: Vec<u8>) {
+        if bytes.len() > MAX_TRANSMIT_SIZE {
+            tracing::warn!(target: P2P, subnet, len = bytes.len(), limit = MAX_TRANSMIT_SIZE, "send dropped: over the transmit limit");
+            return;
+        }
+        crate::wire_debug::trace(&format!("subnet/{subnet}/inbox"), &self.identity, &bytes);
+        self.send_cmd(Cmd::Send { to, subnet, bytes });
+    }
+
+    async fn inbox(&self, subnet: SubnetId) -> Subscription {
+        let mut inboxes = self.shared.inboxes.lock().unwrap();
+        let tx = inboxes
+            .entry(subnet)
+            .or_insert_with(|| broadcast::channel(TOPIC_CAPACITY).0);
+        Subscription::from_broadcast_receiver(tx.subscribe(), format!("subnet/{subnet}/inbox"))
+    }
+
+    fn apply(&self, view: NetView) {
+        *self.shared.senders.lock().unwrap() = view.senders;
+        *self.shared.reg_recipients.lock().unwrap() = view.registration_recipients;
+        *self.shared.subnets.lock().unwrap() = view.subnets.iter().copied().collect();
+        self.send_cmd(Cmd::Track {
+            index: view.index,
+            primary: view.primary,
+            secondary: view.secondary,
         });
     }
 
@@ -230,24 +270,12 @@ impl Transport for CommonwareNetwork {
 
     async fn fetch_config(&self) -> Option<Vec<u8>> {
         let (tx, rx) = oneshot::channel();
-        self.send(Cmd::FetchConfig(tx));
+        self.send_cmd(Cmd::FetchConfig(tx));
         tokio::time::timeout(CONFIG_FETCH_TIMEOUT, rx)
             .await
             .ok()?
             .ok()
             .flatten()
-    }
-
-    fn set_topic_policy(&self, policy: TopicPolicy) {
-        *self.shared.policy.lock().unwrap() = policy;
-    }
-
-    fn track_peers(&self, index: u64, primary: Vec<Pubkey>, secondary: Vec<Pubkey>) {
-        self.send(Cmd::Track {
-            index,
-            primary,
-            secondary,
-        });
     }
 
     fn peers(&self) -> Vec<Pubkey> {
@@ -314,28 +342,13 @@ async fn run(
     let (mut network, mut oracle) = discovery::Network::new(context.child("net"), p2p_cfg);
     // Channels must all be registered before the network starts.
     let quota = Quota::per_second(std::num::NonZeroU32::new(20_000).expect("nonzero"));
-    let (control_tx, control_rx) = network.register(CH_CONTROL, quota, MAILBOX);
-    let (data_tx, data_rx) = network.register(CH_DATA, quota, MAILBOX);
+    let (mut control_tx, control_rx) = network.register(CH_CONTROL, quota, MAILBOX);
+    let (mut data_tx, data_rx) = network.register(CH_DATA, quota, MAILBOX);
     let (mut rr_tx, mut rr_rx) = network.register(CH_RR, quota, MAILBOX);
 
     let mut genesis: Vec<Pubkey> = cfg.genesis_peers.clone();
     genesis.extend(cfg.bootstrappers.iter().map(|(pk, _)| *pk));
     oracle.track(GENESIS_PEER_SET, cw_set(&genesis));
-
-    let (control_mux, mut control_handle, mut control_global) = mux::Muxer::builder(
-        context.child("mux_control"),
-        control_tx,
-        control_rx,
-        MAILBOX,
-    )
-    .with_global_sender()
-    .build();
-    let (data_mux, mut data_handle, mut data_global) =
-        mux::Muxer::builder(context.child("mux_data"), data_tx, data_rx, MAILBOX)
-            .with_global_sender()
-            .build();
-    control_mux.start();
-    data_mux.start();
     network.start();
 
     // Config-pull candidates: no API exposes who is connected, so ask the peers
@@ -343,19 +356,16 @@ async fn run(
     let rr_candidates: Vec<ed25519::PublicKey> =
         genesis.iter().filter_map(keys::to_cw).collect();
 
-    let mut pumps: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
-    // Which topic owns each subchannel, so a hash collision is refused rather
-    // than silently crossing two topics' traffic.
-    let mut registry: HashMap<u64, String> = HashMap::new();
     // Ordered so eviction drops the oldest request, not every in-flight one.
     let mut pending: std::collections::BTreeMap<u64, oneshot::Sender<Option<Vec<u8>>>> =
         std::collections::BTreeMap::new();
     let mut nonce = 0u64;
 
-    // Client-facing plane. Its republish channel re-enters this loop, so client
-    // traffic reaches the backbone through the same path as anything else.
+    // Client-facing plane. Frames forwarded on a client's behalf re-enter this
+    // loop, so they go out exactly like a local publish (registrations
+    // addressed to the committee, open-topic submissions to all).
     let feeds = Feeds::default();
-    let (stream_pub_tx, mut stream_pub_rx) = mpsc::unbounded_channel::<(String, Vec<u8>)>();
+    let (forward_tx, mut forward_rx) = mpsc::unbounded_channel::<(Topic, Vec<u8>)>();
     if let Some(stream_listen) = cfg.stream_listen {
         stream_server::spawn(
             context.child("stream"),
@@ -364,81 +374,93 @@ async fn run(
             Arc::new(ServerHooks {
                 shared: shared.clone(),
                 feeds: feeds.clone(),
-                publish: stream_pub_tx,
+                publish: forward_tx,
                 good_clients: cfg.good_clients.clone(),
             }),
         );
     }
+
+    // Inbound demux: both channels carry `NetFrame`s; a frame for a topic or
+    // inbox nothing local reads is dropped after decode.
+    for (name, rx) in [("recv_control", control_rx), ("recv_data", data_rx)] {
+        let shared = shared.clone();
+        let feeds = feeds.clone();
+        context.child(name).spawn(move |_| async move {
+            let mut rx = rx;
+            while let Ok((peer, buf)) = rx.recv().await {
+                let from = keys::from_cw(&peer);
+                shared.note_seen(from);
+                match bincode::deserialize::<NetFrame>(buf.as_ref()) {
+                    Ok(NetFrame::Topic(topic, payload)) => {
+                        // Links are authenticated, so this only adds roster
+                        // admission on bound topics.
+                        if !shared.admits(topic, from) {
+                            tracing::debug!(target: P2P, %topic, %from, "inbound dropped: publisher not in topic roster");
+                            continue;
+                        }
+                        feeds.fanout(topic, from, &payload);
+                        shared.deliver_local(topic, from, payload);
+                    }
+                    Ok(NetFrame::Direct(subnet, payload)) => {
+                        shared.deliver_inbox(subnet, from, payload);
+                    }
+                    Err(e) => {
+                        tracing::debug!(target: P2P, %from, error = %e, "undecodable frame")
+                    }
+                }
+            }
+        });
+    }
+
+    // One transmit path for both frame kinds: a `Direct` frame goes to its
+    // addressee on the data channel; a topic frame's recipients and channel
+    // derive from the topic. Registrations go to the committee (and watchers),
+    // not the whole network — the recipients are known, so nothing else needs
+    // the bytes.
+    let mut transmit = |frame: NetFrame, to: Option<ed25519::PublicKey>| {
+        let bytes = bincode::serialize(&frame).expect("frame encodes");
+        match frame {
+            NetFrame::Direct(..) => {
+                let Some(to) = to else { return };
+                data_tx.send(Recipients::One(to), bytes, false);
+            }
+            NetFrame::Topic(topic, _) => {
+                let recipients = if topic == Topic::Registration {
+                    Recipients::Some(
+                        shared
+                            .reg_recipients
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter_map(keys::to_cw)
+                            .collect(),
+                    )
+                } else {
+                    Recipients::All
+                };
+                if is_data_topic(topic) {
+                    data_tx.send(recipients, bytes, false);
+                } else {
+                    control_tx.send(recipients, bytes, true);
+                }
+            }
+        }
+    };
 
     loop {
         tokio::select! {
             cmd = cmds.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
-                    Cmd::Subscribe { topic, tx } => {
-                        if pumps.contains_key(&topic) {
-                            continue;
-                        }
-                        let sub = subchannel(&topic);
-                        if let Some(owner) = registry.get(&sub) {
-                            tracing::error!(target: P2P, topic = %topic, %owner, sub, "subchannel collision; refusing to share it");
-                            continue;
-                        }
-                        let registered = if is_subnet_topic(&topic) {
-                            data_handle.register(sub).await
-                        } else {
-                            control_handle.register(sub).await
-                        };
-                        match registered {
-                            Ok((_, mut rx)) => {
-                                registry.insert(sub, topic.clone());
-                                let shared = shared.clone();
-                                let feeds = feeds.clone();
-                                let name = topic.clone();
-                                pumps.insert(topic, tokio::spawn(async move {
-                                    while let Ok((peer, buf)) = rx.recv().await {
-                                        let from = keys::from_cw(&peer);
-                                        shared.note_seen(from);
-                                        // Links are authenticated, so this only
-                                        // adds roster admission on bound topics.
-                                        if let Some(roster) = shared.policy.lock().unwrap().get(&name) {
-                                            if !roster.contains(&from) {
-                                                tracing::debug!(target: P2P, topic = %name, %from, "inbound dropped: publisher not in topic roster");
-                                                continue;
-                                            }
-                                        }
-                                        let payload = buf.as_ref().to_vec();
-                                        feeds.fanout(&name, from, &payload);
-                                        // Send failure just means no local
-                                        // listener; keep the subchannel for a
-                                        // later subscribe.
-                                        let _ = tx.send(Inbound { from, payload });
-                                    }
-                                }));
-                            }
-                            Err(e) => tracing::warn!(target: P2P, topic = %topic, error = %e, "subchannel registration failed"),
-                        }
-                    }
-                    Cmd::Unsubscribe(topic) => {
-                        // Await the abort: deregistration only happens when the
-                        // task is actually dropped, and re-registering a
-                        // subchannel before that fails and leaves no pump.
-                        if let Some(h) = pumps.remove(&topic) {
-                            h.abort();
-                            let _ = h.await;
-                            registry.remove(&subchannel(&topic));
-                        }
-                    }
                     Cmd::Publish { topic, bytes } => {
                         // Stream clients see this node's own output too; the
                         // backbone never loops a publish back to its publisher.
-                        feeds.fanout(&topic, me, &bytes);
-                        let sub = subchannel(&topic);
-                        if is_subnet_topic(&topic) {
-                            data_global.send(sub, Recipients::All, bytes, false);
-                        } else {
-                            control_global.send(sub, Recipients::All, bytes, true);
-                        }
+                        feeds.fanout(topic, me, &bytes);
+                        transmit(NetFrame::Topic(topic, bytes), None);
+                    }
+                    Cmd::Send { to, subnet, bytes } => {
+                        let Some(to) = keys::to_cw(&to) else { continue };
+                        transmit(NetFrame::Direct(subnet, bytes), Some(to));
                     }
                     Cmd::Track { index, primary, secondary } => {
                         oracle.track(
@@ -462,15 +484,10 @@ async fn run(
                 }
             }
 
-            // A client's submission, relayed onto the backbone on its behalf.
-            forward = stream_pub_rx.recv() => {
+            // A client's frame, republished on its behalf.
+            forward = forward_rx.recv() => {
                 let Some((topic, bytes)) = forward else { continue };
-                let sub = subchannel(&topic);
-                if is_subnet_topic(&topic) {
-                    data_global.send(sub, Recipients::All, bytes, false);
-                } else {
-                    control_global.send(sub, Recipients::All, bytes, true);
-                }
+                transmit(NetFrame::Topic(topic, bytes), None);
             }
 
             inbound = rr_rx.recv() => {

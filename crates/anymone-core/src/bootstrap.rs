@@ -103,14 +103,15 @@ impl BootstrapConfig {
             ),
             None => None,
         };
-        let mut genesis_peers: Vec<Pubkey> =
-            self.governance.committee.iter().map(|m| m.pubkey).collect();
+        let committee: Vec<Pubkey> = self.governance.committee.iter().map(|m| m.pubkey).collect();
+        let mut genesis_peers = committee.clone();
         genesis_peers.extend(self.network.genesis_peers.iter().copied());
         Ok(crate::cw::CommonwareConfig {
             listen,
             dialable,
             bootstrappers,
             genesis_peers,
+            committee,
             local: self.network.local,
             stream_listen,
             good_clients,

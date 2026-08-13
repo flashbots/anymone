@@ -59,7 +59,7 @@ fn enact(core: &mut SchedulerCore, committee: &[Identity], proposal: SignedPropo
     assert!(
         actions
             .iter()
-            .any(|a| matches!(a, SchedulerAction::Publish { topic, .. } if topic == TOPIC_CONFIG)),
+            .any(|a| matches!(a, SchedulerAction::Publish { topic, .. } if *topic == TOPIC_CONFIG)),
         "enact: proposal must publish a config at threshold"
     );
 }
@@ -487,7 +487,7 @@ fn multisig_assembles_via_committee_sig() {
     assert!(
         !actions
             .iter()
-            .any(|a| matches!(a, SchedulerAction::Publish { topic, .. } if topic == TOPIC_CONFIG)),
+            .any(|a| matches!(a, SchedulerAction::Publish { topic, .. } if *topic == TOPIC_CONFIG)),
         "must not assemble with a single signature"
     );
 
@@ -502,7 +502,7 @@ fn multisig_assembles_via_committee_sig() {
     let cfg_bytes = actions
         .iter()
         .find_map(|a| match a {
-            SchedulerAction::Publish { topic, bytes } if topic == TOPIC_CONFIG => {
+            SchedulerAction::Publish { topic, bytes } if *topic == TOPIC_CONFIG => {
                 Some(bytes.clone())
             }
             _ => None,
@@ -1223,13 +1223,23 @@ fn config_carries_watchers_and_relay_client_addrs() {
     }
     assert_eq!(body.relay_client_addrs.len(), placed.len());
 
-    let (primary, secondary) = anymone_core::governance::tracked_peers(&body, &pks);
-    assert!(secondary.contains(&watcher.pubkey()), "watchers are secondary");
-    assert!(secondary.contains(&service.pubkey()));
-    assert!(!primary.contains(&watcher.pubkey()));
+    let view = anymone_core::governance::net_view(&body, &pks);
+    assert!(
+        view.secondary.contains(&watcher.pubkey()),
+        "watchers are secondary"
+    );
+    assert!(
+        !view.secondary.contains(&service.pubkey()),
+        "services live on the client plane, not in the peer sets"
+    );
+    assert!(!view.primary.contains(&watcher.pubkey()));
     for r in &relays {
-        assert!(primary.contains(&r.pubkey()), "relays are primary");
+        assert!(view.primary.contains(&r.pubkey()), "relays are primary");
     }
+    assert!(
+        view.registration_recipients.contains(&watcher.pubkey()),
+        "watchers receive registrations"
+    );
 }
 
 /// A live Panetiere subnet (one client + 3 relays, relay 0 the decoding leader,

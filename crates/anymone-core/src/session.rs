@@ -5,9 +5,9 @@
 //! as they arrive. The session itself is otherwise inert — no transport, no
 //! async, no internal time.
 //!
-//! Anymone always broadcasts session outputs on the subnet's p2p topic; there
-//! is no unicast in the trait. Every member receives every message and filters
-//! locally.
+//! Session outputs carry no addressing: each protocol's egress function maps
+//! a message's own content to its destination — a topic for one-to-many flows,
+//! a direct send to the peer(s) it is for otherwise.
 
 use std::collections::HashMap;
 use std::time::Instant;

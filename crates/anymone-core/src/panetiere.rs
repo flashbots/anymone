@@ -53,7 +53,7 @@ use crate::runtime::{
     round_at, route_to_pipe, subnet_leader_pk, AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
 };
 use crate::session::{GoodClients, Misbehavior, PeerId, RoundOutcome, Session};
-use crate::transport::Subscription;
+use crate::transport::{Dest, Subscription, Topic};
 
 /// Channel sizing for a subnet carrying up to `rho` real messages of
 /// `message_bytes` each. The MSE prf key is domain-separated from the shared
@@ -451,7 +451,10 @@ pub(crate) async fn run_subnet(
         None
     };
 
-    let egress = |_key: &SessionKey, bytes: &[u8]| crate::panetiere::egress(subnet.id, bytes);
+    let mut sorted_roster = subnet.relays.clone();
+    sorted_roster.sort();
+    let egress =
+        |_key: &SessionKey, bytes: &[u8]| crate::panetiere::egress(subnet.id, &sorted_roster, bytes);
 
     let dur_ms = (subnet.protocol.round_duration().as_millis() as u64).max(1);
     let schedule = checkpoint_schedule(dur_ms, false, consensus.then(|| relay_rounds(&pp)));
@@ -857,7 +860,7 @@ pub(crate) async fn drain_inbound_upto(
     sessions: &mut HashMap<SessionKey, Box<dyn Session>>,
     fault_monitor: &mut Option<Box<dyn Session>>,
     inner: &Arc<AnymoneInner>,
-    egress: &impl Fn(&SessionKey, &[u8]) -> String,
+    egress: &impl Fn(&SessionKey, &[u8]) -> Dest,
     identity_pk: Pubkey,
     cap: Option<Round>,
 ) {
@@ -1153,9 +1156,12 @@ pub(crate) fn describe(bytes: &[u8]) -> Option<String> {
             "Panetiere Opening cid={client_id} -> sid={target_server}"
         )),
         PanetiereWire::ServerPublic {
-            server_id, clients, ..
+            round,
+            server_id,
+            clients,
+            ..
         } => Some(format!(
-            "Panetiere ServerPublic sid={server_id} clients={}",
+            "Panetiere ServerPublic round={round} sid={server_id} clients={}",
             clients.len()
         )),
         PanetiereWire::ClientSlice {
@@ -1198,31 +1204,42 @@ pub(crate) fn describe(bytes: &[u8]) -> Option<String> {
     }
 }
 
-/// Topic for one outbound message, by its own content. Relay shares and the
-/// leader's `ClientSet` ride shares; a client's constant-size post rides
-/// ingress; its coded share and its sealed opening ride the one lane each is
-/// addressed to, so neither is gossiped to all S relays.
-pub(crate) fn egress(subnet_id: crate::config::SubnetId, bytes: &[u8]) -> String {
-    use crate::runtime::{
-        subnet_broadcast_topic, subnet_ingress_topic, subnet_lane_topic, subnet_shares_topic,
+/// Destination for one outbound message, by its own content. Relay shares and
+/// the leader's `ClientSet` ride the shares topic; a client's constant-size
+/// post goes directly to every relay; its coded share and its sealed opening go
+/// only to the relay each is addressed to. `sorted_roster` maps lane indices to
+/// relay keys — a lane outside it addresses nobody.
+pub(crate) fn egress(
+    subnet_id: crate::config::SubnetId,
+    sorted_roster: &[Pubkey],
+    bytes: &[u8],
+) -> Dest {
+    let to_lane = |lane: u32| match sorted_roster.get(lane as usize) {
+        Some(pk) => Dest::Peer(subnet_id, *pk),
+        None => {
+            tracing::debug!(target: PANETIERE, subnet_id, lane, "egress: lane outside the roster, dropped");
+            Dest::Each(subnet_id, Vec::new())
+        }
     };
     match bincode::deserialize::<PanetiereWire>(bytes) {
         Ok(
             PanetiereWire::ServerPublic { .. }
             | PanetiereWire::ClientSet { .. }
             | PanetiereWire::SetRelay { .. },
-        ) => subnet_shares_topic(subnet_id),
-        Ok(PanetiereWire::ClientPublic { .. }) => subnet_ingress_topic(subnet_id),
+        ) => Dest::Topic(Topic::Shares(subnet_id)),
+        Ok(PanetiereWire::ClientPublic { .. }) => {
+            Dest::Each(subnet_id, sorted_roster.to_vec())
+        }
         Ok(PanetiereWire::ClientSlice { lane, .. } | PanetiereWire::Bundle { lane, .. }) => {
-            subnet_lane_topic(subnet_id, lane)
+            to_lane(lane)
         }
         Ok(
             PanetiereWire::Opening { target_server, .. }
             | PanetiereWire::SetFragment { target_server, .. },
-        ) => subnet_lane_topic(subnet_id, target_server),
+        ) => to_lane(target_server),
         // `Decoded`, `Reservations`, `SetBatch` (clients read only broadcast),
         // and anything undecodable.
-        _ => subnet_broadcast_topic(subnet_id),
+        _ => Dest::Topic(Topic::Broadcast(subnet_id)),
     }
 }
 
@@ -1940,7 +1957,7 @@ struct PanetiereRoundState {
     emitted_my_public: bool,
     decoded: bool,
     /// First pubkey to claim each `ClientId` this round. Binds client input to
-    /// its gossipsub-authenticated origin and blocks a second signer from
+    /// its transport-authenticated origin and blocks a second signer from
     /// grinding a colliding 4-byte id to clobber another client's slot.
     owners: HashMap<ClientId, Pubkey>,
     /// Authenticated clients turned away at `client_set_max` — demand the
@@ -2393,18 +2410,21 @@ impl Session for PanetiereServerSession {
         };
         if !round_in_window(msg.round(), self.cur_round) {
             // A client whose round clock drifts past the window is silently
-            // excluded from the canonical set — a prime cause of a small,
-            // fluctuating set even at full participation.
-            if matches!(
-                msg,
-                PanetiereWire::ClientPublic { .. } | PanetiereWire::Opening { .. }
-            ) {
+            // excluded from the canonical set; a dropped ClientSet kills every
+            // share deferred against it and the round ages out undecoded.
+            let kind = match &msg {
+                PanetiereWire::ClientPublic { .. } => Some("public"),
+                PanetiereWire::Opening { .. } => Some("opening"),
+                PanetiereWire::ClientSet { .. } => Some("set"),
+                _ => None,
+            };
+            if let Some(kind) = kind {
                 tracing::debug!(
                     target: PANETIERE,
                     msg_round = msg.round(),
                     cur_round = ?self.cur_round,
-                    kind = if matches!(msg, PanetiereWire::ClientPublic { .. }) { "public" } else { "opening" },
-                    "panetiere server: client contribution outside round window, dropped"
+                    kind,
+                    "panetiere server: message outside round window, dropped"
                 );
             }
             return Vec::new();

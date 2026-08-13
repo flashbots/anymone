@@ -17,12 +17,12 @@
 //! Individual subsystems dial independently, e.g.
 //! `anymone=info,anymone::panetiere=debug`.
 
-/// Every gossip message in or out, and every pipe route. The firehose: one line
-/// per message per topic, `trace` throughout.
+/// Every wire message in or out, and every pipe route. The firehose: one line
+/// per message per topic or inbox, `trace` throughout.
 pub const WIRE: &str = "anymone::wire";
 
-/// Swarm and gossipsub lifecycle: dials, mesh formation, publish back-pressure,
-/// topic-roster admission.
+/// Backbone and stream-plane lifecycle: dials, peer tracking, publish
+/// back-pressure, topic-roster admission.
 pub const P2P: &str = "anymone::p2p";
 
 /// Panetiere (one-round and scheduled): admission, canonical sets, shares, decode.

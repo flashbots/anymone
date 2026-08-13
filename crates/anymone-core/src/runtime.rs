@@ -22,7 +22,7 @@ use crate::noop;
 use crate::panetiere::PanetiereWatchSession;
 use crate::pipe::{Pipe, PipeIncoming, PipeMessage};
 use crate::session::{GoodClients, Misbehavior, Session};
-use crate::transport::{Inbound, Subscription, Transport};
+use crate::transport::{Dest, Inbound, Subscription, Topic, Transport};
 use crate::wire::{Frame, RouteTag, ServiceTag, SERVICE_TAG_LEN};
 
 /// Consecutive output-less rounds before a subnet's leader-side monitor reports
@@ -31,8 +31,9 @@ use crate::wire::{Frame, RouteTag, ServiceTag, SERVICE_TAG_LEN};
 pub(crate) const FAULT_THRESHOLD: u64 = 2;
 
 /// Rounds after a worker (re)spawn during which observed faults are not
-/// gossiped: a cutover gap or forming mesh reads as a Liveness fault and would
-/// trigger a renegotiation — which causes another cutover, sustaining a storm.
+/// published: a cutover gap or still-connecting peers read as a Liveness fault
+/// and would trigger a renegotiation — which causes another cutover, sustaining
+/// a storm.
 pub(crate) const RECONFIG_FAULT_GRACE: Round = 3;
 
 /// Capacity of the [`Anymone::events`] broadcast. Slow consumers lag and lose
@@ -72,9 +73,6 @@ pub struct Anymone {
 /// roster/protocol change (respawn) from an unchanged subnet (leave running).
 struct SubnetWorker {
     sig: Vec<u8>,
-    /// Topics this worker subscribed to, so tearing it down can also leave
-    /// them (gossipsub subscription outlives a dropped local `Subscription`).
-    topics: Vec<String>,
     handle: JoinHandle<()>,
 }
 
@@ -568,34 +566,12 @@ async fn apply_config(
     let base_round = 0;
     let epoch_unix_ms = config.body.epoch_unix_ms;
 
-    // gossipsub meshes form only over existing connections, so dial the full
-    // roster rather than relying on kademlia adjacency.
-    let mut roster: Vec<Pubkey> = config
-        .body
-        .subnets
-        .iter()
-        .flat_map(|s| {
-            s.relays.iter().copied().chain(
-                s.protocol
-                    .aggregation()
-                    .into_iter()
-                    .flat_map(|a| a.groups.iter().flat_map(|g| g.aggregators.iter().copied())),
-            )
-        })
-        .collect();
-    roster.sort();
-    roster.dedup();
-    inner.transport.ensure_peers(roster).await;
-
-    // Indexed by config version: positional discovery misreads sets that differ
-    // between peers at the same index.
-    let (primary, secondary) = crate::governance::tracked_peers(
+    // Applied before any worker spawns, so its first sends already resolve
+    // against this config's peers and rosters.
+    inner.transport.apply(crate::governance::net_view(
         &config.body,
         inner.committee.as_deref().unwrap_or_default(),
-    );
-    inner
-        .transport
-        .track_peers(config.body.round, primary, secondary);
+    ));
 
     let current: HashMap<SubnetId, Vec<u8>> = {
         let g = tasks.workers.lock().unwrap();
@@ -611,7 +587,6 @@ async fn apply_config(
     let mut built: Vec<(
         SubnetId,
         Vec<u8>,
-        Vec<String>,
         mpsc::UnboundedSender<StageMsg>,
         JoinHandle<()>,
     )> = Vec::new();
@@ -626,10 +601,13 @@ async fn apply_config(
             warn!(target: SCHED, id, "skipping unrunnable subnet in config");
             continue;
         }
-        let topics = subnet_subscription_topics(&subnet, me);
-        let mut subscriptions = Vec::with_capacity(topics.len());
-        for t in &topics {
+        let (topics, wants_inbox) = subnet_subscriptions(&subnet, me);
+        let mut subscriptions = Vec::with_capacity(topics.len() + 1);
+        for t in topics {
             subscriptions.push(inner.transport.subscribe(t).await);
+        }
+        if wants_inbox {
+            subscriptions.push(inner.transport.inbox(id).await);
         }
         let (stage_tx, stage_rx) = mpsc::unbounded_channel();
         let inner_for_task = inner.clone();
@@ -681,11 +659,9 @@ async fn apply_config(
                 unreachable!("filtered by subnet_runnable")
             }
         };
-        built.push((id, sig, topics, stage_tx, handle));
+        built.push((id, sig, stage_tx, handle));
     }
 
-    let mut stale: Vec<SubnetWorker> = Vec::new();
-    let live_topics: std::collections::HashSet<String>;
     {
         let mut workers = tasks.workers.lock().unwrap();
         let mut stage_map = inner.subnets.lock().unwrap();
@@ -696,53 +672,22 @@ async fn apply_config(
             .collect();
         // Outgoing workers (removed or replaced) finish their in-flight round
         // plus one more, then exit — the armed replacement starts at that
-        // boundary, so reconfiguration loses no round.
+        // boundary, so reconfiguration loses no round. A finished worker's
+        // `Subscription`s drop with it; nothing else to tear down.
         for id in removed {
-            if let Some(w) = workers.remove(&id) {
+            if workers.remove(&id).is_some() {
                 if let Some(tx) = stage_map.remove(&id) {
                     let _ = tx.send(StageMsg::Shutdown);
                 }
-                stale.push(w);
             }
         }
-        for (id, sig, topics, stage_tx, handle) in built {
+        for (id, sig, stage_tx, handle) in built {
             if let Some(old_tx) = stage_map.get(&id) {
                 let _ = old_tx.send(StageMsg::Shutdown);
             }
-            if let Some(old) = workers.insert(
-                id,
-                SubnetWorker {
-                    sig,
-                    topics,
-                    handle,
-                },
-            ) {
-                stale.push(old);
-            }
+            workers.insert(id, SubnetWorker { sig, handle });
             stage_map.insert(id, stage_tx);
         }
-        live_topics = workers
-            .values()
-            .flat_map(|w| w.topics.iter().cloned())
-            .collect();
-    }
-    // Leave topics no current worker uses. A respawned subnet reuses its topic
-    // names, so only topics outside the live set may be unsubscribed — and only
-    // after the stale worker has actually terminated and dropped its
-    // `Subscription`s, else the transport still counts it as a listener.
-    // Detached: graceful exits take up to two rounds and must not delay adoption.
-    if !stale.is_empty() {
-        let inner_unsub = inner.clone();
-        tokio::spawn(async move {
-            for w in stale {
-                let _ = w.handle.await;
-                for topic in w.topics {
-                    if !live_topics.contains(&topic) {
-                        inner_unsub.transport.unsubscribe(&topic).await;
-                    }
-                }
-            }
-        });
     }
     // Deliver each subnet's cover rate to its (surviving) worker; a cover-only
     // change isn't in `subnet_sig`, so the worker isn't rebuilt for it.
@@ -754,14 +699,6 @@ async fn apply_config(
             }
         }
     }
-    if let Some(committee) = &inner.committee {
-        inner
-            .transport
-            .set_topic_policy(crate::governance::topic_policy(&config.body, committee));
-    }
-    inner
-        .transport
-        .set_publish_targets(publish_targets(&config.body));
     let _ = inner.events.send(Event::ConfigUpdated {
         round: config.body.round,
     });
@@ -837,38 +774,21 @@ async fn reconfig_watch(
     }
 }
 
-/// Destination topic for one outbound message, given the role that produced it
-/// and the protocol's wire predicates. Shared by every protocol's subnet driver.
-pub(crate) fn egress_dest(
-    subnet_id: SubnetId,
-    uses_ingress: bool,
-    is_share: fn(&[u8]) -> bool,
-    is_client: fn(&[u8]) -> bool,
-    client_agg_topic: Option<&str>,
-    key: &SessionKey,
-    bytes: &[u8],
-) -> String {
-    if !uses_ingress {
-        return subnet_broadcast_topic(subnet_id);
-    }
-    match key {
-        SessionKey::Server => {
-            if is_share(bytes) {
-                subnet_shares_topic(subnet_id)
-            } else {
-                subnet_broadcast_topic(subnet_id)
+/// Put one outbound message where its `Dest` says: a topic publish, or a
+/// direct send to each addressee. A self-addressed send is skipped — the local
+/// loop-back in [`publish_and_loop_back`] already fed it to this node's sessions.
+pub(crate) async fn deliver(inner: &AnymoneInner, me: Pubkey, dest: Dest, bytes: Vec<u8>) {
+    match dest {
+        Dest::Topic(topic) => inner.transport.publish(topic, bytes).await,
+        Dest::Peer(_, pk) if pk == me => {}
+        Dest::Peer(subnet, pk) => inner.transport.send(pk, subnet, bytes).await,
+        Dest::Each(subnet, pks) => {
+            for pk in pks {
+                if pk != me {
+                    inner.transport.send(pk, subnet, bytes.clone()).await;
+                }
             }
         }
-        // In an aggregated (ADCNet) subnet a client's contribution goes to its
-        // aggregator group's topic instead of ingress.
-        SessionKey::Client => match client_agg_topic {
-            Some(t) if is_client(bytes) => t.to_string(),
-            _ => subnet_ingress_topic(subnet_id),
-        },
-        // Aggregators publish their signed group aggregate on the shares topic,
-        // where the leader already listens.
-        SessionKey::Aggregator => subnet_shares_topic(subnet_id),
-        SessionKey::Watch => subnet_broadcast_topic(subnet_id),
     }
 }
 
@@ -879,7 +799,7 @@ pub(crate) async fn publish_and_loop_back(
     sessions: &mut HashMap<SessionKey, Box<dyn Session>>,
     fault_monitor: &mut Option<Box<dyn Session>>,
     inner: &Arc<AnymoneInner>,
-    egress: &impl Fn(&SessionKey, &[u8]) -> String,
+    egress: &impl Fn(&SessionKey, &[u8]) -> Dest,
     identity_pk: Pubkey,
     producer: SessionKey,
     out: Vec<u8>,
@@ -893,11 +813,11 @@ pub(crate) async fn publish_and_loop_back(
         }
         for followup in s.on_inbound(identity_pk, out.clone()) {
             let dest = egress(key, &followup);
-            inner.transport.publish(&dest, followup).await;
+            deliver(inner, identity_pk, dest, followup).await;
         }
     }
     let dest = egress(&producer, &out);
-    inner.transport.publish(&dest, out).await;
+    deliver(inner, identity_pk, dest, out).await;
 }
 
 /// Feed one inbound message to every session, publishing whatever they produce.
@@ -905,7 +825,7 @@ pub(crate) async fn handle_inbound(
     sessions: &mut HashMap<SessionKey, Box<dyn Session>>,
     fault_monitor: &mut Option<Box<dyn Session>>,
     inner: &Arc<AnymoneInner>,
-    egress: &impl Fn(&SessionKey, &[u8]) -> String,
+    egress: &impl Fn(&SessionKey, &[u8]) -> Dest,
     identity_pk: Pubkey,
     msg: Inbound,
 ) {
@@ -943,7 +863,7 @@ pub(crate) async fn drain_inbound(
     sessions: &mut HashMap<SessionKey, Box<dyn Session>>,
     fault_monitor: &mut Option<Box<dyn Session>>,
     inner: &Arc<AnymoneInner>,
-    egress: &impl Fn(&SessionKey, &[u8]) -> String,
+    egress: &impl Fn(&SessionKey, &[u8]) -> Dest,
     identity_pk: Pubkey,
 ) {
     for i in 0..subscriptions.len() {
@@ -1022,7 +942,7 @@ pub(crate) fn deadline_for(
 /// boundary where the outgoing worker (told to [`StageMsg::Shutdown`] at the
 /// same instant) exits. Round boundaries are epoch-aligned, so every node that
 /// adopts the config within the same round picks the same boundary, and the
-/// wait gives fresh gossip subscriptions time to form meshes. Absorbs
+/// wait gives fresh peer connections time to establish. Absorbs
 /// cover-rate updates while waiting; returns `false` on `Shutdown` (or channel
 /// close), meaning this worker was itself replaced before ever running and must
 /// exit — its successor arms to its own boundary, and the round or two of gap a
@@ -1058,25 +978,6 @@ pub(crate) async fn arm_until_cutover(
     }
 }
 
-/// Submissions a censoring relay could otherwise swallow on the way in.
-fn publish_targets(
-    body: &crate::config::AnymoneRoundConfigurationBody,
-) -> crate::transport::PublishTargets {
-    let mut targets = crate::transport::PublishTargets::new();
-    for subnet in &body.subnets {
-        if subnet.relays.is_empty() {
-            continue;
-        }
-        let mut sorted = subnet.relays.clone();
-        sorted.sort();
-        targets.insert(subnet_ingress_topic(subnet.id), sorted.clone());
-        for (lane, pk) in sorted.iter().enumerate() {
-            targets.insert(subnet_lane_topic(subnet.id, lane as u32), vec![*pk]);
-        }
-    }
-    targets
-}
-
 /// A non-empty roster and a protocol with runtime wiring.
 pub fn subnet_runnable(subnet: &Subnet) -> bool {
     !subnet.relays.is_empty()
@@ -1105,10 +1006,13 @@ pub fn leader_of(sorted_roster: &[Pubkey], subnet_id: SubnetId) -> Pubkey {
     sorted_roster[(subnet_id as usize) % n]
 }
 
-/// Topics this node subscribes to for `subnet`. The combining relays read
-/// ingress + shares (ADCNet: only the leader combines; Panetiere: every relay
-/// does); everyone else only the broadcast topic.
-fn subnet_subscription_topics(subnet: &Subnet, me: Pubkey) -> Vec<String> {
+/// What this node reads for `subnet`: topics, plus whether it wants the
+/// subnet's direct inbox. Combining relays (ADCNet: only the leader; Panetiere:
+/// every relay) read the inbox — client posts, their lane's coded shares, the
+/// openings sealed to them — plus the shares topic; everyone else only the
+/// broadcast topic. Aggregators read the inbox (their group's client
+/// contributions) and the shares topic.
+fn subnet_subscriptions(subnet: &Subnet, me: Pubkey) -> (Vec<Topic>, bool) {
     let combines = match &subnet.protocol {
         ProtocolConfig::Panetiere(_) | ProtocolConfig::ScheduledPanetiere(_) => {
             subnet.relays.contains(&me)
@@ -1116,15 +1020,13 @@ fn subnet_subscription_topics(subnet: &Subnet, me: Pubkey) -> Vec<String> {
         ProtocolConfig::Adcnet(_) => subnet_leader_pk(subnet) == me,
         _ => false,
     };
+    let mut wants_inbox = combines;
     let mut topics = if combines {
-        vec![
-            subnet_ingress_topic(subnet.id),
-            subnet_shares_topic(subnet.id),
-        ]
+        vec![Topic::Shares(subnet.id)]
     } else {
-        vec![subnet_broadcast_topic(subnet.id)]
+        vec![Topic::Broadcast(subnet.id)]
     };
-    // Scheduled Panetiere relays combine over ingress+shares like the one-round
+    // Scheduled Panetiere relays combine over inbox+shares like the one-round
     // flow, but also need the leader's `Reservations` broadcast — for their own
     // (possibly co-located) client session and as a follower fallback. Under
     // consensus set formation a co-located client needs the receipts, which
@@ -1132,30 +1034,18 @@ fn subnet_subscription_topics(subnet: &Subnet, me: Pubkey) -> Vec<String> {
     let broadcast_too = matches!(subnet.protocol, ProtocolConfig::ScheduledPanetiere(_))
         || subnet.protocol.set_formation() == crate::config::SetFormation::Consensus;
     if combines && broadcast_too {
-        let broadcast = subnet_broadcast_topic(subnet.id);
-        if !topics.contains(&broadcast) {
-            topics.push(broadcast);
-        }
+        topics.push(Topic::Broadcast(subnet.id));
     }
-    // A Panetiere relay is also lane `j`: it reads only its own lane's coded
-    // shares and the openings sealed to it, so neither is broadcast to all S.
-    if combines {
-        if let Some(lane) = crate::panetiere::server_index(&subnet.relays, me) {
-            topics.push(subnet_lane_topic(subnet.id, lane));
-        }
-    }
-    // An aggregator listens on its group topic for client messages, and joins the
-    // shares mesh to publish its group aggregate there.
     if let Some(a) = subnet_aggregation(subnet) {
-        if let Some(group) = aggregator_group_of(a, me) {
-            topics.push(subnet_aggregator_topic(subnet.id, group));
-            let shares = subnet_shares_topic(subnet.id);
+        if aggregator_group_of(a, me).is_some() {
+            wants_inbox = true;
+            let shares = Topic::Shares(subnet.id);
             if !topics.contains(&shares) {
                 topics.push(shares);
             }
         }
     }
-    topics
+    (topics, wants_inbox)
 }
 
 /// Aggregation config for a subnet — ADCNet only; Panetiere shards its ingress
@@ -1175,11 +1065,12 @@ pub(crate) fn aggregator_group_of(a: &crate::config::Aggregation, me: Pubkey) ->
         .map(|i| i as u32)
 }
 
-/// The group topic a client routes its contribution to in an aggregated subnet.
-pub(crate) fn client_aggregator_topic(subnet: &Subnet, me: Pubkey) -> Option<String> {
+/// The aggregator committee a client routes its contribution to in an
+/// aggregated subnet.
+pub(crate) fn client_aggregators(subnet: &Subnet, me: Pubkey) -> Option<Vec<Pubkey>> {
     let a = subnet_aggregation(subnet)?;
     let group = u32::from_be_bytes([me.0[0], me.0[1], me.0[2], me.0[3]]) % a.groups.len() as u32;
-    Some(subnet_aggregator_topic(subnet.id, group))
+    Some(a.groups[group as usize].aggregators.clone())
 }
 
 /// Await the next message on any of `subs`, dropping closed ones. Parks forever
@@ -1190,8 +1081,8 @@ pub(crate) async fn recv_any(subs: &mut Vec<Subscription>) -> Inbound {
             std::future::pending::<()>().await;
         }
         // Rotate first: `select_all` returns the lowest-index ready future, so a
-        // fixed order lets the high-volume ingress topic starve the low-volume
-        // shares topic (relays would never see each other's decryption shares).
+        // fixed order lets the high-volume inbox starve the low-volume shares
+        // topic (relays would never see each other's decryption shares).
         subs.rotate_left(1);
         let futures: Vec<_> = subs.iter_mut().map(|s| Box::pin(s.recv())).collect();
         let (res, idx, _) = futures_util::future::select_all(futures).await;
@@ -1204,30 +1095,6 @@ pub(crate) async fn recv_any(subs: &mut Vec<Subscription>) -> Inbound {
     }
 }
 
-pub fn subnet_broadcast_topic(id: SubnetId) -> String {
-    format!("anymone/subnet/{id}")
-}
-
-/// Ingress topic: client contributions that every combining relay needs. Under
-/// Panetiere that is only the constant-size RS post — the coded shares and the
-/// sealed openings go to one lane each.
-pub fn subnet_ingress_topic(id: SubnetId) -> String {
-    format!("anymone/subnet/{id}/ingress")
-}
-
-/// Per-lane topic: relay `lane` reads the coded ciphertext shares and the
-/// openings sealed to it, and nothing addressed to another lane.
-pub fn subnet_lane_topic(id: SubnetId, lane: u32) -> String {
-    format!("anymone/subnet/{id}/lane/{lane}")
-}
-
-/// Shares topic: every relay broadcasts its decryption share here (low volume).
-/// The leader combines from it; observers track liveness; broadcasting (rather
-/// than a leader-only channel) keeps shares available for verifiability.
-pub fn subnet_shares_topic(id: SubnetId) -> String {
-    format!("anymone/subnet/{id}/shares")
-}
-
 pub fn subnet_uses_ingress(subnet: &Subnet) -> bool {
     matches!(
         subnet.protocol,
@@ -1235,12 +1102,6 @@ pub fn subnet_uses_ingress(subnet: &Subnet) -> bool {
             | ProtocolConfig::Panetiere(_)
             | ProtocolConfig::ScheduledPanetiere(_)
     )
-}
-
-/// Per-group topic: an ADCNet aggregator group's clients post their blinded
-/// contributions here; the group's aggregators subscribe.
-pub fn subnet_aggregator_topic(id: SubnetId, group: u32) -> String {
-    format!("anymone/subnet/{id}/agg/{group}")
 }
 
 /// Build a non-participating watch session for `subnet`: reads the leader's

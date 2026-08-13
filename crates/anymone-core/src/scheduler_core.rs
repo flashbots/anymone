@@ -117,7 +117,7 @@ pub(crate) fn expected_active(set: u32) -> u32 {
 }
 
 /// Per-subnet wire budget: a subnet's largest per-round message must stay under this,
-/// with headroom below the gossipsub ceiling.
+/// with headroom below the transport ceiling.
 const MAX_SUBNET_WIRE: usize = crate::transport::MAX_TRANSMIT_SIZE * 3 / 4;
 
 /// Capacity ceiling. Subnets split well before this; at this many clients the biggest
@@ -402,7 +402,10 @@ pub enum SchedulerAction {
     /// Panetiere (the lead proposer's job).
     StageProposal(Vec<u8>),
     /// Publish bytes directly on a governance topic (signatures, configs).
-    Publish { topic: String, bytes: Vec<u8> },
+    Publish {
+        topic: crate::transport::Topic,
+        bytes: Vec<u8>,
+    },
 }
 
 /// Wire form for committee signature gossip — one per body a member signed.
@@ -675,7 +678,7 @@ impl SchedulerCore {
                 } else {
                     self.sidelined.remove(&pubkey);
                     // Re-announced every few seconds; the first arrival is the
-                    // one that measures gossip mesh formation.
+                    // one that measures delivery latency.
                     if self.registered.insert(pubkey) {
                         tracing::debug!(
                             target: GOV,
@@ -1256,7 +1259,7 @@ impl SchedulerCore {
             .insert(self.identity.pubkey(), sig.clone());
 
         let mut actions = vec![SchedulerAction::Publish {
-            topic: crate::committee::TOPIC_COMMITTEE_SIGS.to_string(),
+            topic: crate::committee::TOPIC_COMMITTEE_SIGS,
             bytes: bincode::serialize(&CommitteeSig {
                 body_bytes: canonical.clone(),
                 signer: self.identity.pubkey(),
@@ -1414,7 +1417,7 @@ impl SchedulerCore {
                 .map_or(body.round, |r| r.max(body.round)),
         );
         Some(SchedulerAction::Publish {
-            topic: TOPIC_CONFIG.to_string(),
+            topic: TOPIC_CONFIG,
             bytes: bincode::serialize(&cfg).expect("config encodes"),
         })
     }

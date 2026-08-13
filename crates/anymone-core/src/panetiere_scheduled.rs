@@ -1134,7 +1134,10 @@ pub(crate) async fn run_subnet(
         None
     };
 
-    let egress = |_key: &SessionKey, bytes: &[u8]| crate::panetiere::egress(subnet.id, bytes);
+    let mut sorted_roster = subnet.relays.clone();
+    sorted_roster.sort();
+    let egress =
+        |_key: &SessionKey, bytes: &[u8]| crate::panetiere::egress(subnet.id, &sorted_roster, bytes);
 
     let dur_ms = (subnet.protocol.round_duration().as_millis() as u64).max(4);
     let schedule = checkpoint_schedule(

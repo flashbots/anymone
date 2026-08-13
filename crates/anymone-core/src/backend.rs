@@ -34,9 +34,9 @@ pub fn virtual_client_spawner(
     ))
 }
 
-/// Transport and virtual-client spawner for a client-plane process (chat bot,
-/// gateway, bridge). These hold streams to nodes rather than joining the
-/// backbone, so each virtual client costs a connection, not a node.
+/// Transport and virtual-client spawner for a client-plane process (service,
+/// chat bot, gateway, bridge). These hold streams to nodes rather than joining
+/// the backbone, so each virtual client costs a connection, not a node.
 pub fn start_client_transport(
     identity: &Identity,
     bootstrap: &BootstrapConfig,
@@ -45,4 +45,19 @@ pub fn start_client_transport(
     let cfg = bootstrap.stream_client_config()?;
     let net = crate::cw::StreamClientNetwork::start(identity, cfg.clone());
     Ok((net, crate::cw::stream_client_spawner(cfg, gov)))
+}
+
+/// Transport a not-yet-tracked relay registers through: a stream connection to
+/// a bootstrap node when one is configured (the backbone refuses a peer no
+/// tracked set names), else the backbone itself (genesis deployments list
+/// initial relays in `genesis_peers`).
+pub fn registration_transport(
+    identity: &Identity,
+    bootstrap: &BootstrapConfig,
+    backbone: &Arc<dyn Transport>,
+) -> Arc<dyn Transport> {
+    match bootstrap.stream_client_config() {
+        Ok(cfg) => crate::cw::StreamClientNetwork::start(identity, cfg),
+        Err(_) => backbone.clone(),
+    }
 }

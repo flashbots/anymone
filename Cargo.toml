@@ -49,8 +49,14 @@ alloy-consensus = { version = "=2.1.1", default-features = false }
 alloy-eips = { version = "=2.1.1", default-features = false }
 alloy-primitives = { version = "=1.6.1", default-features = false }
 
+# Timed rounds need optimized crypto everywhere (ed25519 lives in commonware,
+# outside the per-package overrides): opt-0 runs ~6-8x slower and wedges the
+# in-memory round loops.
+[profile.dev]
+opt-level = 1
+
 # Crypto-heavy deps stay optimized in dev builds so tests (e.g. client_set_e2e)
-# aren't dominated by unoptimized math; anymone crates keep fast incremental compiles.
+# aren't dominated by unoptimized math.
 [profile.dev.package.panetiere]
 opt-level = 2
 

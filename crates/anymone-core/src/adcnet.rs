@@ -34,12 +34,12 @@ use crate::faults::Fault;
 use crate::identity::Pubkey;
 use crate::log_target::{ADCNET, SCHED};
 use crate::runtime::{
-    aggregator_group_of, client_aggregator_topic, deadline_for, drain_inbound, egress_dest,
-    gossip_faults, handle_inbound, publish_and_loop_back, recv_any, round_at, route_to_pipe,
+    aggregator_group_of, client_aggregators, deadline_for, drain_inbound, gossip_faults,
+    handle_inbound, publish_and_loop_back, recv_any, round_at, route_to_pipe,
     subnet_aggregation, subnet_leader_pk, AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
 };
 use crate::session::{GoodClients, LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
-use crate::transport::Subscription;
+use crate::transport::{Dest, Subscription, Topic};
 
 /// Per-subnet ADCNet parameters (IBLT sizing), built once at subnet start.
 fn one_round_config(cfg: &AdcnetConfig) -> OneRoundConfig {
@@ -167,7 +167,9 @@ pub(crate) async fn run_subnet(
     let identity_pk = inner.identity.pubkey();
     let one_round = one_round_config(&cfg);
     let leader_pk = subnet_leader_pk(&subnet);
-    let client_agg_topic = client_aggregator_topic(&subnet, identity_pk);
+    let client_agg = client_aggregators(&subnet, identity_pk);
+    let mut sorted_roster = subnet.relays.clone();
+    sorted_roster.sort();
 
     let mut sessions: HashMap<SessionKey, Box<dyn Session>> = HashMap::new();
     let mut cover_rate = subnet.cover_rate;
@@ -213,16 +215,20 @@ pub(crate) async fn run_subnet(
         None
     };
 
-    let egress = |key: &SessionKey, bytes: &[u8]| {
-        egress_dest(
-            subnet.id,
-            true,
-            is_server_share,
-            is_client_message,
-            client_agg_topic.as_deref(),
-            key,
-            bytes,
-        )
+    // A client's contribution goes directly to its aggregator group (aggregated
+    // flow) or to every relay (direct flow; only the leader combines, but naming
+    // the whole roster keeps no single relay on the delivery path). Shares and
+    // the aggregators' signed group aggregates ride the shares topic, where the
+    // leader already listens.
+    let egress = |key: &SessionKey, bytes: &[u8]| match key {
+        SessionKey::Server if is_server_share(bytes) => Dest::Topic(Topic::Shares(subnet.id)),
+        SessionKey::Server => Dest::Topic(Topic::Broadcast(subnet.id)),
+        SessionKey::Client => match &client_agg {
+            Some(aggs) if is_client_message(bytes) => Dest::Each(subnet.id, aggs.clone()),
+            _ => Dest::Each(subnet.id, sorted_roster.clone()),
+        },
+        SessionKey::Aggregator => Dest::Topic(Topic::Shares(subnet.id)),
+        SessionKey::Watch => Dest::Topic(Topic::Broadcast(subnet.id)),
     };
 
     // Round labels derive from the signed wall-clock epoch, not a local counter,

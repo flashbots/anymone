@@ -10,7 +10,7 @@ use thiserror::Error;
 use crate::config::{AnymoneRoundConfigurationBody, ExchangePublicKeyWire, Round, SubnetId};
 use crate::faults::Fault;
 use crate::identity::Pubkey;
-use crate::transport::TopicPolicy;
+use crate::transport::{NetView, Topic};
 
 /// The committee + threshold a deployment configures (the `[governance]` section
 /// of the bootstrap TOML).
@@ -39,9 +39,9 @@ impl GovernanceConfig {
     }
 }
 
-pub const TOPIC_CONFIG: &str = "anymone/config";
-pub const TOPIC_REGISTRATION: &str = "anymone/registration";
-pub const TOPIC_FAULTS: &str = "anymone/faults";
+pub const TOPIC_CONFIG: Topic = Topic::Config;
+pub const TOPIC_REGISTRATION: Topic = Topic::Registration;
+pub const TOPIC_FAULTS: Topic = Topic::Faults;
 
 /// A fault a node observed on a subnet, gossiped on `anymone/faults` for the
 /// committee and any auditor. `reporter` is the observing node; the embedded
@@ -88,15 +88,17 @@ pub enum GovernanceError {
     Timeout,
 }
 
-/// Topic admission for an adopted config: subnet shares/broadcast topics bound
-/// to that subnet's relays (+ aggregators), faults to the union of all relays,
-/// config to the committee. Ingress and per-group aggregator topics stay open
-/// — clients are permissionless and can't be bound to a fixed roster. Noop
-/// subnets run their whole protocol (client contributions included) over the
-/// broadcast topic, so theirs stays open too.
-pub fn topic_policy(body: &AnymoneRoundConfigurationBody, committee: &[Pubkey]) -> TopicPolicy {
-    use std::collections::HashSet;
-    let mut policy = TopicPolicy::new();
+/// A config's network view, applied to the transport whole on every adoption.
+///
+/// Topic admission: subnet shares/broadcast topics bound to that subnet's
+/// relays (+ aggregators), faults to the union of all relays, config to the
+/// committee. A Noop subnet's broadcast stays open — its whole protocol
+/// (client contributions included) rides that topic. Peer sets: primary =
+/// committee + relays + aggregators (dialed outbound), secondary = watchers
+/// (inbound only); services live on the client plane and are not peers.
+pub fn net_view(body: &AnymoneRoundConfigurationBody, committee: &[Pubkey]) -> NetView {
+    use std::collections::{HashMap, HashSet};
+    let mut senders: HashMap<Topic, HashSet<Pubkey>> = HashMap::new();
     let mut all_relays: HashSet<Pubkey> = HashSet::new();
     for subnet in &body.subnets {
         let mut shares: HashSet<Pubkey> = subnet.relays.iter().copied().collect();
@@ -107,30 +109,18 @@ pub fn topic_policy(body: &AnymoneRoundConfigurationBody, committee: &[Pubkey]) 
                     .flat_map(|g| g.aggregators.iter().copied()),
             );
         }
-        policy.insert(crate::runtime::subnet_shares_topic(subnet.id), shares);
+        senders.insert(Topic::Shares(subnet.id), shares);
         if !matches!(subnet.protocol, crate::config::ProtocolConfig::Noop(_)) {
-            policy.insert(
-                crate::runtime::subnet_broadcast_topic(subnet.id),
+            senders.insert(
+                Topic::Broadcast(subnet.id),
                 subnet.relays.iter().copied().collect(),
             );
         }
         all_relays.extend(subnet.relays.iter().copied());
     }
-    policy.insert(TOPIC_FAULTS.to_string(), all_relays);
-    policy.insert(
-        TOPIC_CONFIG.to_string(),
-        committee.iter().copied().collect(),
-    );
-    policy
-}
+    senders.insert(Topic::Faults, all_relays);
+    senders.insert(Topic::Config, committee.iter().copied().collect());
 
-/// Peer sets for [`crate::transport::Transport::track_peers`]: primary =
-/// committee + relays + aggregators, secondary = services + watchers. A pubkey
-/// in both is primary only.
-pub fn tracked_peers(
-    body: &AnymoneRoundConfigurationBody,
-    committee: &[Pubkey],
-) -> (Vec<Pubkey>, Vec<Pubkey>) {
     let mut primary: Vec<Pubkey> = committee.to_vec();
     for subnet in &body.subnets {
         primary.extend(subnet.relays.iter().copied());
@@ -145,13 +135,29 @@ pub fn tracked_peers(
     primary.sort();
     primary.dedup();
     let mut secondary: Vec<Pubkey> = body
-        .services
+        .watchers
         .iter()
-        .map(|s| s.pubkey)
-        .chain(body.watchers.iter().copied())
+        .copied()
         .filter(|pk| primary.binary_search(pk).is_err())
         .collect();
     secondary.sort();
     secondary.dedup();
-    (primary, secondary)
+
+    let mut registration_recipients: Vec<Pubkey> = committee
+        .iter()
+        .chain(body.watchers.iter())
+        .copied()
+        .collect();
+    registration_recipients.sort();
+    registration_recipients.dedup();
+
+    NetView {
+        index: body.round,
+        senders,
+        primary,
+        secondary,
+        registration_recipients,
+        relay_client_addrs: body.relay_client_addrs.clone(),
+        subnets: body.subnets.iter().map(|s| s.id).collect(),
+    }
 }

@@ -411,15 +411,6 @@ fn spawn_config_loop(
             if !is_new {
                 continue;
             }
-            let mut roster: Vec<anymone_core::Pubkey> = cfg
-                .body
-                .subnets
-                .iter()
-                .flat_map(|s| s.relays.iter().copied())
-                .collect();
-            roster.sort();
-            roster.dedup();
-            transport.ensure_peers(roster).await;
             let present: std::collections::HashSet<SubnetId> =
                 cfg.body.subnets.iter().map(|s| s.id).collect();
             // drop watchers for subnets no longer in the config
@@ -455,17 +446,18 @@ fn spawn_config_loop(
 /// frontier and liveness faults. Round is anchored from the config and ticked
 /// on the protocol's own cadence (the node's clock isn't observable).
 async fn watch_subnet(subnet: Subnet, transport: Arc<dyn Transport>, obs: Shared) {
-    let topic = anymone_core::runtime::subnet_broadcast_topic(subnet.id);
-    let mut sub = transport.subscribe(&topic).await;
+    let mut sub = transport
+        .subscribe(anymone_core::Topic::Broadcast(subnet.id))
+        .await;
     // The observer derives round stats from real wire messages: anon set +
     // msgs/round + output frontier from the broadcast round output (`ClientSet`
     // / `Decoded`), and the share frontier / liveness from the relays' shares on
-    // the shares topic. It does NOT subscribe to the high-volume ingress
-    // (client contributions).
+    // the shares topic. Client contributions are addressed to the relays and
+    // never pass an observer.
     let mut shares = if anymone_core::runtime::subnet_uses_ingress(&subnet) {
         Some(
             transport
-                .subscribe(&anymone_core::runtime::subnet_shares_topic(subnet.id))
+                .subscribe(anymone_core::Topic::Shares(subnet.id))
                 .await,
         )
     } else {

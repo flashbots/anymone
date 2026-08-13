@@ -243,18 +243,8 @@ async fn bootnode(args: BootnodeArgs) -> Result<()> {
         .with_context(|| format!("identity at {}", bootstrap.identity_path.display()))?;
     tracing::info!(pubkey = %identity.pubkey(), "starting bootnode");
 
-    let transport =
+    let _transport =
         anymone_core::backend::start_node_transport(&identity, &bootstrap, GoodClients::all())?;
-    // Join the governance topics so the bootnode carries them; held for the
-    // process lifetime so the subscriptions stay live.
-    let mut _subs = Vec::new();
-    for topic in [
-        anymone_core::governance::TOPIC_CONFIG,
-        anymone_core::governance::TOPIC_REGISTRATION,
-        anymone_core::governance::TOPIC_FAULTS,
-    ] {
-        _subs.push(transport.subscribe(topic).await);
-    }
     tracing::info!("bootnode online; waiting for ctrl-c");
     tokio::signal::ctrl_c().await.ok();
     Ok(())
@@ -268,11 +258,19 @@ async fn run(args: RunArgs) -> Result<()> {
         .with_context(|| format!("identity at {}", bootstrap.identity_path.display()))?;
     tracing::info!(role = ?args.role, pubkey = %identity.pubkey(), "starting node");
 
+    let gov = GovernanceBootstrap::from_bootstrap_config(&bootstrap);
     // Demo: every client is accepted. A deployment narrows this to attested
     // clients, and the stream handshake is where that is enforced.
-    let transport =
-        anymone_core::backend::start_node_transport(&identity, &bootstrap, GoodClients::all())?;
-    let gov = GovernanceBootstrap::from_bootstrap_config(&bootstrap);
+    // Committee and relays are authorized p2p peers; services and clients live
+    // on the client plane.
+    let transport = match args.role {
+        Role::Committee | Role::Relay => {
+            anymone_core::backend::start_node_transport(&identity, &bootstrap, GoodClients::all())?
+        }
+        Role::Service | Role::Client => {
+            anymone_core::backend::start_client_transport(&identity, &bootstrap, gov.clone())?.0
+        }
+    };
 
     // Endpoint comes up before Anymone start (which blocks on the first
     // config), so scrapes work during bootstrap. The relay's misbehavior route
@@ -302,9 +300,12 @@ async fn run(args: RunArgs) -> Result<()> {
         Role::Relay => {
             let xk = identity.exchange_keys();
             // Advertising the stream address is what lets clients find a relay
-            // from the signed config without joining the p2p network.
+            // from the signed config without joining the p2p network. The
+            // announcement itself rides a stream connection when one is
+            // configured — a relay outside every tracked set can't reach the
+            // committee over the backbone.
             let _reannounce = announce_relay_registration_at(
-                transport.clone(),
+                anymone_core::backend::registration_transport(&identity, &bootstrap, &transport),
                 &identity,
                 xk,
                 bootstrap.network.stream_listen.clone(),

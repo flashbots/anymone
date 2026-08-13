@@ -134,10 +134,10 @@ pub(crate) async fn run_subnet(
 ) {
     use crate::config::ProtocolConfig;
     use crate::runtime::{
-        deadline_for, gossip_faults, recv_any, round_at, route_to_pipe, subnet_broadcast_topic,
-        sync_client_round, SessionKey, StageMsg,
+        deadline_for, gossip_faults, recv_any, round_at, route_to_pipe, sync_client_round,
+        SessionKey, StageMsg,
     };
-    use crate::transport::Inbound;
+    use crate::transport::{Inbound, Topic};
     use std::collections::HashMap;
 
     let cfg = match &subnet.protocol {
@@ -145,7 +145,7 @@ pub(crate) async fn run_subnet(
         _ => unreachable!("noop::run_subnet on a non-Noop subnet"),
     };
     let identity_pk = inner.identity.pubkey();
-    let topic = subnet_broadcast_topic(subnet.id);
+    let topic = Topic::Broadcast(subnet.id);
 
     let mut sessions: HashMap<SessionKey, Box<dyn Session>> = HashMap::new();
     let mut cover_rate = subnet.cover_rate;
@@ -180,7 +180,7 @@ pub(crate) async fn run_subnet(
     });
     for s in sessions.values_mut() {
         for out in s.begin_round(round, Instant::now()) {
-            inner.transport.publish(&topic, out).await;
+            inner.transport.publish(topic, out).await;
         }
     }
 
@@ -195,7 +195,7 @@ pub(crate) async fn run_subnet(
                 for s in sessions.values_mut() {
                     let outcome = s.end_round(round, Instant::now());
                     for out in outcome.outbound {
-                        inner.transport.publish(&topic, out).await;
+                        inner.transport.publish(topic, out).await;
                     }
                     decoded_all.extend(outcome.decoded);
                     faults.extend(outcome.faults);
@@ -226,7 +226,7 @@ pub(crate) async fn run_subnet(
                 });
                 for s in sessions.values_mut() {
                     for out in s.begin_round(round, Instant::now()) {
-                        inner.transport.publish(&topic, out).await;
+                        inner.transport.publish(topic, out).await;
                     }
                 }
             }
@@ -235,7 +235,7 @@ pub(crate) async fn run_subnet(
                 let Inbound { from, payload } = msg;
                 for s in sessions.values_mut() {
                     for out in s.on_inbound(from, payload.clone()) {
-                        inner.transport.publish(&topic, out).await;
+                        inner.transport.publish(topic, out).await;
                     }
                 }
             }

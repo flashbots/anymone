@@ -82,13 +82,10 @@ async fn main() -> Result<()> {
         // (placement is by tag, so a duplicate registration is harmless;
         // re-announced until placed).
         None => {
-            // The room is a service, so it joins the backbone; only the virtual
-            // clients it mints use the client plane.
-            let transport = anymone_core::backend::start_node_transport(
-                &identity,
-                &bootstrap,
-                anymone_core::GoodClients::all(),
-            )?;
+            // The room is a service, but a service is not an authorized p2p
+            // peer: it registers, receives, and sends over the client plane.
+            let (transport, spawn) =
+                anymone_core::backend::start_client_transport(&identity, &bootstrap, gov.clone())?;
             let xk = identity.exchange_keys();
             let _reannounce = announce_service_registration(
                 transport.clone(),
@@ -97,7 +94,6 @@ async fn main() -> Result<()> {
                 xk,
             )
             .await;
-            let spawn = anymone_core::backend::virtual_client_spawner(&bootstrap, gov.clone())?;
             let anymone = Anymone::prepare(identity, transport, gov)
                 .await
                 .start()
