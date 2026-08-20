@@ -19,15 +19,15 @@ tokio.workspace = true
 async-trait.workspace = true
 futures-util.workspace = true
 tracing.workspace = true
-panetiere = { git = "ssh://git@github.com/flashbots/panetiere", rev = "f1277191f5ed99570449ee080bc21fcf278abc2c" }
+panetiere = { git = "https://github.com/flashbots/panetiere", rev = "f1277191f5ed99570449ee080bc21fcf278abc2c" }
 # panetiere also depends on this unpinned; rev-pinning ours conflicts (cargo can't unify).
 chipmunk_code = { git = "https://github.com/Ruteri/Chipmunk", branch = "main", default-features = false, features = ["fast-ntt"] }
 adcnet = { git = "ssh://git@github.com/flashbots/adcnet-rs", rev = "08988b193a4fa78d08f7ffed221ce28c7a1aeb6e" }
-attest-types = { git = "ssh://git@github.com/flashbots/attest", rev = "8206cd19d9dcb1978d85a3d8dece06a3ee7a1206" }
-attest-prove = { git = "ssh://git@github.com/flashbots/attest", rev = "8206cd19d9dcb1978d85a3d8dece06a3ee7a1206", default-features = false, optional = true }
-attest-measure = { git = "ssh://git@github.com/flashbots/attest", rev = "8206cd19d9dcb1978d85a3d8dece06a3ee7a1206", optional = true }
-attest-verify = { git = "ssh://git@github.com/flashbots/attest", rev = "8206cd19d9dcb1978d85a3d8dece06a3ee7a1206", default-features = false, optional = true }
-attest-pccs = { git = "ssh://git@github.com/flashbots/attest", rev = "8206cd19d9dcb1978d85a3d8dece06a3ee7a1206", optional = true }
+attest-types = { git = "https://github.com/flashbots/attest", rev = "8206cd19d9dcb1978d85a3d8dece06a3ee7a1206" }
+attest-prove = { git = "https://github.com/flashbots/attest", rev = "8206cd19d9dcb1978d85a3d8dece06a3ee7a1206", default-features = false, optional = true }
+attest-measure = { git = "https://github.com/flashbots/attest", rev = "8206cd19d9dcb1978d85a3d8dece06a3ee7a1206", optional = true }
+attest-verify = { git = "https://github.com/flashbots/attest", rev = "8206cd19d9dcb1978d85a3d8dece06a3ee7a1206", default-features = false, optional = true }
+attest-pccs = { git = "https://github.com/flashbots/attest", rev = "8206cd19d9dcb1978d85a3d8dece06a3ee7a1206", optional = true }
 parity-scale-codec = { version = "3", default-features = false, features = ["derive"], optional = true }
 aes-gcm = { version = "0.10", optional = true }
 aes-kw = { version = "0.2", features = ["alloc"], optional = true }

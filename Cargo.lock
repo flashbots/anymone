@@ -901,7 +901,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 [[package]]
 name = "attest-measure"
 version = "0.0.1"
-source = "git+ssh://git@github.com/flashbots/attest?rev=8206cd19d9dcb1978d85a3d8dece06a3ee7a1206#8206cd19d9dcb1978d85a3d8dece06a3ee7a1206"
+source = "git+https://github.com/flashbots/attest?rev=8206cd19d9dcb1978d85a3d8dece06a3ee7a1206#8206cd19d9dcb1978d85a3d8dece06a3ee7a1206"
 dependencies = [
  "attest-types",
  "authenticode",
@@ -926,7 +926,7 @@ dependencies = [
 [[package]]
 name = "attest-pccs"
 version = "0.0.1"
-source = "git+ssh://git@github.com/flashbots/attest?rev=8206cd19d9dcb1978d85a3d8dece06a3ee7a1206#8206cd19d9dcb1978d85a3d8dece06a3ee7a1206"
+source = "git+https://github.com/flashbots/attest?rev=8206cd19d9dcb1978d85a3d8dece06a3ee7a1206#8206cd19d9dcb1978d85a3d8dece06a3ee7a1206"
 dependencies = [
  "anyhow",
  "dcap-qvl",
@@ -943,7 +943,7 @@ dependencies = [
 [[package]]
 name = "attest-prove"
 version = "0.0.1"
-source = "git+ssh://git@github.com/flashbots/attest?rev=8206cd19d9dcb1978d85a3d8dece06a3ee7a1206#8206cd19d9dcb1978d85a3d8dece06a3ee7a1206"
+source = "git+https://github.com/flashbots/attest?rev=8206cd19d9dcb1978d85a3d8dece06a3ee7a1206#8206cd19d9dcb1978d85a3d8dece06a3ee7a1206"
 dependencies = [
  "attest-measure",
  "attest-types",
@@ -954,7 +954,7 @@ dependencies = [
 [[package]]
 name = "attest-types"
 version = "0.0.1"
-source = "git+ssh://git@github.com/flashbots/attest?rev=8206cd19d9dcb1978d85a3d8dece06a3ee7a1206#8206cd19d9dcb1978d85a3d8dece06a3ee7a1206"
+source = "git+https://github.com/flashbots/attest?rev=8206cd19d9dcb1978d85a3d8dece06a3ee7a1206#8206cd19d9dcb1978d85a3d8dece06a3ee7a1206"
 dependencies = [
  "parity-scale-codec",
  "serde",
@@ -965,7 +965,7 @@ dependencies = [
 [[package]]
 name = "attest-verify"
 version = "0.0.1"
-source = "git+ssh://git@github.com/flashbots/attest?rev=8206cd19d9dcb1978d85a3d8dece06a3ee7a1206#8206cd19d9dcb1978d85a3d8dece06a3ee7a1206"
+source = "git+https://github.com/flashbots/attest?rev=8206cd19d9dcb1978d85a3d8dece06a3ee7a1206#8206cd19d9dcb1978d85a3d8dece06a3ee7a1206"
 dependencies = [
  "anyhow",
  "attest-measure",
@@ -4199,7 +4199,7 @@ dependencies = [
 [[package]]
 name = "panetiere"
 version = "0.1.0"
-source = "git+ssh://git@github.com/flashbots/panetiere?rev=f1277191f5ed99570449ee080bc21fcf278abc2c#f1277191f5ed99570449ee080bc21fcf278abc2c"
+source = "git+https://github.com/flashbots/panetiere?rev=f1277191f5ed99570449ee080bc21fcf278abc2c#f1277191f5ed99570449ee080bc21fcf278abc2c"
 dependencies = [
  "aes-gcm",
  "chipmunk_code",
