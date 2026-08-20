@@ -38,7 +38,10 @@ impl Feeds {
     fn add(&self, topics: Vec<Topic>, tx: mpsc::Sender<StreamMsg>) {
         let mut map = self.inner.lock().unwrap();
         for t in topics {
-            map.entry(t).or_default().push(tx.clone());
+            let subs = map.entry(t).or_default();
+            if !subs.iter().any(|held| held.same_channel(&tx)) {
+                subs.push(tx.clone());
+            }
         }
     }
 
@@ -79,6 +82,7 @@ pub(crate) struct ServerHooks {
     /// committee) and client-open topic submissions.
     pub(crate) publish: mpsc::UnboundedSender<(Topic, Vec<u8>)>,
     pub(crate) good_clients: GoodClients,
+    pub(crate) attested_clients: Arc<crate::tee::AttestedClients>,
 }
 
 pub(crate) fn spawn(
@@ -184,6 +188,9 @@ async fn session<S, R>(
                 if feed_tx.send(resp).await.is_err() {
                     break;
                 }
+            }
+            StreamMsg::Attest(att) => {
+                hooks.attested_clients.enroll(&client, &att);
             }
             StreamMsg::Register(bytes) => {
                 match bincode::deserialize::<crate::scheduling::Registration>(&bytes) {

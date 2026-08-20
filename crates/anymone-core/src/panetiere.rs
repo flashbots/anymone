@@ -18,7 +18,7 @@ use panetiere::bulletin::{
 };
 use panetiere::channel::{self, ChannelError, ChannelParams};
 use panetiere::cs::{Opening, PackedOpening};
-use panetiere::pke;
+pub use panetiere::pke;
 use panetiere::prony::PronyError;
 use panetiere::protocol::client::run_client_round_rs;
 use panetiere::protocol::server::{
@@ -30,8 +30,9 @@ use panetiere::share_commitment::{
 };
 use panetiere::sig;
 
+pub use panetiere::protocol::ServerId;
 use panetiere::protocol::{
-    message_polys, round_wire_sizes, ClientId, NodeId, ProtocolParams, ServerId, SessionId,
+    message_polys, round_wire_sizes, ClientId, NodeId, ProtocolParams, SessionId,
 };
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
@@ -428,7 +429,7 @@ pub(crate) async fn run_subnet(
                 &subnet,
                 &inner.identity,
                 leader_pk,
-                inner.good_clients.clone(),
+                inner.subnet_clients(&subnet),
             ),
         );
     } else {

@@ -75,33 +75,42 @@ fn proto_name(body: &AnymoneRoundConfigurationBody) -> &'static str {
 }
 
 /// Lead core: sorted(committee)[0], so `is_lead` is true and it stages.
-fn lead_core(committee: &[Identity], threshold: u32) -> SchedulerCore {
+fn lead_params() -> SchedulerParams {
+    SchedulerParams {
+        public_round_duration: Duration::from_millis(200),
+        min_relays: 2,
+        min_services: 1,
+        fault_threshold: 2,
+        escalation_grace: 5,
+        grow_at: 31,
+        message_size: 16,
+        integrity_backoff_ms: 6 * 60 * 1000,
+        sideline: true,
+        renegotiate_on_fault: true,
+        min_capacity: 8,
+        pin: None,
+        vector_bytes: 0,
+        aggregation: true,
+        encoding: anymone_core::config::Encoding::default(),
+        set_formation: anymone_core::config::SetFormation::Leader,
+        attested_subnets: Vec::new(),
+        attestation: Default::default(),
+    }
+}
+
+fn lead_core_with(
+    committee: &[Identity],
+    threshold: u32,
+    params: SchedulerParams,
+) -> SchedulerCore {
     let mut sorted: Vec<_> = committee.to_vec();
     sorted.sort_by_key(|i| i.pubkey());
     let pks: Vec<_> = committee.iter().map(|i| i.pubkey()).collect();
-    SchedulerCore::new(
-        sorted[0].clone(),
-        pks,
-        threshold,
-        SchedulerParams {
-            public_round_duration: Duration::from_millis(200),
-            min_relays: 2,
-            min_services: 1,
-            fault_threshold: 2,
-            escalation_grace: 5,
-            grow_at: 31,
-            message_size: 16,
-            integrity_backoff_ms: 6 * 60 * 1000,
-            sideline: true,
-            renegotiate_on_fault: true,
-            min_capacity: 8,
-            pin: None,
-            vector_bytes: 0,
-            aggregation: true,
-            encoding: anymone_core::config::Encoding::default(),
-            set_formation: anymone_core::config::SetFormation::Leader,
-        },
-    )
+    SchedulerCore::new(sorted[0].clone(), pks, threshold, params)
+}
+
+fn lead_core(committee: &[Identity], threshold: u32) -> SchedulerCore {
+    lead_core_with(committee, threshold, lead_params())
 }
 
 /// Like [`lead_core`] but with a caller-chosen `message_size` — the
@@ -139,6 +148,8 @@ fn lead_core_msg_size(
             aggregation: true,
             encoding: anymone_core::config::Encoding::default(),
             set_formation: anymone_core::config::SetFormation::Leader,
+            attested_subnets: Vec::new(),
+            attestation: Default::default(),
         },
     )
 }
@@ -232,6 +243,8 @@ fn renegotiates_adcnet_panetiere_adcnet() {
             aggregation: true,
             encoding: anymone_core::config::Encoding::default(),
             set_formation: anymone_core::config::SetFormation::Leader,
+            attested_subnets: Vec::new(),
+            attestation: Default::default(),
         },
     );
     let pinned_relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
@@ -288,6 +301,8 @@ fn renegotiates_adcnet_panetiere_adcnet() {
             aggregation: true,
             encoding: anymone_core::config::Encoding::default(),
             set_formation: anymone_core::config::SetFormation::Leader,
+            attested_subnets: Vec::new(),
+            attestation: Default::default(),
         },
     );
     register_relays_and_service(&mut reporting, &pinned_relays, &pinned_service);
@@ -456,6 +471,8 @@ fn multisig_assembles_via_committee_sig() {
         aggregation: true,
         encoding: anymone_core::config::Encoding::default(),
         set_formation: anymone_core::config::SetFormation::Leader,
+        attested_subnets: Vec::new(),
+        attestation: Default::default(),
     };
     let mut core = SchedulerCore::new(lead.clone(), pks.clone(), 2, params.clone());
 
@@ -540,6 +557,7 @@ fn multisig_assembles_via_committee_sig() {
         )],
         relay_client_addrs: vec![],
         watchers: vec![],
+        attestation: Default::default(),
     })
     .sign_with(&sorted.iter().collect::<Vec<_>>());
     let mut fresh_for_bad_cfg = SchedulerCore::new(lead.clone(), pks.clone(), 2, params.clone());
@@ -601,6 +619,8 @@ fn non_lead_core_never_stages() {
             aggregation: true,
             encoding: anymone_core::config::Encoding::default(),
             set_formation: anymone_core::config::SetFormation::Leader,
+            attested_subnets: Vec::new(),
+            attestation: Default::default(),
         },
     );
     assert!(!core.is_lead());
@@ -636,6 +656,45 @@ fn cover_rate_stamped_and_reproposed() {
     assert_eq!(
         reproposed.body.epoch_unix_ms, first.body.epoch_unix_ms,
         "epoch must stay fixed across re-proposals of the same network"
+    );
+    assert!(
+        reproposed.body.subnets.iter().all(|s| !s.attested),
+        "no subnet demands attestation unless governance names it"
+    );
+}
+
+/// Only the named subnets carry the flag, and the policy they screen against
+/// travels in the same signed body.
+#[test]
+fn attested_subnets_named_by_governance() {
+    let committee: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
+    let mut params = lead_params();
+    params.attested_subnets = vec![0];
+    params.attestation = anymone_core::config::AttestationPolicy {
+        validity_rounds: 25,
+        ..Default::default()
+    };
+    let mut core = lead_core_with(&committee, 2, params);
+    let relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
+    register_relays_and_service(&mut core, &relays, &Identity::generate());
+
+    let first = staged_proposal(&core.tick(0, 0)).expect("first proposal staged");
+    assert!(first.body.subnets[0].attested);
+    assert!(
+        first.body.subnets.iter().skip(1).all(|s| !s.attested),
+        "an id governance did not name stays open"
+    );
+    assert_eq!(first.body.attestation.validity_rounds, 25);
+    enact(&mut core, &committee, first.clone());
+    assert!(staged_body(&core.tick(1, 0)).is_none());
+
+    // A member holding a different policy signs nothing: it would screen
+    // clients by a rule the body does not carry.
+    let mut other = lead_core(&committee, 2);
+    register_relays_and_service(&mut other, &relays, &Identity::generate());
+    assert!(
+        other.on_decoded_body(first.clone()).is_empty(),
+        "a member cannot sign a policy that is not the one it enforces"
     );
 }
 
@@ -773,6 +832,8 @@ fn live_core(committee: &[Identity]) -> SchedulerCore {
             aggregation: true,
             encoding: anymone_core::config::Encoding::default(),
             set_formation: anymone_core::config::SetFormation::Leader,
+            attested_subnets: Vec::new(),
+            attestation: Default::default(),
         },
     )
 }
@@ -819,6 +880,8 @@ fn committee_schedules_second_subnet_when_one_nears_capacity() {
                 aggregation: false,
                 encoding: anymone_core::config::Encoding::default(),
                 set_formation: anymone_core::config::SetFormation::Leader,
+            attested_subnets: Vec::new(),
+            attestation: Default::default(),
             },
         )
     };
@@ -1102,17 +1165,26 @@ fn malicious_lead_cannot_insert_unregistered_relay() {
     let service = Identity::generate();
     register_relays_and_service(&mut core, &relays, &service);
 
-    let mut proposal = staged_proposal(&core.tick(0, 0)).expect("staged");
+    let proposal = staged_proposal(&core.tick(0, 0)).expect("staged");
     // The lead splices in a relay nobody registered, then re-signs as the lead.
     let attacker_relay = Identity::generate();
-    proposal.body.subnets[0]
-        .relays
-        .push(attacker_relay.pubkey());
-    let forged = sign_proposal(&lead_of(&committee), proposal.body);
-
+    let mut spliced = proposal.body.clone();
+    spliced.subnets[0].relays.push(attacker_relay.pubkey());
     assert!(
-        core.on_decoded_body(forged).is_empty(),
+        core.on_decoded_body(sign_proposal(&lead_of(&committee), spliced))
+            .is_empty(),
         "a relay never registered must be rejected even from a correctly-signed lead"
+    );
+
+    // Two subnets with one id: `apply_config` would start both workers and
+    // detach one of them.
+    let mut duplicated = proposal.body.clone();
+    let repeat = duplicated.subnets[0].clone();
+    duplicated.subnets.push(repeat);
+    assert!(
+        core.on_decoded_body(sign_proposal(&lead_of(&committee), duplicated))
+            .is_empty(),
+        "a repeated subnet id must be rejected"
     );
 }
 
@@ -1146,6 +1218,15 @@ fn stale_proposal_replay_is_rejected() {
         core.on_decoded_body(sign_proposal(&lead_of(&committee), stale))
             .is_empty(),
         "a strictly older round must be rejected"
+    );
+
+    // A round no later config can beat would pin the committee here forever.
+    let mut future = template.clone();
+    future.round = u64::MAX;
+    assert!(
+        core.on_decoded_body(sign_proposal(&lead_of(&committee), future))
+            .is_empty(),
+        "a round far above the established one must be rejected"
     );
 }
 
@@ -1747,6 +1828,8 @@ fn sustained_traffic_upgrades_to_scheduled_panetiere() {
             aggregation: true,
             encoding: anymone_core::config::Encoding::default(),
             set_formation: anymone_core::config::SetFormation::Leader,
+            attested_subnets: Vec::new(),
+            attestation: Default::default(),
         },
     );
     register_relays_and_service(&mut pinned, &relays, &service);

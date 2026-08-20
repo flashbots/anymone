@@ -15,6 +15,8 @@ use crate::identity::Pubkey;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapConfig {
+    /// Unused when the identity comes from a keystore instead of a file.
+    #[serde(default)]
     pub identity_path: PathBuf,
     pub network: NetworkConfig,
     pub governance: GovernanceConfig,
@@ -22,6 +24,66 @@ pub struct BootstrapConfig {
     /// absent `[committee]` section uses [`CommitteeParams`] defaults.
     #[serde(default)]
     pub committee: CommitteeParams,
+    /// This node's own attestation wiring. What it *demands* of clients comes
+    /// from the signed config, not from here.
+    #[serde(default)]
+    pub tee: TeeConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TeeConfig {
+    /// Platform this node proves itself with. Only "tdx" today; unset means it
+    /// cannot join attested subnets.
+    pub prover: Option<String>,
+    /// Collateral source for verifying others' TDX quotes. Defaults to Intel's
+    /// PCS; a relay wanting no Intel dependency points this at its own cache.
+    pub pccs_url: Option<String>,
+}
+
+impl TeeConfig {
+    /// Builds the wiring, prewarming collateral so verification never blocks a
+    /// client's enrolment on a fetch.
+    pub async fn setup(&self) -> crate::runtime::TeeSetup {
+        let prover: Option<std::sync::Arc<dyn crate::tee::TeeProver>> =
+            match self.prover.as_deref() {
+                None => None,
+                #[cfg(feature = "tdx-attest")]
+                Some("tdx") => Some(std::sync::Arc::new(crate::tee::TdxProver)),
+                Some(other) => {
+                    tracing::warn!(
+                        target: crate::tee::TEE,
+                        prover = other,
+                        "unsupported TEE prover in this build, this node will not attest"
+                    );
+                    None
+                }
+            };
+        #[cfg(feature = "tdx-attest")]
+        let pccs = {
+            let pccs = attest_pccs::Pccs::new(self.pccs_url.clone());
+            match pccs.ready().await {
+                Ok(summary) => tracing::info!(
+                    target: crate::tee::TEE,
+                    fmspcs = summary.discovered_fmspcs,
+                    ok = summary.successes,
+                    failed = summary.failures,
+                    "TDX collateral prewarmed"
+                ),
+                Err(e) => tracing::warn!(
+                    target: crate::tee::TEE,
+                    error = %e,
+                    "TDX collateral prewarm failed; enrolments needing a cold fetch will be refused"
+                ),
+            }
+            Some(pccs)
+        };
+        crate::runtime::TeeSetup {
+            prover,
+            #[cfg(feature = "tdx-attest")]
+            pccs,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,7 +191,10 @@ impl BootstrapConfig {
         if servers.is_empty() {
             return Err(BootstrapError::NoStreamServers);
         }
-        Ok(crate::cw::StreamClientConfig { servers })
+        Ok(crate::cw::StreamClientConfig {
+            servers,
+            ..Default::default()
+        })
     }
 
     fn validate(&self) -> Result<(), BootstrapError> {

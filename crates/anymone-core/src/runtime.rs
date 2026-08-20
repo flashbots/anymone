@@ -129,6 +129,27 @@ pub(crate) struct AnymoneInner {
     misbehavior: AtomicU8,
     /// Which client keys this node's relay sessions accept contributions from.
     pub(crate) good_clients: GoodClients,
+    pub(crate) tee: TeeState,
+}
+
+/// A node's live attestation state: what it proves about itself and which
+/// clients it has admitted.
+#[derive(Default)]
+pub(crate) struct TeeState {
+    pub(crate) clients: Arc<crate::tee::AttestedClients>,
+    pub(crate) prover: Option<Arc<dyn crate::tee::TeeProver>>,
+    /// Prewarmed by the caller; TDX verification reads collateral from it.
+    #[cfg(feature = "tdx-attest")]
+    pub(crate) pccs: Option<attest_pccs::Pccs>,
+    own: Mutex<OwnAttestation>,
+}
+
+/// This node's own proof and whether the relays it submits through have it.
+#[derive(Default)]
+struct OwnAttestation {
+    held: Option<crate::tee::Attestation>,
+    /// Handed to the transport, which presents it on every relay connection.
+    delivered: bool,
 }
 
 impl AnymoneInner {
@@ -143,6 +164,57 @@ impl AnymoneInner {
             .entry(subnet)
             .or_default()
             .clone()
+    }
+
+    /// Whether this node's proof is with the relays it submits through. An
+    /// attested subnet's relays drop a contribution from a key they haven't
+    /// admitted, so drawing one before this holds loses the round's payload.
+    pub(crate) fn attestation_ready(&self) -> bool {
+        let round = self.tee.clients.round();
+        let validity = self.tee.clients.validity_rounds();
+        let own = self.tee.own.lock().unwrap();
+        own.delivered
+            && own
+                .held
+                .as_ref()
+                .is_some_and(|a| a.round <= round && a.round.saturating_add(validity) > round)
+    }
+
+    /// A new policy re-judges every enrolment, this node's own included, so the
+    /// next refresh has to attest from scratch.
+    fn discard_own_attestation(&self) {
+        *self.tee.own.lock().unwrap() = OwnAttestation::default();
+    }
+
+    /// Register an inbox under `tag`. A tag this node already routes to a live
+    /// pipe is refused: one sender per tag, so a second registration would take
+    /// the first pipe's traffic while it stayed open and silent.
+    fn register_pipe(
+        &self,
+        tag: RouteTag,
+    ) -> Result<
+        (
+            mpsc::UnboundedSender<PipeIncoming>,
+            mpsc::UnboundedReceiver<PipeIncoming>,
+        ),
+        OpenError,
+    > {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut pipes = self.pipes.lock().unwrap();
+        if pipes.get(&tag).is_some_and(|held| !held.is_closed()) {
+            return Err(OpenError::TagAlreadyOpen);
+        }
+        pipes.insert(tag, tx.clone());
+        Ok((tx, rx))
+    }
+
+    pub(crate) fn subnet_clients(&self, subnet: &Subnet) -> GoodClients {
+        if !subnet.attested {
+            return self.good_clients.clone();
+        }
+        let base = self.good_clients.clone();
+        let gate = self.tee.clients.clone();
+        GoodClients::new(move |pk| base.allows(pk) && gate.contains(pk))
     }
 
     pub(crate) fn misbehavior(&self) -> Option<Misbehavior> {
@@ -189,6 +261,7 @@ impl Anymone {
             bootstrap,
             config_sub,
             good_clients: GoodClients::all(),
+            tee: TeeSetup::default(),
         }
     }
 
@@ -210,7 +283,24 @@ impl Anymone {
         transport: Arc<dyn Transport>,
         config: AnymoneRoundConfiguration,
     ) -> Self {
-        Self::build_from_config(identity, transport, config, None, GoodClients::all()).await
+        Self::build_from_config(
+            identity,
+            transport,
+            config,
+            None,
+            GoodClients::all(),
+            TeeSetup::default(),
+        )
+        .await
+    }
+
+    pub async fn start_with_config_tee(
+        identity: Identity,
+        transport: Arc<dyn Transport>,
+        config: AnymoneRoundConfiguration,
+        tee: TeeSetup,
+    ) -> Self {
+        Self::build_from_config(identity, transport, config, None, GoodClients::all(), tee).await
     }
 
     /// Build the node from `config`. When `governance` is set (the
@@ -222,6 +312,7 @@ impl Anymone {
         config: AnymoneRoundConfiguration,
         governance: Option<(Subscription, GovernanceBootstrap)>,
         good_clients: GoodClients,
+        tee: TeeSetup,
     ) -> Self {
         let committee = governance.as_ref().map(|(_, gb)| gb.committee.clone());
         let mut participation_seed = [0u8; 32];
@@ -240,6 +331,13 @@ impl Anymone {
             events: broadcast::channel(EVENTS_CAPACITY).0,
             misbehavior: AtomicU8::new(0),
             good_clients,
+            tee: TeeState {
+                clients: transport.attested_clients().unwrap_or_default(),
+                prover: tee.prover,
+                #[cfg(feature = "tdx-attest")]
+                pccs: tee.pccs,
+                ..Default::default()
+            },
         });
         let tasks = Arc::new(SubnetTasks {
             workers: Mutex::new(HashMap::new()),
@@ -249,6 +347,11 @@ impl Anymone {
         apply_config(&inner, &tasks, config).await;
         // Answer config-pull requests from joining peers with what we adopted.
         transport.serve_config(served);
+
+        if inner.tee.prover.is_some() {
+            let handle = tokio::spawn(attest_loop(Arc::downgrade(&inner)));
+            tasks.aux.lock().unwrap().push(handle);
+        }
 
         if let Some((sub, bootstrap)) = governance {
             let inner_w = Arc::downgrade(&inner);
@@ -284,12 +387,7 @@ impl Anymone {
         rand::thread_rng().fill_bytes(&mut return_bytes);
         let return_tag = RouteTag(return_bytes);
 
-        let (in_tx, in_rx) = mpsc::unbounded_channel();
-        self.inner
-            .pipes
-            .lock()
-            .unwrap()
-            .insert(return_tag, in_tx.clone());
+        let (in_tx, in_rx) = self.inner.register_pipe(return_tag)?;
         self.inner.joined.lock().unwrap().insert(return_tag, tag);
 
         Ok(Pipe::new(
@@ -320,12 +418,7 @@ impl Anymone {
             Some(_) => {}
         }
 
-        let (in_tx, in_rx) = mpsc::unbounded_channel();
-        self.inner
-            .pipes
-            .lock()
-            .unwrap()
-            .insert(tag.into(), in_tx.clone());
+        let (in_tx, in_rx) = self.inner.register_pipe(tag.into())?;
 
         Ok(Pipe::new(
             Arc::downgrade(&self.inner),
@@ -354,12 +447,7 @@ impl Anymone {
             return Err(OpenError::TagNotInConfig);
         }
 
-        let (in_tx, in_rx) = mpsc::unbounded_channel();
-        self.inner
-            .pipes
-            .lock()
-            .unwrap()
-            .insert(tag.into(), in_tx.clone());
+        let (in_tx, in_rx) = self.inner.register_pipe(tag.into())?;
         self.inner.joined.lock().unwrap().insert(tag.into(), tag);
 
         Ok(Pipe::new(
@@ -391,12 +479,7 @@ impl Anymone {
             return Err(OpenError::TagNotInConfig);
         }
 
-        let (in_tx, in_rx) = mpsc::unbounded_channel();
-        self.inner
-            .pipes
-            .lock()
-            .unwrap()
-            .insert(tag.into(), in_tx.clone());
+        let (in_tx, in_rx) = self.inner.register_pipe(tag.into())?;
 
         // No peer tag, so a send fails instead of silently making this node a
         // client the moment it transmits.
@@ -426,12 +509,34 @@ impl Anymone {
             .unwrap_or(std::time::Duration::from_secs(1))
     }
 
+    pub fn pubkey(&self) -> Pubkey {
+        self.inner.identity.pubkey()
+    }
+
+    pub fn max_payload(&self) -> usize {
+        let cfg = self.inner.config.read().unwrap();
+        cfg.body
+            .subnets
+            .iter()
+            .filter(|s| subnet_runnable(s))
+            .map(|s| s.protocol.message_size())
+            .min()
+            .map(crate::pipe::max_message_payload)
+            .unwrap_or(0)
+    }
+
     /// Framed payloads accepted from this node's pipes but not yet on the wire.
     /// At most one leaves per round (the round's participation draw stages it),
     /// so a non-zero depth is how many rounds the next send waits — what
     /// [`crate::client_pool::ClientPool`] balances over.
     pub fn queued_outbound(&self) -> usize {
         self.inner.outbox.lock().unwrap().len()
+    }
+
+    /// This node's enrolment table, for backends whose clients don't attest
+    /// over a stream handshake.
+    pub fn attested_clients(&self) -> Arc<crate::tee::AttestedClients> {
+        self.inner.tee.clients.clone()
     }
 
     /// Make this node's relay sessions misbehave (`None` = honest). For demos
@@ -452,6 +557,8 @@ pub enum OpenError {
     TagNotInConfig,
     #[error("local identity is not registered for this service tag")]
     NotOurService,
+    #[error("a live pipe on this node already receives on this tag")]
+    TagAlreadyOpen,
 }
 
 /// Prepared (not yet running) instance with its governance subscription set up.
@@ -464,6 +571,7 @@ pub struct AnymonePrep {
     bootstrap: GovernanceBootstrap,
     config_sub: Subscription,
     good_clients: GoodClients,
+    tee: TeeSetup,
 }
 
 impl AnymonePrep {
@@ -471,6 +579,36 @@ impl AnymonePrep {
     /// every client is accepted otherwise.
     pub fn set_good_clients(&mut self, good_clients: GoodClients) {
         self.good_clients = good_clients;
+    }
+
+    pub fn set_tee(&mut self, tee: TeeSetup) {
+        self.tee = tee;
+    }
+}
+
+/// A node's attestation wiring. The policy arrives in the signed config, so a
+/// relay supplies only the collateral cache.
+#[derive(Default)]
+pub struct TeeSetup {
+    pub prover: Option<Arc<dyn crate::tee::TeeProver>>,
+    #[cfg(feature = "tdx-attest")]
+    pub pccs: Option<attest_pccs::Pccs>,
+}
+
+impl TeeSetup {
+    pub fn with_prover(prover: Arc<dyn crate::tee::TeeProver>) -> Self {
+        TeeSetup {
+            prover: Some(prover),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "tdx-attest")]
+    pub fn with_pccs(pccs: attest_pccs::Pccs) -> Self {
+        TeeSetup {
+            pccs: Some(pccs),
+            ..Default::default()
+        }
     }
 }
 
@@ -525,6 +663,7 @@ impl AnymonePrep {
             cfg,
             Some((self.config_sub, self.bootstrap)),
             self.good_clients,
+            self.tee,
         )
         .await)
     }
@@ -543,7 +682,7 @@ pub(crate) enum SessionKey {
 fn subnet_sig(subnet: &Subnet) -> Vec<u8> {
     let mut roster = subnet.relays.clone();
     roster.sort();
-    bincode::serialize(&(subnet.id, &roster, &subnet.protocol)).unwrap_or_default()
+    bincode::serialize(&(subnet.id, &roster, &subnet.protocol, subnet.attested)).unwrap_or_default()
 }
 
 /// Reconcile running workers to `config`: spawn new/changed, drop removed, leave
@@ -573,6 +712,28 @@ async fn apply_config(
         inner.committee.as_deref().unwrap_or_default(),
     ));
 
+    // Before the workers: a screen built on the outgoing policy would admit the
+    // wrong clients for as long as it stood.
+    #[cfg(feature = "tdx-attest")]
+    let pccs = inner.tee.pccs.clone();
+    let policy_changed = inner
+        .tee
+        .clients
+        .adopt_policy(&config.body.attestation, |p| {
+            #[allow(unused_mut)]
+            let mut verifier = crate::tee::MultiVerifier::from_policy(p);
+            #[cfg(feature = "tdx-attest")]
+            {
+                verifier = verifier.with_tdx(p, pccs);
+            }
+            Arc::new(verifier)
+        });
+    inner.tee.clients.set_round(config.body.round);
+    if policy_changed {
+        inner.discard_own_attestation();
+    }
+    refresh_own_attestation(inner).await;
+
     let current: HashMap<SubnetId, Vec<u8>> = {
         let g = tasks.workers.lock().unwrap();
         g.iter().map(|(id, w)| (*id, w.sig.clone())).collect()
@@ -592,6 +753,10 @@ async fn apply_config(
     )> = Vec::new();
     for subnet in config.body.subnets.iter().cloned() {
         let id = subnet.id;
+        if built.iter().any(|(seen, ..)| *seen == id) {
+            warn!(target: SCHED, id, "skipping a repeated subnet id in config");
+            continue;
+        }
         let sig = subnet_sig(&subnet);
         if current.get(&id) == Some(&sig) {
             continue; // unchanged — leave the running worker in place
@@ -702,6 +867,68 @@ async fn apply_config(
     let _ = inner.events.send(Event::ConfigUpdated {
         round: config.body.round,
     });
+}
+
+/// Retry cadence: an asynchronous prover completes with nothing to notify.
+const ATTEST_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
+async fn refresh_own_attestation(inner: &Arc<AnymoneInner>) {
+    let Some(prover) = inner.tee.prover.clone() else {
+        return;
+    };
+    let round = inner.tee.clients.round();
+    let validity = inner.tee.clients.validity_rounds();
+    {
+        let own = inner.tee.own.lock().unwrap();
+        let fresh = own
+            .held
+            .as_ref()
+            .is_some_and(|a| a.round <= round && a.round.saturating_add(validity / 2) > round);
+        if fresh && own.delivered {
+            return;
+        }
+    }
+    let statement = inner.identity.pubkey();
+    let attested = tokio::task::spawn_blocking(move || prover.attest(&statement.0, round)).await;
+    let att = match attested {
+        Ok(Ok(att)) => att,
+        Ok(Err(e)) => {
+            debug!(
+                target: crate::tee::TEE,
+                error = %e,
+                round,
+                "no attestation for this node yet; it stays off attested subnets"
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(target: crate::tee::TEE, error = %e, round, "attestation task failed");
+            return;
+        }
+    };
+    {
+        let mut own = inner.tee.own.lock().unwrap();
+        if own.held.as_ref().is_some_and(|held| held.round > att.round) {
+            return;
+        }
+        own.held = Some(att.clone());
+        own.delivered = false;
+    }
+    inner.transport.attest(att.clone());
+    let mut own = inner.tee.own.lock().unwrap();
+    if own.held.as_ref().is_some_and(|held| held.round == att.round) {
+        own.delivered = true;
+        debug!(target: crate::tee::TEE, round = att.round, "this node's attestation is with the relays");
+    }
+}
+
+async fn attest_loop(inner: Weak<AnymoneInner>) {
+    loop {
+        let Some(inner) = inner.upgrade() else { return };
+        refresh_own_attestation(&inner).await;
+        drop(inner);
+        tokio::time::sleep(ATTEST_RETRY).await;
+    }
 }
 
 /// How often a node re-pulls the config from peers to catch a version it
@@ -1181,13 +1408,19 @@ pub(crate) fn route_to_pipe(inner: &AnymoneInner, round: Round, bytes: &[u8]) {
 /// this node's workers — exactly one claims each round — and independent of
 /// subnet configuration, so all randomly-participating clients form a single
 /// anonymity set (whitepaper: anonymity superset).
+///
+/// Attested subnets break that: a node whose proof is not yet with the relays
+/// draws only from the subnets that would take it, splitting the superset into
+/// attested and open populations. Drawing one anyway would lose the round's
+/// payload silently.
 pub(crate) fn participation_subnet(inner: &AnymoneInner, round: Round) -> Option<SubnetId> {
+    let can_attest = inner.attestation_ready();
     let cfg = inner.config.read().unwrap();
     let mut candidates: Vec<SubnetId> = cfg
         .body
         .subnets
         .iter()
-        .filter(|s| subnet_runnable(s))
+        .filter(|s| subnet_runnable(s) && (can_attest || !s.attested))
         .map(|s| s.id)
         .collect();
     drop(cfg);
@@ -1335,6 +1568,7 @@ mod outbox_tests {
             events: broadcast::channel(1).0,
             misbehavior: AtomicU8::new(0),
             good_clients: GoodClients::all(),
+            tee: TeeState::default(),
         })
     }
 
@@ -1422,6 +1656,7 @@ mod participation_tests {
             events: broadcast::channel(1).0,
             misbehavior: AtomicU8::new(0),
             good_clients: GoodClients::all(),
+            tee: TeeState::default(),
         };
         let mut counts = [0usize; 4];
         for round in 0..4000u64 {

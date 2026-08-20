@@ -259,8 +259,9 @@ async fn run(args: RunArgs) -> Result<()> {
     tracing::info!(role = ?args.role, pubkey = %identity.pubkey(), "starting node");
 
     let gov = GovernanceBootstrap::from_bootstrap_config(&bootstrap);
-    // Demo: every client is accepted. A deployment narrows this to attested
-    // clients, and the stream handshake is where that is enforced.
+    let tee = bootstrap.tee.setup().await;
+    // Every client is accepted onto the connection; attested subnets narrow it
+    // further, per the signed config's policy.
     // Committee and relays are authorized p2p peers; services and clients live
     // on the client plane.
     let transport = match args.role {
@@ -311,13 +312,13 @@ async fn run(args: RunArgs) -> Result<()> {
                 bootstrap.network.stream_listen.clone(),
             )
             .await;
-            let anymone = Arc::new(
-                Anymone::prepare(identity, transport, gov)
+            let anymone = Arc::new({
+                let mut prep = Anymone::prepare(identity, transport, gov).await;
+                prep.set_tee(tee);
+                prep.start()
                     .await
-                    .start()
-                    .await
-                    .map_err(|e| anyhow!("anymone start: {e}"))?,
-            );
+                    .map_err(|e| anyhow!("anymone start: {e}"))?
+            });
             if let Some(slot) = &misbehavior_slot {
                 *slot.write().unwrap() = Some(anymone.clone());
             }
@@ -332,11 +333,13 @@ async fn run(args: RunArgs) -> Result<()> {
             let xk = identity.exchange_keys();
             let _reannounce =
                 announce_service_registration(transport.clone(), &identity, tag, xk).await;
-            let anymone = Anymone::prepare(identity, transport, gov)
-                .await
-                .start()
-                .await
-                .map_err(|e| anyhow!("anymone start: {e}"))?;
+            let anymone = {
+                let mut prep = Anymone::prepare(identity, transport, gov).await;
+                prep.set_tee(tee);
+                prep.start()
+                    .await
+                    .map_err(|e| anyhow!("anymone start: {e}"))?
+            };
             let mut pipe = anymone
                 .bind(tag)
                 .await

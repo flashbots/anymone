@@ -12,13 +12,43 @@ use anymone_core::config::{
     now_unix_ms, AdcnetConfig, Aggregation, AggregatorGroup, AnymoneRoundConfigurationBody,
     ExchangePublicKeyWire, Subnet,
 };
+use anymone_core::runtime::TeeSetup;
 use anymone_core::session::Session;
 use anymone_core::transport::Transport;
 use anymone_core::{
-    AdcnetObserverSession, Anymone, AnymoneRoundConfiguration, GovernanceBootstrap, Identity,
-    InMemoryNetwork, ProtocolConfig, ServiceEntry, ServiceTag, Topic, TOPIC_CONFIG,
+    AdcnetObserverSession, Anymone, AnymoneRoundConfiguration, Attestation, AttestationScheme,
+    GovernanceBootstrap, Identity, InMemoryNetwork, ProtocolConfig, ServiceEntry, ServiceTag,
+    TeeError, TeeProver, TeeVerifier, Topic, TOPIC_CONFIG,
 };
 use serial_test::serial;
+
+/// Attestation is exercised for real in the `tee` module's own tests; here it
+/// only has to be present or absent.
+struct AcceptAll;
+impl TeeVerifier for AcceptAll {
+    fn verify(&self, _statement: &[u8], _att: &Attestation) -> bool {
+        true
+    }
+}
+
+struct AlwaysAttests;
+impl TeeProver for AlwaysAttests {
+    fn attest(&self, _statement: &[u8], round: u64) -> Result<Attestation, TeeError> {
+        Ok(Attestation {
+            scheme: AttestationScheme::Tdx,
+            round,
+            evidence: vec![0xa1],
+        })
+    }
+}
+
+fn attestation() -> Attestation {
+    Attestation {
+        scheme: AttestationScheme::Tdx,
+        round: 0,
+        evidence: vec![0xa1],
+    }
+}
 
 fn echo_tag() -> ServiceTag {
     ServiceTag::from_label("anymone.echo")
@@ -81,24 +111,62 @@ async fn adcnet_echo_roundtrip_in_memory() {
     let client = Identity::generate();
     let idle = Identity::generate();
 
-    let cfg = build_config(&committee, &relays, &service, &client);
+    let stranger = Identity::generate();
+
+    // The subnet admits only attested clients; the sender, the echo service
+    // (which replies as a client) and the idle coverer all attest, `stranger`
+    // does not.
+    let cfg = {
+        let mut body = build_config(&committee, &relays, &service, &client).body;
+        body.subnets[0].attested = true;
+        AnymoneRoundConfiguration::new(body).sign_with(&[&committee])
+    };
     let roster: Vec<_> = cfg.body.subnets[0].relays.clone();
+
+    let attested = |a: &Anymone| {
+        let gate = a.attested_clients();
+        gate.set_verifier(Some(Arc::new(AcceptAll)), 1000);
+        for id in [&client, &service, &idle] {
+            assert!(gate.enroll(&id.pubkey(), &attestation()));
+        }
+    };
+    let with_prover = || TeeSetup::with_prover(Arc::new(AlwaysAttests));
 
     let mut anymones: Vec<Anymone> = Vec::new();
     for id in relays.into_iter() {
         let handle = net.handle(id.pubkey());
-        anymones.push(Anymone::start_with_config(id, Arc::new(handle), cfg.clone()).await);
+        let a = Anymone::start_with_config(id, Arc::new(handle), cfg.clone()).await;
+        attested(&a);
+        anymones.push(a);
     }
     let service_handle = net.handle(service.pubkey());
-    let service_anymone =
-        Anymone::start_with_config(service, Arc::new(service_handle), cfg.clone()).await;
+    let service_anymone = Anymone::start_with_config_tee(
+        service.clone(),
+        Arc::new(service_handle),
+        cfg.clone(),
+        with_prover(),
+    )
+    .await;
     let client_handle = net.handle(client.pubkey());
-    let client_anymone =
-        Anymone::start_with_config(client, Arc::new(client_handle), cfg.clone()).await;
-    let idle_anymone = Anymone::start_with_config(
+    let client_anymone = Anymone::start_with_config_tee(
+        client.clone(),
+        Arc::new(client_handle),
+        cfg.clone(),
+        with_prover(),
+    )
+    .await;
+    let idle_anymone = Anymone::start_with_config_tee(
         idle.clone(),
         Arc::new(net.handle(idle.pubkey())),
         cfg.clone(),
+        with_prover(),
+    )
+    .await;
+    let stranger_anymone = Anymone::start_with_config_tee(
+        stranger.clone(),
+        Arc::new(net.handle(stranger.pubkey())),
+        cfg.clone(),
+        with_prover(),
     )
     .await;
 
@@ -131,6 +199,10 @@ async fn adcnet_echo_roundtrip_in_memory() {
     // anonymity set every round via zero messages.
     let _idle_pipe = idle_anymone.open(echo_tag()).await.unwrap();
 
+    // Never enrolled with any relay, so its submission is dropped at ingress.
+    let mut stranger_pipe = stranger_anymone.open(echo_tag()).await.unwrap();
+    stranger_pipe.send(b"hello stranger".to_vec()).await.unwrap();
+
     let mut pipe = client_anymone.open(echo_tag()).await.unwrap();
     pipe.send(b"hello adcnet".to_vec()).await.unwrap();
     let reply = tokio::time::timeout(Duration::from_secs(15), pipe.recv())
@@ -139,6 +211,13 @@ async fn adcnet_echo_roundtrip_in_memory() {
         .expect("pipe closed");
     let reply_str = &reply.payload[..reply.payload.len().min(12)];
     assert_eq!(reply_str, b"hello adcnet");
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), stranger_pipe.recv())
+            .await
+            .is_err(),
+        "an unattested client never gets its message onto the subnet"
+    );
 
     // Both the sender and the idle pipe must be in the anonymity set (≥2),
     // proving the idle pipe contributes cover with no `send`.
@@ -305,6 +384,10 @@ async fn broadcast_room_participant_sees_own_message_via_channel() {
 
     let mut recv = owner_anymone.subscribe(echo_tag()).await.unwrap();
     let send = owner_anymone.open(echo_tag()).await.unwrap();
+    assert!(
+        owner_anymone.subscribe(echo_tag()).await.is_err(),
+        "a second pipe on the same tag would silently take this one's traffic"
+    );
 
     let got = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
@@ -382,6 +465,7 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
         subnets: vec![Subnet::new(0, relay_pks.clone(), proto())],
         relay_client_addrs: vec![],
         watchers: vec![],
+        attestation: Default::default(),
     })
     .sign_with(&[&committee]);
     // Every subnet carries every service, so growing to two subnets lets
@@ -406,6 +490,7 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
         ],
         relay_client_addrs: vec![],
         watchers: vec![],
+        attestation: Default::default(),
     })
     .sign_with(&[&committee]);
 
@@ -591,6 +676,7 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
             ],
             relay_client_addrs: vec![],
             watchers: vec![],
+            attestation: Default::default(),
         })
         .sign_with(&[&committee]);
         net.handle(committee.pubkey())

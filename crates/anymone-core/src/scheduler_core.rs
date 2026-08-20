@@ -77,6 +77,8 @@ pub const ESCALATION_GRACE: u32 = 5;
 /// Predicted client set above which ADCNet routes clients' blinded contributions
 /// through an aggregator layer (lessening the leader/broadcast fan-in).
 const AGGREGATION_THRESHOLD: u32 = 16;
+/// Rounds above the established one a proposal may claim.
+const MAX_ROUND_ADVANCE: Round = 8;
 /// Max distance between a `FaultReport.round` and its subnet's `share_frontier`.
 const FAULT_REPORT_ROUND_WINDOW: Round = 32;
 /// How far a subnet's last canonical set may lag the freshest one and still
@@ -191,14 +193,44 @@ fn aggregation_structural_ok(agg: &Option<Aggregation>) -> bool {
             .all(|g| g.aggregators.len() == a.replication as usize)
 }
 
+fn unique<T: Ord>(items: impl Iterator<Item = T>) -> bool {
+    let mut seen: Vec<T> = items.collect();
+    let len = seen.len();
+    seen.sort_unstable();
+    seen.dedup();
+    seen.len() == len
+}
+
 /// Checks independent of local state — safe to run before `registered`/`services`
 /// are populated, e.g. on a just-verified published config ahead of `learn_config`.
 fn validate_structure(body: &AnymoneRoundConfigurationBody) -> bool {
     if body.subnets.is_empty() || body.subnets.len() > MAX_SUBNETS {
         return false;
     }
+    // Duplicates would have `apply_config` start two workers and detach one.
+    if !unique(body.subnets.iter().map(|s| s.id)) {
+        return false;
+    }
+    if !unique(body.services.iter().map(|s| s.tag.0)) {
+        return false;
+    }
+    if !unique(body.relay_exchange_keys.iter().map(|(pk, _)| *pk)) {
+        return false;
+    }
     for s in &body.subnets {
-        if s.relays.is_empty() {
+        if s.relays.is_empty() || s.relays.len() > MAX_COMMITTEE_RELAYS {
+            return false;
+        }
+        if !unique(s.relays.iter().copied()) {
+            return false;
+        }
+        if !(0.0..=1.0).contains(&s.cover_rate) {
+            return false;
+        }
+        if s.protocol.round_duration() == Duration::ZERO
+            || s.protocol.message_size() == 0
+            || s.protocol.client_set_min() > s.protocol.client_set_max()
+        {
             return false;
         }
         if subnet_max_wire(&s.protocol, s.relays.len()) > MAX_SUBNET_WIRE {
@@ -211,7 +243,10 @@ fn validate_structure(body: &AnymoneRoundConfigurationBody) -> bool {
                 }
             }
             ProtocolConfig::Adcnet(c) => {
-                if c.client_set_max < MIN_CAPACITY || !aggregation_structural_ok(&c.aggregation) {
+                if c.client_set_max < MIN_CAPACITY
+                    || c.estimated_messages == 0
+                    || !aggregation_structural_ok(&c.aggregation)
+                {
                     return false;
                 }
             }
@@ -219,6 +254,7 @@ fn validate_structure(body: &AnymoneRoundConfigurationBody) -> bool {
                 let n = s.relays.len() as u32;
                 let threshold_ok = c.threshold >= n / 2 + 1 && c.threshold <= n.max(1);
                 if c.client_set_max < MIN_CAPACITY
+                    || c.estimated_messages == 0
                     || !threshold_ok
                     || !consensus_cadence_fits(c.round_duration_ms, c.set_formation, s.relays.len())
                 {
@@ -229,8 +265,8 @@ fn validate_structure(body: &AnymoneRoundConfigurationBody) -> bool {
                 let n = s.relays.len() as u32;
                 let threshold_ok = c.threshold >= n / 2 + 1 && c.threshold <= n.max(1);
                 if c.client_set_max < MIN_CAPACITY
+                    || c.estimated_messages == 0
                     || !threshold_ok
-                    || c.message_size == 0
                     || c.message_size > u16::MAX as usize
                     || c.vector_bytes == 0
                     || !consensus_cadence_fits(c.round_duration_ms, c.set_formation, s.relays.len())
@@ -299,6 +335,8 @@ mod sizing_tests {
                     aggregation: true,
                     encoding: crate::config::Encoding::default(),
                     set_formation: crate::config::SetFormation::Leader,
+                    attested_subnets: Vec::new(),
+                    attestation: crate::config::AttestationPolicy::default(),
                 },
             );
             for _ in 0..n_relays {
@@ -365,6 +403,8 @@ mod sizing_tests {
                 aggregation: true,
                 encoding: crate::config::Encoding::default(),
                 set_formation: crate::config::SetFormation::Leader,
+                attested_subnets: Vec::new(),
+                attestation: crate::config::AttestationPolicy::default(),
             },
         );
         let body = AnymoneRoundConfigurationBody {
@@ -382,9 +422,11 @@ mod sizing_tests {
                     client_set_max: MIN_CAPACITY,
                 }),
                 cover_rate: 1.0,
+                attested: false,
             }],
             relay_client_addrs: vec![],
             watchers: vec![],
+            attestation: crate::config::AttestationPolicy::default(),
         };
         assert!(
             !core.validate_body(&body),
@@ -476,6 +518,11 @@ pub struct SchedulerParams {
     pub encoding: crate::config::Encoding,
     /// How proposed Panetiere subnets fix their canonical client set.
     pub set_formation: crate::config::SetFormation,
+    /// Subnet ids that accept only attested clients. Ids the network has not
+    /// grown to yet are simply inert.
+    pub attested_subnets: Vec<SubnetId>,
+    /// What those subnets' relays accept as proof.
+    pub attestation: crate::config::AttestationPolicy,
 }
 
 /// One public subnet's escalation state: `general` (unattributable fault, heals
@@ -1116,8 +1163,7 @@ impl SchedulerCore {
             let content = content_key(
                 &protos,
                 &vector_bytes,
-                self.params.pin,
-                self.params.set_formation,
+                &self.params,
                 &self.registered,
                 &self.services,
                 self.capacity,
@@ -1234,7 +1280,24 @@ impl SchedulerCore {
             );
             return Vec::new();
         }
-        // 3. Independent validation: a malicious lead can't insert relays or
+        // 3. Reachability: a lead bumps the version by one per content change, so
+        //    a far-future round is one pinning the committee where no later config
+        //    can ever be newer.
+        let established = self
+            .last_accepted_round
+            .unwrap_or(0)
+            .max(self.public_round)
+            .max(self.published_round.unwrap_or(0));
+        if proposal.body.round > established.saturating_add(MAX_ROUND_ADVANCE) {
+            tracing::warn!(
+                target: GOV,
+                round = proposal.body.round,
+                established,
+                "scheduler: rejecting proposal too far above the established round"
+            );
+            return Vec::new();
+        }
+        // 4. Independent validation: a malicious lead can't insert relays or
         //    services we never saw registered. `validate_body` logs the reason.
         if !self.validate_body(&proposal.body) {
             tracing::debug!(
@@ -1439,6 +1502,20 @@ impl SchedulerCore {
             );
             return false;
         }
+        // The epoch is the round clock's genesis; moving it re-times every subnet.
+        if self
+            .epoch_unix_ms
+            .is_some_and(|known| known != body.epoch_unix_ms)
+        {
+            tracing::debug!(
+                target: GOV,
+                round = body.round,
+                proposed = body.epoch_unix_ms,
+                known = ?self.epoch_unix_ms,
+                "validate_body: proposed epoch is not the one we established"
+            );
+            return false;
+        }
         if !body
             .services
             .iter()
@@ -1463,7 +1540,27 @@ impl SchedulerCore {
             );
             return false;
         }
+        // Relays screen clients against this, so a member that signed a policy
+        // it doesn't hold would admit a different client set than it enforces.
+        if body.attestation != self.params.attestation {
+            tracing::debug!(
+                target: GOV,
+                round = body.round,
+                "validate_body: proposed attestation policy is not ours"
+            );
+            return false;
+        }
         for s in &body.subnets {
+            if s.attested != self.params.attested_subnets.contains(&s.id) {
+                tracing::debug!(
+                    target: GOV,
+                    round = body.round,
+                    subnet = s.id,
+                    proposed = s.attested,
+                    "validate_body: subnet's attestation requirement is not ours"
+                );
+                return false;
+            }
             if !s.relays.iter().all(|pk| self.registered.contains(pk)) {
                 tracing::debug!(
                     target: GOV,
@@ -1701,6 +1798,7 @@ impl SchedulerCore {
                     relays: relay_vec.clone(),
                     protocol,
                     cover_rate: self.cover_rate,
+                    attested: self.params.attested_subnets.contains(&(i as SubnetId)),
                 }
             })
             .collect();
@@ -1725,6 +1823,7 @@ impl SchedulerCore {
             subnets,
             relay_client_addrs,
             watchers,
+            attestation: self.params.attestation.clone(),
         }
     }
 }
@@ -1733,17 +1832,22 @@ impl SchedulerCore {
 /// sorted service tags. The lead stages a new config only when this changes.
 /// Clients aren't part of the fingerprint — they're permissionless and never
 /// appear in the config (they key-exchange directly with relays on the subnet).
-#[allow(clippy::too_many_arguments)]
 fn content_key(
     protos: &[SchedulerProtocol],
     vector_bytes: &[usize],
-    pin: Option<SchedulerProtocol>,
-    set_formation: crate::config::SetFormation,
+    params: &SchedulerParams,
     relays: &HashSet<Pubkey>,
     services: &HashMap<ServiceTag, Pubkey>,
     capacity: u32,
     cover_rate: f32,
 ) -> Vec<u8> {
+    let SchedulerParams {
+        pin,
+        set_formation,
+        attested_subnets,
+        attestation,
+        ..
+    } = params;
     let mut key = Vec::new();
     // Subnet count + each subnet's protocol, so one subnet escalating re-proposes.
     key.extend_from_slice(&(protos.len() as u32).to_le_bytes());
@@ -1770,6 +1874,13 @@ fn content_key(
         crate::config::SetFormation::Leader => 0,
         crate::config::SetFormation::Consensus => 1,
     });
+    // Retuning what an attested subnet demands must re-propose even when the
+    // roster and protocols are unchanged.
+    for id in attested_subnets {
+        key.extend_from_slice(&id.to_le_bytes());
+    }
+    key.push(0xfe);
+    key.extend_from_slice(&bincode::serialize(attestation).expect("policy serialises"));
     key.extend_from_slice(&capacity.to_le_bytes());
     // Quantize so a change in the committee's cover target re-proposes a config.
     key.push((cover_rate.clamp(0.0, 1.0) * 100.0).round() as u8);

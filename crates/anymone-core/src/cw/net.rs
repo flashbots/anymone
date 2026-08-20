@@ -172,6 +172,7 @@ pub struct CommonwareNetwork {
     cmds: mpsc::UnboundedSender<Cmd>,
     shared: Arc<Shared>,
     identity: Pubkey,
+    attested_clients: Arc<crate::tee::AttestedClients>,
 }
 
 impl CommonwareNetwork {
@@ -188,21 +189,25 @@ impl CommonwareNetwork {
             subnets: Mutex::new(HashSet::new()),
             last_seen: Mutex::new(HashMap::new()),
         });
+        let attested_clients = Arc::new(crate::tee::AttestedClients::new());
         let thread_shared = shared.clone();
+        let thread_attested = attested_clients.clone();
         std::thread::Builder::new()
             .name("commonware".into())
             .spawn(move || {
                 let dir = std::env::temp_dir()
                     .join(format!("anymone-cw-{}", hex::encode(&me.0[..8])));
                 let rt = cw_tokio::Config::default().with_storage_directory(dir);
-                cw_tokio::Runner::new(rt)
-                    .start(|context| run(context, signer, cfg, cmd_rx, thread_shared));
+                cw_tokio::Runner::new(rt).start(|context| {
+                    run(context, signer, cfg, cmd_rx, thread_shared, thread_attested)
+                });
             })
             .expect("spawn commonware thread");
         Arc::new(CommonwareNetwork {
             cmds: cmd_tx,
             shared,
             identity: me,
+            attested_clients,
         })
     }
 
@@ -296,6 +301,10 @@ impl Transport for CommonwareNetwork {
     fn local_pubkey(&self) -> Pubkey {
         self.identity
     }
+
+    fn attested_clients(&self) -> Option<Arc<crate::tee::AttestedClients>> {
+        Some(self.attested_clients.clone())
+    }
 }
 
 fn cw_set(peers: &[Pubkey]) -> Set<ed25519::PublicKey> {
@@ -309,6 +318,7 @@ async fn run(
     cfg: CommonwareConfig,
     mut cmds: mpsc::UnboundedReceiver<Cmd>,
     shared: Arc<Shared>,
+    attested_clients: Arc<crate::tee::AttestedClients>,
 ) {
     let signer_for_stream = signer.clone();
     let me = keys::from_cw(&commonware_cryptography::Signer::public_key(&signer));
@@ -376,6 +386,7 @@ async fn run(
                 feeds: feeds.clone(),
                 publish: forward_tx,
                 good_clients: cfg.good_clients.clone(),
+                attested_clients,
             }),
         );
     }

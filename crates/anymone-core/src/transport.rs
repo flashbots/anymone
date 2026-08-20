@@ -175,6 +175,15 @@ pub trait Transport: Send + Sync + 'static {
     /// Adopt a config's network view: topic admission, peer sets, addressing.
     fn apply(&self, _view: NetView) {}
 
+    /// Present this node's platform attestation on every relay connection,
+    /// including ones dialed later.
+    fn attest(&self, _attestation: crate::tee::Attestation) {}
+
+    /// Clients this backend saw attest. `None` where none enrol over the wire.
+    fn attested_clients(&self) -> Option<Arc<crate::tee::AttestedClients>> {
+        None
+    }
+
     /// Store the signed config this node serves to config-pull requests.
     fn serve_config(&self, bytes: Vec<u8>);
 

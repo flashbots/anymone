@@ -16,6 +16,9 @@ pub(crate) enum StreamMsg {
     /// committee, so a process outside every tracked peer set can still be
     /// registered.
     Register(Vec<u8>),
+    /// The client's platform proof. Screened against the handshake-authenticated
+    /// key, so it can't be replayed on another client's behalf.
+    Attest(crate::tee::Attestation),
     /// Client data addressed to the receiving node for `subnet`. Its payload
     /// carries the client's own signature, so delivery doesn't launder its
     /// origin.

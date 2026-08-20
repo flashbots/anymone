@@ -13,9 +13,12 @@ use commonware_codec::{DecodeExt, Encode};
 use commonware_cryptography::{ed25519, Signer};
 use rand::rngs::OsRng;
 use rand::RngCore;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 pub use crate::keys::{ExchangeIdentity, IdentityError, Pubkey};
+
+/// Ed25519 seed followed by the exchange scalar, as [`Identity::secrets`] emits.
+pub const SECRETS_LEN: usize = 64;
 
 /// A node's long-lived keypair. Persisted as the raw 32-byte Ed25519 seed.
 ///
@@ -39,6 +42,29 @@ impl Identity {
             keypair,
             exchange: ExchangeIdentity::generate(),
         }
+    }
+
+    /// Rebuild from key material held elsewhere — a platform keystore rather
+    /// than a file, for a client whose disk an attacker may read.
+    pub fn from_secrets(secrets: &[u8]) -> Result<Self, IdentityError> {
+        if secrets.len() != SECRETS_LEN {
+            return Err(IdentityError::BadSecretsLength {
+                expected: SECRETS_LEN,
+                got: secrets.len(),
+            });
+        }
+        let keypair = ed25519::PrivateKey::decode(&secrets[..32])
+            .map_err(|e| IdentityError::Decode(e.to_string()))?;
+        let exchange = ExchangeIdentity::from_scalar(&secrets[32..])?;
+        Ok(Identity { keypair, exchange })
+    }
+
+    /// Everything [`Self::from_secrets`] needs to reconstruct this identity.
+    pub fn secrets(&self) -> Zeroizing<Vec<u8>> {
+        let mut out = Vec::with_capacity(SECRETS_LEN);
+        out.extend_from_slice(self.keypair.encode().as_ref());
+        out.extend_from_slice(&self.exchange.scalar_bytes());
+        Zeroizing::new(out)
     }
 
     pub fn pubkey(&self) -> Pubkey {
@@ -174,6 +200,20 @@ mod tests {
             0o600,
             "exchange key file must be mode 0600"
         );
+    }
+
+    #[test]
+    fn secrets_rebuild_the_same_identity_without_a_file() {
+        let id = Identity::generate();
+        let restored = Identity::from_secrets(&id.secrets()).unwrap();
+
+        assert_eq!(restored.pubkey(), id.pubkey());
+        assert_eq!(restored.exchange_keys(), id.exchange_keys());
+
+        assert!(matches!(
+            Identity::from_secrets(&[0u8; 8]),
+            Err(IdentityError::BadSecretsLength { .. })
+        ));
     }
 
     #[test]

@@ -1111,7 +1111,7 @@ pub(crate) async fn run_subnet(
                 &inner.identity,
                 leader_pk,
                 inner.sched_reservation_entries(subnet.id),
-                inner.good_clients.clone(),
+                inner.subnet_clients(&subnet),
             ),
         );
     } else {

@@ -5,14 +5,32 @@
 //! attributed).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anymone_core::adcnet::{
     AdcnetClientSession, AdcnetObserverSession, AdcnetServerSession, AdcnetWatchSession,
 };
 use anymone_core::faults::{Attribution, FaultKind};
-use anymone_core::session::Session;
-use anymone_core::{Identity, Pubkey};
+use anymone_core::session::{GoodClients, Session};
+use anymone_core::{
+    Attestation, AttestationScheme, AttestedClients, Identity, Pubkey, TeeVerifier,
+};
+
+struct AcceptAll;
+impl TeeVerifier for AcceptAll {
+    fn verify(&self, _statement: &[u8], _att: &Attestation) -> bool {
+        true
+    }
+}
+
+fn attestation(round: u64) -> Attestation {
+    Attestation {
+        scheme: AttestationScheme::Tdx,
+        round,
+        evidence: vec![0xa1],
+    }
+}
 
 use adcnet::crypto::{ServerId, SharedKey};
 use adcnet::protocol::session::one_round::{IbltMsgParamsOwned, OneRoundConfig};
@@ -110,6 +128,85 @@ fn adcnet_session_happy_path() {
     assert!(
         decoded_all.contains(&payload),
         "payload never decoded; got {decoded_all:?}"
+    );
+
+    // The same subnet, with every relay screening against a gate: the client's
+    // payload arrives only once it has enrolled.
+    let gated_run = |enrolled: bool| -> Vec<Vec<u8>> {
+        let gate = Arc::new(AttestedClients::new());
+        gate.set_verifier(Some(Arc::new(AcceptAll)), 10);
+        if enrolled {
+            assert!(gate.enroll(&client_anymone, &attestation(0)));
+        }
+        let mut servers: Vec<AdcnetServerSession> = (0..n_servers)
+            .map(|i| {
+                let mut s = AdcnetServerSession::new(
+                    cfg.clone(),
+                    server_ids[i],
+                    servers_id[i].to_adcnet_signing_key(),
+                    servers_id[i].exchange().clone(),
+                    n_servers,
+                    servers_id.iter().map(|s| s.pubkey()).collect::<Vec<_>>(),
+                    0,
+                    usize::MAX,
+                    i == 0,
+                    leader_pk,
+                    None,
+                );
+                let gate = gate.clone();
+                s.set_good_clients(GoodClients::new(move |pk| gate.contains(pk)));
+                s
+            })
+            .collect();
+        let mut shared: HashMap<ServerId, SharedKey> = HashMap::new();
+        for (i, sid) in server_ids.iter().enumerate() {
+            shared.insert(
+                *sid,
+                client_id.exchange().ecdh(&servers_id[i].exchange_pubkey()),
+            );
+        }
+        let mut client = AdcnetClientSession::new(
+            cfg.clone(),
+            client_id.to_adcnet_signing_key(),
+            shared,
+            client_id.exchange_pubkey(),
+            [42u8; 32],
+        );
+        client.stage_message(payload.clone());
+
+        let mut bus: Vec<(Pubkey, Vec<u8>)> = Vec::new();
+        let mut decoded: Vec<Vec<u8>> = Vec::new();
+        for r in 0..8u64 {
+            for m in client.begin_round(r, now) {
+                bus.push((client_anymone, m));
+            }
+            for (from, msg) in bus.drain(..).collect::<Vec<_>>() {
+                for s in servers.iter_mut() {
+                    s.on_inbound(from, msg.clone());
+                }
+            }
+            for (i, s) in servers.iter_mut().enumerate() {
+                let out = s.end_round(r, now);
+                decoded.extend(out.decoded);
+                for m in out.outbound {
+                    bus.push((servers_id[i].pubkey(), m));
+                }
+            }
+            for (from, msg) in bus.drain(..).collect::<Vec<_>>() {
+                for s in servers.iter_mut() {
+                    s.on_inbound(from, msg.clone());
+                }
+            }
+        }
+        decoded
+    };
+    assert!(
+        gated_run(true).contains(&payload),
+        "an enrolled client submits as usual"
+    );
+    assert!(
+        !gated_run(false).contains(&payload),
+        "an unenrolled client's payload never reaches the canonical set"
     );
 
     // Idle client: covers at rate 1.0, silent at 0.0; a staged payload always sends.

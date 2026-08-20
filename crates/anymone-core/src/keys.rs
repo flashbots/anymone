@@ -291,6 +291,16 @@ impl ExchangeIdentity {
         Self::from_adcnet_key(adcnet::crypto::ExchangePrivateKey::generate())
     }
 
+    pub fn from_scalar(bytes: &[u8]) -> Result<Self, IdentityError> {
+        let key = adcnet::crypto::ExchangePrivateKey::from_bytes(bytes)
+            .map_err(|e| IdentityError::Decode(e.to_string()))?;
+        Ok(Self::from_adcnet_key(key))
+    }
+
+    pub fn scalar_bytes(&self) -> zeroize::Zeroizing<Vec<u8>> {
+        zeroize::Zeroizing::new(self.key.to_bytes().to_vec())
+    }
+
     pub fn public(&self) -> adcnet::crypto::ExchangePublicKey {
         self.key.public()
     }
@@ -322,10 +332,7 @@ impl ExchangeIdentity {
     }
 
     pub fn load(path: &Path) -> Result<Self, IdentityError> {
-        let bytes = fs::read(path)?;
-        let key = adcnet::crypto::ExchangePrivateKey::from_bytes(&bytes)
-            .map_err(|e| IdentityError::Decode(e.to_string()))?;
-        Ok(Self::from_adcnet_key(key))
+        Self::from_scalar(&fs::read(path)?)
     }
 
     pub fn load_or_generate(path: &Path) -> Result<Self, IdentityError> {
@@ -360,6 +367,8 @@ pub enum IdentityError {
     Io(#[from] io::Error),
     #[error("seed must be exactly 32 bytes, got {0}")]
     BadSeedLength(usize),
+    #[error("secrets must be exactly {expected} bytes, got {got}")]
+    BadSecretsLength { expected: usize, got: usize },
     #[error("ed25519 decode: {0}")]
     Decode(String),
 }

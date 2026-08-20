@@ -23,6 +23,23 @@ panetiere = { git = "ssh://git@github.com/flashbots/panetiere", rev = "f1277191f
 # panetiere also depends on this unpinned; rev-pinning ours conflicts (cargo can't unify).
 chipmunk_code = { git = "https://github.com/Ruteri/Chipmunk", branch = "main", default-features = false, features = ["fast-ntt"] }
 adcnet = { git = "ssh://git@github.com/flashbots/adcnet-rs", rev = "08988b193a4fa78d08f7ffed221ce28c7a1aeb6e" }
+attest-types = { git = "ssh://git@github.com/flashbots/attest", rev = "8206cd19d9dcb1978d85a3d8dece06a3ee7a1206" }
+attest-prove = { git = "ssh://git@github.com/flashbots/attest", rev = "8206cd19d9dcb1978d85a3d8dece06a3ee7a1206", default-features = false, optional = true }
+attest-measure = { git = "ssh://git@github.com/flashbots/attest", rev = "8206cd19d9dcb1978d85a3d8dece06a3ee7a1206", optional = true }
+attest-verify = { git = "ssh://git@github.com/flashbots/attest", rev = "8206cd19d9dcb1978d85a3d8dece06a3ee7a1206", default-features = false, optional = true }
+attest-pccs = { git = "ssh://git@github.com/flashbots/attest", rev = "8206cd19d9dcb1978d85a3d8dece06a3ee7a1206", optional = true }
+parity-scale-codec = { version = "3", default-features = false, features = ["derive"], optional = true }
+aes-gcm = { version = "0.10", optional = true }
+aes-kw = { version = "0.2", features = ["alloc"], optional = true }
+p256 = { version = "0.13", optional = true }
+p384 = { version = "0.13", optional = true }
+ciborium = { version = "0.2", optional = true }
+x509-parser = { version = "0.16", features = ["verify"], optional = true }
+# Same major as x509-parser 0.16's, so the DER types unify.
+asn1-rs = { version = "0.6", optional = true }
+rcgen = { version = "0.13", optional = true }
+base64 = { version = "0.22", optional = true }
+serde_json = { version = "1", optional = true }
 num-bigint = { version = "0.4", features = ["serde"] }
 rayon = "1.10"
 commonware-p2p.workspace = true
@@ -34,7 +51,28 @@ commonware-codec.workspace = true
 
 [features]
 # Spawning full Anymone instances on a loopback transport for tests.
-test-util = []
+test-util = ["dep:rcgen"]
+# Play Integrity / App Attest verification. Relays enforcing a mobile policy must
+# all build with it: a relay without it rejects enrolments its peers accept, and
+# the two disagree on who is in the canonical client set.
+tdx-attest = [
+    "dep:attest-prove",
+    "dep:attest-measure",
+    "dep:attest-verify",
+    "dep:attest-pccs",
+    "dep:parity-scale-codec",
+]
+mobile-attest = [
+    "dep:aes-gcm",
+    "dep:aes-kw",
+    "dep:p256",
+    "dep:p384",
+    "dep:ciborium",
+    "dep:x509-parser",
+    "dep:asn1-rs",
+    "dep:base64",
+    "dep:serde_json",
+]
 # Decoded-plaintext wire tracing (ANYMONE_TRACE=1). Off by default so a release
 # build can't dump decoded traffic even if the env var is set; opt in per binary.
 wire-debug = []
@@ -45,6 +83,7 @@ name = "client_set_e2e"
 test = false
 
 [dev-dependencies]
+rcgen = "0.13"
 serial_test = "3"
 tempfile = "3"
 serde_json = "1"

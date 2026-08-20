@@ -49,6 +49,101 @@ pub struct AnymoneRoundConfigurationBody {
     /// Registered follow-only nodes, tracked as secondary peers.
     #[serde(default)]
     pub watchers: Vec<crate::identity::Pubkey>,
+    /// What an attested subnet's relays accept as proof of a client's platform.
+    #[serde(default)]
+    pub attestation: AttestationPolicy,
+}
+
+/// What relays on an attested subnet demand of a client before it may submit.
+///
+/// Every relay must screen by the same rule or they disagree on the canonical
+/// client set, so this travels in the signed config rather than node-local
+/// files. A scheme with no entry here is refused.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AttestationPolicy {
+    pub tdx_images: Vec<TdxImage>,
+    /// Committee rounds an enrolment stays valid for. Clients re-attest before
+    /// it lapses.
+    pub validity_rounds: Round,
+    pub play_integrity: Option<PlayIntegrityPolicy>,
+    pub app_attest: Option<AppAttestPolicy>,
+    pub android_key: Option<AndroidKeyPolicy>,
+}
+
+/// One accepted client image, as `attest measure` emits it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TdxImage {
+    pub image: attest_types::PortableMeasurements,
+    /// Required for a bare-metal client and unused for a GCP one, which
+    /// rebuilds these from its own quote.
+    pub firmware: Option<FirmwareRegisters>,
+}
+
+/// Registers a firmware fixes. Pinned as values because rebuilding them needs
+/// the firmware binary, which no relay should have to hold.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FirmwareRegisters {
+    pub mrtd: serde_bytes::ByteArray<48>,
+    /// Also covers RAM size, disk count and ACPI tables, so pinning it fixes
+    /// the VM shape.
+    pub rtmr0: serde_bytes::ByteArray<48>,
+}
+
+/// `PortableMeasurements` carries no `PartialEq`, so images compare on the two
+/// halves that do.
+impl PartialEq for AttestationPolicy {
+    fn eq(&self, other: &Self) -> bool {
+        let images = |p: &Self| {
+            p.tdx_images
+                .iter()
+                .map(|i| (i.image.azure.clone(), i.image.dcap.clone(), i.firmware.clone()))
+                .collect::<Vec<_>>()
+        };
+        self.validity_rounds == other.validity_rounds
+            && self.play_integrity == other.play_integrity
+            && self.app_attest == other.app_attest
+            && self.android_key == other.android_key
+            && images(self) == images(other)
+    }
+}
+
+/// Google's verdict token is decrypted and checked locally, so the Play Console
+/// keys live here. Anyone holding the config can read verdict tokens — that is
+/// inherent to local verification, not an accident of this layout.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlayIntegrityPolicy {
+    /// Play Console response-decryption key (AES-256).
+    pub decryption_key: [u8; 32],
+    /// Play Console verification key, SEC1 P-256 point.
+    #[serde(with = "serde_bytes")]
+    pub verification_key: Vec<u8>,
+    pub package_name: String,
+    /// Accepted app signing certificates, SHA-256 of the DER.
+    pub certificate_digests: Vec<[u8; 32]>,
+    /// Demand MEETS_STRONG_INTEGRITY; otherwise MEETS_DEVICE_INTEGRITY passes.
+    pub require_strong_integrity: bool,
+    pub max_token_age_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AndroidKeyPolicy {
+    pub package_name: String,
+    pub certificate_digests: Vec<[u8; 32]>,
+    pub require_strongbox: bool,
+    #[serde(with = "serde_bytes")]
+    pub root_ca_der: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppAttestPolicy {
+    pub team_id: String,
+    pub bundle_id: String,
+    /// Production builds carry the `appattest` aaguid, development
+    /// `appattestdevelop`.
+    pub production: bool,
+    /// Apple's App Attest root, DER. Tests pin their own root here.
+    #[serde(with = "serde_bytes")]
+    pub root_ca_der: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -71,17 +166,26 @@ pub struct Subnet {
     pub protocol: ProtocolConfig,
     /// Probability an idle client sends a cover (zero) message each round.
     pub cover_rate: f32,
+    /// Only clients that enrolled an accepted platform attestation may submit.
+    #[serde(default)]
+    pub attested: bool,
 }
 
 impl Subnet {
-    /// Subnet with the default cover rate (1.0).
+    /// Subnet with the default cover rate (1.0), open to any client.
     pub fn new(id: SubnetId, relays: Vec<Pubkey>, protocol: ProtocolConfig) -> Self {
         Subnet {
             id,
             relays,
             protocol,
             cover_rate: 1.0,
+            attested: false,
         }
+    }
+
+    pub fn attested(mut self, attested: bool) -> Self {
+        self.attested = attested;
+        self
     }
 }
 
@@ -475,6 +579,7 @@ impl AnymoneRoundConfiguration {
             subnets: vec![Subnet::new(0, relays, protocol)],
             relay_client_addrs: Vec::new(),
             watchers: Vec::new(),
+            attestation: AttestationPolicy::default(),
         };
         AnymoneRoundConfiguration::new(body)
     }
@@ -508,6 +613,7 @@ mod tests {
             )],
             relay_client_addrs: vec![],
             watchers: vec![],
+            attestation: AttestationPolicy::default(),
         }
     }
 

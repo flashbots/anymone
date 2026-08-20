@@ -67,6 +67,7 @@ async fn echo_via_governance_topic() {
             client_set_max: 256,
         }),
         cover_rate: 1.0,
+        attested: false,
     });
     let signed_cfg = unsigned.sign_with(&[committee.identity()]);
     let signed_bytes = bincode::serialize(&signed_cfg).expect("serialise cfg");

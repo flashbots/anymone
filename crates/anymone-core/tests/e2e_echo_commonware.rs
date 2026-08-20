@@ -107,6 +107,7 @@ async fn e2e_echo_with_client_over_a_stream() {
         &service,
         StreamClientConfig {
             servers: vec![(relays[0].pubkey(), addr(hub_stream))],
+            ..Default::default()
         },
     );
     let service_anymone =
@@ -124,6 +125,7 @@ async fn e2e_echo_with_client_over_a_stream() {
         &client,
         StreamClientConfig {
             servers: vec![(relays[0].pubkey(), addr(hub_stream))],
+            ..Default::default()
         },
     );
     let client_anymone =

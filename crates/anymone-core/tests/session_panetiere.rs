@@ -3,6 +3,7 @@
 //! config-anonymising round-trip, and a many-round no-stall run.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anymone_core::config::{
@@ -13,11 +14,31 @@ use anymone_core::faults::{Attribution, FaultKind};
 use anymone_core::panetiere::{
     params_for, PanetiereClientSession, PanetiereObserverSession, PanetiereServerSession, SetMode,
 };
-use anymone_core::session::{Misbehavior, Session};
-use anymone_core::{Identity, Pubkey, ServiceEntry, ServiceTag};
+use anymone_core::session::{GoodClients, Misbehavior, Session};
+use anymone_core::{
+    Attestation, AttestationScheme, AttestedClients, Identity, Pubkey, ServiceEntry, ServiceTag,
+    TeeVerifier,
+};
 
 use panetiere::pke;
 use panetiere::protocol::ServerId;
+
+/// Stands in for a platform verifier: what enrolment does with the verdict is
+/// what these tests are about, not how the verdict is reached.
+struct AcceptAll;
+impl TeeVerifier for AcceptAll {
+    fn verify(&self, _statement: &[u8], _att: &Attestation) -> bool {
+        true
+    }
+}
+
+fn attestation(round: u64) -> Attestation {
+    Attestation {
+        scheme: AttestationScheme::Tdx,
+        round,
+        evidence: vec![0xa1],
+    }
+}
 
 /// Per-server identities (sorted by pubkey, matching the runtime's slot order)
 /// plus the client's view of their exchange pubkeys.
@@ -529,7 +550,14 @@ fn panetiere_followers_use_leader_set_with_min_floor() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
-    fn run(min_clients: u32, n_clients: usize, client_set_max: usize) -> usize {
+    /// Enrols every client but the last `unattested` of them into a gate the
+    /// servers screen against, and returns what the subnet decoded.
+    fn run(
+        min_clients: u32,
+        n_clients: usize,
+        client_set_max: usize,
+        unattested: usize,
+    ) -> Vec<Vec<u8>> {
         let n_servers = 3;
         let cfg = PanetiereConfig {
             client_set_min: min_clients,
@@ -557,6 +585,14 @@ fn panetiere_followers_use_leader_set_with_min_floor() {
         for (i, c) in clients.iter_mut().enumerate() {
             c.stage(format!("msg-{i}").into_bytes());
         }
+        let gate = (unattested > 0).then(|| {
+            let gate = Arc::new(AttestedClients::new());
+            gate.set_verifier(Some(Arc::new(AcceptAll)), 10);
+            for pk in &client_pks[..n_clients - unattested] {
+                assert!(gate.enroll(pk, &attestation(0)));
+            }
+            gate
+        });
         let mut servers: Vec<PanetiereServerSession> = server_ids
             .iter()
             .map(|sid| {
@@ -574,6 +610,10 @@ fn panetiere_followers_use_leader_set_with_min_floor() {
                     server_pubkeys(&server_pks),
                 );
                 s.set_client_set_max(client_set_max);
+                if let Some(gate) = &gate {
+                    let gate = gate.clone();
+                    s.set_good_clients(GoodClients::new(move |pk| gate.contains(pk)));
+                }
                 s
             })
             .collect();
@@ -593,10 +633,10 @@ fn panetiere_followers_use_leader_set_with_min_floor() {
         }
         // The leader announces its set at end_round(0); followers receive it and
         // share over it at end_round(1); the leader decodes at end_round(2).
-        let mut decoded_total = 0usize;
+        let mut decoded_total = Vec::new();
         for r in 0..4u64 {
             let outs: Vec<_> = servers.iter_mut().map(|s| s.end_round(r, now)).collect();
-            decoded_total += outs.iter().map(|o| o.decoded.len()).sum::<usize>();
+            decoded_total.extend(outs.iter().flat_map(|o| o.decoded.iter().cloned()));
             for i in 0..servers.len() {
                 for (j, o) in outs.iter().enumerate() {
                     if i == j {
@@ -611,17 +651,27 @@ fn panetiere_followers_use_leader_set_with_min_floor() {
         decoded_total
     }
     assert!(
-        run(2, 2, usize::MAX) >= 1,
+        !run(2, 2, usize::MAX, 0).is_empty(),
         "followers adopt the leader's set and decode at the floor"
     );
-    assert_eq!(
-        run(3, 2, usize::MAX),
-        0,
+    assert!(
+        run(3, 2, usize::MAX, 0).is_empty(),
         "decode is refused below the min client set"
     );
     assert!(
-        run(2, 6, 4) >= 1,
+        !run(2, 6, 4, 0).is_empty(),
         "more submitters than client_set_max must still decode a capped set"
+    );
+
+    let decoded = run(2, 3, usize::MAX, 1);
+    let carried = |msg: &str| decoded.iter().any(|d| d.windows(5).any(|w| w == msg.as_bytes()));
+    assert!(
+        carried("msg-0") && carried("msg-1"),
+        "attested clients still get through the gate"
+    );
+    assert!(
+        !carried("msg-2"),
+        "the client that never enrolled contributes nothing"
     );
 }
 
@@ -669,6 +719,7 @@ fn adcnet_config_body(n_subnets: usize) -> AnymoneRoundConfigurationBody {
         subnets,
         relay_client_addrs: vec![],
         watchers: vec![],
+        attestation: Default::default(),
     }
 }
 

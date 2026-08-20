@@ -62,7 +62,12 @@ pub use scheduling::{
     announce_watcher_registration, Registration, SchedulerProtocol,
 };
 pub use session::{GoodClients, LeaderAggregation, Misbehavior, PeerId, RoundOutcome, Session};
-pub use tee::{NoopProver, TeeProver, TeeVerifier};
+pub use tee::{
+    Attestation, AttestationScheme, AttestedClients, MultiVerifier, TeeError, TeeProver,
+    TeeVerifier,
+};
+#[cfg(feature = "tdx-attest")]
+pub use tee::{TdxProver, TdxVerifier};
 pub use transport::{
     Dest, InMemoryHandle, InMemoryNetwork, Inbound, NetView, Subscription, Topic, Transport,
 };

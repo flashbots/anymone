@@ -122,6 +122,12 @@ pub struct PanetiereCommitteeConfig {
     /// (receipts, coded evidence, Dolev–Strong rounds) instead of a leader's
     /// announcement. Needs a round long enough for the extra phases.
     pub consensus_set: bool,
+    /// Subnet ids whose relays admit only attested clients. Listing an id the
+    /// network has not grown to is harmless; it takes effect if it appears.
+    pub attested_subnets: Vec<crate::config::SubnetId>,
+    /// What those relays accept as proof. An empty policy admits nobody, so a
+    /// subnet listed above with no policy is closed to clients.
+    pub attestation: crate::config::AttestationPolicy,
 }
 
 impl Default for PanetiereCommitteeConfig {
@@ -146,6 +152,8 @@ impl Default for PanetiereCommitteeConfig {
             committee_msg_bytes: COMMITTEE_MSG_BYTES,
             vector_bytes: 0,
             consensus_set: false,
+            attested_subnets: Vec::new(),
+            attestation: crate::config::AttestationPolicy::default(),
         }
     }
 }
@@ -187,6 +195,14 @@ pub struct CommitteeParams {
     pub vector_bytes: usize,
     /// See [`PanetiereCommitteeConfig::consensus_set`].
     pub consensus_set: bool,
+    /// See [`PanetiereCommitteeConfig::attested_subnets`].
+    pub attested_subnets: Vec<crate::config::SubnetId>,
+    pub tdx_images: Vec<crate::config::TdxImage>,
+    /// Committee rounds a client's enrolment holds for.
+    pub attestation_validity_rounds: crate::config::Round,
+    pub play_integrity: Option<crate::config::PlayIntegrityPolicy>,
+    pub app_attest: Option<crate::config::AppAttestPolicy>,
+    pub android_key: Option<crate::config::AndroidKeyPolicy>,
 }
 
 impl Default for CommitteeParams {
@@ -210,6 +226,12 @@ impl Default for CommitteeParams {
             committee_msg_bytes: COMMITTEE_MSG_BYTES,
             vector_bytes: 0,
             consensus_set: false,
+            attested_subnets: Vec::new(),
+            tdx_images: Vec::new(),
+            attestation_validity_rounds: crate::tee::DEFAULT_VALIDITY_ROUNDS,
+            play_integrity: None,
+            app_attest: None,
+            android_key: None,
         }
     }
 }
@@ -236,6 +258,14 @@ impl CommitteeParams {
             committee_msg_bytes: self.committee_msg_bytes,
             vector_bytes: self.vector_bytes,
             consensus_set: self.consensus_set,
+            attested_subnets: self.attested_subnets,
+            attestation: crate::config::AttestationPolicy {
+                tdx_images: self.tdx_images,
+                validity_rounds: self.attestation_validity_rounds,
+                play_integrity: self.play_integrity,
+                app_attest: self.app_attest,
+                android_key: self.android_key,
+            },
         }
     }
 }
@@ -366,6 +396,8 @@ pub async fn spawn_panetiere_committee_scheduler(
         } else {
             crate::config::SetFormation::Leader
         },
+        attested_subnets: config.attested_subnets.clone(),
+        attestation: config.attestation.clone(),
     };
 
     tokio::spawn(async move {

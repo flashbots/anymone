@@ -686,6 +686,7 @@ mod tests {
             subnets: vec![],
             relay_client_addrs: vec![],
             watchers: vec![],
+            attestation: Default::default(),
         })
     }
 

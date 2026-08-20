@@ -67,6 +67,7 @@ async fn client_submits_and_receives_over_a_stream() {
         &client,
         StreamClientConfig {
             servers: vec![(relay.pubkey(), addr(stream_port))],
+            ..Default::default()
         },
     );
 
@@ -196,6 +197,7 @@ async fn client_submits_and_receives_over_a_stream() {
         &stranger,
         StreamClientConfig {
             servers: vec![(strict_id.pubkey(), addr(strict_stream))],
+            ..Default::default()
         },
     );
     for _ in 0..10 {
@@ -215,6 +217,7 @@ async fn client_submits_and_receives_over_a_stream() {
         &client,
         StreamClientConfig {
             servers: vec![(strict_id.pubkey(), addr(strict_stream))],
+            ..Default::default()
         },
     );
     let mut seen = None;

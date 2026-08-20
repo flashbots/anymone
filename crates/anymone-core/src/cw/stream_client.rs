@@ -17,7 +17,7 @@ use commonware_runtime::{
     tokio as cw_tokio, Network as _, Runner as _, Spawner as _, Supervisor as _,
 };
 use commonware_stream::encrypted;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::config::SubnetId;
 use crate::identity::{Identity, Pubkey};
@@ -30,12 +30,18 @@ use super::stream_wire::StreamMsg;
 const TOPIC_CAPACITY: usize = 1024;
 const CONFIG_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const RECONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+const CONN_QUEUE: usize = 32;
+/// A round's contribution is worthless to the round after it.
+const DATA_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct StreamClientConfig {
     /// Bootstrap nodes to dial. Every one is tried; the first to answer serves
     /// a request.
     pub servers: Vec<(Pubkey, SocketAddr)>,
+    /// Commonware storage directory. `None` = the system temp dir, which does
+    /// not exist for app sandboxes (Android has no writable /tmp).
+    pub storage_dir: Option<std::path::PathBuf>,
 }
 
 enum Cmd {
@@ -48,6 +54,7 @@ enum Cmd {
     },
     /// Adopted config's relay dial addresses.
     Relays(Vec<(Pubkey, String)>),
+    Attest(crate::tee::Attestation),
     FetchConfig(oneshot::Sender<Option<Vec<u8>>>),
 }
 
@@ -73,11 +80,14 @@ impl StreamClientNetwork {
             identity: me,
         });
         // Frames arrive on the commonware thread and fan out on this one.
-        let sink = net.clone();
+        // Weak, so the last external handle dropping tears the client down.
+        let sink = Arc::downgrade(&net);
         tokio::spawn(async move {
             let mut frame_rx = frame_rx;
             while let Some((topic, from, payload)) = frame_rx.recv().await {
-                if let Some(tx) = sink.topics.lock().unwrap().get(&topic) {
+                let Some(net) = sink.upgrade() else { break };
+                let topics = net.topics.lock().unwrap();
+                if let Some(tx) = topics.get(&topic) {
                     let _ = tx.send(Inbound { from, payload });
                 }
             }
@@ -85,7 +95,10 @@ impl StreamClientNetwork {
         std::thread::Builder::new()
             .name("commonware-client".into())
             .spawn(move || {
-                let dir = std::env::temp_dir()
+                let dir = cfg
+                    .storage_dir
+                    .clone()
+                    .unwrap_or_else(std::env::temp_dir)
                     .join(format!("anymone-cwc-{}", hex::encode(&me.0[..8])));
                 let rt = cw_tokio::Config::default().with_storage_directory(dir);
                 cw_tokio::Runner::new(rt)
@@ -156,6 +169,10 @@ impl Transport for StreamClientNetwork {
         self.send_cmd(Cmd::Relays(view.relay_client_addrs));
     }
 
+    fn attest(&self, attestation: crate::tee::Attestation) {
+        self.send_cmd(Cmd::Attest(attestation));
+    }
+
     /// A client serves no config; only nodes answer pulls.
     fn serve_config(&self, _bytes: Vec<u8>) {}
 
@@ -202,14 +219,29 @@ pub fn stream_client_spawner(
 /// a submission onto a dead connection loses it silently.
 struct Conn {
     peer: Pubkey,
-    tx: mpsc::UnboundedSender<StreamMsg>,
+    addr: SocketAddr,
+    tx: mpsc::Sender<Queued>,
     up: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct Queued {
+    msg: StreamMsg,
+    expires_at: Option<tokio::time::Instant>,
+}
+
+/// State every connection re-presents on connect, so a dropped frame can't lose
+/// a subscription or an enrolment.
+#[derive(Clone, Default)]
+struct Control {
+    subscriptions: Vec<Topic>,
+    attestation: Option<crate::tee::Attestation>,
 }
 
 type Frames = mpsc::UnboundedSender<(Topic, Pubkey, Vec<u8>)>;
 /// Fetches awaiting any server's config; all of them are satisfied by one reply.
 type PendingFetches = Arc<Mutex<Vec<oneshot::Sender<Option<Vec<u8>>>>>>;
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_conn(
     context: &cw_tokio::Context,
     signer: &ed25519::PrivateKey,
@@ -217,24 +249,38 @@ fn spawn_conn(
     addr: SocketAddr,
     frames: &Frames,
     pending: &PendingFetches,
+    control: &watch::Sender<Control>,
 ) -> Option<Conn> {
     let peer = keys::to_cw(&pk)?;
-    let (out_tx, out_rx) = mpsc::unbounded_channel();
+    let (out_tx, out_rx) = mpsc::channel(CONN_QUEUE);
     let up = Arc::new(std::sync::atomic::AtomicBool::new(false));
     context.child("conn").spawn({
         let signer = signer.clone();
         let frames = frames.clone();
         let pending = pending.clone();
         let up = up.clone();
+        let control = control.subscribe();
         move |ctx| async move {
-            connection(ctx, signer, peer, addr, out_rx, frames, pending, up).await;
+            connection(ctx, signer, peer, addr, out_rx, frames, pending, up, control).await;
         }
     });
     Some(Conn {
         peer: pk,
+        addr,
         tx: out_tx,
         up,
     })
+}
+
+fn enqueue(conn: &Conn, msg: StreamMsg, ttl: Option<std::time::Duration>) {
+    let queued = Queued {
+        msg,
+        expires_at: ttl.map(|t| tokio::time::Instant::now() + t),
+    };
+    if let Err(e) = conn.tx.try_send(queued) {
+        let full = matches!(e, mpsc::error::TrySendError::Full(_));
+        tracing::warn!(target: P2P, peer = %conn.peer, full, "stream client dropped an outbound message");
+    }
 }
 
 async fn run(
@@ -245,13 +291,13 @@ async fn run(
     frames: Frames,
 ) {
     let pending: PendingFetches = Arc::new(Mutex::new(Vec::new()));
+    let (control, _) = watch::channel(Control::default());
     let mut servers: Vec<Conn> = Vec::new();
     // Relay data connections, keyed by relay; re-dialed from every adopted config.
     let mut relays: HashMap<Pubkey, Conn> = HashMap::new();
-    let mut subscribed: Vec<Topic> = Vec::new();
 
     for (pk, addr) in &cfg.servers {
-        if let Some(conn) = spawn_conn(&context, &signer, *pk, *addr, &frames, &pending) {
+        if let Some(conn) = spawn_conn(&context, &signer, *pk, *addr, &frames, &pending, &control) {
             servers.push(conn);
         }
     }
@@ -262,16 +308,13 @@ async fn run(
     while let Some(cmd) = cmds.recv().await {
         match cmd {
             Cmd::Subscribe(topic) => {
-                if subscribed.contains(&topic) {
-                    continue;
-                }
-                subscribed.push(topic);
-                let msg = StreamMsg::FeedSubscribe {
-                    topics: vec![topic],
-                };
-                for c in &servers {
-                    let _ = c.tx.send(msg.clone());
-                }
+                control.send_if_modified(|c| {
+                    let fresh = !c.subscriptions.contains(&topic);
+                    if fresh {
+                        c.subscriptions.push(topic);
+                    }
+                    fresh
+                });
             }
             Cmd::Publish(topic, bytes) => {
                 // One server suffices: a registration is forwarded to every
@@ -279,20 +322,23 @@ async fn run(
                 // submission is republished network-wide. Prefer a connection
                 // that is up, but queue on the first if none is yet — it
                 // drains once the dial completes.
-                let msg = if topic == Topic::Registration {
-                    StreamMsg::Register(bytes)
+                let (msg, ttl) = if topic == Topic::Registration {
+                    (StreamMsg::Register(bytes), None)
                 } else {
-                    StreamMsg::Submit {
-                        topic,
-                        payload: bytes,
-                    }
+                    (
+                        StreamMsg::Submit {
+                            topic,
+                            payload: bytes,
+                        },
+                        Some(DATA_TTL),
+                    )
                 };
                 let target = servers
                     .iter()
                     .find(|c| c.up.load(std::sync::atomic::Ordering::Relaxed))
                     .or_else(|| servers.first());
                 if let Some(c) = target {
-                    let _ = c.tx.send(msg);
+                    enqueue(c, msg, ttl);
                 }
             }
             Cmd::Send { to, subnet, bytes } => {
@@ -301,33 +347,45 @@ async fn run(
                     .get(&to)
                     .or_else(|| servers.iter().find(|c| c.peer == to));
                 match conn {
-                    Some(c) => {
-                        let _ = c.tx.send(StreamMsg::Data {
+                    Some(c) => enqueue(
+                        c,
+                        StreamMsg::Data {
                             subnet,
                             payload: bytes,
-                        });
-                    }
+                        },
+                        Some(DATA_TTL),
+                    ),
                     None => {
                         tracing::warn!(target: P2P, to = %to, subnet, "no connection to the addressed relay; frame dropped")
                     }
                 }
             }
             Cmd::Relays(addrs) => {
-                let named: HashMap<Pubkey, String> = addrs.into_iter().collect();
-                relays.retain(|pk, _| named.contains_key(pk));
+                let named: HashMap<Pubkey, SocketAddr> = addrs
+                    .into_iter()
+                    .filter_map(|(pk, addr)| match addr.parse::<SocketAddr>() {
+                        Ok(addr) => Some((pk, addr)),
+                        Err(_) => {
+                            tracing::warn!(target: P2P, relay = %pk, %addr, "unparseable relay client address");
+                            None
+                        }
+                    })
+                    .collect();
+                // A re-addressed relay is dropped too, or it redials the old endpoint forever.
+                relays.retain(|pk, conn| named.get(pk) == Some(&conn.addr));
                 for (pk, addr) in named {
                     if relays.contains_key(&pk) || servers.iter().any(|c| c.peer == pk) {
                         continue;
                     }
-                    let Ok(addr) = addr.parse::<SocketAddr>() else {
-                        tracing::warn!(target: P2P, relay = %pk, %addr, "unparseable relay client address");
-                        continue;
-                    };
-                    if let Some(conn) = spawn_conn(&context, &signer, pk, addr, &frames, &pending)
+                    if let Some(conn) =
+                        spawn_conn(&context, &signer, pk, addr, &frames, &pending, &control)
                     {
                         relays.insert(pk, conn);
                     }
                 }
+            }
+            Cmd::Attest(att) => {
+                control.send_modify(|c| c.attestation = Some(att));
             }
             Cmd::FetchConfig(responder) => {
                 if servers.is_empty() {
@@ -336,7 +394,7 @@ async fn run(
                 }
                 pending.lock().unwrap().push(responder);
                 for c in &servers {
-                    let _ = c.tx.send(StreamMsg::ConfigReq);
+                    enqueue(c, StreamMsg::ConfigReq, Some(DATA_TTL));
                 }
             }
         }
@@ -351,23 +409,52 @@ async fn run(
         .await;
 }
 
-/// Hold one connection open, redialing on loss. Re-sends the current feed
-/// subscriptions after every reconnect, since the server forgets them.
+async fn present_control<O: commonware_runtime::Sink>(
+    tx: &mut encrypted::Sender<O>,
+    control: &mut watch::Receiver<Control>,
+) -> bool {
+    let held = control.borrow_and_update().clone();
+    if let Some(att) = held.attestation {
+        if tx.send(StreamMsg::Attest(att).encode()).await.is_err() {
+            return false;
+        }
+    }
+    if held.subscriptions.is_empty() {
+        return true;
+    }
+    tx.send(
+        StreamMsg::FeedSubscribe {
+            topics: held.subscriptions,
+        }
+        .encode(),
+    )
+    .await
+    .is_ok()
+}
+
+/// Hold one connection open, redialing on loss. Re-presents the control state
+/// after every reconnect, since the server forgets it.
 #[allow(clippy::too_many_arguments)]
 async fn connection(
     context: cw_tokio::Context,
     signer: ed25519::PrivateKey,
     peer: ed25519::PublicKey,
     addr: SocketAddr,
-    mut out_rx: mpsc::UnboundedReceiver<StreamMsg>,
+    mut out_rx: mpsc::Receiver<Queued>,
     frames: Frames,
     pending: PendingFetches,
     up: Arc<std::sync::atomic::AtomicBool>,
+    mut control: watch::Receiver<Control>,
 ) {
-    let mut subscriptions: Vec<Topic> = Vec::new();
     // Without this the redial loop outlives the runtime it dials on.
     let mut stop = context.stopped();
     loop {
+        // A dropped `Conn` sender means `run` has returned; nothing will ever
+        // be sent on this connection again.
+        if out_rx.is_closed() {
+            up.store(false, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         let cfg = encrypted::Config {
             signing_key: signer.clone(),
             namespace: b"anymone-stream-v0".to_vec(),
@@ -376,18 +463,31 @@ async fn connection(
             max_handshake_age: std::time::Duration::from_secs(10),
             handshake_timeout: std::time::Duration::from_secs(5),
         };
-        let dialed = match context.dial(addr).await {
-            // `dial` takes stream before sink, the reverse of the runtime's pair.
-            Ok((sink, stream)) => {
-                encrypted::dial(context.child("handshake"), cfg, peer.clone(), stream, sink)
-                    .await
-                    .ok()
+        let dial = async {
+            match context.dial(addr).await {
+                // `dial` takes stream before sink, the reverse of the runtime's pair.
+                Ok((sink, stream)) => {
+                    encrypted::dial(context.child("handshake"), cfg, peer.clone(), stream, sink)
+                        .await
+                        .ok()
+                }
+                Err(_) => None,
             }
-            Err(_) => None,
+        };
+        // Dialing an unreachable peer is the one place this task can sit for a
+        // long time, so shutdown has to reach it here or not at all.
+        let dialed = tokio::select! {
+            _ = &mut stop => {
+                up.store(false, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            dialed = dial => dialed,
         };
         let Some((mut tx, mut rx)) = dialed else {
-            tokio::time::sleep(RECONNECT_BACKOFF).await;
-            continue;
+            tokio::select! {
+                _ = &mut stop => return,
+                _ = tokio::time::sleep(RECONNECT_BACKOFF) => continue,
+            }
         };
         up.store(true, std::sync::atomic::Ordering::Relaxed);
         // Reading gets its own task: a cancelled encrypted recv may have
@@ -432,28 +532,26 @@ async fn connection(
         });
 
         // The server has no memory of a previous connection.
-        let mut resent = true;
-        for t in &subscriptions {
-            let msg = StreamMsg::FeedSubscribe { topics: vec![*t] };
-            if tx.send(msg.encode()).await.is_err() {
-                resent = false;
-                break;
-            }
-        }
-        if resent {
+        if present_control(&mut tx, &mut control).await {
             loop {
                 // Only the plain channels are cancelled here; the send below is
                 // awaited to completion inside the arm.
                 tokio::select! {
                     outbound = out_rx.recv() => {
-                        let Some(msg) = outbound else {
+                        let Some(queued) = outbound else {
                             reader.abort();
                             return;
                         };
-                        if let StreamMsg::FeedSubscribe { topics } = &msg {
-                            subscriptions.extend(topics.iter().copied());
+                        if queued.expires_at.is_some_and(|at| at <= tokio::time::Instant::now()) {
+                            tracing::debug!(target: P2P, "stream client dropped a stale queued frame");
+                            continue;
                         }
-                        if tx.send(msg.encode()).await.is_err() {
+                        if tx.send(queued.msg.encode()).await.is_err() {
+                            break;
+                        }
+                    }
+                    changed = control.changed() => {
+                        if changed.is_err() || !present_control(&mut tx, &mut control).await {
                             break;
                         }
                     }
@@ -468,6 +566,9 @@ async fn connection(
         }
         up.store(false, std::sync::atomic::Ordering::Relaxed);
         reader.abort();
-        tokio::time::sleep(RECONNECT_BACKOFF).await;
+        tokio::select! {
+            _ = &mut stop => return,
+            _ = tokio::time::sleep(RECONNECT_BACKOFF) => {}
+        }
     }
 }

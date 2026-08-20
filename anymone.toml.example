@@ -41,3 +41,46 @@ subnet_grow_at = 63         # per-subnet load that triggers another subnet
 message_size = 256          # per-message payload bound
 consensus_set = false       # form the client set by consensus, not a leader's
                             # announcement; needs a longer public round
+attested_subnets = []       # subnet ids admitting only attested clients, e.g. [0].
+                            # With no policy below, such a subnet admits nobody.
+attestation_validity_rounds = 100   # rounds a client's enrolment holds for
+
+# One entry per accepted client image, verbatim from `attest measure`. A
+# bare-metal image also pins its firmware registers, which a GCP one rebuilds
+# from its own quote.
+# [[committee.tdx_images]]
+# image.dcap = { uki_authenticode = "<96 hex>", kernel_authenticode = "<96 hex>", \
+#                cmdline_hash = "<96 hex>", initrd_hash = "<96 hex>", \
+#                gpt_disk_guid_hash = "<96 hex>" }
+# firmware = { mrtd = [0, 0], rtmr0 = [0, 0] }   # bare metal only
+
+# Play Integrity verdicts are decrypted and checked on each relay, so these Play
+# Console keys sit in the signed config and every relay holding it can read a
+# verdict token. Needs the `mobile-attest` build; relays without it refuse these
+# enrolments while their peers accept them.
+# [committee.play_integrity]
+# decryption_key = [0, 0]     # 32 bytes, Play Console response-decryption key
+# verification_key = [0, 0]   # SEC1 P-256 point, Play Console verification key
+# package_name = "net.flashbots.anymone"
+# certificate_digests = [[0, 0]]   # sha256 of each accepted app signing cert
+# require_strong_integrity = true
+# max_token_age_ms = 60000
+
+# [committee.app_attest]
+# team_id = "ABCDE12345"
+# bundle_id = "net.flashbots.anymone"
+# production = true
+# root_ca_der = [0, 0]        # Apple App Attest root, DER
+
+# Android hardware key attestation: the Keystore cert chain names the calling
+# app, so no Play Console keys are involved. Also needs `mobile-attest`.
+# [committee.android_key]
+# package_name = "net.flashbots.anymone"
+# certificate_digests = [[0, 0]]   # sha256 of each accepted app signing cert
+# require_strongbox = true         # else a TEE-backed key passes
+# root_ca_der = [0, 0]             # Google hardware attestation root, DER
+
+# This node's own attestation. Independent of what it demands of others.
+[tee]
+# prover = "tdx"              # unset: this node stays off attested subnets
+# pccs_url = "https://api.trustedservices.intel.com"

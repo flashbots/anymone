@@ -11,13 +11,12 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 
 use crate::identity::{ExchangeIdentity, Identity};
-use adcnet::crypto::{
-    ExchangePrivateKey, ExchangePublicKey, PrivateKey, PublicKey, ServerId, SharedKey,
-};
+pub use adcnet::crypto::ServerId;
+use adcnet::crypto::{ExchangePrivateKey, ExchangePublicKey, PrivateKey, PublicKey, SharedKey};
 use adcnet::protocol::messages::Signed;
+pub use adcnet::protocol::session::one_round::{IbltMsgParamsOwned, OneRoundConfig};
 use adcnet::protocol::session::one_round::{
-    client_contribute, combine_round, server_contribute, ClientContribution, IbltMsgParamsOwned,
-    OneRoundConfig, ServerShare,
+    client_contribute, combine_round, server_contribute, ClientContribution, ServerShare,
 };
 use adcnet::protocol::session::two_round::{ClientService, ServerService};
 use adcnet::protocol::{
@@ -183,7 +182,7 @@ pub(crate) async fn run_subnet(
                 &subnet,
                 &inner.identity,
                 leader_pk,
-                inner.good_clients.clone(),
+                inner.subnet_clients(&subnet),
             ),
         );
     } else {
@@ -198,6 +197,7 @@ pub(crate) async fn run_subnet(
                 AdcnetAggregatorSession::new(group, a.groups.len() as u32, inner.identity.clone());
             agg_session
                 .set_client_set_max((cfg.client_set_max as usize / a.groups.len().max(1)).max(1));
+            agg_session.set_good_clients(inner.subnet_clients(&subnet));
             sessions.insert(SessionKey::Aggregator, Box::new(agg_session));
         }
     }
@@ -1045,6 +1045,9 @@ pub struct AdcnetAggregatorSession {
     /// Per-group ceiling: the groups' union forms the canonical set, which
     /// servers reject above the subnet's `client_set_max`.
     client_set_max: usize,
+    /// Screened here too: the leader sees an aggregate, not the clients behind
+    /// it, so a client the leader would refuse must not reach the group sum.
+    good_clients: GoodClients,
 }
 
 impl AdcnetAggregatorSession {
@@ -1057,6 +1060,7 @@ impl AdcnetAggregatorSession {
             emitted: std::collections::HashSet::new(),
             cur_round: 0,
             client_set_max: usize::MAX,
+            good_clients: GoodClients::all(),
         }
     }
 
@@ -1064,6 +1068,10 @@ impl AdcnetAggregatorSession {
     /// `client_set_max / group_count`.
     pub(crate) fn set_client_set_max(&mut self, max: usize) {
         self.client_set_max = max;
+    }
+
+    pub(crate) fn set_good_clients(&mut self, good_clients: GoodClients) {
+        self.good_clients = good_clients;
     }
 }
 
@@ -1104,6 +1112,18 @@ impl Session for AdcnetAggregatorSession {
                     c_round = c.round,
                     group = self.group,
                     "adcnet aggregator: key and contribution signers differ, dropped"
+                );
+                return Vec::new();
+            }
+            let signer_pk = <[u8; 32]>::try_from(signer.as_bytes())
+                .map(Pubkey::from_bytes)
+                .ok();
+            if !signer_pk.is_some_and(|pk| self.good_clients.allows(&pk)) {
+                debug!(
+                    target: ADCNET,
+                    c_round = c.round,
+                    group = self.group,
+                    "adcnet aggregator: signer not an accepted client, dropped"
                 );
                 return Vec::new();
             }
@@ -1286,7 +1306,7 @@ impl AdcnetServerSession {
         }
     }
 
-    pub(crate) fn set_good_clients(&mut self, good_clients: GoodClients) {
+    pub fn set_good_clients(&mut self, good_clients: GoodClients) {
         self.good_clients = good_clients;
     }
 

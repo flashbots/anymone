@@ -64,8 +64,8 @@ pub struct Pipe {
     return_tag: RouteTag,
     inbound: mpsc::UnboundedReceiver<PipeIncoming>,
     /// Clone of the sender registered under `return_tag` in `AnymoneInner.pipes`,
-    /// so `Drop` only removes that entry if a later `bind`/`subscribe` on the
-    /// same tag hasn't since overwritten it.
+    /// so `Drop` only removes that entry if a later `bind`/`subscribe` hasn't
+    /// since reclaimed the tag.
     self_tx: mpsc::UnboundedSender<PipeIncoming>,
 }
 
