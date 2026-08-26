@@ -7,7 +7,7 @@ use anymone_core::client_set::{
     batch_signing_bytes, build_fragments, plurality_set, relay_rounds, run_client_round_set,
     ClientSetRound, ReceiptBatch, Relay, RelayItem, SetRound, SetServer,
 };
-use chipmunk_code::{HVCPoly, KahePoly, N};
+use panetiere::{HVCPoly, KahePoly, N};
 use panetiere::bulletin::{RsClientBulletinEntry, RsNodeBulletinEntry, ServerBulletinEntry};
 use panetiere::kahe::T_MODULUS_DEFAULT;
 use panetiere::pke;

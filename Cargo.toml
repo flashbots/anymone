@@ -66,5 +66,8 @@ opt-level = 2
 [profile.dev.package.chipmunk_code]
 opt-level = 2
 
+[profile.dev.package.negacyclic-rings]
+opt-level = 2
+
 [profile.dev.package.num-bigint]
 opt-level = 2

@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chipmunk_code::{DgtNTTPoly, N};
+use panetiere::{DgtNTTPoly, N};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 

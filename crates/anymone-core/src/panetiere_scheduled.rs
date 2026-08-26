@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
-use chipmunk_code::KahePoly;
+use panetiere::KahePoly;
 use panetiere::channel::ChannelParams;
 use panetiere::codec;
 use panetiere::mse::MseEncoding;

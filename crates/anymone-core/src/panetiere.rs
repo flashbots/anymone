@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use chipmunk_code::{CsPoly, DgtNTTPoly, HVCPoly, KahePoly};
+use panetiere::{CsPoly, DgtNTTPoly, HVCPoly, KahePoly};
 use panetiere::bulletin::{
     dgt_packed_len, RsClientBulletinEntry, RsNodeBulletinEntry, ServerBulletinEntry,
 };

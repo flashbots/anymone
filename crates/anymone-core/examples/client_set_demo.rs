@@ -11,7 +11,7 @@ use anymone_core::client_set::{
     build_fragments, plurality_set, relay_rounds, run_client_round_set, ClientSetRound,
     ReceiptBatch, Relay, SetRound, SetServer,
 };
-use chipmunk_code::HVCPoly;
+use panetiere::HVCPoly;
 use panetiere::bulletin::{RsClientBulletinEntry, RsNodeBulletinEntry, ServerBulletinEntry};
 use panetiere::channel::{self, ChannelParams};
 use panetiere::kahe::T_MODULUS_DEFAULT;
