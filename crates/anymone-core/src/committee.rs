@@ -284,7 +284,10 @@ pub async fn spawn_panetiere_committee_scheduler(
 ) -> JoinHandle<()> {
     // Subscribe-before-spawn for every consumed topic.
     let mut inbound: Vec<(Source, crate::transport::Subscription)> = vec![
-        (Source::Registration, transport.subscribe(TOPIC_REGISTRATION).await),
+        (
+            Source::Registration,
+            transport.subscribe(TOPIC_REGISTRATION).await,
+        ),
         (Source::Faults, transport.subscribe(TOPIC_FAULTS).await),
         (
             Source::Panetiere,
@@ -311,15 +314,11 @@ pub async fn spawn_panetiere_committee_scheduler(
         // (liveness / share frontier). Both feed the same per-subnet observer.
         inbound.push((
             Source::Subnet(id),
-            transport
-                .subscribe(Topic::Broadcast(id))
-                .await,
+            transport.subscribe(Topic::Broadcast(id)).await,
         ));
         inbound.push((
             Source::Subnet(id),
-            transport
-                .subscribe(Topic::Shares(id))
-                .await,
+            transport.subscribe(Topic::Shares(id)).await,
         ));
     }
 

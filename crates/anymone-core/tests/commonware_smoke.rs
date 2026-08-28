@@ -24,9 +24,7 @@ async fn publish_until<T: Transport + ?Sized>(
 ) -> anymone_core::Inbound {
     for _ in 0..tries {
         net.publish(topic, payload.to_vec()).await;
-        if let Ok(Some(msg)) =
-            tokio::time::timeout(Duration::from_millis(400), sub.recv()).await
-        {
+        if let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(400), sub.recv()).await {
             return msg;
         }
     }
@@ -44,9 +42,7 @@ async fn send_until<T: Transport + ?Sized>(
 ) -> anymone_core::Inbound {
     for _ in 0..tries {
         net.send(to, subnet, payload.to_vec()).await;
-        if let Ok(Some(msg)) =
-            tokio::time::timeout(Duration::from_millis(400), sub.recv()).await
-        {
+        if let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(400), sub.recv()).await {
             return msg;
         }
     }

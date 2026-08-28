@@ -195,8 +195,8 @@ impl CommonwareNetwork {
         std::thread::Builder::new()
             .name("commonware".into())
             .spawn(move || {
-                let dir = std::env::temp_dir()
-                    .join(format!("anymone-cw-{}", hex::encode(&me.0[..8])));
+                let dir =
+                    std::env::temp_dir().join(format!("anymone-cw-{}", hex::encode(&me.0[..8])));
                 let rt = cw_tokio::Config::default().with_storage_directory(dir);
                 cw_tokio::Runner::new(rt).start(|context| {
                     run(context, signer, cfg, cmd_rx, thread_shared, thread_attested)
@@ -363,8 +363,7 @@ async fn run(
 
     // Config-pull candidates: no API exposes who is connected, so ask the peers
     // we know are meant to be reachable.
-    let rr_candidates: Vec<ed25519::PublicKey> =
-        genesis.iter().filter_map(keys::to_cw).collect();
+    let rr_candidates: Vec<ed25519::PublicKey> = genesis.iter().filter_map(keys::to_cw).collect();
 
     // Ordered so eviction drops the oldest request, not every in-flight one.
     let mut pending: std::collections::BTreeMap<u64, oneshot::Sender<Option<Vec<u8>>>> =

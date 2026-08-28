@@ -22,12 +22,20 @@ pub(crate) enum StreamMsg {
     /// Client data addressed to the receiving node for `subnet`. Its payload
     /// carries the client's own signature, so delivery doesn't launder its
     /// origin.
-    Data { subnet: SubnetId, payload: Vec<u8> },
+    Data {
+        subnet: SubnetId,
+        payload: Vec<u8>,
+    },
     /// A client's publish on a client-open topic (a Noop subnet's broadcast,
     /// where the whole protocol rides the topic). The node republishes it on
     /// the backbone; bound topics are refused.
-    Submit { topic: Topic, payload: Vec<u8> },
-    FeedSubscribe { topics: Vec<Topic> },
+    Submit {
+        topic: Topic,
+        payload: Vec<u8>,
+    },
+    FeedSubscribe {
+        topics: Vec<Topic>,
+    },
     /// A frame on a subscribed topic. `from` is the frame's publisher on the
     /// backbone (the serving node itself, for its own publishes); the stream
     /// peer is authenticated, so a client can trust it named the origin honestly.

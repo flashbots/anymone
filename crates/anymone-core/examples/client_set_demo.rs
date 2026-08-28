@@ -11,7 +11,6 @@ use anymone_core::client_set::{
     build_fragments, plurality_set, relay_rounds, run_client_round_set, ClientSetRound,
     ReceiptBatch, Relay, SetRound, SetServer,
 };
-use panetiere::HVCPoly;
 use panetiere::bulletin::{RsClientBulletinEntry, RsNodeBulletinEntry, ServerBulletinEntry};
 use panetiere::channel::{self, ChannelParams};
 use panetiere::kahe::T_MODULUS_DEFAULT;
@@ -20,6 +19,7 @@ use panetiere::protocol::server::{run_rs_node_round, run_server_round};
 use panetiere::protocol::verify::aggregate_and_decrypt_rs;
 use panetiere::protocol::{ClientId, ProtocolParams, ServerId, SessionId};
 use panetiere::sig::{self, SigningKey};
+use panetiere::HVCPoly;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
@@ -86,8 +86,9 @@ impl Demo {
             RHO_MAX,
             [0x42; 32],
         );
-        let server_keys: Vec<pke::PrivateKey> =
-            (0..S).map(|_| pke::PrivateKey::generate(&mut rng)).collect();
+        let server_keys: Vec<pke::PrivateKey> = (0..S)
+            .map(|_| pke::PrivateKey::generate(&mut rng))
+            .collect();
         let server_sig: Vec<SigningKey> = (0..S).map(|_| SigningKey::generate(&mut rng)).collect();
         let servers = roster(&server_keys);
 
@@ -212,11 +213,17 @@ impl Demo {
         let sets: Vec<Option<SetRound>> = servers
             .iter()
             .enumerate()
-            .map(|(j, s)| publishes[j].then(|| s.finalize(&self.pp, &self.server_keys[j], &SESSION)))
+            .map(|(j, s)| {
+                publishes[j].then(|| s.finalize(&self.pp, &self.server_keys[j], &SESSION))
+            })
             .collect();
 
         let published: Vec<&SetRound> = sets.iter().flatten().collect();
-        let scp = self.pp.share_comm.as_ref().expect("share-commitment params");
+        let scp = self
+            .pp
+            .share_comm
+            .as_ref()
+            .expect("share-commitment params");
         let roots: Vec<(ClientId, HVCPoly)> = self
             .entries
             .iter()
@@ -364,12 +371,7 @@ fn main() {
     let victim = ClientId(5);
     d.report(
         "2. lane 7 never took client 5's bundle — absorbed, lane 7 abstains",
-        &d.run(
-            |c, lane| !(c == victim && lane == S - 1),
-            never,
-            all,
-            None,
-        ),
+        &d.run(|c, lane| !(c == victim && lane == S - 1), never, all, None),
     );
 
     let blind = [S - 3, S - 2, S - 1];

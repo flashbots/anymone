@@ -10,7 +10,9 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use commonware_cryptography::ed25519;
-use commonware_runtime::{tokio as cw_tokio, Listener as _, Network as _, Spawner as _, Supervisor as _};
+use commonware_runtime::{
+    tokio as cw_tokio, Listener as _, Network as _, Spawner as _, Supervisor as _,
+};
 use commonware_stream::encrypted;
 use tokio::sync::mpsc;
 
@@ -200,7 +202,9 @@ async fn session<S, R>(
                             .deliver_local(Topic::Registration, client, bytes.clone());
                         let _ = hooks.publish.send((Topic::Registration, bytes));
                     }
-                    _ => tracing::debug!(target: P2P, %client, "unverifiable registration over stream, ignored"),
+                    _ => {
+                        tracing::debug!(target: P2P, %client, "unverifiable registration over stream, ignored")
+                    }
                 }
             }
             // A bound topic is closed to clients: forwarding puts the frame on
@@ -208,7 +212,8 @@ async fn session<S, R>(
             // receiving relays' admission would pass and the roster would mean
             // nothing. Only an open broadcast (a Noop subnet) qualifies.
             StreamMsg::Submit { topic, payload } => {
-                let open = matches!(topic, Topic::Broadcast(_)) && !hooks.shared.topic_is_bound(topic);
+                let open =
+                    matches!(topic, Topic::Broadcast(_)) && !hooks.shared.topic_is_bound(topic);
                 if !open {
                     tracing::debug!(target: P2P, %client, %topic, "client may not submit on this topic");
                     continue;

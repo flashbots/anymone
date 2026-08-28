@@ -916,7 +916,11 @@ async fn refresh_own_attestation(inner: &Arc<AnymoneInner>) {
     }
     inner.transport.attest(att.clone());
     let mut own = inner.tee.own.lock().unwrap();
-    if own.held.as_ref().is_some_and(|held| held.round == att.round) {
+    if own
+        .held
+        .as_ref()
+        .is_some_and(|held| held.round == att.round)
+    {
         own.delivered = true;
         debug!(target: crate::tee::TEE, round = att.round, "this node's attestation is with the relays");
     }
@@ -1532,8 +1536,8 @@ pub(crate) fn queue_outbound(
 #[cfg(test)]
 mod outbox_tests {
     use super::*;
-    use crate::config::{AnymoneRoundConfiguration, NoopConfig, ProtocolConfig};
     use crate::config::ScheduledPanetiereConfig;
+    use crate::config::{AnymoneRoundConfiguration, NoopConfig, ProtocolConfig};
     use crate::panetiere_scheduled::{
         params_for, ReservationEntries, ScheduledPanetiereClientSession,
     };

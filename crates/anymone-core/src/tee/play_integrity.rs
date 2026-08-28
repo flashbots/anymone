@@ -144,9 +144,10 @@ impl PlayIntegrityVerifier {
 
         let device = verdict["deviceIntegrity"]["deviceRecognitionVerdict"].as_array();
         let met = device.is_some_and(|labels| {
-            labels.iter().filter_map(Value::as_str).any(|l| {
-                l == STRONG || (!self.policy.require_strong_integrity && l == DEVICE)
-            })
+            labels
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|l| l == STRONG || (!self.policy.require_strong_integrity && l == DEVICE))
         });
         if !met {
             tracing::debug!(target: TEE, "play integrity: device integrity not met");
@@ -169,8 +170,7 @@ impl TeeVerifier for PlayIntegrityVerifier {
             tracing::debug!(target: TEE, "play integrity: verdict signature invalid");
             return false;
         };
-        let expected =
-            URL_SAFE_NO_PAD.encode(challenge(att.scheme, statement, att.round));
+        let expected = URL_SAFE_NO_PAD.encode(challenge(att.scheme, statement, att.round));
         self.check_verdict(&verdict, &expected)
     }
 }
@@ -186,8 +186,8 @@ pub struct PlayIntegrityMinter {
 #[cfg(any(test, feature = "test-util"))]
 impl PlayIntegrityMinter {
     pub fn new(seed: u8) -> Self {
-        let signing = p256::ecdsa::SigningKey::from_bytes(&[seed.max(1); 32].into())
-            .expect("valid scalar");
+        let signing =
+            p256::ecdsa::SigningKey::from_bytes(&[seed.max(1); 32].into()).expect("valid scalar");
         PlayIntegrityMinter {
             decryption_key: [seed; 32],
             signing,
@@ -217,10 +217,7 @@ impl PlayIntegrityMinter {
         let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(verdict).expect("verdict json"));
         let signing_input = format!("{jws_header}.{payload}");
         let sig: Signature = self.signing.sign(signing_input.as_bytes());
-        let jws = format!(
-            "{signing_input}.{}",
-            URL_SAFE_NO_PAD.encode(sig.to_bytes())
-        );
+        let jws = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()));
 
         let jwe_header = URL_SAFE_NO_PAD.encode(br#"{"alg":"A256KW","enc":"A256GCM"}"#);
         let cek = [0x2bu8; 32];
@@ -349,8 +346,7 @@ mod tests {
         let pk = [3u8; 32];
 
         let mut stale = verdict_for(&pk, 5, PKG, cert);
-        stale["requestDetails"]["timestampMillis"] =
-            (now_unix_ms() - 3_600_000).to_string().into();
+        stale["requestDetails"]["timestampMillis"] = (now_unix_ms() - 3_600_000).to_string().into();
         assert!(!verifier.verify(&pk, &att(&minter, &stale, 5)));
 
         let forged = PlayIntegrityMinter::new(11);

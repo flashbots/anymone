@@ -201,7 +201,10 @@ async fn adcnet_echo_roundtrip_in_memory() {
 
     // Never enrolled with any relay, so its submission is dropped at ingress.
     let mut stranger_pipe = stranger_anymone.open(echo_tag()).await.unwrap();
-    stranger_pipe.send(b"hello stranger".to_vec()).await.unwrap();
+    stranger_pipe
+        .send(b"hello stranger".to_vec())
+        .await
+        .unwrap();
 
     let mut pipe = client_anymone.open(echo_tag()).await.unwrap();
     pipe.send(b"hello adcnet".to_vec()).await.unwrap();

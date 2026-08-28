@@ -13,8 +13,8 @@
 //! as well, so `certificate_digests` is what separates a real client from a
 //! rebuilt one.
 
-use sha2::{Digest, Sha256};
 use asn1_rs::{Any, Class, FromDer, Tag};
+use sha2::{Digest, Sha256};
 use x509_parser::prelude::*;
 
 use super::{challenge, Attestation, AttestationScheme, TeeVerifier, TEE};
@@ -419,7 +419,10 @@ mod minter {
             let challenge = challenge(AttestationScheme::AndroidKeyAttestation, statement, round);
 
             let app_id = der::seq(&[
-                der::set(&[der::seq(&[der::octets(package_name.as_bytes()), der::uint(1)])]),
+                der::set(&[der::seq(&[
+                    der::octets(package_name.as_bytes()),
+                    der::uint(1),
+                ])]),
                 der::set(&[der::octets(&digest)]),
             ]);
             let software_enforced = der::seq(&[der::context(

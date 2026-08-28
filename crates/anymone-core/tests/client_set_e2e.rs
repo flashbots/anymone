@@ -7,7 +7,6 @@ use anymone_core::client_set::{
     batch_signing_bytes, build_fragments, plurality_set, relay_rounds, run_client_round_set,
     ClientSetRound, ReceiptBatch, Relay, RelayItem, SetRound, SetServer,
 };
-use panetiere::{HVCPoly, KahePoly, N};
 use panetiere::bulletin::{RsClientBulletinEntry, RsNodeBulletinEntry, ServerBulletinEntry};
 use panetiere::kahe::T_MODULUS_DEFAULT;
 use panetiere::pke;
@@ -15,6 +14,7 @@ use panetiere::protocol::server::{run_rs_node_round, run_server_round};
 use panetiere::protocol::verify::{aggregate_and_decrypt_rs, VerifyError};
 use panetiere::protocol::{ClientId, ProtocolParams, ServerId, SessionId};
 use panetiere::sig::{self, SigningKey};
+use panetiere::{HVCPoly, KahePoly, N};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
@@ -98,8 +98,9 @@ impl Round {
             RHO_MAX,
             [0x42; 32],
         );
-        let server_keys: Vec<pke::PrivateKey> =
-            (0..s).map(|_| pke::PrivateKey::generate(&mut rng)).collect();
+        let server_keys: Vec<pke::PrivateKey> = (0..s)
+            .map(|_| pke::PrivateKey::generate(&mut rng))
+            .collect();
         let server_sig: Vec<SigningKey> = (0..s).map(|_| SigningKey::generate(&mut rng)).collect();
         let servers = roster(&server_keys);
 
@@ -247,7 +248,11 @@ impl Round {
     }
 
     fn publish(&self, sets: &[&SetRound]) -> (Vec<ServerBulletinEntry>, Vec<RsNodeBulletinEntry>) {
-        let scp = self.pp.share_comm.as_ref().expect("share-commitment params");
+        let scp = self
+            .pp
+            .share_comm
+            .as_ref()
+            .expect("share-commitment params");
         let roots: Vec<(ClientId, HVCPoly)> = self
             .entries
             .iter()
@@ -269,10 +274,14 @@ impl Round {
     fn recover(&self, sets: &[&SetRound]) -> Result<(Vec<ClientId>, Vec<KahePoly>), VerifyError> {
         let (servers, lanes) = self.publish(sets);
         let anchor = plurality_set(&servers);
-        let agreeing: Vec<ServerBulletinEntry> =
-            servers.into_iter().filter(|sp| sp.clients == anchor).collect();
-        let agreeing_lanes: Vec<RsNodeBulletinEntry> =
-            lanes.into_iter().filter(|np| np.clients == anchor).collect();
+        let agreeing: Vec<ServerBulletinEntry> = servers
+            .into_iter()
+            .filter(|sp| sp.clients == anchor)
+            .collect();
+        let agreeing_lanes: Vec<RsNodeBulletinEntry> = lanes
+            .into_iter()
+            .filter(|np| np.clients == anchor)
+            .collect();
         aggregate_and_decrypt_rs(
             &self.pp,
             &SESSION,
@@ -355,7 +364,11 @@ fn a_gap_within_the_budget_is_absorbed() {
     }
     let blind_lane = out.sets[blind].as_ref().expect("finalized");
     assert!(
-        !blind_lane.lane_inbox.items.iter().any(|(c, _, _)| *c == victim),
+        !blind_lane
+            .lane_inbox
+            .items
+            .iter()
+            .any(|(c, _, _)| *c == victim),
         "the blind lane cannot serve the victim, so it must abstain"
     );
 
@@ -378,7 +391,11 @@ fn a_gap_past_the_budget_is_repaired() {
     assert_eq!(out.agreed_set(), r.all_clients());
     for (j, sr) in out.sets.iter().enumerate() {
         let sr = sr.as_ref().expect("finalized");
-        let expect = if blind.contains(&j) { vec![victim] } else { vec![] };
+        let expect = if blind.contains(&j) {
+            vec![victim]
+        } else {
+            vec![]
+        };
         assert_eq!(sr.repaired, expect, "lane {j}");
     }
     let published: Vec<&SetRound> = out.published().collect();
@@ -437,7 +454,11 @@ fn a_double_boot_is_excluded_everywhere() {
     let bus = r.exchange(&mut servers, NEVER);
     r.settle(&mut servers, bus);
 
-    let expected: Vec<ClientId> = r.all_clients().into_iter().filter(|c| *c != twice).collect();
+    let expected: Vec<ClientId> = r
+        .all_clients()
+        .into_iter()
+        .filter(|c| *c != twice)
+        .collect();
     for (j, s) in servers.iter().enumerate() {
         let sr = s.finalize(&r.pp, &r.server_keys[j], &SESSION);
         assert_eq!(sr.set, expected, "lane {j}");
@@ -536,7 +557,10 @@ fn a_lane_naming_a_bogus_key_evicts_nobody() {
 
     for (j, s) in servers.iter().enumerate() {
         let sr = s.finalize(&r.pp, &r.server_keys[j], &SESSION);
-        assert!(sr.conflicted.is_empty(), "lane {j} was talked into a conflict");
+        assert!(
+            sr.conflicted.is_empty(),
+            "lane {j} was talked into a conflict"
+        );
         assert!(sr.set.contains(&victim), "lane {j} dropped the victim");
     }
 }
@@ -556,7 +580,11 @@ fn plurality_prefers_the_most_published_then_the_larger_set() {
     for s in servers.iter_mut().take(4) {
         s.clients = short.clone();
     }
-    assert_eq!(plurality_set(&servers), full, "a 4–4 tie goes to the larger");
+    assert_eq!(
+        plurality_set(&servers),
+        full,
+        "a 4–4 tie goes to the larger"
+    );
 
     servers[4].clients = short.clone();
     assert_eq!(plurality_set(&servers), short, "5 votes the other way");

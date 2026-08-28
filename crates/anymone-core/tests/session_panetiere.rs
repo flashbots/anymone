@@ -664,7 +664,11 @@ fn panetiere_followers_use_leader_set_with_min_floor() {
     );
 
     let decoded = run(2, 3, usize::MAX, 1);
-    let carried = |msg: &str| decoded.iter().any(|d| d.windows(5).any(|w| w == msg.as_bytes()));
+    let carried = |msg: &str| {
+        decoded
+            .iter()
+            .any(|d| d.windows(5).any(|w| w == msg.as_bytes()))
+    };
     assert!(
         carried("msg-0") && carried("msg-1"),
         "attested clients still get through the gate"
@@ -880,7 +884,9 @@ fn consensus_set_formation_agrees_and_excludes_a_double_boot() {
             c
         })
         .collect();
-    let payloads: Vec<Vec<u8>> = (0..3).map(|i| format!("consensus-{i}").into_bytes()).collect();
+    let payloads: Vec<Vec<u8>> = (0..3)
+        .map(|i| format!("consensus-{i}").into_bytes())
+        .collect();
     for (i, p) in payloads.iter().enumerate() {
         clients[i].stage(p.clone());
     }
@@ -1015,7 +1021,9 @@ fn consensus_set_formation_agrees_and_excludes_a_double_boot() {
     let decoded: Vec<Vec<u8>> = servers[0].end_round(1, now).decoded;
     for (i, p) in payloads.iter().enumerate().take(2) {
         assert!(
-            decoded.iter().any(|d| d.windows(p.len()).any(|w| w == &p[..])),
+            decoded
+                .iter()
+                .any(|d| d.windows(p.len()).any(|w| w == &p[..])),
             "payload {i} not decoded from the consensus set"
         );
     }

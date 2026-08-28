@@ -45,20 +45,20 @@ impl TeeConfig {
     /// Builds the wiring, prewarming collateral so verification never blocks a
     /// client's enrolment on a fetch.
     pub async fn setup(&self) -> crate::runtime::TeeSetup {
-        let prover: Option<std::sync::Arc<dyn crate::tee::TeeProver>> =
-            match self.prover.as_deref() {
-                None => None,
-                #[cfg(feature = "tdx-attest")]
-                Some("tdx") => Some(std::sync::Arc::new(crate::tee::TdxProver)),
-                Some(other) => {
-                    tracing::warn!(
-                        target: crate::tee::TEE,
-                        prover = other,
-                        "unsupported TEE prover in this build, this node will not attest"
-                    );
-                    None
-                }
-            };
+        let prover: Option<std::sync::Arc<dyn crate::tee::TeeProver>> = match self.prover.as_deref()
+        {
+            None => None,
+            #[cfg(feature = "tdx-attest")]
+            Some("tdx") => Some(std::sync::Arc::new(crate::tee::TdxProver)),
+            Some(other) => {
+                tracing::warn!(
+                    target: crate::tee::TEE,
+                    prover = other,
+                    "unsupported TEE prover in this build, this node will not attest"
+                );
+                None
+            }
+        };
         #[cfg(feature = "tdx-attest")]
         let pccs = {
             let pccs = attest_pccs::Pccs::new(self.pccs_url.clone());

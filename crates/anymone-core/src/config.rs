@@ -96,7 +96,13 @@ impl PartialEq for AttestationPolicy {
         let images = |p: &Self| {
             p.tdx_images
                 .iter()
-                .map(|i| (i.image.azure.clone(), i.image.dcap.clone(), i.firmware.clone()))
+                .map(|i| {
+                    (
+                        i.image.azure.clone(),
+                        i.image.dcap.clone(),
+                        i.firmware.clone(),
+                    )
+                })
                 .collect::<Vec<_>>()
         };
         self.validity_rounds == other.validity_rounds

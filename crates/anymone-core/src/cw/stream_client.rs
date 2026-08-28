@@ -137,9 +137,7 @@ impl Transport for StreamClientNetwork {
         match topic {
             // Registrations, and a Noop subnet's broadcast (its whole protocol
             // rides the open topic); the node refuses anything bound.
-            Topic::Registration | Topic::Broadcast(_) => {
-                self.send_cmd(Cmd::Publish(topic, bytes))
-            }
+            Topic::Registration | Topic::Broadcast(_) => self.send_cmd(Cmd::Publish(topic, bytes)),
             // Every other topic originates on the backbone; a client has
             // nothing to say on them.
             _ => {
@@ -261,7 +259,10 @@ fn spawn_conn(
         let up = up.clone();
         let control = control.subscribe();
         move |ctx| async move {
-            connection(ctx, signer, peer, addr, out_rx, frames, pending, up, control).await;
+            connection(
+                ctx, signer, peer, addr, out_rx, frames, pending, up, control,
+            )
+            .await;
         }
     });
     Some(Conn {
@@ -524,7 +525,9 @@ async fn connection(
                         }
                         // A server without a config yet; another may have one.
                         Some(StreamMsg::ConfigResp(None)) => {}
-                        _ => tracing::debug!(target: P2P, "unexpected stream message from a server"),
+                        _ => {
+                            tracing::debug!(target: P2P, "unexpected stream message from a server")
+                        }
                     }
                 }
                 let _ = dead_tx.send(());

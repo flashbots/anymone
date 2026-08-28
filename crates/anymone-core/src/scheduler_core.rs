@@ -1803,7 +1803,10 @@ impl SchedulerCore {
             })
             .collect();
         // Only placed relays, so a flood of registrations can't inflate the body.
-        let placed: HashSet<Pubkey> = subnets.iter().flat_map(|s| s.relays.iter().copied()).collect();
+        let placed: HashSet<Pubkey> = subnets
+            .iter()
+            .flat_map(|s| s.relays.iter().copied())
+            .collect();
         let mut relay_client_addrs: Vec<(Pubkey, String)> = self
             .relay_client_addrs
             .iter()

@@ -161,7 +161,9 @@ impl ClientPool {
         member.pipe.check_size(payload.len())?;
         let mut queue = self.0.queue.lock().unwrap();
         if queue.len() >= MAX_QUEUED {
-            return Err(PoolError::Saturated { queued: queue.len() });
+            return Err(PoolError::Saturated {
+                queued: queue.len(),
+            });
         }
         queue.push_back(payload);
         Ok(())

@@ -111,7 +111,11 @@ async fn client_submits_and_receives_over_a_stream() {
         }
     }
     let msg = delivered.expect("relay broadcast never reached the client");
-    assert_eq!(msg.from, relay.pubkey(), "frames are attributed to the node");
+    assert_eq!(
+        msg.from,
+        relay.pubkey(),
+        "frames are attributed to the node"
+    );
     assert_eq!(msg.payload, b"decoded-round");
 
     // Data for a subnet outside the served config is refused.

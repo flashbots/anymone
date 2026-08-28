@@ -17,11 +17,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use panetiere::{DgtNTTPoly, N};
+use panetiere::{RsNTTPoly, N};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
-use panetiere::bulletin::{dgt_packed_len, RsClientBulletinEntry, ServerBulletinEntry};
+use panetiere::bulletin::{rs_poly_packed_len, RsClientBulletinEntry, ServerBulletinEntry};
 use panetiere::kahe::{Kahe, KaheScheme};
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round_rs;
@@ -51,13 +51,11 @@ fn sha(parts: &[&[u8]]) -> [u8; 32] {
     h.finalize().into()
 }
 
-fn hash_share(share: &[DgtNTTPoly]) -> [u8; 32] {
+fn hash_share(share: &[RsNTTPoly]) -> [u8; 32] {
+    let mut bytes = Vec::with_capacity(share.len() * rs_poly_packed_len());
+    pack_share(share, &mut bytes);
     let mut h = Sha256::new();
-    for p in share {
-        for c in p.coeffs() {
-            h.update(c.to_le_bytes());
-        }
-    }
+    h.update(bytes);
     h.finalize().into()
 }
 
@@ -76,7 +74,7 @@ pub fn bundle_signing_bytes(
     sid: &SessionId,
     client_id: ClientId,
     lane: usize,
-    share: &[DgtNTTPoly],
+    share: &[RsNTTPoly],
     path: &SharePath,
     envelope: &[u8],
 ) -> Vec<u8> {
@@ -109,7 +107,7 @@ impl Bundle {
     /// Exact packed size under `scp`'s geometry — the share and path lengths are
     /// fixed by it, so only the envelope varies.
     pub fn packed_len(scp: &ShareCommitmentParams, envelope_len: usize) -> usize {
-        8 + scp.block_len * dgt_packed_len()
+        8 + scp.block_len * rs_poly_packed_len()
             + fresh_path_packed_len(scp.n_lanes)
             + envelope_len
             + sig::PUBKEY_LEN
@@ -175,7 +173,7 @@ impl Bundle {
         };
         let lane = word(0)?;
         let mut at = 4;
-        let share_len = scp.block_len * dgt_packed_len();
+        let share_len = scp.block_len * rs_poly_packed_len();
         let share = unpack_share(bytes.get(at..at + share_len)?, scp.block_len)?;
         at += share_len;
         let path_len = fresh_path_packed_len(scp.n_lanes);
@@ -245,14 +243,9 @@ pub struct ReceiptBatch {
     pub sig: [u8; sig::SIG_LEN],
 }
 
-pub fn batch_signing_bytes(
-    sid: &SessionId,
-    server_id: ServerId,
-    receipts: &[Receipt],
-) -> Vec<u8> {
+pub fn batch_signing_bytes(sid: &SessionId, server_id: ServerId, receipts: &[Receipt]) -> Vec<u8> {
     const DOMAIN: &[u8] = b"panetiere/client-set/batch/v1";
-    let mut out =
-        Vec::with_capacity(DOMAIN.len() + 40 + receipts.len() * Receipt::PACKED_LEN);
+    let mut out = Vec::with_capacity(DOMAIN.len() + 40 + receipts.len() * Receipt::PACKED_LEN);
     out.extend_from_slice(DOMAIN);
     out.extend_from_slice(&sid.0);
     out.extend_from_slice(&server_id.0.to_le_bytes());
@@ -325,7 +318,7 @@ pub fn fragment_signing_bytes(
     sid: &SessionId,
     client_id: ClientId,
     idx: usize,
-    data: &[DgtNTTPoly],
+    data: &[RsNTTPoly],
 ) -> Vec<u8> {
     const DOMAIN: &[u8] = b"panetiere/client-set/fragment/v1";
     let mut out = Vec::with_capacity(DOMAIN.len() + 32 + 8 + 32);
@@ -340,7 +333,7 @@ pub fn fragment_signing_bytes(
 impl Fragment {
     pub fn pack(&self) -> Vec<u8> {
         let mut out =
-            Vec::with_capacity(12 + self.data.len() * dgt_packed_len() + sig::SIG_LEN);
+            Vec::with_capacity(12 + self.data.len() * rs_poly_packed_len() + sig::SIG_LEN);
         out.extend_from_slice(&self.client_id.0.to_le_bytes());
         out.extend_from_slice(&(self.idx as u32).to_le_bytes());
         out.extend_from_slice(&(self.data.len() as u32).to_le_bytes());
@@ -358,8 +351,8 @@ impl Fragment {
         let client_id = ClientId(word(0)? as u32);
         let idx = word(4)?;
         let n_polys = word(8)?;
-        let body = 12 + n_polys * dgt_packed_len();
-        if n_polys > bytes.len().saturating_sub(12) / dgt_packed_len()
+        let body = 12 + n_polys * rs_poly_packed_len();
+        if n_polys > bytes.len().saturating_sub(12) / rs_poly_packed_len()
             || bytes.len() != body + sig::SIG_LEN
         {
             return None;
@@ -426,8 +419,7 @@ impl Relay {
             RelayItem::Batch(b) => (0u8, b.pack()),
             RelayItem::Fragment(f) => (1u8, f.pack()),
         };
-        let mut out =
-            Vec::with_capacity(9 + item.len() + self.chain.len() * Self::CHAIN_ENTRY);
+        let mut out = Vec::with_capacity(9 + item.len() + self.chain.len() * Self::CHAIN_ENTRY);
         out.push(tag);
         out.extend_from_slice(&(item.len() as u32).to_le_bytes());
         out.extend_from_slice(&item);
@@ -472,9 +464,9 @@ impl Relay {
     }
 }
 
-const BYTES_PER_COEFF: usize = 7;
+const BYTES_PER_COEFF: usize = 5;
 
-fn blob_to_polys(blob: &[u8]) -> Vec<DgtNTTPoly> {
+fn blob_to_polys(blob: &[u8]) -> Vec<RsNTTPoly> {
     let coeffs = blob.len().div_ceil(BYTES_PER_COEFF).max(1);
     (0..coeffs.div_ceil(N))
         .map(|p| {
@@ -482,20 +474,23 @@ fn blob_to_polys(blob: &[u8]) -> Vec<DgtNTTPoly> {
             for (i, a) in arr.iter_mut().enumerate() {
                 let at = (p * N + i) * BYTES_PER_COEFF;
                 let mut word = [0u8; 8];
-                for (w, b) in word.iter_mut().zip(blob.iter().skip(at).take(BYTES_PER_COEFF)) {
+                for (w, b) in word
+                    .iter_mut()
+                    .zip(blob.iter().skip(at).take(BYTES_PER_COEFF))
+                {
                     *w = *b;
                 }
                 *a = u64::from_le_bytes(word);
             }
-            DgtNTTPoly::from_raw(&arr)
+            RsNTTPoly::from_ntt_slots(&arr).expect("40-bit slots fit the KAHE RNS product")
         })
         .collect()
 }
 
-fn polys_to_blob(polys: &[DgtNTTPoly], blob_len: usize) -> Vec<u8> {
+fn polys_to_blob(polys: &[RsNTTPoly], blob_len: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(polys.len() * N * BYTES_PER_COEFF);
     for p in polys {
-        for c in p.coeffs() {
+        for c in p.ntt_slots() {
             out.extend_from_slice(&c.to_le_bytes()[..BYTES_PER_COEFF]);
         }
     }
@@ -884,7 +879,12 @@ impl SetServer {
     /// (if any) rebuild and verify. Membership is uniform by construction;
     /// only serving can fail locally, and then this server abstains from
     /// publishing instead of splitting the set.
-    pub fn finalize(&self, pp: &ProtocolParams, key: &pke::PrivateKey, sid: &SessionId) -> SetRound {
+    pub fn finalize(
+        &self,
+        pp: &ProtocolParams,
+        key: &pke::PrivateKey,
+        sid: &SessionId,
+    ) -> SetRound {
         let me = self.server_id.0 as usize;
         let mut out = SetRound {
             set: Vec::new(),
@@ -1028,7 +1028,7 @@ impl SetServer {
         if held.len() < params.k {
             return None;
         }
-        let samples: Vec<(usize, &[DgtNTTPoly])> = held
+        let samples: Vec<(usize, &[RsNTTPoly])> = held
             .values()
             .map(|f| (f.idx, f.data.as_slice()))
             .take(params.k)
@@ -1075,7 +1075,15 @@ mod tests {
     #[test]
     fn blob_codec_round_trips() {
         let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
-        for len in [0usize, 1, 6, 7, 8, N * BYTES_PER_COEFF - 1, N * BYTES_PER_COEFF + 13] {
+        for len in [
+            0usize,
+            1,
+            6,
+            7,
+            8,
+            N * BYTES_PER_COEFF - 1,
+            N * BYTES_PER_COEFF + 13,
+        ] {
             let blob: Vec<u8> = (0..len).map(|_| rand::Rng::gen(&mut rng)).collect();
             let polys = blob_to_polys(&blob);
             assert_eq!(polys_to_blob(&polys, len), blob, "len {len}");

@@ -117,11 +117,7 @@ impl TeeVerifier for AppAttestVerifier {
             .extensions()
             .iter()
             .find(|e| e.oid.to_id_string() == NONCE_OID)
-            .is_some_and(|e| {
-                e.value
-                    .windows(nonce.len())
-                    .any(|w| w == nonce)
-            });
+            .is_some_and(|e| e.value.windows(nonce.len()).any(|w| w == nonce));
         if !carries_nonce {
             tracing::debug!(target: TEE, "app attest: certificate does not bind this enrolment");
             return false;
@@ -211,7 +207,12 @@ mod minter {
         }
 
         pub fn mint(&self, statement: &[u8], round: Round) -> Vec<u8> {
-            self.mint_with(statement, round, &self.policy.team_id, &self.policy.bundle_id)
+            self.mint_with(
+                statement,
+                round,
+                &self.policy.team_id,
+                &self.policy.bundle_id,
+            )
         }
 
         /// `team_id`/`bundle_id` are separate so a test can attest the wrong app.
@@ -226,9 +227,8 @@ mod minter {
             let key_id: [u8; 32] = Sha256::digest(public_point(&key)).into();
 
             let mut auth_data = Vec::new();
-            auth_data.extend_from_slice(&Sha256::digest(
-                format!("{team_id}.{bundle_id}").as_bytes(),
-            ));
+            auth_data
+                .extend_from_slice(&Sha256::digest(format!("{team_id}.{bundle_id}").as_bytes()));
             auth_data.push(0x40);
             auth_data.extend_from_slice(&0u32.to_be_bytes());
             auth_data.extend_from_slice(AAGUID_DEV);
@@ -271,8 +271,8 @@ mod minter {
 
     fn public_point(key: &KeyPair) -> Vec<u8> {
         let spki = key.public_key_der();
-        let (_, parsed) = x509_parser::prelude::SubjectPublicKeyInfo::from_der(&spki)
-            .expect("spki");
+        let (_, parsed) =
+            x509_parser::prelude::SubjectPublicKeyInfo::from_der(&spki).expect("spki");
         parsed.subject_public_key.data.to_vec()
     }
 }

@@ -11,9 +11,7 @@ use anymone_core::config::{NoopConfig, ProtocolConfig, ServiceEntry};
 use anymone_core::cw::{
     CommonwareConfig, CommonwareNetwork, StreamClientConfig, StreamClientNetwork,
 };
-use anymone_core::{
-    Anymone, AnymoneRoundConfiguration, GoodClients, Identity, Pubkey, ServiceTag,
-};
+use anymone_core::{Anymone, AnymoneRoundConfiguration, GoodClients, Identity, Pubkey, ServiceTag};
 
 fn addr(port: u16) -> std::net::SocketAddr {
     format!("127.0.0.1:{port}").parse().unwrap()
@@ -96,8 +94,7 @@ async fn e2e_echo_with_client_over_a_stream() {
 
     let mut backbone_nodes: Vec<Anymone> = Vec::new();
     for (id, net) in &nets {
-        let node =
-            Anymone::start_with_config(id.clone(), net.clone(), config.clone()).await;
+        let node = Anymone::start_with_config(id.clone(), net.clone(), config.clone()).await;
         backbone_nodes.push(node);
     }
 
@@ -137,8 +134,7 @@ async fn e2e_echo_with_client_over_a_stream() {
     let reply = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let _ = pipe.send(b"hello over a stream".to_vec()).await;
-            if let Ok(Some(reply)) =
-                tokio::time::timeout(Duration::from_secs(2), pipe.recv()).await
+            if let Ok(Some(reply)) = tokio::time::timeout(Duration::from_secs(2), pipe.recv()).await
             {
                 return reply;
             }

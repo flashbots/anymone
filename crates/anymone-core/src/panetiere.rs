@@ -12,9 +12,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use panetiere::{CsPoly, DgtNTTPoly, HVCPoly, KahePoly};
 use panetiere::bulletin::{
-    dgt_packed_len, RsClientBulletinEntry, RsNodeBulletinEntry, ServerBulletinEntry,
+    rs_poly_packed_len, RsClientBulletinEntry, RsNodeBulletinEntry, ServerBulletinEntry,
 };
 use panetiere::channel::{self, ChannelError, ChannelParams};
 use panetiere::cs::{Opening, PackedOpening};
@@ -29,6 +28,7 @@ use panetiere::share_commitment::{
     fresh_path_packed_len, lane_post_packed_len, ShareOpening, SharePath,
 };
 use panetiere::sig;
+use panetiere::{CsPoly, HVCPoly, KahePoly, RsNTTPoly};
 
 pub use panetiere::protocol::ServerId;
 use panetiere::protocol::{
@@ -40,8 +40,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::client_set::{
-    build_fragments, relay_rounds, run_client_round_set, Bundle, ClientSetRound, Fragment, Relay,
-    ReceiptBatch, SetServer,
+    build_fragments, relay_rounds, run_client_round_set, Bundle, ClientSetRound, Fragment,
+    ReceiptBatch, Relay, SetServer,
 };
 use crate::config::{
     Encoding, ExchangePublicKeyWire, PanetiereConfig, ProtocolConfig, Round, SetFormation, Subnet,
@@ -50,8 +50,8 @@ use crate::faults::{Attribution, Fault, FaultKind, OutputFaultTracker};
 use crate::identity::{Identity, Pubkey};
 use crate::log_target::{PANETIERE, SCHED};
 use crate::runtime::{
-    deadline_for, gossip_faults, handle_inbound, publish_and_loop_back, recv_any,
-    round_at, route_to_pipe, subnet_leader_pk, AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
+    deadline_for, gossip_faults, handle_inbound, publish_and_loop_back, recv_any, round_at,
+    route_to_pipe, subnet_leader_pk, AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
 };
 use crate::session::{GoodClients, Misbehavior, PeerId, RoundOutcome, Session};
 use crate::transport::{Dest, Subscription, Topic};
@@ -123,7 +123,7 @@ fn slice_wire_lens(pp: &ProtocolParams) -> (usize, usize) {
         return (0, 0);
     };
     (
-        scp.block_len * dgt_packed_len(),
+        scp.block_len * rs_poly_packed_len(),
         fresh_path_packed_len(scp.n_lanes),
     )
 }
@@ -172,7 +172,7 @@ pub(crate) fn consensus_wire_estimate(
     // The aggregated opening bounds a single sealed one, plus the ML-KEM
     // ciphertext and AEAD framing around it.
     let sealed = round_wire_sizes(n, n_polys, rho as u32).server_entry + 1600;
-    let bundle = block * dgt_packed_len() + fresh_path_packed_len(n) + sealed + FRAMING;
+    let bundle = block * rs_poly_packed_len() + fresh_path_packed_len(n) + sealed + FRAMING;
     // A fragment never encodes more than a full set of withheld bundles.
     let fragment = bundle;
     let batch = ReceiptBatch::packed_len(rho) + FRAMING;
@@ -195,11 +195,9 @@ pub(crate) fn rs_wire_estimate(
     let block = panetiere::rs::RsParams::new(rs_k(n), n).block_len(n_polys);
     let w = round_wire_sizes(n, n_polys, rho);
     let client_public = RsClientBulletinEntry::packed_len() + FRAMING;
-    let slice = block * dgt_packed_len() + fresh_path_packed_len(n) + FRAMING;
-    let server_public = w.server_entry
-        + lane_post_packed_len(block, n, rho as usize)
-        + rho as usize * 4
-        + FRAMING;
+    let slice = block * rs_poly_packed_len() + fresh_path_packed_len(n) + FRAMING;
+    let server_public =
+        w.server_entry + lane_post_packed_len(block, n, rho as usize) + rho as usize * 4 + FRAMING;
     client_public
         .max(slice)
         .max(server_public)
@@ -249,15 +247,13 @@ pub(crate) fn verify_batch(
     batch: &ReceiptBatch,
     set_pks: &[sig::VerifyingKey],
 ) -> bool {
-    set_pks
-        .get(batch.server_id.0 as usize)
-        .is_some_and(|vk| {
-            vk.verify(
-                &crate::client_set::batch_signing_bytes(sid, batch.server_id, &batch.receipts),
-                &batch.sig,
-            )
-            .is_ok()
-        })
+    set_pks.get(batch.server_id.0 as usize).is_some_and(|vk| {
+        vk.verify(
+            &crate::client_set::batch_signing_bytes(sid, batch.server_id, &batch.receipts),
+            &batch.sig,
+        )
+        .is_ok()
+    })
 }
 
 /// Panetière `sid` for one round of one subnet. The round must stay in the
@@ -381,8 +377,9 @@ fn server_session(
     session.set_good_clients(good_clients);
     if consensus {
         match set_roster(relay_xk, subnet) {
-            Some(pks) => session
-                .set_consensus_keys(identity.exchange().set_signing_key().clone(), pks),
+            Some(pks) => {
+                session.set_consensus_keys(identity.exchange().set_signing_key().clone(), pks)
+            }
             None => tracing::error!(
                 target: PANETIERE,
                 subnet = subnet.id,
@@ -454,8 +451,9 @@ pub(crate) async fn run_subnet(
 
     let mut sorted_roster = subnet.relays.clone();
     sorted_roster.sort();
-    let egress =
-        |_key: &SessionKey, bytes: &[u8]| crate::panetiere::egress(subnet.id, &sorted_roster, bytes);
+    let egress = |_key: &SessionKey, bytes: &[u8]| {
+        crate::panetiere::egress(subnet.id, &sorted_roster, bytes)
+    };
 
     let dur_ms = (subnet.protocol.round_duration().as_millis() as u64).max(1);
     let schedule = checkpoint_schedule(dur_ms, false, consensus.then(|| relay_rounds(&pp)));
@@ -967,7 +965,7 @@ pub(crate) fn client_slice_wire(
     round: Round,
     client_id: u32,
     lane: u32,
-    share: &[DgtNTTPoly],
+    share: &[RsNTTPoly],
     path: &SharePath,
     identity: &Identity,
 ) -> PanetiereWire {
@@ -1167,7 +1165,9 @@ pub(crate) fn describe(bytes: &[u8]) -> Option<String> {
         )),
         PanetiereWire::ClientSlice {
             client_id, lane, ..
-        } => Some(format!("Panetiere ClientSlice cid={client_id} -> lane={lane}")),
+        } => Some(format!(
+            "Panetiere ClientSlice cid={client_id} -> lane={lane}"
+        )),
         PanetiereWire::Decoded { round, payloads } => Some(format!(
             "Panetiere Decoded round={round} payloads={}",
             payloads.len()
@@ -1228,9 +1228,7 @@ pub(crate) fn egress(
             | PanetiereWire::ClientSet { .. }
             | PanetiereWire::SetRelay { .. },
         ) => Dest::Topic(Topic::Shares(subnet_id)),
-        Ok(PanetiereWire::ClientPublic { .. }) => {
-            Dest::Each(subnet_id, sorted_roster.to_vec())
-        }
+        Ok(PanetiereWire::ClientPublic { .. }) => Dest::Each(subnet_id, sorted_roster.to_vec()),
         Ok(PanetiereWire::ClientSlice { lane, .. } | PanetiereWire::Bundle { lane, .. }) => {
             to_lane(lane)
         }
@@ -1308,13 +1306,7 @@ pub(crate) fn integrity_culprit_from_evidence(
             let culprit = *roster.get(server_id as usize)?;
             if !culprit.verify(
                 &server_public_signing_bytes(
-                    round,
-                    server_id,
-                    &clients,
-                    &agg_open,
-                    &agg_share,
-                    &share_sum,
-                    &lane_open,
+                    round, server_id, &clients, &agg_open, &agg_share, &share_sum, &lane_open,
                 ),
                 &signature,
             ) {
@@ -1886,14 +1878,7 @@ impl Session for PanetiereClientSession {
             return Vec::new();
         };
         let sid = session_id(&self.setup_seed, round);
-        fragment_wire(
-            &self.pp,
-            &sid,
-            round,
-            state,
-            &self.post_key,
-            &self.identity,
-        )
+        fragment_wire(&self.pp, &sid, round, state, &self.post_key, &self.identity)
     }
 
     fn end_round(&mut self, _round: Round, _now: Instant) -> RoundOutcome {
@@ -1951,7 +1936,7 @@ struct PanetiereRoundState {
     publics: HashMap<ClientId, RsClientBulletinEntry>,
     inbox_items: Vec<(ClientId, Opening)>,
     /// Our lane's coded share from each client, with that lane's opening.
-    lane_items: Vec<(ClientId, Vec<DgtNTTPoly>, SharePath)>,
+    lane_items: Vec<(ClientId, Vec<RsNTTPoly>, SharePath)>,
     peer_server_publics: HashMap<ServerId, ServerBulletinEntry>,
     /// Peer lane sums for the round, with the raw wire kept as fault evidence.
     peer_lane_sums: HashMap<NodeId, (RsNodeBulletinEntry, Vec<u8>)>,
@@ -2182,7 +2167,10 @@ impl PanetiereServerSession {
         for (&r, state) in self.rounds.iter() {
             // The predecessor worker announced pre-spawn rounds from full state.
             let partial = self.first_round.is_some_and(|f| r < f);
-            if r > round || partial || self.announced_rounds.contains(&r) || state.inbox_items.is_empty()
+            if r > round
+                || partial
+                || self.announced_rounds.contains(&r)
+                || state.inbox_items.is_empty()
             {
                 continue;
             }
@@ -2341,7 +2329,8 @@ fn recover_rs(
         }
         match aggregate_and_decrypt_rs(pp, sid, set, &entries, &servers, &lanes) {
             Ok((plain, _)) => return Some(plain),
-            Err(VerifyError::InvalidServerOpening(i)) | Err(VerifyError::ShareOpeningMismatch(i)) => {
+            Err(VerifyError::InvalidServerOpening(i))
+            | Err(VerifyError::ShareOpeningMismatch(i)) => {
                 tracing::debug!(
                     target: PANETIERE,
                     round,
@@ -2385,7 +2374,6 @@ fn candidate_sets(outputs: &[ServerBulletinEntry]) -> Vec<Vec<ClientId>> {
     sets.dedup();
     sets
 }
-
 
 impl Session for PanetiereServerSession {
     fn begin_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
@@ -2742,12 +2730,7 @@ impl Session for PanetiereServerSession {
                 if from != expected
                     || !expected.verify(
                         &server_public_signing_bytes(
-                            round,
-                            server_id,
-                            &clients,
-                            &agg_open,
-                            &agg_share,
-                            &share_sum,
+                            round, server_id, &clients, &agg_open, &agg_share, &share_sum,
                             &lane_open,
                         ),
                         &signature,
@@ -2928,7 +2911,8 @@ impl Session for PanetiereServerSession {
                 ) {
                     return Vec::new();
                 }
-                let Some(fragment) = Fragment::unpack(&data).filter(|f| f.client_id == ClientId(client_id))
+                let Some(fragment) =
+                    Fragment::unpack(&data).filter(|f| f.client_id == ClientId(client_id))
                 else {
                     return Vec::new();
                 };
@@ -3365,7 +3349,9 @@ impl PanetiereServerSession {
                         clients = sp.clients.len(),
                         "panetiere server: emitting share"
                     );
-                    state.peer_lane_sums.insert(NodeId(sid.0), (lane, Vec::new()));
+                    state
+                        .peer_lane_sums
+                        .insert(NodeId(sid.0), (lane, Vec::new()));
                     state.peer_server_publics.insert(sp.server_id, sp);
                     outbound.push(bincode::serialize(&wire).expect("serialise server public"));
                     state.emitted_my_public = true;
@@ -3581,8 +3567,7 @@ mod observer_tests {
 
         // A far-future round must be dropped once the observer's clock advances.
         obs.begin_round(9, Instant::now());
-        let far_signing =
-            server_public_signing_bytes(u64::MAX, 1, &[10], &agg_open, &[], &[], &[]);
+        let far_signing = server_public_signing_bytes(u64::MAX, 1, &[10], &agg_open, &[], &[], &[]);
         let far = bincode::serialize(&PanetiereWire::ServerPublic {
             round: u64::MAX,
             server_id: 1,

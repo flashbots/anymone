@@ -146,7 +146,9 @@ async fn fault_for(mode: Misbehavior, panetiere: bool, want: FaultKind) -> Repor
     let reached = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             match leader_events.recv().await {
-                Ok(Event::RoundDecoded { round, subnet: 0, .. }) => {
+                Ok(Event::RoundDecoded {
+                    round, subnet: 0, ..
+                }) => {
                     healthy_through = healthy_through.max(round);
                     decoded += 1;
                     if decoded >= 3 {

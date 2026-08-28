@@ -880,8 +880,8 @@ fn committee_schedules_second_subnet_when_one_nears_capacity() {
                 aggregation: false,
                 encoding: anymone_core::config::Encoding::default(),
                 set_formation: anymone_core::config::SetFormation::Leader,
-            attested_subnets: Vec::new(),
-            attestation: Default::default(),
+                attested_subnets: Vec::new(),
+                attestation: Default::default(),
             },
         )
     };
@@ -1371,8 +1371,13 @@ impl PanetiereSubnet {
             .collect();
 
         let client_id = Identity::generate();
-        let client =
-            PanetiereClientSession::new(pp.clone(), mse.clone(), client_id.clone(), xpubs, [42u8; 32]);
+        let client = PanetiereClientSession::new(
+            pp.clone(),
+            mse.clone(),
+            client_id.clone(),
+            xpubs,
+            [42u8; 32],
+        );
         let mut servers: Vec<PanetiereServerSession> = server_ids
             .iter()
             .map(|sid| {

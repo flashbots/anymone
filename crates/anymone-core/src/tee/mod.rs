@@ -163,7 +163,10 @@ impl MultiVerifier {
             #[cfg(feature = "tdx-attest")]
             tdx: None,
             #[cfg(feature = "mobile-attest")]
-            play_integrity: policy.play_integrity.clone().map(PlayIntegrityVerifier::new),
+            play_integrity: policy
+                .play_integrity
+                .clone()
+                .map(PlayIntegrityVerifier::new),
             #[cfg(feature = "mobile-attest")]
             app_attest: policy.app_attest.clone().map(AppAttestVerifier::new),
             #[cfg(feature = "mobile-attest")]

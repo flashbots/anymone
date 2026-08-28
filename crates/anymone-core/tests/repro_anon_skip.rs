@@ -86,11 +86,9 @@ async fn subnet_counts_all_clients_every_round() {
     // Observer vantage: leader ClientSet broadcasts ride the shares topic.
     let obs_id = Identity::generate();
     let obs_transport = net.handle(obs_id.pubkey());
-    let mut shares_sub = anymone_core::Transport::subscribe(
-        &obs_transport,
-        anymone_core::Topic::Shares(subnet.id),
-    )
-    .await;
+    let mut shares_sub =
+        anymone_core::Transport::subscribe(&obs_transport, anymone_core::Topic::Shares(subnet.id))
+            .await;
     let mut observer = PanetiereObserverSession::new(relay_pks.clone(), Some(leader_pk), 2);
 
     // Sample (round, size) pairs as they become the observer's latest set.

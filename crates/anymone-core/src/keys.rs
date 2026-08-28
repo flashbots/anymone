@@ -281,9 +281,8 @@ impl ExchangeIdentity {
         s.update(b"anymone/client-set/sig/v1");
         s.update(key.to_bytes());
         let seed: [u8; 32] = s.finalize().into();
-        let set_sig = panetiere::sig::SigningKey::generate(
-            &mut rand_chacha::ChaCha20Rng::from_seed(seed),
-        );
+        let set_sig =
+            panetiere::sig::SigningKey::generate(&mut rand_chacha::ChaCha20Rng::from_seed(seed));
         ExchangeIdentity { key, pke, set_sig }
     }
 

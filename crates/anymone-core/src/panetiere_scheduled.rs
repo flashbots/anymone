@@ -15,13 +15,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
-use panetiere::KahePoly;
 use panetiere::channel::ChannelParams;
 use panetiere::codec;
 use panetiere::mse::MseEncoding;
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round_rs;
 use panetiere::protocol::{message_polys, ClientId, ProtocolParams, ServerId};
+use panetiere::KahePoly;
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use tokio::sync::mpsc;
@@ -39,8 +39,8 @@ use crate::panetiere::{
     PanetiereWire, SetMode, PANETIERE_ROUND_RETENTION,
 };
 use crate::runtime::{
-    deadline_for, gossip_faults, handle_inbound, publish_and_loop_back, recv_any,
-    round_at, route_to_pipe, subnet_leader_pk, AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
+    deadline_for, gossip_faults, handle_inbound, publish_and_loop_back, recv_any, round_at,
+    route_to_pipe, subnet_leader_pk, AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
 };
 use crate::session::{GoodClients, Misbehavior, PeerId, RoundOutcome, Session};
 use crate::transport::Subscription;
@@ -533,14 +533,7 @@ impl Session for ScheduledPanetiereClientSession {
                 return Vec::new();
             };
             let sid = crate::panetiere::session_id(&self.setup_seed, round);
-            return fragment_wire(
-                &self.pp,
-                &sid,
-                round,
-                state,
-                &self.post_key,
-                &self.identity,
-            );
+            return fragment_wire(&self.pp, &sid, round, state, &self.post_key, &self.identity);
         }
         if k != 1 {
             return Vec::new();
@@ -725,9 +718,11 @@ impl Session for ScheduledPanetiereClientSession {
             bincode::serialize(&PanetiereWire::ClientPublic {
                 round,
                 client_id: cid,
-                signature: self.identity.sign(
-                    &crate::panetiere::client_public_signing_bytes(round, cid, &entry),
-                ),
+                signature: self
+                    .identity
+                    .sign(&crate::panetiere::client_public_signing_bytes(
+                        round, cid, &entry,
+                    )),
                 entry,
                 signer: self.identity.pubkey(),
             })
@@ -757,14 +752,14 @@ impl Session for ScheduledPanetiereClientSession {
                     round,
                     client_id: cid,
                     target_server: server_id.0,
-                    signature: self.identity.sign(
-                        &crate::panetiere::client_opening_signing_bytes(
+                    signature: self
+                        .identity
+                        .sign(&crate::panetiere::client_opening_signing_bytes(
                             round,
                             cid,
                             server_id.0,
                             &sealed,
-                        ),
-                    ),
+                        )),
                     sealed,
                     signer: self.identity.pubkey(),
                 })
@@ -1136,8 +1131,9 @@ pub(crate) async fn run_subnet(
 
     let mut sorted_roster = subnet.relays.clone();
     sorted_roster.sort();
-    let egress =
-        |_key: &SessionKey, bytes: &[u8]| crate::panetiere::egress(subnet.id, &sorted_roster, bytes);
+    let egress = |_key: &SessionKey, bytes: &[u8]| {
+        crate::panetiere::egress(subnet.id, &sorted_roster, bytes)
+    };
 
     let dur_ms = (subnet.protocol.round_duration().as_millis() as u64).max(4);
     let schedule = checkpoint_schedule(

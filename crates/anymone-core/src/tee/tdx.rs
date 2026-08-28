@@ -99,9 +99,8 @@ impl TeeVerifier for TdxVerifier {
         for image in &self.approved {
             match evidence.platform.attestation_type {
                 attest_types::AttestationType::GcpTdx => {
-                    let measurement = attest_types::MeasurementOutput::Portable(Box::new(
-                        image.image.clone(),
-                    ));
+                    let measurement =
+                        attest_types::MeasurementOutput::Portable(Box::new(image.image.clone()));
                     match attest_verify::verify(&measurement, &evidence, &self.pccs, None) {
                         Ok(data) => return bound(data),
                         Err(e) => {

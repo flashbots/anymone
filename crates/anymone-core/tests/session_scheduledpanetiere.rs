@@ -351,14 +351,7 @@ fn scheduled_direct_flow_pipelines_reservations() {
     clients[1].stage(payload_b.clone());
 
     let stores = fresh_entries(ids.len());
-    let mut servers = make_servers(
-        &pp,
-        &sched_mse,
-        vector_bytes,
-        &ids,
-        &server_pks,
-        &stores,
-    );
+    let mut servers = make_servers(&pp, &sched_mse, vector_bytes, &ids, &server_pks, &stores);
     let now = Instant::now();
 
     let mut final_decoded: Vec<Vec<Vec<u8>>> = Vec::new();
