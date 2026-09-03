@@ -4209,7 +4209,7 @@ dependencies = [
 [[package]]
 name = "panetiere"
 version = "0.1.0"
-source = "git+https://github.com/flashbots/panetiere?rev=e5c9cdf033b4873ee3a97210d97b37f435c5f573#e5c9cdf033b4873ee3a97210d97b37f435c5f573"
+source = "git+https://github.com/flashbots/panetiere?rev=94eac72385ca73f615b4f97861fcf7a56a4a67ab#94eac72385ca73f615b4f97861fcf7a56a4a67ab"
 dependencies = [
  "aes-gcm",
  "chipmunk_code",

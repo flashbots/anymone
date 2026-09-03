@@ -19,7 +19,7 @@ use panetiere::channel::ChannelParams;
 use panetiere::codec;
 use panetiere::mse::MseEncoding;
 use panetiere::pke;
-use panetiere::protocol::client::run_client_round_rs;
+use panetiere::protocol::client::RsClientRound;
 use panetiere::protocol::{message_polys, ClientId, ProtocolParams, ServerId};
 use panetiere::KahePoly;
 use rand::{Rng, RngCore, SeedableRng};
@@ -33,10 +33,10 @@ use crate::config::{
 use crate::identity::{Identity, Pubkey};
 use crate::log_target::{PANETIERE, SCHED};
 use crate::panetiere::{
-    bundle_wire, checkpoint_deadline, checkpoint_schedule, client_slice_wire, derive_post_key,
-    drain_inbound_upto, fragment_wire, server_index, set_roster, verify_batch, wire_round_past,
-    ClientSetState, PanetiereObserverSession, PanetiereServerSession, PanetiereWatchSession,
-    PanetiereWire, SetMode, PANETIERE_ROUND_RETENTION,
+    bundle_wire, checkpoint_deadline, checkpoint_schedule, client_round, client_slice_wire,
+    derive_post_key, drain_inbound_upto, fragment_wire, server_index, set_roster, verify_batch,
+    wire_round_past, ClientSetState, PanetiereObserverSession, PanetiereServerSession,
+    PanetiereWatchSession, PanetiereWire, SetMode, PANETIERE_ROUND_RETENTION,
 };
 use crate::runtime::{
     deadline_for, gossip_faults, handle_inbound, publish_and_loop_back, recv_any, round_at,
@@ -301,6 +301,7 @@ pub struct ScheduledPanetiereClientSession {
     post_key: panetiere::sig::SigningKey,
     /// Subnet's `setup_seed`; with the round it forms the `sid` openings bind to.
     setup_seed: [u8; 32],
+    client_round: Option<(Round, RsClientRound)>,
     /// Consensus set formation: the roster receipts verify under, and the
     /// rounds whose bundles are still collecting them.
     set_pks: Option<Vec<panetiere::sig::VerifyingKey>>,
@@ -344,6 +345,7 @@ impl ScheduledPanetiereClientSession {
             rand_rng: ChaCha20Rng::from_seed(rand_seed),
             post_key: derive_post_key(rng_seed),
             setup_seed: [0u8; 32],
+            client_round: None,
             set_pks: None,
             set_rounds: BTreeMap::new(),
         }
@@ -355,6 +357,7 @@ impl ScheduledPanetiereClientSession {
 
     pub(crate) fn set_setup_seed(&mut self, setup_seed: [u8; 32]) {
         self.setup_seed = setup_seed;
+        self.client_round = None;
     }
 
     /// See [`crate::panetiere::PanetiereClientSession::set_consensus`].
@@ -528,6 +531,27 @@ impl Session for ScheduledPanetiereClientSession {
     }
 
     fn checkpoint(&mut self, round: Round, k: u8, _now: Instant) -> Vec<Vec<u8>> {
+        if k == 2 && self.servers.len() == self.pp.cs.n_servers {
+            let next = round.saturating_add(1);
+            if !self
+                .client_round
+                .as_ref()
+                .is_some_and(|(prepared_round, _)| *prepared_round == next)
+            {
+                self.client_round = Some((
+                    next,
+                    client_round(
+                        &self.pp,
+                        &self.setup_seed,
+                        next,
+                        self.client_id,
+                        &self.servers,
+                        self.rng_seed,
+                    ),
+                ));
+            }
+            return Vec::new();
+        }
         if self.set_pks.is_some() && k == crate::panetiere::K_REPAIR {
             let Some(state) = self.set_rounds.get_mut(&round) else {
                 return Vec::new();
@@ -680,18 +704,24 @@ impl Session for ScheduledPanetiereClientSession {
         // shares are a fixed block width, so every round rides the full width.
         plaintext.resize(message_polys(&self.pp), KahePoly::default());
 
-        let mut seed = self.rng_seed;
-        seed[24..32].copy_from_slice(&round.to_le_bytes());
-        let mut rng = ChaCha20Rng::from_seed(seed);
         let sid = crate::panetiere::session_id(&self.setup_seed, round);
+        let client_round = match self.client_round.take() {
+            Some((prepared_round, client_round)) if prepared_round == round => client_round,
+            _ => client_round(
+                &self.pp,
+                &self.setup_seed,
+                round,
+                self.client_id,
+                &self.servers,
+                self.rng_seed,
+            ),
+        };
+        let round_out = client_round.finalize(&self.pp, &sid, &plaintext, &self.post_key);
         if self.set_pks.is_some() {
-            let round_out = crate::client_set::run_client_round_set(
-                &mut rng,
+            let round_out = crate::client_set::client_set_round_from_rs(
                 &self.pp,
                 &sid,
-                self.client_id,
-                plaintext,
-                &self.servers,
+                round_out,
                 &self.post_key,
             );
             let out = bundle_wire(&self.pp, round, &round_out, &self.identity);
@@ -701,16 +731,6 @@ impl Session for ScheduledPanetiereClientSession {
                 .retain(|r, _| *r + PANETIERE_ROUND_RETENTION >= round);
             return out;
         }
-        let round_out = run_client_round_rs(
-            &mut rng,
-            &self.pp,
-            &sid,
-            self.client_id,
-            plaintext,
-            &self.servers,
-            &self.post_key,
-        );
-
         let mut out: Vec<Vec<u8>> = Vec::with_capacity(1 + 2 * self.servers.len());
         let cid = round_out.client_id.0;
         let entry = round_out.bulletin.to_bytes();

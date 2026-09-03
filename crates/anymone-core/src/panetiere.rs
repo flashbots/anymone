@@ -19,7 +19,7 @@ use panetiere::channel::{self, ChannelError, ChannelParams};
 use panetiere::cs::{Opening, PackedOpening};
 pub use panetiere::pke;
 use panetiere::prony::PronyError;
-use panetiere::protocol::client::run_client_round_rs;
+use panetiere::protocol::client::RsClientRound;
 use panetiere::protocol::server::{
     run_rs_node_round, run_server_round, unseal_opening, RsNodeInbox, ServerInbox,
 };
@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::client_set::{
-    build_fragments, relay_rounds, run_client_round_set, Bundle, ClientSetRound, Fragment,
+    build_fragments, client_set_round_from_rs, relay_rounds, Bundle, ClientSetRound, Fragment,
     ReceiptBatch, Relay, SetServer,
 };
 use crate::config::{
@@ -240,6 +240,26 @@ pub(crate) fn checkpoint_deadline(
 pub(crate) const CONSENSUS_PHASES: usize = 3;
 const K_BATCH: u8 = 2;
 pub(crate) const K_REPAIR: u8 = 3;
+
+pub(crate) fn client_round(
+    pp: &ProtocolParams,
+    setup_seed: &[u8; 32],
+    round: Round,
+    client_id: ClientId,
+    servers: &[(ServerId, pke::PublicKey)],
+    rng_seed: [u8; 32],
+) -> RsClientRound {
+    let mut seed = rng_seed;
+    seed[24..32].copy_from_slice(&round.to_le_bytes());
+    let mut rng = ChaCha20Rng::from_seed(seed);
+    RsClientRound::new(
+        &mut rng,
+        pp,
+        &session_id(setup_seed, round),
+        client_id,
+        servers,
+    )
+}
 
 /// A batch verifies under the client-set key of the lane it names.
 pub(crate) fn verify_batch(
@@ -1677,6 +1697,7 @@ pub struct PanetiereClientSession {
     post_key: sig::SigningKey,
     /// Subnet's `setup_seed`; with the round it forms the `sid` openings bind to.
     setup_seed: [u8; 32],
+    client_round: Option<(Round, RsClientRound)>,
     /// Consensus set formation: the roster receipts verify under. `None` in
     /// leader mode, where the client neither collects nor needs them.
     set_pks: Option<Vec<sig::VerifyingKey>>,
@@ -1712,6 +1733,7 @@ impl PanetiereClientSession {
             r_rng: ChaCha20Rng::from_seed(r_seed),
             post_key,
             setup_seed: [0u8; 32],
+            client_round: None,
             set_pks: None,
             set_rounds: std::collections::BTreeMap::new(),
         }
@@ -1719,6 +1741,7 @@ impl PanetiereClientSession {
 
     pub(crate) fn set_setup_seed(&mut self, setup_seed: [u8; 32]) {
         self.setup_seed = setup_seed;
+        self.client_round = None;
     }
 
     /// Submit bundles, collect receipts, package the evidence at [`K_EVIDENCE`].
@@ -1760,22 +1783,21 @@ impl Session for PanetiereClientSession {
                 return Vec::new();
             }
         };
-        // The RNG is rebuilt from the seed each round; folding the round into
-        // the trailing bytes keeps per-round randomness distinct.
-        let mut seed = self.rng_seed;
-        seed[24..32].copy_from_slice(&round.to_le_bytes());
-        let mut rng = ChaCha20Rng::from_seed(seed);
         let sid = session_id(&self.setup_seed, round);
-        if self.set_pks.is_some() {
-            let round_out = run_client_round_set(
-                &mut rng,
+        let client_round = match self.client_round.take() {
+            Some((prepared_round, client_round)) if prepared_round == round => client_round,
+            _ => client_round(
                 &self.pp,
-                &sid,
+                &self.setup_seed,
+                round,
                 self.client_id,
-                msg,
                 &self.servers,
-                &self.post_key,
-            );
+                self.rng_seed,
+            ),
+        };
+        let round_out = client_round.finalize(&self.pp, &sid, &msg, &self.post_key);
+        if self.set_pks.is_some() {
+            let round_out = client_set_round_from_rs(&self.pp, &sid, round_out, &self.post_key);
             tracing::trace!(
                 target: PANETIERE,
                 round,
@@ -1790,15 +1812,6 @@ impl Session for PanetiereClientSession {
                 .retain(|r, _| *r + PANETIERE_ROUND_RETENTION >= round);
             return out;
         }
-        let round_out = run_client_round_rs(
-            &mut rng,
-            &self.pp,
-            &sid,
-            self.client_id,
-            msg,
-            &self.servers,
-            &self.post_key,
-        );
         tracing::trace!(
             target: PANETIERE,
             round,
@@ -1871,6 +1884,26 @@ impl Session for PanetiereClientSession {
     }
 
     fn checkpoint(&mut self, round: Round, k: u8, _now: Instant) -> Vec<Vec<u8>> {
+        if k == 1 && self.servers.len() == self.pp.cs.n_servers {
+            let next = round.saturating_add(1);
+            if !self
+                .client_round
+                .as_ref()
+                .is_some_and(|(prepared_round, _)| *prepared_round == next)
+            {
+                self.client_round = Some((
+                    next,
+                    client_round(
+                        &self.pp,
+                        &self.setup_seed,
+                        next,
+                        self.client_id,
+                        &self.servers,
+                        self.rng_seed,
+                    ),
+                ));
+            }
+        }
         if k != K_REPAIR || self.set_pks.is_none() {
             return Vec::new();
         }

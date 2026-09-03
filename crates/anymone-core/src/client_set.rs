@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use panetiere::bulletin::{rs_poly_packed_len, RsClientBulletinEntry, ServerBulletinEntry};
 use panetiere::kahe::{Kahe, KaheScheme};
 use panetiere::pke;
-use panetiere::protocol::client::run_client_round_rs;
+use panetiere::protocol::client::{run_client_round_rs, RsClientRoundOutput};
 use panetiere::protocol::server::{unseal_opening, RsNodeInbox, ServerInbox};
 use panetiere::protocol::{ClientId, NodeId, ProtocolParams, ServerId, SessionId};
 use panetiere::rs::{pack_share, unpack_share, Rs, RsParams, Share};
@@ -519,9 +519,19 @@ pub fn run_client_round_set<R: rand::CryptoRng + rand::Rng>(
     servers: &[(ServerId, pke::PublicKey)],
     signing_key: &sig::SigningKey,
 ) -> ClientSetRound {
-    let rs = code(pp);
     let round = run_client_round_rs(rng, pp, sid, client_id, message, servers, signing_key);
+    client_set_round_from_rs(pp, sid, round, signing_key)
+}
+
+pub(crate) fn client_set_round_from_rs(
+    pp: &ProtocolParams,
+    sid: &SessionId,
+    round: RsClientRoundOutput,
+    signing_key: &sig::SigningKey,
+) -> ClientSetRound {
+    let rs = code(pp);
     assert_eq!(round.sealed_openings.len(), rs.n);
+    let client_id = round.client_id;
 
     let pubkey = signing_key.verifying_key().to_sec1_bytes();
     let bundles = (0..rs.n)
