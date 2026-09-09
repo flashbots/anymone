@@ -3,7 +3,7 @@
 //! The Pipe layer hides round structure, subnet selection, and the inner
 //! routing format. From the caller's point of view: bytes in, bytes out.
 
-use std::sync::Weak;
+use std::sync::{Arc, Weak};
 
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -55,17 +55,24 @@ fn framing_overhead() -> usize {
 }
 
 pub struct Pipe {
-    anymone: Weak<AnymoneInner>,
-    /// For client-opened pipes: the bound service tag (so `send` knows where).
-    /// For service-bound pipes: `None` (caller must use `send_to`).
-    peer_tag: Option<ServiceTag>,
-    /// Our own delivery address — for client pipes a random per-pipe return
-    /// path, for service pipes the service tag as a delivery address.
-    return_tag: RouteTag,
+    sender: PipeSender,
+    receiver: PipeReceiver,
+}
+
+#[derive(Clone)]
+pub struct PipeSender {
+    state: Arc<PipeState>,
+}
+
+pub struct PipeReceiver {
+    state: Arc<PipeState>,
     inbound: mpsc::UnboundedReceiver<PipeIncoming>,
-    /// Clone of the sender registered under `return_tag` in `AnymoneInner.pipes`,
-    /// so `Drop` only removes that entry if a later `bind`/`subscribe` hasn't
-    /// since reclaimed the tag.
+}
+
+struct PipeState {
+    anymone: Weak<AnymoneInner>,
+    peer_tag: Option<ServiceTag>,
+    return_tag: RouteTag,
     self_tx: mpsc::UnboundedSender<PipeIncoming>,
 }
 
@@ -77,34 +84,68 @@ impl Pipe {
         inbound: mpsc::UnboundedReceiver<PipeIncoming>,
         self_tx: mpsc::UnboundedSender<PipeIncoming>,
     ) -> Self {
-        Pipe {
+        let state = Arc::new(PipeState {
             anymone,
             peer_tag,
             return_tag,
-            inbound,
             self_tx,
+        });
+        Pipe {
+            sender: PipeSender {
+                state: state.clone(),
+            },
+            receiver: PipeReceiver { state, inbound },
         }
     }
 
-    /// Our own delivery address.
+    /// Both halves retain the pipe registration until the last half is dropped.
+    pub fn split(self) -> (PipeSender, PipeReceiver) {
+        (self.sender, self.receiver)
+    }
+
     pub fn return_tag(&self) -> RouteTag {
-        self.return_tag
+        self.sender.return_tag()
     }
-
-    /// Send `payload` to the pipe's bound counterparty (client-side only).
     pub async fn send(&self, payload: Vec<u8>) -> Result<(), SendError> {
-        let dst = self.peer_tag.ok_or(SendError::NoPeerTag)?;
-        self.send_to(dst, payload).await
+        self.sender.send(payload)
     }
-
-    /// Send `payload` addressed to `dst` (a service tag, or a peer's return
-    /// path). Service-side replies pass the request's `return_tag`.
     pub async fn send_to(
         &self,
         dst: impl Into<RouteTag>,
         payload: Vec<u8>,
     ) -> Result<(), SendError> {
-        self.send_inner(dst.into(), self.return_tag, payload).await
+        self.sender.send_to(dst, payload)
+    }
+    pub async fn send_unlinkable(&self, payload: Vec<u8>) -> Result<(), SendError> {
+        self.sender.send_unlinkable(payload)
+    }
+    pub fn check_size(&self, payload_len: usize) -> Result<(), SendError> {
+        self.sender.check_size(payload_len)
+    }
+    pub async fn recv(&mut self) -> Option<PipeIncoming> {
+        self.receiver.recv().await
+    }
+    pub fn try_recv(&mut self) -> Option<PipeIncoming> {
+        self.receiver.try_recv()
+    }
+}
+
+impl PipeSender {
+    /// Our own delivery address.
+    pub fn return_tag(&self) -> RouteTag {
+        self.state.return_tag
+    }
+
+    /// Send `payload` to the pipe's bound counterparty (client-side only).
+    pub fn send(&self, payload: Vec<u8>) -> Result<(), SendError> {
+        let dst = self.state.peer_tag.ok_or(SendError::NoPeerTag)?;
+        self.send_to(dst, payload)
+    }
+
+    /// Send `payload` addressed to `dst` (a service tag, or a peer's return
+    /// path). Service-side replies pass the request's `return_tag`.
+    pub fn send_to(&self, dst: impl Into<RouteTag>, payload: Vec<u8>) -> Result<(), SendError> {
+        self.send_inner(dst.into(), self.state.return_tag, payload)
     }
 
     /// Send to the bound service with a one-off random return path instead of
@@ -113,18 +154,18 @@ impl Pipe {
     /// where reusing `return_tag` across sends would deanonymize the sender
     /// as "the same submitter" even though individual messages stay unlinked
     /// from the pipe's identity otherwise.
-    pub async fn send_unlinkable(&self, payload: Vec<u8>) -> Result<(), SendError> {
-        let dst = self.peer_tag.ok_or(SendError::NoPeerTag)?;
+    pub fn send_unlinkable(&self, payload: Vec<u8>) -> Result<(), SendError> {
+        let dst = self.state.peer_tag.ok_or(SendError::NoPeerTag)?;
         let mut bytes = [0u8; SERVICE_TAG_LEN];
         rand::thread_rng().fill_bytes(&mut bytes);
-        self.send_inner(dst.into(), RouteTag(bytes), payload).await
+        self.send_inner(dst.into(), RouteTag(bytes), payload)
     }
 
     /// Whether a `payload_len`-byte payload fits one message, by the same
     /// encoding `send*` uses — so a caller can refuse an oversized payload
     /// before queueing it rather than at the head of a queue.
     pub fn check_size(&self, payload_len: usize) -> Result<(), SendError> {
-        let anymone = self.anymone.upgrade().ok_or(SendError::Closed)?;
+        let anymone = self.state.anymone.upgrade().ok_or(SendError::Closed)?;
         Self::check_size_against(&anymone, payload_len)
     }
 
@@ -151,13 +192,13 @@ impl Pipe {
         Ok(())
     }
 
-    async fn send_inner(
+    fn send_inner(
         &self,
         dst: RouteTag,
         return_tag: RouteTag,
         payload: Vec<u8>,
     ) -> Result<(), SendError> {
-        let anymone = self.anymone.upgrade().ok_or(SendError::Closed)?;
+        let anymone = self.state.anymone.upgrade().ok_or(SendError::Closed)?;
         Self::check_size_against(&anymone, payload.len())?;
         let msg = PipeMessage {
             return_tag,
@@ -167,7 +208,13 @@ impl Pipe {
         let framed = 1 + SERVICE_TAG_LEN + data.len();
         let mut bytes = Vec::with_capacity(framed);
         Frame::Raw { dst, data: &data }.encode(&mut bytes);
-        queue_outbound(&self.anymone, bytes)
+        queue_outbound(&self.state.anymone, bytes)
+    }
+}
+
+impl PipeReceiver {
+    pub fn return_tag(&self) -> RouteTag {
+        self.state.return_tag
     }
 
     /// Receive the next inbound message, or `None` once the pipe is closed.
@@ -182,7 +229,7 @@ impl Pipe {
     }
 }
 
-impl Drop for Pipe {
+impl Drop for PipeState {
     fn drop(&mut self) {
         let Some(inner) = self.anymone.upgrade() else {
             return;

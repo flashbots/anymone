@@ -57,7 +57,6 @@ fn describe_config(bytes: &[u8]) -> String {
                     crate::config::ProtocolConfig::Noop(_) => "noop",
                     crate::config::ProtocolConfig::ScheduledAdcnet(_) => "scheduled-adcnet",
                     crate::config::ProtocolConfig::ScheduledPanetiere(_) => "scheduled-panetiere",
-                    crate::config::ProtocolConfig::Nym(_) => "nym",
                 })
                 .unwrap_or("none");
             let relays = s.map(|s| s.relays.len()).unwrap_or(0);

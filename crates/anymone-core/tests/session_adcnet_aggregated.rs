@@ -1,5 +1,5 @@
 //! Aggregated 1-round ADCNet flow over a synchronous bus: clients send their
-//! blinded contributions to a 1-of-n aggregator committee per group; each
+//! blinded contributions to one aggregator per group; each
 //! aggregator sums its group and forwards a signed `GroupAggregate` (with the
 //! members' keys); the leader announces the ClientSet from the union and
 //! combines the re-summed group totals against the relays' shares.
@@ -23,14 +23,12 @@ fn test_config() -> OneRoundConfig {
     }
 }
 
-/// `live_replicas` aggregators per group emit (1 ⇒ exercises 1-of-n liveness).
 /// Returns all payloads the leader (relay 0) decoded.
 fn run_adcnet_aggregated(
     n_servers: usize,
     n_clients: usize,
     group_count: u32,
-    replication: u32,
-    live_replicas: u32,
+    authorized: bool,
     payload: &[u8],
 ) -> Vec<Vec<u8>> {
     let cfg = test_config();
@@ -40,13 +38,20 @@ fn run_adcnet_aggregated(
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let leader_pk = relay_pks[0];
 
-    let agg_ids: Vec<Vec<Identity>> = (0..group_count)
-        .map(|_| (0..replication).map(|_| Identity::generate()).collect())
-        .collect();
-    let roster: HashMap<u32, Vec<Pubkey>> = agg_ids
+    let agg_ids: Vec<Identity> = (0..group_count).map(|_| Identity::generate()).collect();
+    let roster: HashMap<u32, Pubkey> = agg_ids
         .iter()
         .enumerate()
-        .map(|(g, ids)| (g as u32, ids.iter().map(|i| i.pubkey()).collect()))
+        .map(|(g, id)| {
+            (
+                g as u32,
+                if authorized {
+                    id.pubkey()
+                } else {
+                    Identity::generate().pubkey()
+                },
+            )
+        })
         .collect();
 
     let client_ids: Vec<Identity> = (0..n_clients).map(|_| Identity::generate()).collect();
@@ -99,16 +104,11 @@ fn run_adcnet_aggregated(
     let mut aggregators: Vec<(Pubkey, AdcnetAggregatorSession)> = agg_ids
         .iter()
         .enumerate()
-        .flat_map(|(g, ids)| {
-            ids.iter()
-                .take(live_replicas as usize)
-                .map(move |id| {
-                    (
-                        id.pubkey(),
-                        AdcnetAggregatorSession::new(g as u32, group_count, id.clone()),
-                    )
-                })
-                .collect::<Vec<_>>()
+        .map(|(g, id)| {
+            (
+                id.pubkey(),
+                AdcnetAggregatorSession::new(g as u32, group_count, id.clone()),
+            )
         })
         .collect();
 
@@ -173,10 +173,10 @@ fn run_realtime(aggregated: bool, payload: &[u8]) -> Vec<u64> {
     let leader_pk = relay_pks[0];
 
     let agg_ids: Vec<Identity> = (0..group_count).map(|_| Identity::generate()).collect();
-    let roster: HashMap<u32, Vec<Pubkey>> = agg_ids
+    let roster: HashMap<u32, Pubkey> = agg_ids
         .iter()
         .enumerate()
-        .map(|(g, id)| (g as u32, vec![id.pubkey()]))
+        .map(|(g, id)| (g as u32, id.pubkey()))
         .collect();
 
     let client_ids: Vec<Identity> = (0..6).map(|_| Identity::generate()).collect();
@@ -308,7 +308,7 @@ fn aggregated_decodes_within_subnet_lag_window() {
 #[test]
 fn adcnet_aggregated_decodes_through_groups() {
     let payload = b"aggregated adcnet across groups".to_vec();
-    let decoded = run_adcnet_aggregated(3, 6, 2, 2, 2, &payload);
+    let decoded = run_adcnet_aggregated(3, 6, 2, true, &payload);
     assert!(
         decoded.contains(&payload),
         "payload never decoded; got {decoded:?}"
@@ -316,11 +316,11 @@ fn adcnet_aggregated_decodes_through_groups() {
 }
 
 #[test]
-fn adcnet_aggregated_survives_one_dead_replica_per_group() {
-    let payload = b"one live adcnet aggregator suffices".to_vec();
-    let decoded = run_adcnet_aggregated(3, 6, 2, 2, 1, &payload);
+fn adcnet_aggregated_rejects_unassigned_signers() {
+    let payload = b"unassigned aggregator".to_vec();
+    let decoded = run_adcnet_aggregated(3, 6, 2, false, &payload);
     assert!(
-        decoded.contains(&payload),
-        "payload never decoded; got {decoded:?}"
+        decoded.is_empty(),
+        "unassigned aggregator was accepted: {decoded:?}"
     );
 }

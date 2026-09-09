@@ -232,21 +232,18 @@ fn spawn_reannounce(transport: Arc<dyn Transport>, reg: Vec<u8>) -> JoinHandle<(
     })
 }
 
-/// Which protocol a subnet runs. The committee's `SchedulerCore` picks this
-/// per subnet (ADCNet optimistic, Panetiere when escalated); it is not a global
-/// knob.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Protocol selected for a subnet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SchedulerProtocol {
     /// ADCNet 1-round IBLT-message flow. Non-threshold; optimistic default.
     Adcnet,
-    /// Real Panetiere threshold ABC. Strict mode on fault.
+    /// Panetiere threshold ABC.
     Panetiere,
-    /// Panetiere's staggered two-phase mode, layered onto a `Panetiere`-family
-    /// subnet once its observed traffic passes the scheduled-mode threshold
-    /// (see `SchedulerCore::apply_sched_mode`); not chosen by the escalation
-    /// ladder itself.
+    /// Panetiere's staggered two-phase mode.
     ScheduledPanetiere,
     /// Crypto-free broadcast, pin-only (`protocol = "noop"`): isolates the
     /// scheduling/runtime control loop from protocol cost in load tests.
     Noop,
+    ScheduledAdcnet,
 }

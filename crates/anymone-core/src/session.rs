@@ -16,10 +16,10 @@ use crate::config::{Aggregation, Round};
 use crate::faults::Fault;
 use crate::identity::Pubkey;
 
-/// An ADCNet leader's view of the aggregator layer: which pubkeys may sign each
+/// An ADCNet leader's view of the aggregator layer: which pubkey may sign each
 /// group's aggregate.
 pub struct LeaderAggregation {
-    pub roster: HashMap<u32, Vec<Pubkey>>,
+    pub roster: HashMap<u32, Pubkey>,
 }
 
 impl LeaderAggregation {
@@ -28,7 +28,7 @@ impl LeaderAggregation {
             .groups
             .iter()
             .enumerate()
-            .map(|(i, g)| (i as u32, g.aggregators.clone()))
+            .map(|(i, g)| (i as u32, g.aggregator))
             .collect();
         LeaderAggregation { roster }
     }
@@ -83,6 +83,11 @@ pub trait Session: Send {
     /// Stage a payload for transmission on the next round.
     /// Default impl: no-op (server / watch sessions ignore this).
     fn stage(&mut self, _payload: Vec<u8>) {}
+
+    /// Keep the client alive while transmissions span later rounds.
+    fn has_pending_transmissions(&self) -> bool {
+        false
+    }
 
     /// Adopt a new cover rate from a config change. Client sessions that
     /// originate cover honor it; others ignore it.

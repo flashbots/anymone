@@ -602,9 +602,9 @@ impl Observatory {
             "anon_set": live.anon_set,
             "capacity": s.protocol.client_set_max(),
             // Aggregator groups (null = direct flow); each group lists its
-            // replication-sized aggregator committee.
+            // single aggregator.
             "aggregators": s.protocol.aggregation().map(|a| {
-                a.groups.iter().map(|g| g.aggregators.clone()).collect::<Vec<_>>()
+                a.groups.iter().map(|g| vec![g.aggregator]).collect::<Vec<_>>()
             }),
             "decoded": live.decoded,
             "msgs_round": msgs_round,
@@ -643,7 +643,6 @@ fn proto_name(p: &ProtocolConfig) -> &'static str {
         ProtocolConfig::ScheduledPanetiere(_) => "Panetiere",
         ProtocolConfig::Adcnet(_) => "Adcnet",
         ProtocolConfig::ScheduledAdcnet(_) => "Adcnet",
-        ProtocolConfig::Nym(_) => "Nym",
     }
 }
 

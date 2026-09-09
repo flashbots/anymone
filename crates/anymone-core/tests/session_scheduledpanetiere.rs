@@ -237,13 +237,22 @@ fn consensus_round(
 /// leader's announcement.
 #[test]
 fn scheduled_consensus_flow_pipelines_reservations() {
+    for threshold in [3, 4, 5] {
+        scheduled_consensus_at_threshold(threshold);
+    }
+}
+
+fn scheduled_consensus_at_threshold(threshold: u32) {
     let n_servers = 5;
     let vector_bytes = 128usize;
     let cfg = ScheduledPanetiereConfig {
+        threshold,
         set_formation: anymone_core::config::SetFormation::Consensus,
         ..subnet(2, vector_bytes, 8)
     };
     let (sched_mse, pp) = params_for(&cfg, n_servers);
+    assert_eq!(pp.shamir.t, threshold as usize);
+    assert_eq!(pp.rs.as_ref().unwrap().k, threshold as usize);
     let ds_rounds = anymone_core::client_set::relay_rounds(&pp);
     let (ids, server_pks, xpubs) = server_env(n_servers);
     let set_pks: Vec<panetiere::sig::VerifyingKey> = ids

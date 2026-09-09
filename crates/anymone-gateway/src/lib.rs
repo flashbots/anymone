@@ -8,8 +8,8 @@
 //! Submissions go through an [`anymone_core::ClientPool`]: the gateway
 //! broadcasts unlinkably (nobody replies, and reusing one return path across
 //! submissions would mark them as coming from the same submitter), and since one
-//! client carries at most one message per round, the pool spawns virtual clients
-//! while callers are queued up. Everything the gateway read back is public
+//! client carries at most one message per round, the pool queues messages. With `--max-clients N` above one, it can spawn
+//! virtual clients while callers wait. Everything the gateway read back is public
 //! channel traffic — who sent a message is not knowable here, which is the
 //! property the channel exists to provide.
 //!

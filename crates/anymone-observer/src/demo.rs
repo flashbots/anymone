@@ -101,16 +101,19 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
     ));
     let ccfg = PanetiereCommitteeConfig {
         committee_round_duration: Duration::from_millis(args.committee_round_ms),
-        public_round_duration: Duration::from_millis(args.public_round_ms),
-        min_relays: args.relays,
-        min_services: 1,
-        fault_grace: 2,
         cover_rate: cover_target.clone(),
-        // Panetiere-only demo: pin the protocol so the subnet runs Panetiere
-        // from the first config instead of starting on ADCNet and escalating.
-        // Sidelining on a corrupt-share fault still runs (the fault knob).
-        protocol: Some("panetiere".to_string()),
-        ..PanetiereCommitteeConfig::default()
+        scheduler: anymone_core::SchedulerParams {
+            public_round_duration: Duration::from_millis(args.public_round_ms),
+            min_relays: args.relays,
+            min_services: 1,
+            fault_threshold: 2,
+            // Panetiere-only demo: pin the protocol so the subnet runs Panetiere
+            // from the first config instead of starting on ADCNet and escalating.
+            // Sidelining on a corrupt-share fault still runs (the fault knob).
+            pin: Some(anymone_core::SchedulerProtocol::Panetiere),
+            ..Default::default()
+        },
+        ..Default::default()
     };
     // Schedulers subscribe to the registration topic before returning, so it's
     // safe to publish registrations afterwards.

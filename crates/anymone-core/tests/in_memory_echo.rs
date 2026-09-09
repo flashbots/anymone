@@ -340,3 +340,67 @@ async fn subscribe_delivers_broadcast_to_participants() {
 
     drop(anymones);
 }
+
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn scheduled_panetiere_passive_service_replies() {
+    use anymone_core::config::{ScheduledPanetiereConfig, SetFormation};
+    for set_formation in [SetFormation::Leader, SetFormation::Consensus] {
+        let committee = Identity::generate();
+        let relays: Vec<_> = (0..3).map(|_| Identity::generate()).collect();
+        let service = Identity::generate();
+        let client = Identity::generate();
+        let mut cfg = panetiere_config(&committee, &relays, service.pubkey());
+        cfg.body.subnets[0].protocol =
+            ProtocolConfig::ScheduledPanetiere(ScheduledPanetiereConfig {
+                round_duration_ms: 1200,
+                message_size: 1024,
+                vector_bytes: 4096,
+                estimated_messages: 4,
+                client_set_max: 8,
+                threshold: 2,
+                set_formation,
+                ..Default::default()
+            });
+        let reply = echo_roundtrip(
+            cfg.sign_with(&[&committee]),
+            relays,
+            service,
+            client,
+            b"scheduled reply",
+            Duration::from_secs(35),
+        )
+        .await;
+        assert_eq!(reply.payload, b"scheduled reply");
+    }
+}
+
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn scheduled_adcnet_passive_service_replies() {
+    let committee = Identity::generate();
+    let relays: Vec<_> = (0..3).map(|_| Identity::generate()).collect();
+    let service = Identity::generate();
+    let client = Identity::generate();
+    let mut cfg = panetiere_config(&committee, &relays, service.pubkey());
+    cfg.body.epoch_unix_ms = anymone_core::config::now_unix_ms().saturating_sub(10_000);
+    cfg.body.subnets[0].protocol =
+        ProtocolConfig::ScheduledAdcnet(anymone_core::ScheduledAdcnetConfig {
+            round_duration_ms: 300,
+            message_length: 1024,
+            auction_slots: 16,
+            min_message_size: 64,
+            client_set_min: 0,
+            client_set_max: 8,
+        });
+    let reply = echo_roundtrip(
+        cfg.sign_with(&[&committee]),
+        relays,
+        service,
+        client,
+        b"scheduled adcnet reply",
+        Duration::from_secs(12),
+    )
+    .await;
+    assert_eq!(reply.payload, b"scheduled adcnet reply");
+}

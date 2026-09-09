@@ -1,9 +1,3 @@
-//! Synchronous tests for the sans-IO `SchedulerCore` — the deterministic
-//! replacement for the flaky full-stack committee e2e. No tokio, no timers, no
-//! transport: drive the decision machine with synthetic registrations/faults
-//! (escalation, healing, multisig assembly) and with real ADCNet subnet traffic
-//! (capacity-driven grow/shrink).
-
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -81,7 +75,6 @@ fn lead_params() -> SchedulerParams {
         min_relays: 2,
         min_services: 1,
         fault_threshold: 2,
-        escalation_grace: 5,
         grow_at: 31,
         message_size: 16,
         integrity_backoff_ms: 6 * 60 * 1000,
@@ -113,47 +106,6 @@ fn lead_core(committee: &[Identity], threshold: u32) -> SchedulerCore {
     lead_core_with(committee, threshold, lead_params())
 }
 
-/// Like [`lead_core`] but with a caller-chosen `message_size` — the
-/// scheduled-mode upgrade/downgrade thresholds scale off it (`2x`/`0.5x`), so
-/// mode-selection tests need it small enough for real test traffic to cross.
-/// `escalation_grace` is generous so an unrelated honest-traffic de-escalation
-/// (the original fault healing) doesn't interfere with a mode-selection test
-/// running many rounds of otherwise-clean traffic.
-fn lead_core_msg_size(
-    committee: &[Identity],
-    threshold: u32,
-    message_size: usize,
-) -> SchedulerCore {
-    let mut sorted: Vec<_> = committee.to_vec();
-    sorted.sort_by_key(|i| i.pubkey());
-    let pks: Vec<_> = committee.iter().map(|i| i.pubkey()).collect();
-    SchedulerCore::new(
-        sorted[0].clone(),
-        pks,
-        threshold,
-        SchedulerParams {
-            public_round_duration: Duration::from_millis(200),
-            min_relays: 2,
-            min_services: 1,
-            fault_threshold: 2,
-            escalation_grace: 100,
-            grow_at: 31,
-            message_size,
-            integrity_backoff_ms: 6 * 60 * 1000,
-            sideline: true,
-            renegotiate_on_fault: true,
-            min_capacity: 8,
-            pin: None,
-            vector_bytes: 0,
-            aggregation: true,
-            encoding: anymone_core::config::Encoding::default(),
-            set_formation: anymone_core::config::SetFormation::Leader,
-            attested_subnets: Vec::new(),
-            attestation: Default::default(),
-        },
-    )
-}
-
 fn register_relays_and_service(core: &mut SchedulerCore, relays: &[Identity], service: &Identity) {
     for r in relays {
         core.on_registration(Registration::relay(r, xkw(r)));
@@ -166,7 +118,7 @@ fn register_relays_and_service(core: &mut SchedulerCore, relays: &[Identity], se
 }
 
 #[test]
-fn renegotiates_adcnet_panetiere_adcnet() {
+fn fault_response_preserves_selected_protocol() {
     let committee: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
     let mut core = lead_core(&committee, 2);
     assert!(core.is_lead());
@@ -203,9 +155,9 @@ fn renegotiates_adcnet_panetiere_adcnet() {
         0,
     );
 
-    // Escalate to Panetiere with the victim dropped.
-    let body = staged_body(&core.tick(3, 0)).expect("escalation proposal staged");
-    assert_eq!(proto_name(&body), "panetiere");
+    // Sideline the victim without changing protocol.
+    let body = staged_body(&core.tick(3, 0)).expect("roster proposal staged");
+    assert_eq!(proto_name(&body), "adcnet");
     assert_eq!(body.subnets[0].relays.len(), 2);
     assert!(!body.subnets[0].relays.contains(&victim));
 
@@ -215,9 +167,6 @@ fn renegotiates_adcnet_panetiere_adcnet() {
     assert_eq!(proto_name(&body), "adcnet");
     assert_eq!(body.subnets[0].relays.len(), 3);
 
-    // Pinned core: proposes Panetiere from round 0 with zero faults, and a
-    // liveness fault still sidelines the culprit — escalation bookkeeping keeps
-    // running underneath the pin, only the protocol *choice* is fixed.
     let pinned_committee: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
     let mut sorted = pinned_committee.clone();
     sorted.sort_by_key(|i| i.pubkey());
@@ -231,7 +180,6 @@ fn renegotiates_adcnet_panetiere_adcnet() {
             min_relays: 2,
             min_services: 1,
             fault_threshold: 2,
-            escalation_grace: 5,
             grow_at: 31,
             message_size: 16,
             integrity_backoff_ms: 6 * 60 * 1000,
@@ -289,7 +237,6 @@ fn renegotiates_adcnet_panetiere_adcnet() {
             min_relays: 2,
             min_services: 1,
             fault_threshold: 2,
-            escalation_grace: 5,
             grow_at: 31,
             message_size: 16,
             integrity_backoff_ms: 6 * 60 * 1000,
@@ -325,74 +272,26 @@ fn renegotiates_adcnet_panetiere_adcnet() {
 }
 
 #[test]
-fn unattributable_fault_escalates_without_dropping() {
-    let committee: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
+fn unattributable_fault_preserves_protocol_and_roster() {
+    let committee: Vec<_> = (0..3).map(|_| Identity::generate()).collect();
+    let relays: Vec<_> = (0..3).map(|_| Identity::generate()).collect();
     let mut core = lead_core(&committee, 2);
-
-    let relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
-    let service = Identity::generate();
-    register_relays_and_service(&mut core, &relays, &service);
-
-    let body = staged_body(&core.tick(0, 0)).expect("first proposal");
-    assert_eq!(proto_name(&body), "adcnet");
-    assert_eq!(body.subnets[0].relays.len(), 3);
-
-    // General subnetwork fault (no output, all/none shares) — unattributable.
+    register_relays_and_service(&mut core, &relays, &Identity::generate());
+    let first = staged_proposal(&core.tick(0, 0)).unwrap();
+    assert_eq!(proto_name(&first.body), "adcnet");
+    enact(&mut core, &committee, first);
     core.apply_observed_faults(
         0,
         vec![Fault {
             kind: FaultKind::Liveness,
             attribution: Attribution::None,
-            evidence: Vec::new(),
+            evidence: vec![],
         }],
         0,
     );
-
-    // Escalate to Panetiere but keep all 3 relays (nobody specific to drop).
-    let esc = staged_proposal(&core.tick(1, 0)).expect("escalation proposal");
-    assert_eq!(proto_name(&esc.body), "panetiere");
-    assert_eq!(esc.body.subnets[0].relays.len(), 3);
-    let epoch = esc.body.epoch_unix_ms;
-    let round_ms = esc.body.subnets[0].protocol.round_duration().as_millis() as u64;
-    enact(&mut core, &committee, esc);
-
-    // A relay re-announcing must NOT de-escalate: the general fault names no
-    // culprit, so only a fault-free streak proves the cause is gone. Content
-    // unchanged means no re-proposal at all.
-    core.on_registration(Registration::relay(&relays[0], xkw(&relays[0])));
-    assert!(staged_body(&core.tick(2, 0)).is_none());
-
-    // Ticking well past the grace with the subnet fully silent must not heal
-    // it — silence produces no fault either, but it isn't a clean round.
-    for r in 3..10 {
-        assert!(
-            staged_body(&core.tick(r, 0)).is_none(),
-            "silence must not heal the subnet"
-        );
+    for r in 1..10 {
+        assert!(staged_proposal(&core.tick(r, 0)).is_none());
     }
-
-    // Real signed Panetiere traffic for the grace period does heal it — even
-    // when the subnet runs far ahead of the last round the observer accepted.
-    // Traffic alone can't move the observer's clock past its acceptance
-    // window; the tick's wall clock must catch it up.
-    let mut net = PanetiereSubnet::new(&relays, None);
-    let (wire, _, _) = net.round(0);
-    for (from, bytes) in wire {
-        core.on_subnet_message(0, from, bytes);
-    }
-    core.tick(10, epoch);
-    let mut healed = None;
-    let base = 5_000u64;
-    for r in 0..8u64 {
-        let (wire, _, _) = net.round(base + r);
-        for (from, bytes) in wire {
-            core.on_subnet_message(0, from, bytes);
-        }
-        if let Some(b) = staged_body(&core.tick(11 + r, epoch + (base + r) * round_ms)) {
-            healed = Some(proto_name(&b));
-        }
-    }
-    assert_eq!(healed, Some("adcnet"));
 }
 
 /// An *integrity* offender is sidelined like a liveness fault but, unlike one,
@@ -421,8 +320,8 @@ fn integrity_offender_barred_until_backoff() {
         0,
     );
 
-    let esc = staged_proposal(&core.tick(1, 0)).expect("escalation proposal");
-    assert_eq!(proto_name(&esc.body), "panetiere");
+    let esc = staged_proposal(&core.tick(1, 0)).expect("roster proposal");
+    assert_eq!(proto_name(&esc.body), "adcnet");
     assert!(!esc.body.subnets[0].relays.contains(&victim));
     enact(&mut core, &committee, esc);
 
@@ -459,7 +358,6 @@ fn multisig_assembles_via_committee_sig() {
         min_relays: 1,
         min_services: 1,
         fault_threshold: 2,
-        escalation_grace: 5,
         grow_at: 31,
         message_size: 16,
         integrity_backoff_ms: 6 * 60 * 1000,
@@ -607,7 +505,6 @@ fn non_lead_core_never_stages() {
             min_relays: 1,
             min_services: 1,
             fault_threshold: 2,
-            escalation_grace: 5,
             grow_at: 31,
             message_size: 16,
             integrity_backoff_ms: 6 * 60 * 1000,
@@ -820,7 +717,6 @@ fn live_core(committee: &[Identity]) -> SchedulerCore {
             min_relays: 2,
             min_services: 1,
             fault_threshold: 2,
-            escalation_grace: 5,
             grow_at: 31,
             message_size: 16,
             integrity_backoff_ms: 6 * 60 * 1000,
@@ -868,7 +764,6 @@ fn committee_schedules_second_subnet_when_one_nears_capacity() {
                 min_relays: 2,
                 min_services: 1,
                 fault_threshold: 2,
-                escalation_grace: 5,
                 grow_at: 31,
                 message_size: 16,
                 integrity_backoff_ms: 6 * 60 * 1000,
@@ -940,8 +835,6 @@ fn committee_schedules_second_subnet_when_one_nears_capacity() {
         "aggregation: false must suppress the layer even above the capacity threshold"
     );
 
-    // Per-subnet escalation (#19/#21): an unattributable fault on subnet 1
-    // escalates only subnet 1 to Panetiere; subnet 0 stays optimistic ADCNet.
     let count = body.subnets.len();
     core.apply_observed_faults(
         1,
@@ -963,8 +856,8 @@ fn committee_schedules_second_subnet_when_one_nears_capacity() {
         "unfaulted subnet 0 stays ADCNet"
     );
     assert!(
-        matches!(mixed.subnets[1].protocol, ProtocolConfig::Panetiere(_)),
-        "faulted subnet 1 escalates to Panetiere"
+        matches!(mixed.subnets[1].protocol, ProtocolConfig::Adcnet(_)),
+        "faulted subnet 1 stays ADCNet"
     );
 }
 
@@ -1078,9 +971,6 @@ fn adcnet_capacity_resizes_to_observed_load() {
         "capacity grew from {floor} to {grown_cap}"
     );
 
-    // Load collapses → capacity resizes back down. Sparse traffic over the
-    // (longer, damped) drive can trip a low-load escalation to Panetiere; this
-    // test is about capacity, so read it regardless of the ladder state.
     let shrunk_cap = subnet_capacity(&drive(&mut core, 1).subnets[0].protocol);
     assert!(
         shrunk_cap < grown_cap,
@@ -1455,50 +1345,17 @@ impl PanetiereSubnet {
     }
 }
 
-/// A relay that corrupts its Panetiere shares is tolerated by t-of-n decode, so
-/// the subnet keeps producing output (liveness met) and the leader attributes
-/// an `Integrity` fault every round. The committee must not de-escalate back to
-/// optimistic ADCNet while that fault keeps recurring, even though its liveness
-/// observer alone would see nothing wrong. (This is not a stall: the subnet
-/// decodes fine; the signal that must be honored is the integrity fault, not
-/// missing output.)
 #[test]
-fn corrupt_panetiere_keeps_escalation() {
+fn corrupt_panetiere_preserves_selected_protocol() {
     let committee: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
-    let mut core = lead_core(&committee, 2);
     let relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
-    let service = Identity::generate();
-    register_relays_and_service(&mut core, &relays, &service);
-
-    // Optimistic ADCNet baseline.
-    let first = staged_proposal(&core.tick(0, 0)).expect("first proposal");
-    assert_eq!(proto_name(&first.body), "adcnet");
-    enact(&mut core, &committee, first);
-
-    // An ADCNet corrupt share fails decode without attribution → unattributable
-    // fault → escalate to Panetiere keeping all 3 relays (the corrupt one rides in).
-    core.apply_observed_faults(
-        0,
-        vec![Fault {
-            kind: FaultKind::Liveness,
-            attribution: Attribution::None,
-            evidence: Vec::new(),
-        }],
-        0,
-    );
-    let esc = staged_proposal(&core.tick(1, 0)).expect("escalation proposal");
-    assert_eq!(proto_name(&esc.body), "panetiere");
-    assert_eq!(esc.body.subnets[0].relays.len(), 3);
+    let mut core = selected_panetiere_core(&committee, &relays, &Identity::generate());
     let corrupt_pk = {
         let mut sorted: Vec<Pubkey> = relays.iter().map(|i| i.pubkey()).collect();
         sorted.sort();
         sorted[2]
     };
-    assert!(esc.body.subnets[0].relays.contains(&corrupt_pk));
-    enact(&mut core, &committee, esc);
 
-    // Run the corrupt Panetiere subnet into the committee observer well past the
-    // escalation grace, ticking the core each round as the daemon would.
     let mut net = PanetiereSubnet::new(&relays, Some(Misbehavior::CorruptShare));
     let mut saw_integrity = false;
     let mut total_output = 0usize;
@@ -1532,8 +1389,6 @@ fn corrupt_panetiere_keeps_escalation() {
         "leader must attribute an integrity fault to the corrupt relay"
     );
 
-    // The ongoing integrity fault must keep the subnet escalated; it must NOT
-    // fall back to ADCNet with the offender re-included.
     assert!(
         !deescalated,
         "subnet de-escalated to ADCNet despite an ongoing integrity fault \
@@ -1541,29 +1396,18 @@ fn corrupt_panetiere_keeps_escalation() {
     );
 }
 
-/// A core escalated to a 3-relay Panetiere subnet 0 (via an unattributable fault,
-/// so no relay is dropped), ready to receive integrity fault reports.
-fn escalated_panetiere_core(
+fn selected_panetiere_core(
     committee: &[Identity],
     relays: &[Identity],
     service: &Identity,
 ) -> SchedulerCore {
-    let mut core = lead_core(committee, 2);
+    let mut params = lead_params();
+    params.pin = Some(anymone_core::SchedulerProtocol::Panetiere);
+    let mut core = lead_core_with(committee, 2, params);
     register_relays_and_service(&mut core, relays, service);
-    let first = staged_proposal(&core.tick(0, 0)).expect("first proposal");
+    let first = staged_proposal(&core.tick(0, 0)).unwrap();
+    assert_eq!(proto_name(&first.body), "panetiere");
     enact(&mut core, committee, first);
-    core.apply_observed_faults(
-        0,
-        vec![Fault {
-            kind: FaultKind::Liveness,
-            attribution: Attribution::None,
-            evidence: Vec::new(),
-        }],
-        0,
-    );
-    let esc = staged_proposal(&core.tick(1, 0)).expect("escalation");
-    assert_eq!(proto_name(&esc.body), "panetiere");
-    enact(&mut core, committee, esc);
     core
 }
 
@@ -1615,7 +1459,7 @@ fn committee_acts_on_verified_integrity_report() {
     let corrupt_sp = corrupt_sp.expect("captured the corrupt ServerPublic");
 
     // Verified report from the leader sidelines the offender; subnet stays Panetiere.
-    let mut core = escalated_panetiere_core(&committee, &relays, &service);
+    let mut core = selected_panetiere_core(&committee, &relays, &service);
     core.on_fault_report(
         leader_pk,
         FaultReport {
@@ -1651,7 +1495,7 @@ fn committee_acts_on_verified_integrity_report() {
     );
 
     // A follower decodes the same round, so its verified report also sidelines.
-    let mut core = escalated_panetiere_core(&committee, &relays, &service);
+    let mut core = selected_panetiere_core(&committee, &relays, &service);
     core.on_fault_report(
         honest_pk,
         FaultReport {
@@ -1667,7 +1511,7 @@ fn committee_acts_on_verified_integrity_report() {
     assert!(!body.subnets[0].relays.contains(&corrupt_pk));
 
     // A report from outside the subnet's roster is ignored.
-    let mut core = escalated_panetiere_core(&committee, &relays, &service);
+    let mut core = selected_panetiere_core(&committee, &relays, &service);
     core.on_fault_report(
         service.pubkey(),
         FaultReport {
@@ -1683,7 +1527,7 @@ fn committee_acts_on_verified_integrity_report() {
     assert!(body.subnets[0].relays.contains(&corrupt_pk));
 
     // Evidence that re-verifies as consistent can't frame an honest relay.
-    let mut core = escalated_panetiere_core(&committee, &relays, &service);
+    let mut core = selected_panetiere_core(&committee, &relays, &service);
     core.on_fault_report(
         leader_pk,
         FaultReport {
@@ -1704,7 +1548,7 @@ fn committee_acts_on_verified_integrity_report() {
 
     // Genuine (signed, inconsistent) evidence attributes only its signer: a
     // report pairing it with a different relay is ignored entirely.
-    let mut core = escalated_panetiere_core(&committee, &relays, &service);
+    let mut core = selected_panetiere_core(&committee, &relays, &service);
     core.on_fault_report(
         leader_pk,
         FaultReport {
@@ -1728,85 +1572,29 @@ fn committee_acts_on_verified_integrity_report() {
     );
 }
 
-/// A fresh escalation always starts one-round Panetiere; sustained real
-/// traffic then upgrades the subnet to scheduled mode, and steady traffic
-/// afterwards re-proposes nothing (content key stable).
 #[test]
-fn sustained_traffic_upgrades_to_scheduled_panetiere() {
+fn sustained_traffic_preserves_selected_protocol() {
     let committee: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
     let relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
     let service = Identity::generate();
-    // message_size=4 -> upgrade at >=8 decoded bytes/round, downgrade at <=2;
-    // the harness's real ~10-byte payload sits above the upgrade bar.
-    let mut core = lead_core_msg_size(&committee, 2, 4);
+    let mut params = lead_params();
+    params.message_size = 4;
+    params.pin = Some(anymone_core::SchedulerProtocol::Panetiere);
+    let mut core = lead_core_with(&committee, 2, params);
     register_relays_and_service(&mut core, &relays, &service);
-
-    let first = staged_proposal(&core.tick(0, 0)).expect("first proposal");
-    assert_eq!(proto_name(&first.body), "adcnet");
+    let first = staged_proposal(&core.tick(0, 0)).unwrap();
     enact(&mut core, &committee, first);
-
-    core.apply_observed_faults(
-        0,
-        vec![Fault {
-            kind: FaultKind::Liveness,
-            attribution: Attribution::None,
-            evidence: Vec::new(),
-        }],
-        0,
-    );
-    let esc = staged_proposal(&core.tick(1, 0)).expect("escalation proposal");
-    assert_eq!(
-        proto_name(&esc.body),
-        "panetiere",
-        "a fresh escalation always starts one-round"
-    );
-    enact(&mut core, &committee, esc);
-
     let mut net = PanetiereSubnet::new(&relays, None);
-    let mut upgraded_body = None;
-    for r in 0..6u64 {
+    for r in 0..12 {
         let (wire, _, _) = net.round(r);
         for (from, bytes) in wire {
             core.on_subnet_message(0, from, bytes);
         }
-        if let Some(body) = staged_body(&core.tick(2 + r, 0)) {
-            if proto_name(&body) == "scheduled-panetiere" {
-                upgraded_body = Some(body.clone());
-            }
-            enact(
-                &mut core,
-                &committee,
-                sign_proposal(&lead_of(&committee), body),
-            );
-            if upgraded_body.is_some() {
-                break;
-            }
+        if let Some(p) = staged_proposal(&core.tick(r + 1, 0)) {
+            assert_eq!(proto_name(&p.body), "panetiere");
+            enact(&mut core, &committee, p);
         }
     }
-    let upgraded = upgraded_body.expect("sustained real traffic must upgrade the subnet");
-    let ProtocolConfig::ScheduledPanetiere(cfg) = &upgraded.subnets[0].protocol else {
-        panic!("expected ScheduledPanetiere");
-    };
-    assert!(
-        cfg.vector_bytes > 0,
-        "scheduled subnet must get a sized message vector"
-    );
-
-    // Steady traffic afterwards must not keep re-proposing (content key stable).
-    let mut restaged = false;
-    for r in 6..10u64 {
-        let (wire, _, _) = net.round(r);
-        for (from, bytes) in wire {
-            core.on_subnet_message(0, from, bytes);
-        }
-        if staged_body(&core.tick(2 + r, 0)).is_some() {
-            restaged = true;
-        }
-    }
-    assert!(
-        !restaged,
-        "steady scheduled-mode traffic must not keep re-proposing"
-    );
 
     // Pinned deployment shapes: "scheduled-panetiere" forces the mode from the
     // first proposal, no traffic needed.
@@ -1821,7 +1609,6 @@ fn sustained_traffic_upgrades_to_scheduled_panetiere() {
             min_relays: 2,
             min_services: 1,
             fault_threshold: 2,
-            escalation_grace: 5,
             grow_at: 31,
             message_size: 4,
             integrity_backoff_ms: 6 * 60 * 1000,
@@ -1851,4 +1638,94 @@ fn sustained_traffic_upgrades_to_scheduled_panetiere() {
         cfg.vector_bytes > 0,
         "pinned scheduled subnet gets the default vector sizing"
     );
+}
+
+#[test]
+fn published_content_changes_trigger_new_proposals() {
+    let committee: Vec<_> = (0..3).map(|_| Identity::generate()).collect();
+    let mut params = lead_params();
+    params.min_capacity = 16;
+    params.renegotiate_on_fault = false;
+    let mut core = lead_core_with(&committee, 2, params);
+    let relays: Vec<_> = (0..3).map(|_| Identity::generate()).collect();
+    let service = Identity::generate();
+    let tag = ServiceTag::from_label("anymone.echo");
+    for relay in &relays {
+        core.on_registration(Registration::relay(relay, xkw(relay)));
+    }
+    core.on_registration(Registration::service(&service, tag, xkw(&service)));
+    let now = anymone_core::config::now_unix_ms();
+    let initial = staged_proposal(&core.tick(1, now)).unwrap();
+    let mut version = initial.body.round;
+    enact(&mut core, &committee, initial);
+    assert!(staged_proposal(&core.tick(2, now)).is_none());
+
+    let watcher = Identity::generate();
+    let replacement = Identity::generate();
+    let exchange = xkw(&Identity::generate());
+    for change in 0..5 {
+        match change {
+            0 => core.on_registration(Registration::watcher(&watcher)),
+            1 => core.on_registration(Registration::relay_at(
+                &relays[0],
+                xkw(&relays[0]),
+                Some("127.0.0.1:9000".into()),
+            )),
+            2 => core.on_registration(Registration::relay_at(
+                &relays[0],
+                exchange.clone(),
+                Some("127.0.0.1:9000".into()),
+            )),
+            3 => core.on_registration(Registration::service(&replacement, tag, xkw(&replacement))),
+            4 => core.set_cover_rate(0.999),
+            _ => unreachable!(),
+        }
+        let tick = 3 + change * 2;
+        let proposal = staged_proposal(&core.tick(tick, now))
+            .expect("a changed published field must trigger a proposal");
+        assert_eq!(proposal.body.round, version + 1);
+        match change {
+            0 => assert!(proposal.body.watchers.contains(&watcher.pubkey())),
+            1 => assert!(proposal
+                .body
+                .relay_client_addrs
+                .contains(&(relays[0].pubkey(), "127.0.0.1:9000".into()))),
+            2 => assert!(proposal
+                .body
+                .relay_exchange_keys
+                .contains(&(relays[0].pubkey(), exchange.clone()))),
+            3 => assert_eq!(
+                proposal
+                    .body
+                    .services
+                    .iter()
+                    .find(|s| s.tag == tag)
+                    .unwrap()
+                    .pubkey,
+                replacement.pubkey()
+            ),
+            4 => assert!(proposal.body.subnets.iter().all(|s| s.cover_rate == 0.999)),
+            _ => unreachable!(),
+        }
+        version = proposal.body.round;
+        enact(&mut core, &committee, proposal);
+        assert!(staged_proposal(&core.tick(tick + 1, now)).is_none());
+    }
+}
+
+#[test]
+fn scheduled_adcnet_can_be_explicitly_selected() {
+    let committee: Vec<_> = (0..3).map(|_| Identity::generate()).collect();
+    let relays: Vec<_> = (0..3).map(|_| Identity::generate()).collect();
+    let service = Identity::generate();
+    let mut params = lead_params();
+    params.pin = Some(anymone_core::SchedulerProtocol::ScheduledAdcnet);
+    let mut core = lead_core_with(&committee, 2, params);
+    register_relays_and_service(&mut core, &relays, &service);
+    let proposal = staged_proposal(&core.tick(0, 0)).expect("scheduled ADCNet proposal");
+    let ProtocolConfig::ScheduledAdcnet(config) = &proposal.body.subnets[0].protocol else {
+        panic!()
+    };
+    assert_eq!(config.message_length, 1024);
+    enact(&mut core, &committee, proposal);
 }

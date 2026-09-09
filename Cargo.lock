@@ -5,22 +5,19 @@ version = 4
 [[package]]
 name = "adcnet"
 version = "0.1.0"
-source = "git+ssh://git@github.com/flashbots/adcnet-rs?rev=08988b193a4fa78d08f7ffed221ce28c7a1aeb6e#08988b193a4fa78d08f7ffed221ce28c7a1aeb6e"
+source = "git+https://github.com/flashbots/adcnet-rs?rev=d99f4fe61a69883e25d8a226baa6c5c9c9e75356#d99f4fe61a69883e25d8a226baa6c5c9c9e75356"
 dependencies = [
  "aes",
  "aes-gcm",
  "bincode",
  "blake3",
- "ctr",
  "ed25519-dalek",
  "hex",
- "once_cell",
+ "negacyclic-rings",
  "p256 0.13.2",
  "rand 0.8.7",
- "rand_core 0.6.4",
  "serde",
  "serde_bytes",
- "serde_json",
  "sha2 0.10.9",
  "sha3 0.10.9",
  "thiserror 1.0.69",
@@ -485,13 +482,6 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "anymone-masque"
-version = "0.0.1"
-dependencies = [
- "anymone-core",
 ]
 
 [[package]]
@@ -4337,7 +4327,7 @@ dependencies = [
 [[package]]
 name = "panetiere"
 version = "0.1.0"
-source = "git+https://github.com/flashbots/panetiere?rev=94eac72385ca73f615b4f97861fcf7a56a4a67ab#94eac72385ca73f615b4f97861fcf7a56a4a67ab"
+source = "git+https://github.com/flashbots/panetiere?rev=dc01b293e0d41a4869739af8b685853ac2c7970c#dc01b293e0d41a4869739af8b685853ac2c7970c"
 dependencies = [
  "aes-gcm",
  "chipmunk_code",

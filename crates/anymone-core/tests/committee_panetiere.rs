@@ -45,14 +45,17 @@ async fn committee_panetiere_publishes_multisig_config() {
 
     let cfg = PanetiereCommitteeConfig {
         committee_round_duration: Duration::from_millis(600),
-        public_round_duration: Duration::from_millis(200),
-        min_relays: 1,
-        min_services: 1,
-        fault_grace: 2,
-        message_size: 64,
         // A 12KB channel's KAHE work per round doesn't fit a short round.
         committee_msg_bytes: 8192,
-        ..PanetiereCommitteeConfig::default()
+        scheduler: anymone_core::SchedulerParams {
+            public_round_duration: Duration::from_millis(200),
+            min_relays: 1,
+            min_services: 1,
+            fault_threshold: 2,
+            message_size: 64,
+            ..Default::default()
+        },
+        ..Default::default()
     };
 
     let _h0 = spawn_panetiere_committee_scheduler(
@@ -148,14 +151,17 @@ async fn committee_converges_despite_staggered_member_start() {
 
     let cfg = PanetiereCommitteeConfig {
         committee_round_duration: Duration::from_millis(600),
-        public_round_duration: Duration::from_millis(200),
-        min_relays: 1,
-        min_services: 1,
-        fault_grace: 2,
-        message_size: 64,
         // A 12KB channel's KAHE work per round doesn't fit a short round.
         committee_msg_bytes: 8192,
-        ..PanetiereCommitteeConfig::default()
+        scheduler: anymone_core::SchedulerParams {
+            public_round_duration: Duration::from_millis(200),
+            min_relays: 1,
+            min_services: 1,
+            fault_threshold: 2,
+            message_size: 64,
+            ..Default::default()
+        },
+        ..Default::default()
     };
 
     let observer = Identity::generate();
@@ -255,20 +261,22 @@ async fn committee_scales_to_second_subnet_under_load() {
 
     let ccfg = PanetiereCommitteeConfig {
         committee_round_duration: Duration::from_millis(1500),
-        public_round_duration: Duration::from_millis(1500),
-        min_relays: 3,
-        min_services: 1,
-        fault_grace: 2,
-        escalation_grace: 5,
-        subnet_grow_at: 31,
-        message_size: 64,
         // This test's proposals (3 relays, ≤2 subnets) reach ~4.2KB; the full
         // 12KB channel costs ~3× the KAHE work per committee round for nothing.
         committee_msg_bytes: 8192,
-        // Subnet-count growth is the subject here, not protocol crypto: Noop
-        // subnets isolate the scheduling/runtime control loop entirely.
-        protocol: Some("noop".into()),
-        ..PanetiereCommitteeConfig::default()
+        scheduler: anymone_core::SchedulerParams {
+            public_round_duration: Duration::from_millis(1500),
+            min_relays: 3,
+            min_services: 1,
+            fault_threshold: 2,
+            grow_at: 31,
+            message_size: 64,
+            // Subnet-count growth is the subject here, not protocol crypto: Noop
+            // subnets isolate the scheduling/runtime control loop entirely.
+            pin: Some(anymone_core::SchedulerProtocol::Noop),
+            ..Default::default()
+        },
+        ..Default::default()
     };
     let mut committee_tasks = Vec::new();
     for id in &committee_ids {
@@ -373,14 +381,10 @@ async fn committee_scales_to_second_subnet_under_load() {
     let _keep = keep;
 }
 
-/// The demo's headline: a live ADCNet subnet loses a relay (in-band via
-/// `set_misbehavior`, the demo's `fault` knob), the committee — observing the
-/// subnet's shares topic — detects the liveness fault, sidelines the relay, and
-/// escalates the subnet ADCNet→Panetiere, publishing the new config. Proves the
-/// fault→escalation path the demo relies on, end to end over a real committee.
+/// A relay fault changes the roster while keeping ADCNet.
 #[serial]
 #[tokio::test(flavor = "multi_thread")]
-async fn committee_escalates_to_panetiere_on_relay_fault() {
+async fn committee_sidelines_faulted_relay_without_switching_protocol() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -400,19 +404,22 @@ async fn committee_escalates_to_panetiere_on_relay_fault() {
 
     // `min_relays` = the full relay count, exactly as the demo configures it.
     // Sidelining a faulted relay drops it from the registered set, so the
-    // committee must still escalate with the relays that remain — not wedge.
+    // committee must still reconfigure with the relays that remain.
     let n_relays = 3;
     let ccfg = PanetiereCommitteeConfig {
         committee_round_duration: Duration::from_millis(600),
-        public_round_duration: Duration::from_millis(600),
-        min_relays: n_relays,
-        min_services: 1,
-        fault_grace: 2,
-        message_size: 64,
         // The full 12KB channel's KAHE work overruns a 600ms round and skips
         // rounds; 4096 is under this test's proposal size.
         committee_msg_bytes: 8192,
-        ..PanetiereCommitteeConfig::default()
+        scheduler: anymone_core::SchedulerParams {
+            public_round_duration: Duration::from_millis(600),
+            min_relays: n_relays,
+            min_services: 1,
+            fault_threshold: 2,
+            message_size: 64,
+            ..Default::default()
+        },
+        ..Default::default()
     };
     let mut committee_tasks = Vec::new();
     for id in &committee_ids {
@@ -512,28 +519,32 @@ async fn committee_escalates_to_panetiere_on_relay_fault() {
         .map(|(_, a)| a.set_misbehavior(Some(Misbehavior::Withhold)))
         .expect("victim relay present");
 
-    // The committee must observe the stall and publish a Panetiere config.
+    // The committee must observe the stall and publish a roster update.
     // Under CPU contention members overrun rounds and re-stage, which is slow
     // but converges.
-    let escalated = tokio::time::timeout(Duration::from_secs(90), async {
+    let updated = tokio::time::timeout(Duration::from_secs(90), async {
         loop {
             let msg = config_sub.recv().await.expect("config topic closed");
             if let Ok(cfg) = bincode::deserialize::<AnymoneRoundConfiguration>(&msg.payload) {
-                if matches!(cfg.body.subnets[0].protocol, ProtocolConfig::Panetiere(_)) {
+                if !cfg.body.subnets[0].relays.contains(&victim) {
+                    assert!(matches!(
+                        cfg.body.subnets[0].protocol,
+                        ProtocolConfig::Adcnet(_)
+                    ));
                     return cfg;
                 }
             }
         }
     })
     .await
-    .expect("committee never escalated the faulted subnet to Panetiere");
+    .expect("committee never sidelined the faulted relay");
 
-    escalated
+    updated
         .verify_multisig(&committee_pks, threshold)
         .expect("multisig verifies");
     assert!(
-        escalated.body.round > v0.body.round,
-        "escalated config is a newer version"
+        updated.body.round > v0.body.round,
+        "updated config is a newer version"
     );
     let _committee_tasks = committee_tasks;
     let _relay_nodes = relay_nodes;

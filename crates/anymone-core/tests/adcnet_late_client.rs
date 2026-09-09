@@ -50,12 +50,15 @@ async fn late_clients_join_and_grow_anon_set() {
         // committee tick is kept short here so the test isn't dominated by
         // config-deliberation latency (the demo runs the committee at 10s).
         committee_round_duration: Duration::from_millis(1000),
-        public_round_duration: Duration::from_millis(4000),
-        min_relays: 3,
-        min_services: 1,
-        fault_grace: 2,
-        message_size: 64,
-        ..PanetiereCommitteeConfig::default()
+        scheduler: anymone_core::SchedulerParams {
+            public_round_duration: Duration::from_millis(4000),
+            min_relays: 3,
+            min_services: 1,
+            fault_threshold: 2,
+            message_size: 64,
+            ..Default::default()
+        },
+        ..Default::default()
     };
     for id in &committee {
         spawn_panetiere_committee_scheduler(

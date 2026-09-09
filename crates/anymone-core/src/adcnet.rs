@@ -2,7 +2,7 @@
 //! [`crate::ProtocolConfig`]: a 1-round IBLT-message flow ([`AdcnetClientSession`]
 //! / [`AdcnetServerSession`]) and a 2-round auction-then-broadcast flow
 //! ([`ScheduledAdcnetClientSession`] / [`ScheduledAdcnetServerSession`], which
-//! wrap the upstream stateful services). See IMPLEMENTATION.md §ADCNet sessions.
+//! use the upstream auction, blinding, and share-combining primitives).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use adcnet::protocol::session::one_round::{
     client_contribute, combine_round, server_contribute, ClientContribution, ServerShare,
 };
 pub use adcnet::protocol::session::one_round::{IbltMsgParamsOwned, OneRoundConfig};
-use adcnet::protocol::session::two_round::{ClientService, ServerService};
+use adcnet::protocol::session::two_round::ServerService;
 use adcnet::protocol::{
     AdcNetConfig as UpstreamAdcNetConfig, AggregationMode, ClientRoundMessage,
     Round as UpstreamRound, RoundBroadcast, RoundContext, ServerPartialDecryptionMessage,
@@ -33,7 +33,7 @@ use crate::faults::Fault;
 use crate::identity::Pubkey;
 use crate::log_target::{ADCNET, SCHED};
 use crate::runtime::{
-    aggregator_group_of, client_aggregators, deadline_for, drain_inbound, gossip_faults,
+    aggregator_group_of, client_aggregator, deadline_for, drain_inbound, gossip_faults,
     handle_inbound, publish_and_loop_back, recv_any, round_at, route_to_pipe, subnet_aggregation,
     subnet_leader_pk, AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
 };
@@ -94,21 +94,45 @@ fn client_shared_secrets(
 }
 
 fn client_session(
-    one_round: &OneRoundConfig,
+    round: Round,
+    inner: &Arc<AnymoneInner>,
     relay_xk: &[(Pubkey, ExchangePublicKeyWire)],
     subnet: &Subnet,
     identity: &Identity,
 ) -> Box<dyn Session> {
-    let shared_secrets = client_shared_secrets(relay_xk, identity, subnet);
     let mut seed = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut seed);
-    Box::new(AdcnetClientSession::new(
-        one_round.clone(),
-        identity.to_adcnet_signing_key(),
-        shared_secrets,
-        identity.exchange_pubkey(),
-        seed,
-    ))
+    match &subnet.protocol {
+        ProtocolConfig::Adcnet(cfg) => Box::new(AdcnetClientSession::new(
+            one_round_config(cfg),
+            identity.to_adcnet_signing_key(),
+            client_shared_secrets(relay_xk, identity, subnet),
+            identity.exchange_pubkey(),
+            seed,
+        )),
+        ProtocolConfig::ScheduledAdcnet(cfg) => {
+            let config = scheduled_config(cfg);
+            let servers: Vec<_> = crate::keys::roster_exchange_pubkeys(&subnet.relays, relay_xk)
+                .into_iter()
+                .map(|(i, key)| (ServerId(i as u32), key))
+                .collect();
+            let initial = empty_scheduled_broadcast(&config, 0);
+            let mut client = ScheduledAdcnetClientSession::new(
+                config,
+                identity.to_adcnet_signing_key(),
+                ExchangePrivateKey::from_bytes(&identity.exchange().scalar_bytes())
+                    .expect("valid exchange scalar"),
+                &servers,
+                initial,
+                round as i64 + 1,
+                subnet_leader_pk(subnet),
+            );
+            client.min_message_size = cfg.min_message_size as usize;
+            client.node = Some(Arc::downgrade(inner));
+            Box::new(client)
+        }
+        _ => unreachable!(),
+    }
 }
 
 fn server_session(
@@ -159,14 +183,10 @@ pub(crate) async fn run_subnet(
     epoch_unix_ms: u64,
     armed: bool,
 ) {
-    let cfg = match &subnet.protocol {
-        ProtocolConfig::Adcnet(c) => c.clone(),
-        _ => unreachable!("adcnet::run_subnet on a non-ADCNet subnet"),
-    };
+    let scheduled = matches!(subnet.protocol, ProtocolConfig::ScheduledAdcnet(_));
     let identity_pk = inner.identity.pubkey();
-    let one_round = one_round_config(&cfg);
     let leader_pk = subnet_leader_pk(&subnet);
-    let client_agg = client_aggregators(&subnet, identity_pk);
+    let client_agg = client_aggregator(&subnet, identity_pk);
     let mut sorted_roster = subnet.relays.clone();
     sorted_roster.sort();
 
@@ -174,29 +194,53 @@ pub(crate) async fn run_subnet(
     let mut cover_rate = subnet.cover_rate;
 
     if subnet.relays.contains(&identity_pk) {
-        sessions.insert(
-            SessionKey::Server,
-            server_session(
-                &one_round,
-                &cfg,
+        let session = match &subnet.protocol {
+            ProtocolConfig::Adcnet(cfg) => server_session(
+                &one_round_config(cfg),
+                cfg,
                 &subnet,
                 &inner.identity,
                 leader_pk,
                 inner.subnet_clients(&subnet),
             ),
-        );
-    } else {
+            ProtocolConfig::ScheduledAdcnet(cfg) => {
+                let peers: Vec<_> = sorted_roster
+                    .iter()
+                    .enumerate()
+                    .map(|(i, pk)| (ServerId(i as u32), PublicKey::from_bytes(&pk.0)))
+                    .collect();
+                let mut server = ScheduledAdcnetServerSession::new(
+                    scheduled_config(cfg),
+                    ServerId(relay_index(&subnet, identity_pk).unwrap()),
+                    inner.identity.to_adcnet_signing_key(),
+                    ExchangePrivateKey::from_bytes(&inner.identity.exchange().scalar_bytes())
+                        .expect("valid exchange scalar"),
+                    &[],
+                    &peers,
+                    1,
+                    leader_pk,
+                );
+                server.client_set_max = cfg.client_set_max as usize;
+                server.good_clients = inner.subnet_clients(&subnet);
+                Box::new(server) as Box<dyn Session>
+            }
+            _ => unreachable!(),
+        };
+        sessions.insert(SessionKey::Server, session);
+    }
+    if scheduled || !subnet.relays.contains(&identity_pk) {
         sessions.insert(
             SessionKey::Watch,
-            Box::new(AdcnetWatchSession::new(leader_pk)),
+            crate::runtime::watch_session_for(&subnet),
         );
     }
     if let Some(a) = subnet_aggregation(&subnet) {
         if let Some(group) = aggregator_group_of(a, identity_pk) {
             let mut agg_session =
                 AdcnetAggregatorSession::new(group, a.groups.len() as u32, inner.identity.clone());
-            agg_session
-                .set_client_set_max((cfg.client_set_max as usize / a.groups.len().max(1)).max(1));
+            agg_session.set_client_set_max(
+                (subnet.protocol.client_set_max() as usize / a.groups.len().max(1)).max(1),
+            );
             agg_session.set_good_clients(inner.subnet_clients(&subnet));
             sessions.insert(SessionKey::Aggregator, Box::new(agg_session));
         }
@@ -206,7 +250,8 @@ pub(crate) async fn run_subnet(
     let mut fault_monitor: Option<Box<dyn Session>> = if leader_pk == identity_pk {
         let mut roster = subnet.relays.clone();
         roster.sort();
-        Some(Box::new(AdcnetObserverSession::new(
+        Some(Box::new(AdcnetObserverSession::for_protocol(
+            scheduled,
             roster,
             leader_pk,
             FAULT_THRESHOLD,
@@ -221,10 +266,24 @@ pub(crate) async fn run_subnet(
     // the aggregators' signed group aggregates ride the shares topic, where the
     // leader already listens.
     let egress = |key: &SessionKey, bytes: &[u8]| match key {
-        SessionKey::Server if is_server_share(bytes) => Dest::Topic(Topic::Shares(subnet.id)),
+        SessionKey::Server
+            if if scheduled {
+                matches!(
+                    bincode::deserialize::<ScheduledAdcnetWire>(bytes),
+                    Ok(ScheduledAdcnetWire::Partial(_) | ScheduledAdcnetWire::ClientSet(_))
+                )
+            } else {
+                is_server_share(bytes)
+            } =>
+        {
+            Dest::Topic(Topic::Shares(subnet.id))
+        }
         SessionKey::Server => Dest::Topic(Topic::Broadcast(subnet.id)),
+        SessionKey::Client if scheduled => Dest::Each(subnet.id, vec![leader_pk]),
         SessionKey::Client => match &client_agg {
-            Some(aggs) if is_client_message(bytes) => Dest::Each(subnet.id, aggs.clone()),
+            Some(aggregator) if is_client_message(bytes) => {
+                Dest::Each(subnet.id, vec![*aggregator])
+            }
             _ => Dest::Each(subnet.id, sorted_roster.clone()),
         },
         SessionKey::Aggregator => Dest::Topic(Topic::Shares(subnet.id)),
@@ -260,7 +319,7 @@ pub(crate) async fn run_subnet(
         m.begin_round(round, Instant::now());
     }
     crate::runtime::sync_client_round(&inner, subnet.id, round, cover_rate, &mut sessions, || {
-        client_session(&one_round, &relay_xk, &subnet, &inner.identity)
+        client_session(round, &inner, &relay_xk, &subnet, &inner.identity)
     });
     let misbehavior = inner.misbehavior();
     let outs: Vec<(SessionKey, Vec<u8>)> = sessions
@@ -338,7 +397,7 @@ pub(crate) async fn run_subnet(
                         n_messages: n_decoded,
                     });
                 }
-                crate::runtime::log_round_outcome("adcnet", subnet.id, round, n_decoded, faults.len());
+                crate::runtime::log_round_outcome(if scheduled { "scheduled-adcnet" } else { "adcnet" }, subnet.id, round, n_decoded, faults.len());
                 if round >= spawn_round + crate::runtime::RECONFIG_FAULT_GRACE {
                     gossip_faults(&inner, subnet.id, identity_pk, &mut reported, faults.into_iter().map(|f| (round, f)).collect()).await;
                 }
@@ -356,7 +415,7 @@ pub(crate) async fn run_subnet(
                     m.begin_round(round, Instant::now());
                 }
                 crate::runtime::sync_client_round(&inner, subnet.id, round, cover_rate, &mut sessions, || {
-                    client_session(&one_round, &relay_xk, &subnet, &inner.identity)
+                    client_session(round, &inner, &relay_xk, &subnet, &inner.identity)
                 });
                 let misbehavior = inner.misbehavior();
                 let outs: Vec<(SessionKey, Vec<u8>)> = sessions
@@ -561,10 +620,50 @@ fn observe_adcnet(bytes: &[u8]) -> AdcnetObserved {
     }
 }
 
+fn observe_scheduled_adcnet(bytes: &[u8], leader: Pubkey) -> AdcnetObserved {
+    let wire_round = |r: i64| (r > 0).then(|| (r - 1) as u64);
+    match bincode::deserialize::<ScheduledAdcnetWire>(bytes) {
+        Ok(ScheduledAdcnetWire::Partial(signed)) => {
+            if let Ok((partial, signer)) = signed.recover() {
+                if let Some(round) = wire_round(partial.original_aggregate.round_number) {
+                    return AdcnetObserved::Share {
+                        round,
+                        signer: signer.clone(),
+                    };
+                }
+            }
+        }
+        Ok(ScheduledAdcnetWire::ClientSet(signed)) => {
+            if let Ok((set, signer)) = signed.recover() {
+                if signer.as_bytes() == leader.0 {
+                    if let Some(round) = wire_round(set.round) {
+                        return AdcnetObserved::ClientSet {
+                            round,
+                            size: set.clients.len(),
+                        };
+                    }
+                }
+            }
+        }
+        Ok(ScheduledAdcnetWire::Broadcast(signed)) => {
+            if let Ok((result, signer)) = signed.recover() {
+                if result.completed && signer.as_bytes() == leader.0 {
+                    if let Some(round) = wire_round(result.broadcast.round_number) {
+                        return AdcnetObserved::Output { round };
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    AdcnetObserved::Other
+}
+
 /// Liveness observer for an ADCNet subnet — run by the committee/dashboard
 /// without participating. Recognises ADCNet share/output messages and feeds a
 /// protocol-agnostic [`OutputFaultTracker`].
 pub struct AdcnetObserverSession {
+    scheduled: bool,
     tracker: crate::faults::OutputFaultTracker,
     /// Sorted roster; a share is credited to its signer's slot here.
     roster: Vec<PeerId>,
@@ -582,7 +681,17 @@ const ANON_SET_HISTORY: usize = 16;
 
 impl AdcnetObserverSession {
     pub fn new(roster: Vec<PeerId>, leader: PeerId, fault_threshold: u64) -> Self {
+        Self::for_protocol(false, roster, leader, fault_threshold)
+    }
+
+    pub fn for_protocol(
+        scheduled: bool,
+        roster: Vec<PeerId>,
+        leader: PeerId,
+        fault_threshold: u64,
+    ) -> Self {
         AdcnetObserverSession {
+            scheduled,
             tracker: crate::faults::OutputFaultTracker::new(roster.clone(), fault_threshold),
             roster,
             anon_set_by_round: std::collections::BTreeMap::new(),
@@ -659,7 +768,11 @@ impl Session for AdcnetObserverSession {
     }
 
     fn on_inbound(&mut self, from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
-        let observed = observe_adcnet(&payload);
+        let observed = if self.scheduled {
+            observe_scheduled_adcnet(&payload, self.leader)
+        } else {
+            observe_adcnet(&payload)
+        };
         // Observed rounds are u32 wire values widened to u64; compare wrapped.
         let future = |round: u64| {
             self.cur_round
@@ -1758,7 +1871,7 @@ impl Session for AdcnetServerSession {
                 // An oversized group pushes the canonical union past what
                 // servers accept, making the whole round undecodable.
                 let group_cap = (self.client_set_max / agg.roster.len().max(1)).max(1);
-                if !roster.contains(&signer)
+                if *roster != signer
                     || clients.len() > group_cap
                     || !signer.verify(
                         &group_aggregate_signing_bytes(round, group, &blinded, &clients),
@@ -1774,7 +1887,7 @@ impl Session for AdcnetServerSession {
                         n = clients.len(),
                         group_cap,
                         cur = self.cur_round,
-                        in_roster = roster.contains(&signer),
+                        in_roster = *roster == signer,
                         "adcnet leader: rejected group aggregate"
                     );
                     return Vec::new();
@@ -2067,17 +2180,86 @@ impl Session for AdcnetWatchSession {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScheduledClient {
+    message: Signed<ClientRoundMessage>,
+    key: Signed<KeyExchange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScheduledSet {
+    round: i64,
+    clients: Vec<ScheduledClient>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScheduledResult {
+    broadcast: RoundBroadcast,
+    completed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum ScheduledAdcnetWire {
-    Client(Signed<ClientRoundMessage>),
-    Partial(ServerPartialDecryptionMessage),
-    /// Decoded round result; clients read it to find their winning slots next round.
-    Broadcast(RoundBroadcast),
+    Client(ScheduledClient),
+    ClientSet(Signed<ScheduledSet>),
+    Partial(Signed<ServerPartialDecryptionMessage>),
+    Broadcast(Signed<ScheduledResult>),
+}
+
+fn empty_scheduled_broadcast(config: &UpstreamAdcNetConfig, round: i64) -> RoundBroadcast {
+    RoundBroadcast {
+        round_number: round,
+        auction_vector: adcnet::auction::iblt::IbltVector::new(config.auction_slots),
+        message_vector: Vec::new(),
+    }
+}
+
+pub(crate) fn scheduled_max_wire_estimate(
+    cfg: &crate::config::ScheduledAdcnetConfig,
+    n_relays: usize,
+) -> usize {
+    let auction = adcnet::auction::iblt::iblt_field_element_count(
+        cfg.auction_slots,
+        adcnet::auction::auction::AUCTION_BID_XI,
+    )
+    .saturating_mul(8);
+    let contribution = auction
+        .saturating_add(cfg.message_length)
+        .saturating_add(n_relays.saturating_mul(4))
+        .saturating_add(512);
+    let client_set = contribution
+        .saturating_mul(cfg.client_set_max as usize)
+        .saturating_add(256);
+    let partial = contribution
+        .saturating_mul(2)
+        .saturating_add((cfg.client_set_max as usize).saturating_mul(128));
+    client_set.max(partial)
+}
+
+fn scheduled_config(cfg: &crate::config::ScheduledAdcnetConfig) -> UpstreamAdcNetConfig {
+    UpstreamAdcNetConfig {
+        auction_slots: cfg.auction_slots,
+        message_length: cfg.message_length,
+        min_clients: cfg.client_set_min,
+        round_duration: std::time::Duration::from_millis(cfg.round_duration_ms),
+        aggregation: AggregationMode::Disabled,
+        ..Default::default()
+    }
 }
 
 pub struct ScheduledAdcnetClientSession {
-    svc: ClientService,
-    pending: Option<(Vec<u8>, u32)>,
+    config: UpstreamAdcNetConfig,
+    signing_key: PrivateKey,
+    key: Signed<KeyExchange>,
+    shared: HashMap<ServerId, SharedKey>,
+    pending: std::collections::VecDeque<(Vec<u8>, u32)>,
+    inflight: Option<(Vec<u8>, u32, i64)>,
+    previous: RoundBroadcast,
     current_round: i64,
+    leader: Pubkey,
+    cover_rate: f32,
+    min_message_size: usize,
+    submitted_round: Option<i64>,
+    node: Option<std::sync::Weak<AnymoneInner>>,
 }
 
 impl ScheduledAdcnetClientSession {
@@ -2088,48 +2270,134 @@ impl ScheduledAdcnetClientSession {
         servers: &[(ServerId, adcnet::crypto::ExchangePublicKey)],
         initial_broadcast: RoundBroadcast,
         starting_round: i64,
+        leader: Pubkey,
     ) -> Self {
-        let svc = ClientService::new(config, signing_key, exchange_key);
-        for (sid, xpub) in servers {
-            svc.register_server(*sid, xpub).expect("register server");
-        }
-        svc.advance_to_round(UpstreamRound::new(starting_round, RoundContext::Client));
-        svc.process_round_broadcast(initial_broadcast);
-        ScheduledAdcnetClientSession {
-            svc,
-            pending: None,
+        let key = Signed::new(
+            &signing_key,
+            KeyExchange {
+                xpub: exchange_key.public().to_sec1_bytes(),
+            },
+        )
+        .expect("sign client exchange key");
+        Self {
+            config,
+            signing_key,
+            key,
+            shared: servers
+                .iter()
+                .map(|(id, key)| (*id, exchange_key.ecdh(key)))
+                .collect(),
+            pending: Default::default(),
+            inflight: None,
+            previous: initial_broadcast,
             current_round: starting_round,
+            leader,
+            cover_rate: 1.0,
+            min_message_size: 1,
+            submitted_round: None,
+            node: None,
         }
     }
 
-    pub fn stage_message(&mut self, payload: Vec<u8>, bid_value: u32) {
-        self.pending = Some((payload, bid_value));
+    pub fn stage_message(&mut self, mut payload: Vec<u8>, bid_value: u32) {
+        payload.resize(payload.len().max(self.min_message_size), 0);
+        self.pending.push_back((payload, bid_value));
+    }
+
+    fn submit(&mut self) -> Vec<Vec<u8>> {
+        if self.previous.round_number != self.current_round - 1
+            || self.submitted_round == Some(self.current_round)
+        {
+            return Vec::new();
+        }
+        if self
+            .inflight
+            .as_ref()
+            .is_some_and(|(_, _, r)| *r != self.current_round - 1)
+        {
+            let (payload, bid, _) = self.inflight.take().unwrap();
+            self.pending.push_front((payload, bid));
+        }
+        if self.pending.is_empty()
+            && self.inflight.is_none()
+            && rand::thread_rng().gen::<f32>() >= self.cover_rate
+        {
+            return Vec::new();
+        }
+        let bid = self.pending.front().map(|(payload, bid)| {
+            adcnet::auction::auction::AuctionData::from_message(payload, *bid)
+        });
+        let message = self
+            .inflight
+            .as_ref()
+            .map(|(p, _, _)| p.as_slice())
+            .unwrap_or_default();
+        let messager = adcnet::protocol::messager::ClientMessager {
+            config: &self.config,
+            shared_secrets: &self.shared,
+        };
+        let Ok((message, won)) = messager.prepare_message(
+            self.current_round,
+            &self.previous,
+            message,
+            bid.as_ref(),
+            &mut rand::thread_rng(),
+        ) else {
+            return Vec::new();
+        };
+        tracing::trace!(target: ADCNET, round = self.current_round, won, pending = self.pending.len(), inflight = self.inflight.is_some(), "scheduled submit");
+        let signed = Signed::new(&self.signing_key, message).expect("sign scheduled contribution");
+        let next = self.pending.pop_front();
+        if let Some((payload, bid, _)) = self.inflight.take() {
+            if !won {
+                self.pending.push_back((payload, bid));
+            }
+        }
+        self.inflight = next.map(|(p, bid)| (p, bid, self.current_round));
+        self.submitted_round = Some(self.current_round);
+        vec![
+            bincode::serialize(&ScheduledAdcnetWire::Client(ScheduledClient {
+                message: signed,
+                key: self.key.clone(),
+            }))
+            .expect("serialize scheduled client"),
+        ]
+    }
+}
+
+impl Drop for ScheduledAdcnetClientSession {
+    fn drop(&mut self) {
+        let Some(inner) = self.node.as_ref().and_then(|node| node.upgrade()) else {
+            return;
+        };
+        if let Some((payload, bid, _)) = self.inflight.take() {
+            self.pending.push_front((payload, bid));
+        }
+        let mut outbox = inner.outbox.lock().unwrap();
+        for (payload, _) in self.pending.drain(..).rev() {
+            outbox.push_front(payload);
+        }
     }
 }
 
 impl Session for ScheduledAdcnetClientSession {
-    fn begin_round(&mut self, _round: Round, _now: Instant) -> Vec<Vec<u8>> {
-        if let Some((payload, bid)) = self.pending.take() {
-            let _ = self.svc.schedule_message_for_next_round(&payload, bid);
-        }
-        let mut out = Vec::new();
-        if let Ok((signed, _won)) = self.svc.messages_for_current_round() {
-            out.push(
-                bincode::serialize(&ScheduledAdcnetWire::Client(signed)).expect("serialise client"),
-            );
-        }
-        out
+    fn begin_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
+        self.current_round = round as i64 + 1;
+        self.submit()
     }
 
     fn on_inbound(&mut self, _from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
-        if let Ok(ScheduledAdcnetWire::Broadcast(rb)) = bincode::deserialize(&payload) {
-            // Advance through every round we've now observed.
-            while self.current_round < rb.round_number + 1 {
-                self.current_round += 1;
-                self.svc
-                    .advance_to_round(UpstreamRound::new(self.current_round, RoundContext::Client));
+        if let Ok(ScheduledAdcnetWire::Broadcast(signed)) = bincode::deserialize(&payload) {
+            if let Ok((result, signer)) = signed.recover() {
+                let rb = &result.broadcast;
+                if signer.as_bytes() == self.leader.0
+                    && rb.round_number >= self.previous.round_number
+                    && rb.round_number <= self.current_round
+                {
+                    self.previous = rb.clone();
+                    return self.submit();
+                }
             }
-            self.svc.process_round_broadcast(rb);
         }
         Vec::new()
     }
@@ -2137,19 +2405,34 @@ impl Session for ScheduledAdcnetClientSession {
     fn end_round(&mut self, _round: Round, _now: Instant) -> RoundOutcome {
         RoundOutcome::default()
     }
+
+    fn stage(&mut self, payload: Vec<u8>) {
+        self.stage_message(payload, 1);
+    }
+    fn set_cover_rate(&mut self, rate: f32) {
+        self.cover_rate = rate;
+    }
+    fn has_pending_transmissions(&self) -> bool {
+        !self.pending.is_empty() || self.inflight.is_some()
+    }
 }
 
 pub struct ScheduledAdcnetServerSession {
     svc: ServerService,
     config: UpstreamAdcNetConfig,
     current_round: i64,
-    has_clients_this_round: bool,
-    emitted_my_partial: bool,
+    leader: Pubkey,
+    roster: Vec<ServerId>,
+    clients: std::collections::BTreeMap<Pubkey, ScheduledClient>,
+    early_clients: std::collections::BTreeMap<Pubkey, ScheduledClient>,
+    registered_clients: Vec<PublicKey>,
+    client_set_max: usize,
+    good_clients: GoodClients,
+    selected: bool,
     pending_broadcast: Option<RoundBroadcast>,
-    /// Auction state from the previous round — needed by `extract_payloads`
-    /// because round R's `message_vector` slots are allocated by round R-1's
-    /// winners (cf. `ClientMessager::process_previous_auction`).
-    prev_auction: Option<adcnet::auction::iblt::IbltVector>,
+    published: bool,
+    previous: RoundBroadcast,
+    misbehavior: Option<Misbehavior>,
 }
 
 impl ScheduledAdcnetServerSession {
@@ -2161,11 +2444,9 @@ impl ScheduledAdcnetServerSession {
         clients: &[(PublicKey, adcnet::crypto::ExchangePublicKey)],
         peer_servers: &[(ServerId, PublicKey)],
         starting_round: i64,
+        leader: Pubkey,
     ) -> Self {
-        assert!(
-            matches!(config.aggregation, AggregationMode::Disabled),
-            "ScheduledAdcnetServerSession requires AggregationMode::Disabled"
-        );
+        assert!(matches!(config.aggregation, AggregationMode::Disabled));
         let svc = ServerService::new(config.clone(), server_id, signing_key, exchange_key);
         for (pk, xpub) in clients {
             svc.register_client(pk, xpub).expect("register client");
@@ -2174,20 +2455,107 @@ impl ScheduledAdcnetServerSession {
             svc.register_peer_server(*sid, pk.clone());
         }
         svc.advance_to_round(UpstreamRound::new(starting_round, RoundContext::Client));
-        ScheduledAdcnetServerSession {
+        let mut roster: Vec<_> = peer_servers.iter().map(|(sid, _)| *sid).collect();
+        roster.sort();
+        Self {
+            previous: empty_scheduled_broadcast(&config, starting_round - 1),
             svc,
             config,
             current_round: starting_round,
-            has_clients_this_round: false,
-            emitted_my_partial: false,
+            leader,
+            roster,
+            clients: Default::default(),
+            early_clients: Default::default(),
+            registered_clients: clients.iter().map(|(pk, _)| pk.clone()).collect(),
+            client_set_max: 300,
+            good_clients: GoodClients::all(),
+            selected: false,
             pending_broadcast: None,
-            prev_auction: None,
+            published: false,
+            misbehavior: None,
         }
+    }
+
+    fn is_leader(&self) -> bool {
+        self.svc.signing_key().public_key().unwrap().as_bytes() == self.leader.0
+    }
+
+    fn valid_client(
+        &self,
+        client: &ScheduledClient,
+        round: i64,
+    ) -> Option<(Pubkey, ExchangePublicKey)> {
+        let (message, signer) = client.message.recover().ok()?;
+        let (key, key_signer) = client.key.recover().ok()?;
+        let pk = Pubkey(signer.as_bytes().try_into().ok()?);
+        let auction_len = adcnet::auction::iblt::iblt_field_element_count(
+            self.config.auction_slots,
+            adcnet::auction::auction::AUCTION_BID_XI,
+        );
+        let expected_message_len = adcnet::protocol::messager::ClientMessager {
+            config: &self.config,
+            shared_secrets: &HashMap::new(),
+        }
+        .process_previous_auction(&self.previous.auction_vector, &[])
+        .total_allocated;
+        if signer != key_signer
+            || !self.good_clients.allows(&pk)
+            || message.round_number != round
+            || message.all_server_ids != self.roster
+            || message.auction_vector.len() != auction_len
+            || message.message_vector.len() != expected_message_len
+        {
+            tracing::debug!(target: ADCNET, round = self.current_round, message_round = message.round_number, expected_message_len, actual_message_len = message.message_vector.len(), "scheduled client rejected");
+            return None;
+        }
+        Some((pk, ExchangePublicKey::from_sec1_bytes(&key.xpub).ok()?))
+    }
+
+    fn broadcast_result(&mut self) -> Vec<Vec<u8>> {
+        if !self.is_leader() || self.published {
+            return Vec::new();
+        }
+        self.published = true;
+        let completed = self.pending_broadcast.is_some();
+        tracing::trace!(target: ADCNET, round = self.current_round, completed, clients = self.registered_clients.len(), "scheduled result");
+        let broadcast = self
+            .pending_broadcast
+            .take()
+            .unwrap_or_else(|| empty_scheduled_broadcast(&self.config, self.current_round));
+        self.previous = broadcast.clone();
+        let result = Signed::new(
+            self.svc.signing_key(),
+            ScheduledResult {
+                broadcast,
+                completed,
+            },
+        )
+        .expect("sign round result");
+        vec![bincode::serialize(&ScheduledAdcnetWire::Broadcast(result))
+            .expect("serialize broadcast")]
     }
 }
 
 impl Session for ScheduledAdcnetServerSession {
-    fn begin_round(&mut self, _round: Round, _now: Instant) -> Vec<Vec<u8>> {
+    fn begin_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
+        self.current_round = round as i64 + 1;
+        self.svc
+            .advance_to_round(UpstreamRound::new(self.current_round, RoundContext::Client));
+        for pk in self.registered_clients.drain(..) {
+            self.svc.deregister_client(&pk);
+        }
+        self.clients.clear();
+        self.selected = false;
+        self.pending_broadcast = None;
+        self.published = false;
+        if self.previous.round_number != self.current_round - 1 {
+            self.previous = empty_scheduled_broadcast(&self.config, self.current_round - 1);
+        }
+        for (pk, client) in std::mem::take(&mut self.early_clients) {
+            if self.valid_client(&client, self.current_round).is_some() {
+                self.clients.insert(pk, client);
+            }
+        }
         Vec::new()
     }
 
@@ -2196,70 +2564,194 @@ impl Session for ScheduledAdcnetServerSession {
             return Vec::new();
         };
         match msg {
-            ScheduledAdcnetWire::Client(signed) => {
-                if self.svc.process_client_message(&signed).is_ok() {
-                    self.has_clients_this_round = true;
+            ScheduledAdcnetWire::Client(client) if self.is_leader() => {
+                let round = client.message.object.round_number;
+                if round == self.current_round + 1 && self.published {
+                    if self.early_clients.len() < self.client_set_max {
+                        if let Some((pk, _)) = self.valid_client(&client, round) {
+                            self.early_clients.entry(pk).or_insert(client);
+                        }
+                    }
+                } else if round == self.current_round
+                    && !self.selected
+                    && self.clients.len() < self.client_set_max
+                {
+                    if let Some((pk, _)) = self.valid_client(&client, round) {
+                        self.clients.entry(pk).or_insert(client);
+                    }
                 }
             }
-            ScheduledAdcnetWire::Partial(partial) => {
-                if let Ok(Some(bc)) = self.svc.process_partial_decryption_message(partial) {
-                    self.pending_broadcast = Some(bc);
+            ScheduledAdcnetWire::ClientSet(signed) if !self.selected => {
+                let Ok((set, signer)) = signed.recover() else {
+                    return Vec::new();
+                };
+                if signer.as_bytes() != self.leader.0
+                    || set.round != self.current_round
+                    || set.clients.len() > self.client_set_max
+                    || (!set.clients.is_empty()
+                        && set.clients.len() < self.config.min_clients as usize)
+                {
+                    return Vec::new();
+                }
+                let Some(keys) = set
+                    .clients
+                    .iter()
+                    .map(|c| self.valid_client(c, self.current_round))
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return Vec::new();
+                };
+                if keys.windows(2).any(|w| w[0].0 >= w[1].0) {
+                    return Vec::new();
+                }
+                self.selected = true;
+                for (client, (pk, xpub)) in set.clients.iter().zip(keys) {
+                    let public = PublicKey::from_bytes(&pk.0);
+                    if self.svc.register_client(&public, &xpub).is_err() {
+                        return Vec::new();
+                    }
+                    self.registered_clients.push(public);
+                    if self.svc.process_client_message(&client.message).is_err() {
+                        return Vec::new();
+                    }
+                }
+                if self.misbehavior == Some(Misbehavior::Withhold) {
+                    return Vec::new();
+                }
+                if let Ok(mut partial) = self.svc.finalize_partial_for_direct_aggregate() {
+                    if self.misbehavior == Some(Misbehavior::CorruptShare) {
+                        if let Some(value) = partial.message_vector.first_mut() {
+                            *value ^= 1;
+                        } else if let Some(value) = partial.auction_vector.first_mut() {
+                            *value ^= 1;
+                        }
+                    }
+                    let signed = self.svc.sign_partial(partial).expect("sign partial");
+                    if self.is_leader() {
+                        if let Ok(Some(rb)) = self
+                            .svc
+                            .process_signed_partial_decryption_message(signed.clone())
+                        {
+                            self.pending_broadcast = Some(rb);
+                        }
+                    }
+                    return vec![bincode::serialize(&ScheduledAdcnetWire::Partial(signed))
+                        .expect("serialize partial")];
                 }
             }
-            ScheduledAdcnetWire::Broadcast(_) => {
-                // Server doesn't need peer broadcasts — its own service
-                // produces them.
+            ScheduledAdcnetWire::Partial(partial) if self.is_leader() => {
+                if let Ok(Some(rb)) = self.svc.process_signed_partial_decryption_message(partial) {
+                    self.pending_broadcast = Some(rb);
+                    return self.broadcast_result();
+                }
             }
+            ScheduledAdcnetWire::Broadcast(signed) => {
+                if let Ok((result, signer)) = signed.recover() {
+                    if signer.as_bytes() == self.leader.0
+                        && result.broadcast.round_number >= self.previous.round_number
+                        && result.broadcast.round_number <= self.current_round
+                    {
+                        self.previous = result.broadcast.clone();
+                    }
+                }
+            }
+            _ => {}
         }
         Vec::new()
     }
 
+    fn checkpoint(&mut self, _round: Round, k: u8, _now: Instant) -> Vec<Vec<u8>> {
+        if k != 1 || !self.is_leader() || self.selected {
+            return Vec::new();
+        }
+        let clients = if self.clients.len() >= self.config.min_clients as usize {
+            std::mem::take(&mut self.clients).into_values().collect()
+        } else {
+            Vec::new()
+        };
+        let set = Signed::new(
+            self.svc.signing_key(),
+            ScheduledSet {
+                round: self.current_round,
+                clients,
+            },
+        )
+        .expect("sign client set");
+        let bytes =
+            bincode::serialize(&ScheduledAdcnetWire::ClientSet(set)).expect("serialize client set");
+        let partials = self.on_inbound(self.leader, bytes.clone());
+        let mut outbound = vec![bytes];
+        outbound.extend(partials);
+        if self.pending_broadcast.is_some() {
+            outbound.extend(self.broadcast_result());
+        }
+        outbound
+    }
+
     fn end_round(&mut self, _round: Round, _now: Instant) -> RoundOutcome {
-        let mut outbound = Vec::new();
-        let mut decoded = Vec::new();
-
-        if !self.emitted_my_partial && self.has_clients_this_round {
-            if let Ok(partial) = self.svc.finalize_partial_for_direct_aggregate() {
-                // Process_partial counts our own partial as one of the
-                // collected shares and may produce the round broadcast right
-                // away if it's the last partial we needed.
-                if let Ok(Some(bc)) = self.svc.process_partial_decryption_message(partial.clone()) {
-                    self.pending_broadcast = Some(bc);
-                }
-                outbound.push(
-                    bincode::serialize(&ScheduledAdcnetWire::Partial(partial))
-                        .expect("serialise partial"),
-                );
-                self.emitted_my_partial = true;
-            }
-        }
-
-        if let Some(rb) = self.pending_broadcast.take() {
-            // Decode this round's payloads using the *previous* round's
-            // auction (winners determine slot offsets in this round's
-            // `message_vector`). The first broadcast has no prior auction —
-            // skip decode there (its `message_vector` is empty anyway).
-            if let Some(prev_auction) = &self.prev_auction {
-                decoded.extend(extract_payloads(&rb, prev_auction, &self.config));
-            }
-            // Stash this round's auction for next round's decoder.
-            self.prev_auction = Some(rb.auction_vector.clone());
-            outbound.push(
-                bincode::serialize(&ScheduledAdcnetWire::Broadcast(rb))
-                    .expect("serialise broadcast"),
-            );
-            // Advance to the next round.
-            self.current_round += 1;
-            self.svc
-                .advance_to_round(UpstreamRound::new(self.current_round, RoundContext::Client));
-            self.has_clients_this_round = false;
-            self.emitted_my_partial = false;
-        }
-
         RoundOutcome {
-            outbound,
-            decoded,
-            faults: Vec::new(),
+            outbound: self.broadcast_result(),
+            ..Default::default()
+        }
+    }
+
+    fn set_misbehavior(&mut self, mode: Option<Misbehavior>) {
+        self.misbehavior = mode;
+    }
+}
+
+pub struct ScheduledAdcnetWatchSession {
+    config: UpstreamAdcNetConfig,
+    leader: Pubkey,
+    previous: Option<RoundBroadcast>,
+    decoded: Vec<Vec<u8>>,
+}
+
+impl ScheduledAdcnetWatchSession {
+    pub fn new(config: &crate::config::ScheduledAdcnetConfig, leader: Pubkey) -> Self {
+        Self {
+            config: scheduled_config(config),
+            leader,
+            previous: None,
+            decoded: Vec::new(),
+        }
+    }
+}
+
+impl Session for ScheduledAdcnetWatchSession {
+    fn begin_round(&mut self, _round: Round, _now: Instant) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+    fn on_inbound(&mut self, _from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
+        let Ok(ScheduledAdcnetWire::Broadcast(signed)) = bincode::deserialize(&payload) else {
+            return Vec::new();
+        };
+        let Ok((result, signer)) = signed.recover() else {
+            return Vec::new();
+        };
+        let rb = &result.broadcast;
+        if signer.as_bytes() != self.leader.0
+            || rb.round_number < 1
+            || self
+                .previous
+                .as_ref()
+                .is_some_and(|prev| rb.round_number <= prev.round_number)
+        {
+            return Vec::new();
+        }
+        if let Some(previous) = &self.previous {
+            if result.completed && previous.round_number + 1 == rb.round_number {
+                self.decoded
+                    .extend(extract_payloads(rb, &previous.auction_vector, &self.config));
+            }
+        }
+        self.previous = Some(rb.clone());
+        Vec::new()
+    }
+    fn end_round(&mut self, _round: Round, _now: Instant) -> RoundOutcome {
+        RoundOutcome {
+            decoded: std::mem::take(&mut self.decoded),
+            ..Default::default()
         }
     }
 }
@@ -2284,4 +2776,106 @@ fn extract_payloads(
         return Vec::new();
     }
     message_slots::read_slots(&rb.message_vector, &winners)
+}
+
+#[cfg(test)]
+mod scheduled_tests {
+    use super::*;
+
+    #[test]
+    fn scheduled_adcnet_authenticates_keys_shares_and_results() {
+        let leader = Identity::generate();
+        let peer = Identity::generate();
+        let client_id = Identity::generate();
+        let stranger = Identity::generate();
+        let exchange =
+            |id: &Identity| ExchangePrivateKey::from_bytes(&id.exchange().scalar_bytes()).unwrap();
+        let cfg = crate::config::ScheduledAdcnetConfig {
+            round_duration_ms: 200,
+            message_length: 1024,
+            auction_slots: 16,
+            min_message_size: 1,
+            client_set_min: 0,
+            client_set_max: 8,
+        };
+        let config = scheduled_config(&cfg);
+        let peers = [
+            (ServerId(0), leader.to_adcnet_public_key()),
+            (ServerId(1), peer.to_adcnet_public_key()),
+        ];
+        let mut server = ScheduledAdcnetServerSession::new(
+            config.clone(),
+            ServerId(0),
+            leader.to_adcnet_signing_key(),
+            exchange(&leader),
+            &[],
+            &peers,
+            1,
+            leader.pubkey(),
+        );
+        let mut client = ScheduledAdcnetClientSession::new(
+            config.clone(),
+            client_id.to_adcnet_signing_key(),
+            exchange(&client_id),
+            &[
+                (ServerId(0), leader.exchange_pubkey()),
+                (ServerId(1), peer.exchange_pubkey()),
+            ],
+            empty_scheduled_broadcast(&config, 0),
+            1,
+            leader.pubkey(),
+        );
+        let now = Instant::now();
+        client.stage(b"payload".to_vec());
+        let bytes = client.begin_round(0, now).pop().unwrap();
+        let ScheduledAdcnetWire::Client(mut contribution) = bincode::deserialize(&bytes).unwrap()
+        else {
+            panic!()
+        };
+        contribution.key = Signed::new(
+            &stranger.to_adcnet_signing_key(),
+            contribution.key.object.clone(),
+        )
+        .unwrap();
+        server.on_inbound(
+            client_id.pubkey(),
+            bincode::serialize(&ScheduledAdcnetWire::Client(contribution)).unwrap(),
+        );
+        assert!(server.clients.is_empty());
+        server.good_clients = GoodClients::new(|_| false);
+        server.on_inbound(client_id.pubkey(), bytes.clone());
+        assert!(server.clients.is_empty());
+        server.good_clients = GoodClients::all();
+        server.on_inbound(client_id.pubkey(), bytes);
+        assert_eq!(server.clients.len(), 1);
+        let outputs = server.checkpoint(0, 1, now);
+        let mut partial = outputs
+            .into_iter()
+            .find_map(|bytes| match bincode::deserialize(&bytes).unwrap() {
+                ScheduledAdcnetWire::Partial(signed) => Some(signed.object),
+                _ => None,
+            })
+            .unwrap();
+        partial.server_id = ServerId(1);
+        let forged = Signed::new(&stranger.to_adcnet_signing_key(), partial).unwrap();
+        assert!(server
+            .on_inbound(
+                peer.pubkey(),
+                bincode::serialize(&ScheduledAdcnetWire::Partial(forged)).unwrap()
+            )
+            .is_empty());
+        assert!(!server.published);
+        let result = ScheduledResult {
+            broadcast: empty_scheduled_broadcast(&config, 1),
+            completed: true,
+        };
+        let forged = Signed::new(&stranger.to_adcnet_signing_key(), result).unwrap();
+        let bytes = bincode::serialize(&ScheduledAdcnetWire::Broadcast(forged)).unwrap();
+        client.on_inbound(leader.pubkey(), bytes.clone());
+        assert_eq!(client.previous.round_number, 0);
+        let mut watcher = ScheduledAdcnetWatchSession::new(&cfg, leader.pubkey());
+        watcher.begin_round(0, now);
+        watcher.on_inbound(leader.pubkey(), bytes);
+        assert!(watcher.previous.is_none());
+    }
 }

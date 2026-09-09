@@ -103,11 +103,7 @@ pub fn net_view(body: &AnymoneRoundConfigurationBody, committee: &[Pubkey]) -> N
     for subnet in &body.subnets {
         let mut shares: HashSet<Pubkey> = subnet.relays.iter().copied().collect();
         if let Some(agg) = crate::runtime::subnet_aggregation(subnet) {
-            shares.extend(
-                agg.groups
-                    .iter()
-                    .flat_map(|g| g.aggregators.iter().copied()),
-            );
+            shares.extend(agg.groups.iter().map(|g| g.aggregator));
         }
         senders.insert(Topic::Shares(subnet.id), shares);
         if !matches!(subnet.protocol, crate::config::ProtocolConfig::Noop(_)) {
@@ -125,11 +121,7 @@ pub fn net_view(body: &AnymoneRoundConfigurationBody, committee: &[Pubkey]) -> N
     for subnet in &body.subnets {
         primary.extend(subnet.relays.iter().copied());
         if let Some(agg) = crate::runtime::subnet_aggregation(subnet) {
-            primary.extend(
-                agg.groups
-                    .iter()
-                    .flat_map(|g| g.aggregators.iter().copied()),
-            );
+            primary.extend(agg.groups.iter().map(|g| g.aggregator));
         }
     }
     primary.sort();

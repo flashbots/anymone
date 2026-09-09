@@ -102,7 +102,7 @@ impl Member {
 
 struct PoolInner {
     tag: ServiceTag,
-    spawn: SpawnClient,
+    spawn: Option<SpawnClient>,
     max_clients: usize,
     /// The caller's own client first, virtual clients after it.
     members: Mutex<Vec<Arc<Member>>>,
@@ -121,6 +121,21 @@ impl ClientPool {
     /// growth). Returns before attaching: until the tag is placed on a subnet,
     /// [`send`](Self::send) reports [`PoolError::NotAttached`].
     pub fn new(own: Anymone, tag: ServiceTag, spawn: SpawnClient, max_clients: usize) -> Self {
+        let spawn = (max_clients > 1).then_some(spawn);
+        Self::start(own, tag, spawn, max_clients)
+    }
+
+    /// A bounded send queue backed only by the caller's own client.
+    pub fn single(own: Anymone, tag: ServiceTag) -> Self {
+        Self::start(own, tag, None, 1)
+    }
+
+    fn start(
+        own: Anymone,
+        tag: ServiceTag,
+        spawn: Option<SpawnClient>,
+        max_clients: usize,
+    ) -> Self {
         let inner = Arc::new(PoolInner {
             tag,
             spawn,
@@ -142,7 +157,9 @@ impl ClientPool {
             });
         }
         tokio::spawn(distribute(Arc::downgrade(&inner)));
-        tokio::spawn(reap(Arc::downgrade(&inner)));
+        if inner.spawn.is_some() {
+            tokio::spawn(reap(Arc::downgrade(&inner)));
+        }
         ClientPool(inner)
     }
 
@@ -235,6 +252,9 @@ impl PoolInner {
     }
 
     fn grow(self: &Arc<Self>) {
+        let Some(spawn) = self.spawn.clone() else {
+            return;
+        };
         if self.members.lock().unwrap().len() >= self.max_clients {
             return;
         }
@@ -243,7 +263,7 @@ impl PoolInner {
         }
         let inner = self.clone();
         tokio::spawn(async move {
-            match (inner.spawn)().await {
+            match spawn().await {
                 Some(anymone) => {
                     match open_when_placed(&anymone, inner.tag, Some(VIRTUAL_ATTACH_TRIES)).await {
                         Some(pipe) => {
@@ -326,5 +346,83 @@ async fn reap(pool: Weak<PoolInner>) {
                 "client pool: idle virtual clients retired"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::NoopConfig;
+    use crate::{
+        AnymoneRoundConfiguration, Identity, InMemoryNetwork, ProtocolConfig, ServiceEntry,
+    };
+
+    async fn own_client() -> (Anymone, ServiceTag) {
+        let id = Identity::generate();
+        let relay = Identity::generate();
+        let tag = ServiceTag::from_label("pool.single");
+        let cfg = AnymoneRoundConfiguration::singleton_subnet(
+            0,
+            ProtocolConfig::Noop(NoopConfig {
+                round_duration_ms: 200,
+                message_size: 1024,
+                client_set_min: 0,
+                client_set_max: 8,
+            }),
+            vec![relay.pubkey()],
+            vec![],
+            vec![ServiceEntry {
+                tag,
+                pubkey: relay.pubkey(),
+            }],
+        );
+        let net = InMemoryNetwork::new();
+        let transport = Arc::new(net.handle(id.pubkey()));
+        (Anymone::start_with_config(id, transport, cfg).await, tag)
+    }
+
+    async fn wait_attached(pool: &ClientPool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pool.clients() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pool did not attach");
+    }
+
+    #[tokio::test]
+    async fn single_client_queue_is_bounded_and_drains_without_growth() {
+        let (own, tag) = own_client().await;
+        let pool = ClientPool::single(own, tag);
+        wait_attached(&pool).await;
+        for _ in 0..MAX_QUEUED {
+            pool.send(vec![1]).unwrap();
+        }
+        assert!(matches!(
+            pool.send(vec![2]),
+            Err(PoolError::Saturated { queued: MAX_QUEUED })
+        ));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while pool.queued() >= MAX_QUEUED {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("single client did not drain the queue");
+        assert_eq!(pool.clients(), 1);
+        pool.send(vec![3]).unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_client_limit_never_invokes_the_spawner() {
+        let (own, tag) = own_client().await;
+        let spawn: SpawnClient = Arc::new(|| panic!("virtual client spawned with limit one"));
+        let pool = ClientPool::new(own, tag, spawn, 1);
+        wait_attached(&pool).await;
+        pool.send(vec![1]).unwrap();
+        pool.0.dispatch().await;
+        assert_eq!(pool.clients(), 1);
+        assert!(pool.0.spawn.is_none());
     }
 }

@@ -198,6 +198,25 @@ impl BootstrapConfig {
     }
 
     fn validate(&self) -> Result<(), BootstrapError> {
+        if self.committee.committee_round_ms == 0 || self.committee.public_round_ms == 0 {
+            return Err(BootstrapError::BadCommitteeConfig(
+                "round durations must be positive",
+            ));
+        }
+        if self.committee.message_size == 0 || self.committee.committee_msg_bytes == 0 {
+            return Err(BootstrapError::BadCommitteeConfig(
+                "message sizes must be positive",
+            ));
+        }
+        if self.committee.min_relays == 0
+            || self.committee.min_capacity == 0
+            || self.committee.subnet_grow_at == 0
+            || self.committee.fault_grace == 0
+        {
+            return Err(BootstrapError::BadCommitteeConfig(
+                "relay, capacity, growth, and fault limits must be positive",
+            ));
+        }
         if self.governance.committee.is_empty() {
             return Err(BootstrapError::EmptyCommittee);
         }
@@ -235,6 +254,8 @@ fn parse_peer_addr(s: &str) -> Result<(Pubkey, std::net::SocketAddr), BootstrapE
 
 #[derive(Debug, Error)]
 pub enum BootstrapError {
+    #[error("invalid committee settings: {0}")]
+    BadCommitteeConfig(&'static str),
     #[error("io: {0}")]
     Io(#[from] io::Error),
     #[error("toml decode: {0}")]
@@ -330,8 +351,26 @@ aggregation = false"#
         // Present fields parse; omitted committee fields fall back to defaults.
         assert_eq!(cfg.committee.public_round_ms, 2000);
         assert_eq!(cfg.committee.committee_round_ms, 10_000);
-        assert_eq!(cfg.committee.protocol.as_deref(), Some("panetiere"));
+        assert_eq!(
+            cfg.committee.protocol,
+            Some(crate::scheduling::SchedulerProtocol::Panetiere)
+        );
         assert!(!cfg.committee.aggregation);
+        let runtime = cfg.committee.clone().into_config();
+        assert_eq!(runtime.scheduler.public_round_duration.as_millis(), 2000);
+        assert_eq!(runtime.scheduler.pin, cfg.committee.protocol);
+        assert!(!runtime.scheduler.aggregation);
+        assert!(BootstrapConfig::from_toml_str(
+            &toml.replace("protocol = \"panetiere\"", "protocol = \"typo\"")
+        )
+        .is_err());
+        assert!(matches!(
+            BootstrapConfig::from_toml_str(
+                &toml.replace("public_round_ms = 2000", "public_round_ms = 0")
+            ),
+            Err(BootstrapError::BadCommitteeConfig(_))
+        ));
+
         // The client plane a deployment renders for a bot/forwarder: streams to
         // dial and nothing else, so it joins no peer set.
         let client = BootstrapConfig::from_toml_str(&format!(

@@ -276,9 +276,8 @@ async fn adcnet_aggregated_echo_roundtrip_when_leader_is_aggregator() {
             client_set_min: 0,
             client_set_max: 8,
             aggregation: Some(Aggregation {
-                replication: 1,
                 groups: vec![AggregatorGroup {
-                    aggregators: vec![relay_pks[0]],
+                    aggregator: relay_pks[0],
                 }],
             }),
         }),

@@ -40,7 +40,7 @@ struct Args {
 
     /// Clients to send through at most, this backend's own included. Virtual
     /// clients are spawned while messages are queued; `1` disables them.
-    #[arg(long, default_value = "8")]
+    #[arg(long, default_value = "1")]
     max_clients: usize,
 
     /// Origin allowed to read `/chat/feed` via CORS. Defaults to `*`.

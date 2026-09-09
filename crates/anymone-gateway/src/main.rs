@@ -48,7 +48,7 @@ struct Args {
 
     /// Clients to submit through at most, this gateway's own included. Virtual
     /// clients are spawned while submissions are queued; `1` disables them.
-    #[arg(long, default_value = "8")]
+    #[arg(long, default_value = "1")]
     max_clients: usize,
 
     /// Origin allowed to read the API via CORS. Defaults to `*`.

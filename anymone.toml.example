@@ -36,7 +36,6 @@ public_round_ms = 4000      # public-subnet round (lands in every ProtocolConfig
 min_relays = 1              # relays observed before the first config is staged
 min_services = 1
 fault_grace = 2             # output-less public rounds before renegotiating
-escalation_grace = 5        # fault-free rounds before de-escalating
 subnet_grow_at = 63         # per-subnet load that triggers another subnet
 message_size = 256          # per-message payload bound
 consensus_set = false       # form the client set by consensus, not a leader's

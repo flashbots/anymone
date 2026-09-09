@@ -468,9 +468,14 @@ async fn watch_subnet(subnet: Subnet, transport: Arc<dyn Transport>, obs: Shared
     roster.sort();
     let leader = anymone_core::subnet_leader_pk(&subnet);
     let mut adcnet_obs = match subnet.protocol {
-        ProtocolConfig::Adcnet(_) | ProtocolConfig::ScheduledAdcnet(_) => Some(
-            AdcnetObserverSession::new(roster.clone(), leader, FAULT_THRESHOLD),
-        ),
+        ProtocolConfig::Adcnet(_) | ProtocolConfig::ScheduledAdcnet(_) => {
+            Some(AdcnetObserverSession::for_protocol(
+                matches!(subnet.protocol, ProtocolConfig::ScheduledAdcnet(_)),
+                roster.clone(),
+                leader,
+                FAULT_THRESHOLD,
+            ))
+        }
         _ => None,
     };
     let mut panetiere_obs = match subnet.protocol {
@@ -746,7 +751,6 @@ fn proto_key(p: &ProtocolConfig) -> String {
         ProtocolConfig::ScheduledPanetiere(_) => "scheduledpanetiere",
         ProtocolConfig::Adcnet(_) => "adcnet",
         ProtocolConfig::ScheduledAdcnet(_) => "scheduledadcnet",
-        ProtocolConfig::Nym(_) => "nym",
     }
     .to_string()
 }

@@ -69,91 +69,22 @@ async fn recv_any(
     (src, msg)
 }
 
-/// Tunables for the Panetiere-coordinated committee scheduler.
+/// Runtime settings for the committee's own channel and public-subnet scheduler.
 #[derive(Debug, Clone)]
 pub struct PanetiereCommitteeConfig {
-    /// Round duration for the committee's internal Panetiere subnet.
     pub committee_round_duration: Duration,
-    /// Round duration the committee uses for the public subnet it schedules.
-    pub public_round_duration: Duration,
-    /// Minimum relays observed before the first proposal is staged.
-    pub min_relays: usize,
-    /// Minimum services observed before the first proposal is staged.
-    pub min_services: usize,
-    /// Consecutive output-less public-subnet rounds before the committee
-    /// faults + renegotiates (demo: 2 — "fault on the second round").
-    pub fault_grace: u64,
-    /// Fault-free rounds before a general escalation de-escalates; keep above
-    /// `fault_grace` so a recurring cause re-trips first.
-    pub escalation_grace: u32,
-    /// Per-subnet load at which the committee schedules another subnet.
-    pub subnet_grow_at: u32,
-    /// Per-message payload bound the scheduled subnets carry.
-    pub message_size: usize,
-    /// How long an integrity offender stays barred from re-registration.
-    pub integrity_backoff_ms: u64,
-    /// Whether attributed faults drop the culprit from the roster; `false`
-    /// reports faults without removing relays.
-    pub sideline: bool,
-    /// Whether observed faults change the network at all (escalation ladder,
-    /// sidelining, re-roster); `false` logs them and never reconfigures.
-    pub renegotiate_on_fault: bool,
-    /// Hard floor / initial subnet capacity; set above expected load to hold
-    /// capacity constant and avoid resize-driven worker respawns.
-    pub min_capacity: u32,
-    /// Fixed scheduled-Panetiere message-vector width; `0` derives it from
-    /// capacity and observed traffic.
-    pub vector_bytes: usize,
-    /// Cover rate (f32 bits) shared so a caller can retune it live.
-    pub cover_rate: Arc<AtomicU32>,
-    /// Freeze every subnet onto one protocol ("adcnet" | "panetiere" |
-    /// "scheduled-panetiere"), bypassing the escalation ladder and the
-    /// traffic-driven scheduled upgrade. `None` keeps the default
-    /// ADCNet-unless-escalated behavior with the upgrade live.
-    pub protocol: Option<String>,
-    /// Whether large ADCNet subnets may route through an aggregator layer.
-    pub aggregation: bool,
-    /// Payload encoding for every Panetiere channel, the committee's included.
-    pub encoding: crate::config::Encoding,
-    /// Per-message byte bound of the committee's config-anonymising channel;
-    /// must fit the largest proposal it will carry and MATCH across members.
     pub committee_msg_bytes: usize,
-    /// Whether proposed Panetiere subnets form their client set by consensus
-    /// (receipts, coded evidence, Dolev–Strong rounds) instead of a leader's
-    /// announcement. Needs a round long enough for the extra phases.
-    pub consensus_set: bool,
-    /// Subnet ids whose relays admit only attested clients. Listing an id the
-    /// network has not grown to is harmless; it takes effect if it appears.
-    pub attested_subnets: Vec<crate::config::SubnetId>,
-    /// What those relays accept as proof. An empty policy admits nobody, so a
-    /// subnet listed above with no policy is closed to clients.
-    pub attestation: crate::config::AttestationPolicy,
+    pub scheduler: SchedulerParams,
+    pub cover_rate: Arc<AtomicU32>,
 }
 
 impl Default for PanetiereCommitteeConfig {
     fn default() -> Self {
-        PanetiereCommitteeConfig {
+        Self {
             committee_round_duration: Duration::from_secs(1),
-            public_round_duration: Duration::from_secs(1),
-            min_relays: 1,
-            min_services: 1,
-            fault_grace: 2,
-            escalation_grace: crate::scheduler_core::ESCALATION_GRACE,
-            subnet_grow_at: crate::scheduler_core::SUBNET_GROW_AT,
-            message_size: 256,
-            integrity_backoff_ms: crate::scheduler_core::INTEGRITY_BACKOFF_MS,
-            sideline: true,
-            renegotiate_on_fault: true,
-            min_capacity: crate::scheduler_core::INITIAL_CAPACITY,
-            cover_rate: Arc::new(AtomicU32::new(1.0f32.to_bits())),
-            protocol: None,
-            aggregation: true,
-            encoding: crate::config::Encoding::default(),
             committee_msg_bytes: COMMITTEE_MSG_BYTES,
-            vector_bytes: 0,
-            consensus_set: false,
-            attested_subnets: Vec::new(),
-            attestation: crate::config::AttestationPolicy::default(),
+            scheduler: SchedulerParams::default(),
+            cover_rate: Arc::new(AtomicU32::new(1.0f32.to_bits())),
         }
     }
 }
@@ -170,32 +101,28 @@ pub struct CommitteeParams {
     pub min_relays: usize,
     pub min_services: usize,
     pub fault_grace: u64,
-    pub escalation_grace: u32,
     pub subnet_grow_at: u32,
     pub message_size: usize,
     pub integrity_backoff_ms: u64,
     /// Whether attributed faults drop the culprit from the roster.
     pub sideline: bool,
-    /// Whether observed faults change the network at all (escalation ladder,
-    /// sidelining, re-roster); `false` logs them and never reconfigures.
+    /// Whether observed faults change the roster (sidelining and re-registration); `false` logs them and never reconfigures.
     pub renegotiate_on_fault: bool,
     /// Hard floor / initial subnet capacity.
     pub min_capacity: u32,
-    /// Force every subnet onto one protocol ("adcnet" | "panetiere" |
-    /// "scheduled-panetiere"); absent or unrecognized keeps the default
-    /// ADCNet-unless-escalated ladder. See [`PanetiereCommitteeConfig::protocol`].
-    pub protocol: Option<String>,
+    /// Protocol for every subnet; `None` selects ADCNet.
+    pub protocol: Option<crate::scheduling::SchedulerProtocol>,
     /// Whether large ADCNet subnets may route through an aggregator layer.
     pub aggregation: bool,
-    /// See [`PanetiereCommitteeConfig::encoding`].
+    /// See [`SchedulerParams::encoding`].
     pub encoding: crate::config::Encoding,
     /// See [`PanetiereCommitteeConfig::committee_msg_bytes`].
     pub committee_msg_bytes: usize,
-    /// See [`PanetiereCommitteeConfig::vector_bytes`].
+    /// See [`SchedulerParams::vector_bytes`].
     pub vector_bytes: usize,
-    /// See [`PanetiereCommitteeConfig::consensus_set`].
+    /// Use consensus client-set formation for public Panetiere subnets.
     pub consensus_set: bool,
-    /// See [`PanetiereCommitteeConfig::attested_subnets`].
+    /// See [`SchedulerParams::attested_subnets`].
     pub attested_subnets: Vec<crate::config::SubnetId>,
     pub tdx_images: Vec<crate::config::TdxImage>,
     /// Committee rounds a client's enrolment holds for.
@@ -207,26 +134,26 @@ pub struct CommitteeParams {
 
 impl Default for CommitteeParams {
     fn default() -> Self {
+        let scheduler = SchedulerParams::default();
         CommitteeParams {
             committee_round_ms: 10_000,
             public_round_ms: 4_000,
-            min_relays: 1,
-            min_services: 1,
-            fault_grace: 2,
-            escalation_grace: crate::scheduler_core::ESCALATION_GRACE,
-            subnet_grow_at: crate::scheduler_core::SUBNET_GROW_AT,
-            message_size: 256,
-            integrity_backoff_ms: crate::scheduler_core::INTEGRITY_BACKOFF_MS,
-            sideline: true,
-            renegotiate_on_fault: true,
-            min_capacity: crate::scheduler_core::INITIAL_CAPACITY,
-            protocol: None,
-            aggregation: true,
-            encoding: crate::config::Encoding::default(),
+            min_relays: scheduler.min_relays,
+            min_services: scheduler.min_services,
+            fault_grace: scheduler.fault_threshold,
+            subnet_grow_at: scheduler.grow_at,
+            message_size: scheduler.message_size,
+            integrity_backoff_ms: scheduler.integrity_backoff_ms,
+            sideline: scheduler.sideline,
+            renegotiate_on_fault: scheduler.renegotiate_on_fault,
+            min_capacity: scheduler.min_capacity,
+            protocol: scheduler.pin,
+            aggregation: scheduler.aggregation,
+            encoding: scheduler.encoding,
             committee_msg_bytes: COMMITTEE_MSG_BYTES,
-            vector_bytes: 0,
+            vector_bytes: scheduler.vector_bytes,
             consensus_set: false,
-            attested_subnets: Vec::new(),
+            attested_subnets: scheduler.attested_subnets,
             tdx_images: Vec::new(),
             attestation_validity_rounds: crate::tee::DEFAULT_VALIDITY_ROUNDS,
             play_integrity: None,
@@ -240,31 +167,36 @@ impl CommitteeParams {
     pub fn into_config(self) -> PanetiereCommitteeConfig {
         PanetiereCommitteeConfig {
             committee_round_duration: Duration::from_millis(self.committee_round_ms),
-            public_round_duration: Duration::from_millis(self.public_round_ms),
-            min_relays: self.min_relays,
-            min_services: self.min_services,
-            fault_grace: self.fault_grace,
-            escalation_grace: self.escalation_grace,
-            subnet_grow_at: self.subnet_grow_at,
-            message_size: self.message_size,
-            integrity_backoff_ms: self.integrity_backoff_ms,
-            sideline: self.sideline,
-            renegotiate_on_fault: self.renegotiate_on_fault,
-            min_capacity: self.min_capacity,
-            cover_rate: Arc::new(AtomicU32::new(1.0f32.to_bits())),
-            protocol: self.protocol,
-            aggregation: self.aggregation,
-            encoding: self.encoding,
             committee_msg_bytes: self.committee_msg_bytes,
-            vector_bytes: self.vector_bytes,
-            consensus_set: self.consensus_set,
-            attested_subnets: self.attested_subnets,
-            attestation: crate::config::AttestationPolicy {
-                tdx_images: self.tdx_images,
-                validity_rounds: self.attestation_validity_rounds,
-                play_integrity: self.play_integrity,
-                app_attest: self.app_attest,
-                android_key: self.android_key,
+            cover_rate: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            scheduler: SchedulerParams {
+                public_round_duration: Duration::from_millis(self.public_round_ms),
+                min_relays: self.min_relays,
+                min_services: self.min_services,
+                fault_threshold: self.fault_grace,
+                grow_at: self.subnet_grow_at,
+                message_size: self.message_size,
+                integrity_backoff_ms: self.integrity_backoff_ms,
+                sideline: self.sideline,
+                renegotiate_on_fault: self.renegotiate_on_fault,
+                min_capacity: self.min_capacity,
+                pin: self.protocol,
+                aggregation: self.aggregation,
+                encoding: self.encoding,
+                vector_bytes: self.vector_bytes,
+                set_formation: if self.consensus_set {
+                    crate::config::SetFormation::Consensus
+                } else {
+                    crate::config::SetFormation::Leader
+                },
+                attested_subnets: self.attested_subnets,
+                attestation: crate::config::AttestationPolicy {
+                    tdx_images: self.tdx_images,
+                    validity_rounds: self.attestation_validity_rounds,
+                    play_integrity: self.play_integrity,
+                    app_attest: self.app_attest,
+                    android_key: self.android_key,
+                },
             },
         }
     }
@@ -333,7 +265,7 @@ pub async fn spawn_panetiere_committee_scheduler(
         client_set_max: n as u32,
         threshold: (n as u32) / 2 + 1,
         setup_seed: crate::keys::derive_seed(b"anymone/committee-seed", &committee),
-        encoding: config.encoding,
+        encoding: config.scheduler.encoding,
         // The committee's own channel is leaderless already, and its client set
         // is the membership — there is nothing for consensus formation to add.
         set_formation: crate::config::SetFormation::Leader,
@@ -357,53 +289,16 @@ pub async fn spawn_panetiere_committee_scheduler(
         })
         .collect();
 
-    let pin = match config.protocol.as_deref() {
-        Some("adcnet") => Some(crate::scheduling::SchedulerProtocol::Adcnet),
-        Some("panetiere") => Some(crate::scheduling::SchedulerProtocol::Panetiere),
-        Some("scheduled-panetiere") => {
-            Some(crate::scheduling::SchedulerProtocol::ScheduledPanetiere)
-        }
-        Some("noop") => Some(crate::scheduling::SchedulerProtocol::Noop),
-        Some(other) => {
-            tracing::warn!(
-                target: GOV,
-                protocol = other,
-                "unrecognized committee protocol pin, ignoring"
-            );
-            None
-        }
-        None => None,
-    };
-    let params = SchedulerParams {
-        public_round_duration: config.public_round_duration,
-        min_relays: config.min_relays,
-        min_services: config.min_services,
-        fault_threshold: config.fault_grace,
-        escalation_grace: config.escalation_grace,
-        grow_at: config.subnet_grow_at,
-        message_size: config.message_size,
-        integrity_backoff_ms: config.integrity_backoff_ms,
-        sideline: config.sideline,
-        renegotiate_on_fault: config.renegotiate_on_fault,
-        min_capacity: config.min_capacity,
-        pin,
-        aggregation: config.aggregation,
-        encoding: config.encoding,
-        vector_bytes: config.vector_bytes,
-        set_formation: if config.consensus_set {
-            crate::config::SetFormation::Consensus
-        } else {
-            crate::config::SetFormation::Leader
-        },
-        attested_subnets: config.attested_subnets.clone(),
-        attestation: config.attestation.clone(),
-    };
-
     tokio::spawn(async move {
         let topic = TOPIC_COMMITTEE_PANETIERE;
         let round_duration = config.committee_round_duration;
 
-        let mut core = SchedulerCore::new(identity.clone(), committee.clone(), threshold, params);
+        let mut core = SchedulerCore::new(
+            identity.clone(),
+            committee.clone(),
+            threshold,
+            config.scheduler,
+        );
         let mut seeded = match pull_config(&transport).await {
             Some(cfg) if core.on_published_config(&cfg) => {
                 adopt_transport_policy(&transport, &committee, &cfg);

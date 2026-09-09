@@ -77,8 +77,20 @@ fn subnet(rho: usize, msg_bytes: usize, set_max: usize) -> PanetiereConfig {
 
 #[test]
 fn panetiere_session_happy_path() {
+    for threshold in [2, 3] {
+        panetiere_roundtrip_at_threshold(threshold);
+    }
+}
+
+fn panetiere_roundtrip_at_threshold(threshold: u32) {
     let n_servers = 3;
-    let (mse, pp) = params_for(&subnet(1, 64, 1), n_servers);
+    let cfg = PanetiereConfig {
+        threshold,
+        ..subnet(1, 64, 1)
+    };
+    let (mse, pp) = params_for(&cfg, n_servers);
+    assert_eq!(pp.shamir.t, threshold as usize);
+    assert_eq!(pp.rs.as_ref().unwrap().k, threshold as usize);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_identity = Identity::generate();
     let client_pk = client_identity.pubkey();
@@ -701,10 +713,9 @@ fn adcnet_config_body(n_subnets: usize) -> AnymoneRoundConfigurationBody {
                     client_set_min: 0,
                     client_set_max: 32,
                     aggregation: Some(Aggregation {
-                        replication: 1,
                         groups: (0..8)
                             .map(|g| AggregatorGroup {
-                                aggregators: vec![relay_pks[g]],
+                                aggregator: relay_pks[g],
                             })
                             .collect(),
                     }),

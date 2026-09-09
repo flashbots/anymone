@@ -7,7 +7,10 @@ use std::time::Duration;
 use anymone_core::cw::StreamClientNetwork;
 use anymone_core::runtime::TeeSetup;
 use anymone_core::wire::RouteTag;
-use anymone_core::{Anymone, BootstrapConfig, Event, GovernanceBootstrap, Pipe, ServiceTag};
+use anymone_core::{
+    Anymone, BootstrapConfig, Event, GovernanceBootstrap, Pipe, PipeReceiver, PipeSender,
+    ServiceTag,
+};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::attest::{AttestationStatus, AttestationTokenFetcher, BridgeProver, MobileScheme};
@@ -268,16 +271,18 @@ impl AnymoneClient {
 
 #[derive(uniffi::Object)]
 pub struct AnymonePipe {
-    /// `recv` needs `&mut`, and uniffi objects are shared.
-    pipe: tokio::sync::Mutex<Pipe>,
+    sender: PipeSender,
+    receiver: tokio::sync::Mutex<PipeReceiver>,
     own_tag: RouteTag,
 }
 
 impl AnymonePipe {
     fn wrap(pipe: Pipe) -> Arc<Self> {
         let own_tag = pipe.return_tag();
+        let (sender, receiver) = pipe.split();
         Arc::new(AnymonePipe {
-            pipe: tokio::sync::Mutex::new(pipe),
+            sender,
+            receiver: tokio::sync::Mutex::new(receiver),
             own_tag,
         })
     }
@@ -287,7 +292,7 @@ impl AnymonePipe {
 impl AnymonePipe {
     /// The next message on this pipe, or `None` once it is closed.
     pub async fn recv(&self) -> Option<IncomingMessage> {
-        let mut pipe = self.pipe.lock().await;
+        let mut pipe = self.receiver.lock().await;
         let msg = pipe.recv().await?;
         Some(IncomingMessage {
             payload: msg.payload,
@@ -300,19 +305,19 @@ impl AnymonePipe {
     /// Queues one payload for the next round this node is drawn to submit in;
     /// it never blocks on the network.
     pub async fn send(&self, payload: Vec<u8>) -> Result<(), AnymoneError> {
-        Ok(self.pipe.lock().await.send(payload).await?)
+        Ok(self.sender.send(payload)?)
     }
 
     /// Reply to a `return_tag` taken from an `IncomingMessage`.
     pub async fn send_to(&self, return_tag: Vec<u8>, payload: Vec<u8>) -> Result<(), AnymoneError> {
         let tag = route_tag(&return_tag)?;
-        Ok(self.pipe.lock().await.send_to(tag, payload).await?)
+        Ok(self.sender.send_to(tag, payload)?)
     }
 
     /// Send with a one-off return path, so the recipient cannot link this
     /// message to anything else this pipe sends.
     pub async fn send_unlinkable(&self, payload: Vec<u8>) -> Result<(), AnymoneError> {
-        Ok(self.pipe.lock().await.send_unlinkable(payload).await?)
+        Ok(self.sender.send_unlinkable(payload)?)
     }
 
     pub fn own_return_tag(&self) -> Vec<u8> {
@@ -412,8 +417,19 @@ mod tests {
         ));
 
         let pipe = ffi.open("anymone.echo".into(), 5_000).await.unwrap();
-        pipe.send(b"hello ffi".to_vec()).await.unwrap();
-        let reply = tokio::time::timeout(Duration::from_secs(15), pipe.recv())
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+        let mut receive = std::pin::pin!(pipe.recv());
+        poll_fn(|cx| {
+            assert!(receive.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::timeout(Duration::from_secs(1), pipe.send(b"hello ffi".to_vec()))
+            .await
+            .expect("send blocked behind recv")
+            .unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(15), receive)
             .await
             .expect("recv timed out")
             .expect("pipe closed");

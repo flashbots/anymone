@@ -24,26 +24,19 @@ use panetiere::protocol::{message_polys, ClientId, ProtocolParams, ServerId};
 use panetiere::KahePoly;
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
-use tokio::sync::mpsc;
 
 use crate::config::{
-    ExchangePublicKeyWire, ProtocolConfig, Round, ScheduledPanetiereConfig, SetFormation, Subnet,
-    SubnetId,
+    ExchangePublicKeyWire, Round, ScheduledPanetiereConfig, SetFormation, Subnet, SubnetId,
 };
 use crate::identity::{Identity, Pubkey};
-use crate::log_target::{PANETIERE, SCHED};
+use crate::log_target::PANETIERE;
 use crate::panetiere::{
-    bundle_wire, checkpoint_deadline, checkpoint_schedule, client_round, client_slice_wire,
-    derive_post_key, drain_inbound_upto, fragment_wire, server_index, set_roster, verify_batch,
-    wire_round_past, ClientSetState, PanetiereObserverSession, PanetiereServerSession,
-    PanetiereWatchSession, PanetiereWire, SetMode, PANETIERE_ROUND_RETENTION,
+    bundle_wire, client_round, client_slice_wire, derive_post_key, fragment_wire, server_index,
+    set_roster, verify_batch, ClientSetState, PanetiereServerSession, PanetiereWire, SetMode,
+    PANETIERE_ROUND_RETENTION,
 };
-use crate::runtime::{
-    deadline_for, gossip_faults, handle_inbound, publish_and_loop_back, recv_any, round_at,
-    route_to_pipe, subnet_leader_pk, AnymoneInner, SessionKey, StageMsg, FAULT_THRESHOLD,
-};
+use crate::runtime::AnymoneInner;
 use crate::session::{GoodClients, Misbehavior, PeerId, RoundOutcome, Session};
-use crate::transport::Subscription;
 
 /// `(rand, size)` per reservation: two `Z_t` symbols carrying the `u16`s
 /// directly, so this channel is symbol-oriented and not byte-packed.
@@ -111,12 +104,13 @@ pub fn params_for(
         &mut rng,
         n_servers,
         mu_kahe,
-        crate::panetiere::rs_k(n_servers),
+        cfg.threshold as usize,
         n_servers,
         sched_mse.plaintext_modulus(),
         cfg.client_set_max.max(1) as usize,
         cfg.setup_seed,
     );
+    pp.shamir = panetiere::sss::ShamirParams::new(cfg.threshold as usize, n_servers);
     pp.min_clients = cfg.client_set_min.max(1) as usize;
     (sched_mse, Arc::new(pp))
 }
@@ -129,18 +123,20 @@ pub(crate) fn max_wire_estimate(
     estimated_messages: u32,
     client_set_max: u32,
     n_relays: usize,
+    threshold: u32,
     set_formation: SetFormation,
 ) -> usize {
     const FRAMING: usize = 512;
     let sched_mse = sched_channel_params(estimated_messages, [0u8; 32]);
     let n_polys = sched_mse.n_polys() + msg_polys(vector_bytes);
     let reservations = 4 * estimated_messages as usize + FRAMING;
-    crate::panetiere::rs_wire_estimate(n_polys, vector_bytes, client_set_max, n_relays)
+    crate::panetiere::rs_wire_estimate(n_polys, vector_bytes, client_set_max, n_relays, threshold)
         .max(reservations)
         .max(crate::panetiere::consensus_wire_estimate(
             n_polys,
             client_set_max,
             n_relays,
+            threshold,
             set_formation,
         ))
 }
@@ -158,7 +154,7 @@ fn seal_roster(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn client_session(
+pub(crate) fn client_session(
     pp: &Arc<ProtocolParams>,
     sched_mse: &ChannelParams,
     vector_bytes: usize,
@@ -209,7 +205,7 @@ fn client_session(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn server_session(
+pub(crate) fn server_session(
     pp: &Arc<ProtocolParams>,
     sched_mse: &ChannelParams,
     vector_bytes: usize,
@@ -797,6 +793,13 @@ impl Session for ScheduledPanetiereClientSession {
         self.staged.push(payload);
     }
 
+    fn has_pending_transmissions(&self) -> bool {
+        !self.staged.is_empty()
+            || !self.deferred.is_empty()
+            || !self.reserved.is_empty()
+            || !self.granted.is_empty()
+    }
+
     fn set_cover_rate(&mut self, rate: f32) {
         self.cover_rate = rate;
     }
@@ -1087,323 +1090,7 @@ impl Session for ScheduledPanetiereServerSession {
     }
 }
 
-/// Self-contained scheduled-Panetiere subnet driver, mirroring
-/// `panetiere::run_subnet`'s structure with a quarter-round checkpoint
-/// cadence: k=1 client submit, k=3 leader announce, end_round shares + decode
-/// + broadcast.
-pub(crate) async fn run_subnet(
-    subnet: Subnet,
-    relay_xk: Vec<(Pubkey, ExchangePublicKeyWire)>,
-    inner: Arc<AnymoneInner>,
-    mut stage_rx: mpsc::UnboundedReceiver<StageMsg>,
-    mut subscriptions: Vec<Subscription>,
-    base_round: Round,
-    epoch_unix_ms: u64,
-    armed: bool,
-) {
-    let cfg = match &subnet.protocol {
-        ProtocolConfig::ScheduledPanetiere(c) => c.clone(),
-        _ => unreachable!("panetiere_scheduled::run_subnet on a non-ScheduledPanetiere subnet"),
-    };
-    let identity_pk = inner.identity.pubkey();
-    let (sched_mse, pp) = params_for(&cfg, subnet.relays.len());
-    let leader_pk = subnet_leader_pk(&subnet);
-
-    let mut sessions: HashMap<SessionKey, Box<dyn Session>> = HashMap::new();
-    let mut cover_rate = subnet.cover_rate;
-
-    let consensus = cfg.set_formation == SetFormation::Consensus;
-    if subnet.relays.contains(&identity_pk) {
-        sessions.insert(
-            SessionKey::Server,
-            server_session(
-                &pp,
-                &sched_mse,
-                cfg.vector_bytes,
-                &cfg,
-                &relay_xk,
-                &subnet,
-                &inner.identity,
-                leader_pk,
-                inner.sched_reservation_entries(subnet.id),
-                inner.subnet_clients(&subnet),
-            ),
-        );
-    } else {
-        sessions.insert(
-            SessionKey::Watch,
-            Box::new(PanetiereWatchSession::new(leader_pk)),
-        );
-    }
-    let mut fault_monitor: Option<Box<dyn Session>> = if leader_pk == identity_pk {
-        let mut roster = subnet.relays.clone();
-        roster.sort();
-        // Consensus announces no set; the observer reads membership off shares.
-        let observed_leader = (!consensus).then_some(leader_pk);
-        Some(Box::new(PanetiereObserverSession::new(
-            roster,
-            observed_leader,
-            FAULT_THRESHOLD,
-        )))
-    } else {
-        None
-    };
-
-    let mut sorted_roster = subnet.relays.clone();
-    sorted_roster.sort();
-    let egress = |_key: &SessionKey, bytes: &[u8]| {
-        crate::panetiere::egress(subnet.id, &sorted_roster, bytes)
-    };
-
-    let dur_ms = (subnet.protocol.round_duration().as_millis() as u64).max(4);
-    let schedule = checkpoint_schedule(
-        dur_ms,
-        true,
-        consensus.then(|| crate::client_set::relay_rounds(&pp)),
-    );
-
-    if armed
-        && !crate::runtime::arm_until_cutover(
-            base_round,
-            epoch_unix_ms,
-            dur_ms,
-            &mut stage_rx,
-            &mut cover_rate,
-        )
-        .await
-    {
-        return;
-    }
-    let mut final_round: Option<Round> = None;
-    // Set on entering the drain round: the last round this worker owns. Wire
-    // for later rounds belongs to the successor and is not ingested.
-    let mut drain_cap: Option<Round> = None;
-    let now_ms = crate::config::now_unix_ms();
-    let mut round = round_at(base_round, epoch_unix_ms, dur_ms, now_ms);
-    let spawn_round = round;
-    tracing::debug!(
-        target: SCHED,
-        subnet = subnet.id,
-        round,
-        relay = subnet.relays.contains(&identity_pk),
-        leader = leader_pk == identity_pk,
-        vector_bytes = cfg.vector_bytes,
-        dur_ms,
-        "scheduled panetiere worker: start"
-    );
-    let mut deadline = deadline_for(round, base_round, epoch_unix_ms, dur_ms, now_ms);
-    let mut cp = 0usize;
-    let mut cp_deadline = checkpoint_deadline(deadline, dur_ms, &schedule, cp);
-
-    if let Some(m) = fault_monitor.as_mut() {
-        m.begin_round(round, Instant::now());
-    }
-    crate::runtime::sync_client_round(&inner, subnet.id, round, cover_rate, &mut sessions, || {
-        client_session(
-            &pp,
-            &sched_mse,
-            cfg.vector_bytes,
-            &relay_xk,
-            &subnet,
-            &inner.identity,
-            leader_pk,
-            inner.sched_reservation_entries(subnet.id),
-            Arc::downgrade(&inner),
-            cfg.setup_seed,
-            consensus,
-        )
-    });
-    let misbehavior = inner.misbehavior();
-    let outs: Vec<(SessionKey, Vec<u8>)> = sessions
-        .iter_mut()
-        .flat_map(|(key, s)| {
-            if let SessionKey::Server = key {
-                s.set_misbehavior(misbehavior);
-            }
-            let key = *key;
-            s.begin_round(round, Instant::now())
-                .into_iter()
-                .map(move |out| (key, out))
-        })
-        .collect();
-    for (key, out) in outs {
-        publish_and_loop_back(
-            &mut sessions,
-            &mut fault_monitor,
-            &inner,
-            &egress,
-            identity_pk,
-            key,
-            out,
-        )
-        .await;
-    }
-
-    let mut reported = crate::runtime::ReportedFaults::default();
-    loop {
-        tokio::select! {
-            biased;
-
-            _ = tokio::time::sleep_until(cp_deadline), if cp < schedule.len() => {
-                let k = schedule[cp].0;
-                cp += 1;
-                cp_deadline = checkpoint_deadline(deadline, dur_ms, &schedule, cp);
-                drain_inbound_upto(&mut subscriptions, &mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, drain_cap).await;
-                let outs: Vec<(SessionKey, Vec<u8>)> = sessions
-                    .iter_mut()
-                    .flat_map(|(key, s)| {
-                        let key = *key;
-                        s.checkpoint(round, k, Instant::now()).into_iter().map(move |out| (key, out))
-                    })
-                    .collect();
-                for (key, out) in outs {
-                    publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
-                        .await;
-                }
-            }
-
-            _ = tokio::time::sleep_until(deadline) => {
-                drain_inbound_upto(&mut subscriptions, &mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, drain_cap).await;
-                let mut decoded_all: Vec<Vec<u8>> = Vec::new();
-                let mut faults = Vec::new();
-                let mut outs: Vec<(SessionKey, Vec<u8>)> = Vec::new();
-                for (key, s) in sessions.iter_mut() {
-                    let outcome = s.end_round(round, Instant::now());
-                    outs.extend(outcome.outbound.into_iter().map(|out| (*key, out)));
-                    decoded_all.extend(outcome.decoded);
-                    faults.extend(outcome.faults);
-                }
-                for (key, out) in outs {
-                    publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
-                        .await;
-                }
-                let n_decoded = decoded_all.len();
-                for bytes in decoded_all {
-                    route_to_pipe(&inner, round, &bytes);
-                }
-                if n_decoded > 0 {
-                    let _ = inner.events.send(crate::runtime::Event::RoundDecoded {
-                        round,
-                        subnet: subnet.id,
-                        n_messages: n_decoded,
-                    });
-                }
-                if drain_cap.is_some() {
-                    tracing::debug!(
-                        target: SCHED,
-                        subnet = subnet.id,
-                        round,
-                        decoded = n_decoded,
-                        "scheduled panetiere worker: drain exit"
-                    );
-                    return;
-                }
-                if let Some(m) = fault_monitor.as_mut() {
-                    faults.extend(m.end_round(round, Instant::now()).faults);
-                }
-                crate::runtime::log_round_outcome("scheduled-panetiere", subnet.id, round, n_decoded, faults.len());
-                let faults = faults
-                    .into_iter()
-                    .map(|f| (crate::panetiere::evidence_round(&f.evidence).unwrap_or(round), f))
-                    .collect();
-                if round >= spawn_round + crate::runtime::RECONFIG_FAULT_GRACE {
-                    gossip_faults(&inner, subnet.id, identity_pk, &mut reported, faults).await;
-                }
-
-                if final_round.is_some_and(|f| round >= f) {
-                    // A round decodes from shares arriving the round after it,
-                    // so a relay stays one drain round: sessions that only
-                    // consume and revisit, no new submissions against the
-                    // successor. Watch-only workers hold no crypto state — the
-                    // successor's watcher routes the drained leader's late
-                    // `Decoded` instead.
-                    if !sessions.contains_key(&SessionKey::Server) {
-                        tracing::debug!(
-                            target: SCHED,
-                            subnet = subnet.id,
-                            round,
-                            "scheduled panetiere worker: graceful exit"
-                        );
-                        return;
-                    }
-                    tracing::debug!(
-                        target: SCHED,
-                        subnet = subnet.id,
-                        round,
-                        "scheduled panetiere worker: graceful exit; draining one round"
-                    );
-                    drain_cap = Some(round);
-                    sessions.remove(&SessionKey::Client);
-                    sessions.remove(&SessionKey::Aggregator);
-                }
-                let now_ms = crate::config::now_unix_ms();
-                let next = round_at(base_round, epoch_unix_ms, dur_ms, now_ms).max(round + 1);
-                if next > round + 1 {
-                    tracing::debug!(
-                        target: SCHED,
-                        from = round,
-                        to = next,
-                        "scheduled panetiere worker: lagged past a round boundary, skipping rounds"
-                    );
-                }
-                round = next;
-                deadline = deadline_for(round, base_round, epoch_unix_ms, dur_ms, now_ms);
-                cp = 0;
-                cp_deadline = checkpoint_deadline(deadline, dur_ms, &schedule, cp);
-                if drain_cap.is_none() {
-                    if let Some(m) = fault_monitor.as_mut() {
-                        m.begin_round(round, Instant::now());
-                    }
-                    crate::runtime::sync_client_round(&inner, subnet.id, round, cover_rate, &mut sessions, || {
-                        client_session(
-                            &pp,
-                            &sched_mse,
-                            cfg.vector_bytes,
-                            &relay_xk,
-                            &subnet,
-                            &inner.identity,
-                            leader_pk,
-                            inner.sched_reservation_entries(subnet.id),
-                            Arc::downgrade(&inner),
-                            cfg.setup_seed,
-                            consensus,
-                        )
-                    });
-                    let misbehavior = inner.misbehavior();
-                    let outs: Vec<(SessionKey, Vec<u8>)> = sessions
-                        .iter_mut()
-                        .flat_map(|(key, s)| {
-                            if let SessionKey::Server = key {
-                                s.set_misbehavior(misbehavior);
-                            }
-                            let key = *key;
-                            s.begin_round(round, Instant::now()).into_iter().map(move |out| (key, out))
-                        })
-                        .collect();
-                    for (key, out) in outs {
-                        publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
-                            .await;
-                    }
-                }
-            }
-
-            msg = recv_any(&mut subscriptions) => {
-                if !drain_cap.is_some_and(|c| wire_round_past(&msg.payload, c)) {
-                    handle_inbound(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, msg).await;
-                }
-            }
-
-            Some(stage) = stage_rx.recv() => {
-                match stage {
-                    StageMsg::SetCoverRate(rate) => cover_rate = rate,
-                    StageMsg::Shutdown => {
-                        final_round.get_or_insert(round + 1);
-                    }
-                }
-            }
-        }
-    }
-}
+pub(crate) use crate::panetiere::run_subnet;
 
 #[cfg(test)]
 mod sizing_tests {
@@ -1413,7 +1100,14 @@ mod sizing_tests {
     #[test]
     fn wire_estimate_covers_real_messages() {
         let (vector_bytes, rho, cset, n_relays) = (256usize, 4u32, 40u32, 3usize);
-        let est = max_wire_estimate(vector_bytes, rho, cset, n_relays, SetFormation::Consensus);
+        let est = max_wire_estimate(
+            vector_bytes,
+            rho,
+            cset,
+            n_relays,
+            2,
+            SetFormation::Consensus,
+        );
 
         let cfg = ScheduledPanetiereConfig {
             vector_bytes,

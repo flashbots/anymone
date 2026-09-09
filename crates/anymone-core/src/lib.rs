@@ -1,8 +1,7 @@
 //! anymone — anonymous broadcast channel meta-protocol.
 //!
 //! See `IMPLEMENTATION.md` at the repo root for design and milestones.
-//! This crate is the entire library; binaries (`anymone-node`, `anymone-masque`)
-//! are thin shells over it.
+//! Protocol and runtime library used by the node and application binaries.
 
 pub mod adcnet;
 pub mod backend;
@@ -42,8 +41,8 @@ pub use committee::{
 };
 pub use config::{
     AdcnetConfig, AnymoneRoundConfiguration, AnymoneRoundConfigurationBody, ConfigError,
-    NoopConfig, NymConfig, PanetiereConfig, ProtocolConfig, Round, ScheduledAdcnetConfig,
-    ServiceEntry, Signature, Subnet, SubnetId,
+    NoopConfig, PanetiereConfig, ProtocolConfig, Round, ScheduledAdcnetConfig, ServiceEntry,
+    Signature, Subnet, SubnetId,
 };
 pub use faults::{Attribution, Fault, FaultKind, OutputFaultTracker};
 pub use governance::{
@@ -54,7 +53,7 @@ pub use identity::{Identity, Pubkey};
 pub use panetiere::{
     PanetiereClientSession, PanetiereObserverSession, PanetiereServerSession, PanetiereWatchSession,
 };
-pub use pipe::{max_message_payload, Pipe, PipeIncoming, SendError};
+pub use pipe::{max_message_payload, Pipe, PipeIncoming, PipeReceiver, PipeSender, SendError};
 pub use runtime::{leader_of, subnet_leader_pk, Anymone, AnymonePrep, Event, OpenError};
 pub use scheduler_core::{SchedulerAction, SchedulerCore, SchedulerParams, SignedProposal};
 pub use scheduling::{

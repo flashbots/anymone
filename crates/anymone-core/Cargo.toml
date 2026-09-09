@@ -19,8 +19,8 @@ tokio.workspace = true
 async-trait.workspace = true
 futures-util.workspace = true
 tracing.workspace = true
-panetiere = { git = "https://github.com/flashbots/panetiere", rev = "94eac72385ca73f615b4f97861fcf7a56a4a67ab" }
-adcnet = { git = "ssh://git@github.com/flashbots/adcnet-rs", rev = "08988b193a4fa78d08f7ffed221ce28c7a1aeb6e" }
+panetiere = { git = "https://github.com/flashbots/panetiere", rev = "dc01b293e0d41a4869739af8b685853ac2c7970c" }
+adcnet = { git = "https://github.com/flashbots/adcnet-rs", rev = "d99f4fe61a69883e25d8a226baa6c5c9c9e75356" }
 attest-types = { git = "https://github.com/flashbots/attest", rev = "8206cd19d9dcb1978d85a3d8dece06a3ee7a1206" }
 attest-prove = { git = "https://github.com/flashbots/attest", rev = "8206cd19d9dcb1978d85a3d8dece06a3ee7a1206", default-features = false, optional = true }
 attest-measure = { git = "https://github.com/flashbots/attest", rev = "8206cd19d9dcb1978d85a3d8dece06a3ee7a1206", optional = true }

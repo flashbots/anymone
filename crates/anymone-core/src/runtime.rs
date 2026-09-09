@@ -779,16 +779,18 @@ async fn apply_config(
         // The one place that dispatches on protocol: each runs its own self-contained
         // subnet driver. Unsupported protocols were filtered by subnet_runnable above.
         let handle = match &subnet.protocol {
-            ProtocolConfig::Adcnet(_) => tokio::spawn(crate::adcnet::run_subnet(
-                subnet,
-                config.body.relay_exchange_keys.clone(),
-                inner_for_task,
-                stage_rx,
-                subscriptions,
-                base_round,
-                epoch_unix_ms,
-                armed,
-            )),
+            ProtocolConfig::Adcnet(_) | ProtocolConfig::ScheduledAdcnet(_) => {
+                tokio::spawn(crate::adcnet::run_subnet(
+                    subnet,
+                    config.body.relay_exchange_keys.clone(),
+                    inner_for_task,
+                    stage_rx,
+                    subscriptions,
+                    base_round,
+                    epoch_unix_ms,
+                    armed,
+                ))
+            }
             ProtocolConfig::Panetiere(_) => tokio::spawn(crate::panetiere::run_subnet(
                 subnet,
                 config.body.relay_exchange_keys.clone(),
@@ -820,9 +822,6 @@ async fn apply_config(
                 epoch_unix_ms,
                 armed,
             )),
-            ProtocolConfig::ScheduledAdcnet(_) | ProtocolConfig::Nym(_) => {
-                unreachable!("filtered by subnet_runnable")
-            }
         };
         built.push((id, sig, stage_tx, handle));
     }
@@ -1215,6 +1214,7 @@ pub fn subnet_runnable(subnet: &Subnet) -> bool {
         && matches!(
             subnet.protocol,
             ProtocolConfig::Adcnet(_)
+                | ProtocolConfig::ScheduledAdcnet(_)
                 | ProtocolConfig::Panetiere(_)
                 | ProtocolConfig::ScheduledPanetiere(_)
                 | ProtocolConfig::Noop(_)
@@ -1245,9 +1245,9 @@ pub fn leader_of(sorted_roster: &[Pubkey], subnet_id: SubnetId) -> Pubkey {
 /// contributions) and the shares topic.
 fn subnet_subscriptions(subnet: &Subnet, me: Pubkey) -> (Vec<Topic>, bool) {
     let combines = match &subnet.protocol {
-        ProtocolConfig::Panetiere(_) | ProtocolConfig::ScheduledPanetiere(_) => {
-            subnet.relays.contains(&me)
-        }
+        ProtocolConfig::Panetiere(_)
+        | ProtocolConfig::ScheduledPanetiere(_)
+        | ProtocolConfig::ScheduledAdcnet(_) => subnet.relays.contains(&me),
         ProtocolConfig::Adcnet(_) => subnet_leader_pk(subnet) == me,
         _ => false,
     };
@@ -1262,8 +1262,11 @@ fn subnet_subscriptions(subnet: &Subnet, me: Pubkey) -> (Vec<Topic>, bool) {
     // (possibly co-located) client session and as a follower fallback. Under
     // consensus set formation a co-located client needs the receipts, which
     // ride broadcast for the same reason.
-    let broadcast_too = matches!(subnet.protocol, ProtocolConfig::ScheduledPanetiere(_))
-        || subnet.protocol.set_formation() == crate::config::SetFormation::Consensus;
+    let broadcast_too = matches!(
+        subnet.protocol,
+        ProtocolConfig::ScheduledPanetiere(_) | ProtocolConfig::ScheduledAdcnet(_)
+    ) || subnet.protocol.set_formation()
+        == crate::config::SetFormation::Consensus;
     if combines && broadcast_too {
         topics.push(Topic::Broadcast(subnet.id));
     }
@@ -1288,20 +1291,20 @@ pub(crate) fn subnet_aggregation(subnet: &Subnet) -> Option<&crate::config::Aggr
     }
 }
 
-/// Group index whose aggregator committee includes `me`, if any.
+/// Group index whose aggregator is `me`, if any.
 pub(crate) fn aggregator_group_of(a: &crate::config::Aggregation, me: Pubkey) -> Option<u32> {
     a.groups
         .iter()
-        .position(|g| g.aggregators.contains(&me))
+        .position(|g| g.aggregator == me)
         .map(|i| i as u32)
 }
 
-/// The aggregator committee a client routes its contribution to in an
+/// The aggregator a client routes its contribution to in an
 /// aggregated subnet.
-pub(crate) fn client_aggregators(subnet: &Subnet, me: Pubkey) -> Option<Vec<Pubkey>> {
+pub(crate) fn client_aggregator(subnet: &Subnet, me: Pubkey) -> Option<Pubkey> {
     let a = subnet_aggregation(subnet)?;
     let group = u32::from_be_bytes([me.0[0], me.0[1], me.0[2], me.0[3]]) % a.groups.len() as u32;
-    Some(a.groups[group as usize].aggregators.clone())
+    Some(a.groups[group as usize].aggregator)
 }
 
 /// Await the next message on any of `subs`, dropping closed ones. Parks forever
@@ -1330,6 +1333,7 @@ pub fn subnet_uses_ingress(subnet: &Subnet) -> bool {
     matches!(
         subnet.protocol,
         ProtocolConfig::Adcnet(_)
+            | ProtocolConfig::ScheduledAdcnet(_)
             | ProtocolConfig::Panetiere(_)
             | ProtocolConfig::ScheduledPanetiere(_)
     )
@@ -1344,9 +1348,9 @@ pub fn watch_session_for(subnet: &Subnet) -> Box<dyn Session> {
             Box::new(PanetiereWatchSession::new(subnet_leader_pk(subnet)))
         }
         ProtocolConfig::Adcnet(_) => Box::new(AdcnetWatchSession::new(subnet_leader_pk(subnet))),
-        ProtocolConfig::ScheduledAdcnet(_) | ProtocolConfig::Nym(_) => {
-            unimplemented!("ScheduledAdcnet / Nym runtime wiring is not yet implemented")
-        }
+        ProtocolConfig::ScheduledAdcnet(c) => Box::new(
+            crate::adcnet::ScheduledAdcnetWatchSession::new(c, subnet_leader_pk(subnet)),
+        ),
     }
 }
 
@@ -1455,8 +1459,12 @@ pub(crate) fn sync_client_round(
 ) {
     let joined = !inner.joined.lock().unwrap().is_empty();
     if !joined && inner.outbox.lock().unwrap().is_empty() {
-        // Dropping the session strands anything queued after this check but
-        // before the next round's — worth seeing when a send goes missing.
+        if let Some(session) = sessions.get_mut(&SessionKey::Client) {
+            session.set_cover_rate(0.0);
+            if session.has_pending_transmissions() {
+                return;
+            }
+        }
         if sessions.remove(&SessionKey::Client).is_some() {
             debug!(
                 target: SCHED,
@@ -1576,6 +1584,57 @@ mod outbox_tests {
         })
     }
 
+    #[test]
+    fn split_pipe_registration_lives_until_last_half_drops() {
+        let inner = test_inner(vec![crate::Identity::generate().pubkey()]);
+        let tag = ServiceTag::from_label("split-pipe");
+        let route: RouteTag = tag.into();
+        let (tx, rx) = mpsc::unbounded_channel();
+        inner.pipes.lock().unwrap().insert(route, tx.clone());
+        inner.joined.lock().unwrap().insert(route, tag);
+        let pipe = Pipe::new(Arc::downgrade(&inner), Some(tag), route, rx, tx);
+        let (sender, receiver) = pipe.split();
+        let cloned_sender = sender.clone();
+        drop(sender);
+        drop(receiver);
+        assert!(inner.pipes.lock().unwrap().contains_key(&route));
+        assert!(inner.joined.lock().unwrap().contains_key(&route));
+        cloned_sender.send(vec![1]).unwrap();
+        drop(cloned_sender);
+        assert!(!inner.pipes.lock().unwrap().contains_key(&route));
+        assert!(!inner.joined.lock().unwrap().contains_key(&route));
+    }
+
+    #[test]
+    fn split_pipe_receiver_survives_sender_and_preserves_replacement() {
+        let inner = test_inner(vec![crate::Identity::generate().pubkey()]);
+        let tag = ServiceTag::from_label("split-pipe");
+        let route: RouteTag = tag.into();
+        let (tx, rx) = mpsc::unbounded_channel();
+        inner.pipes.lock().unwrap().insert(route, tx.clone());
+        inner.joined.lock().unwrap().insert(route, tag);
+        let pipe = Pipe::new(Arc::downgrade(&inner), Some(tag), route, rx, tx.clone());
+        let (sender, mut receiver) = pipe.split();
+        drop(sender);
+        assert!(inner.joined.lock().unwrap().contains_key(&route));
+        tx.send(PipeIncoming {
+            return_tag: route,
+            payload: vec![1],
+            round: 0,
+        })
+        .unwrap();
+        assert_eq!(receiver.try_recv().unwrap().payload, vec![1]);
+        let (replacement, _rx) = mpsc::unbounded_channel();
+        inner
+            .pipes
+            .lock()
+            .unwrap()
+            .insert(route, replacement.clone());
+        drop(receiver);
+        assert!(inner.pipes.lock().unwrap()[&route].same_channel(&replacement));
+        assert!(inner.joined.lock().unwrap().contains_key(&route));
+    }
+
     /// A reconfig cutover drops the client session mid-flight; its payloads came
     /// off the outbox, so they have to go back or the send is silently lost.
     #[test]
@@ -1584,6 +1643,7 @@ mod outbox_tests {
         let inner = test_inner(vec![identity.pubkey()]);
         let cfg = ScheduledPanetiereConfig {
             vector_bytes: 128,
+            threshold: 1,
             estimated_messages: 2,
             ..Default::default()
         };

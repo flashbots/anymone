@@ -216,7 +216,6 @@ pub enum ProtocolConfig {
     /// ADCNet 2-round flow: auction round allocates message-vector slots,
     /// next round carries the actual payloads.
     ScheduledAdcnet(ScheduledAdcnetConfig),
-    Nym(NymConfig),
 }
 
 impl ProtocolConfig {
@@ -227,7 +226,6 @@ impl ProtocolConfig {
             ProtocolConfig::ScheduledPanetiere(c) => Duration::from_millis(c.round_duration_ms),
             ProtocolConfig::Adcnet(c) => Duration::from_millis(c.round_duration_ms),
             ProtocolConfig::ScheduledAdcnet(c) => Duration::from_millis(c.round_duration_ms),
-            ProtocolConfig::Nym(c) => Duration::from_millis(c.round_duration_ms),
         }
     }
 
@@ -238,7 +236,6 @@ impl ProtocolConfig {
             ProtocolConfig::ScheduledPanetiere(c) => c.message_size,
             ProtocolConfig::Adcnet(c) => c.max_payload_bytes,
             ProtocolConfig::ScheduledAdcnet(c) => c.message_length,
-            ProtocolConfig::Nym(c) => c.message_size,
         }
     }
 
@@ -249,7 +246,6 @@ impl ProtocolConfig {
             ProtocolConfig::ScheduledPanetiere(c) => c.client_set_min,
             ProtocolConfig::Adcnet(c) => c.client_set_min,
             ProtocolConfig::ScheduledAdcnet(c) => c.client_set_min,
-            ProtocolConfig::Nym(c) => c.client_set_min,
         }
     }
 
@@ -260,7 +256,6 @@ impl ProtocolConfig {
             ProtocolConfig::ScheduledPanetiere(c) => c.client_set_max,
             ProtocolConfig::Adcnet(c) => c.client_set_max,
             ProtocolConfig::ScheduledAdcnet(c) => c.client_set_max,
-            ProtocolConfig::Nym(c) => c.client_set_max,
         }
     }
 
@@ -396,17 +391,16 @@ impl Default for ScheduledPanetiereConfig {
 }
 
 /// ADCNet aggregator groups: each sums its clients' blinded contributions. Each
-/// group is a `replication`-of-n committee; clients map to
+/// group has one aggregator; clients map to
 /// `hash(client) % groups.len()`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Aggregation {
-    pub replication: u32,
     pub groups: Vec<AggregatorGroup>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AggregatorGroup {
-    pub aggregators: Vec<crate::identity::Pubkey>,
+    pub aggregator: crate::identity::Pubkey,
 }
 
 mod serde_bytes_array {
@@ -449,24 +443,15 @@ pub struct AdcnetConfig {
 
 pub use crate::keys::ExchangePublicKeyWire;
 
-/// ADCNet 2-round (auction-then-broadcast) config. The auction round
-/// allocates `message_length`-byte slots; the message round carries the
-/// payloads for clients that won a slot.
+/// ADCNet auction-then-broadcast config. `message_length` is the total
+/// message-vector capacity, in multiples of the auction's 1 KiB allocation
+/// unit. `min_message_size` pads each submitted message before bidding.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScheduledAdcnetConfig {
     pub round_duration_ms: u64,
     pub message_length: usize,
     pub auction_slots: u32,
     pub min_message_size: u32,
-    pub client_set_min: u32,
-    pub client_set_max: u32,
-}
-
-/// Placeholder Nym config; details TBD.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NymConfig {
-    pub round_duration_ms: u64,
-    pub message_size: usize,
     pub client_set_min: u32,
     pub client_set_max: u32,
 }

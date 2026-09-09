@@ -107,12 +107,13 @@ pub fn params_for(cfg: &PanetiereConfig, n_servers: usize) -> (ChannelParams, Ar
         &mut rng,
         n_servers,
         ch.n_polys(),
-        rs_k(n_servers),
+        cfg.threshold as usize,
         n_servers,
         ch.plaintext_modulus(),
         cfg.client_set_max.max(1) as usize,
         cfg.setup_seed,
     );
+    pp.shamir = panetiere::sss::ShamirParams::new(cfg.threshold as usize, n_servers);
     pp.min_clients = cfg.client_set_min.max(1) as usize;
     (ch, Arc::new(pp))
 }
@@ -136,6 +137,7 @@ pub(crate) fn max_wire_estimate(
     estimated_messages: u32,
     client_set_max: u32,
     n_relays: usize,
+    threshold: u32,
     encoding: Encoding,
     set_formation: SetFormation,
 ) -> usize {
@@ -145,11 +147,13 @@ pub(crate) fn max_wire_estimate(
         estimated_messages as usize * message_size,
         client_set_max,
         n_relays,
+        threshold,
     )
     .max(consensus_wire_estimate(
         ch.n_polys(),
         client_set_max,
         n_relays,
+        threshold,
         set_formation,
     ))
 }
@@ -160,6 +164,7 @@ pub(crate) fn consensus_wire_estimate(
     n_polys: usize,
     client_set_max: u32,
     n_relays: usize,
+    threshold: u32,
     set_formation: SetFormation,
 ) -> usize {
     if set_formation != SetFormation::Consensus {
@@ -168,7 +173,7 @@ pub(crate) fn consensus_wire_estimate(
     const FRAMING: usize = 512;
     let n = n_relays.max(1);
     let rho = client_set_max.max(1) as usize;
-    let block = panetiere::rs::RsParams::new(rs_k(n), n).block_len(n_polys);
+    let block = panetiere::rs::RsParams::new(threshold as usize, n).block_len(n_polys);
     // The aggregated opening bounds a single sealed one, plus the ML-KEM
     // ciphertext and AEAD framing around it.
     let sealed = round_wire_sizes(n, n_polys, rho as u32).server_entry + 1600;
@@ -188,11 +193,12 @@ pub(crate) fn rs_wire_estimate(
     decoded_bytes: usize,
     client_set_max: u32,
     n_relays: usize,
+    threshold: u32,
 ) -> usize {
     const FRAMING: usize = 512;
     let n = n_relays.max(1);
     let rho = client_set_max.max(1);
-    let block = panetiere::rs::RsParams::new(rs_k(n), n).block_len(n_polys);
+    let block = panetiere::rs::RsParams::new(threshold as usize, n).block_len(n_polys);
     let w = round_wire_sizes(n, n_polys, rho);
     let client_public = RsClientBulletinEntry::packed_len() + FRAMING;
     let slice = block * rs_poly_packed_len() + fresh_path_packed_len(n) + FRAMING;
@@ -411,8 +417,7 @@ fn server_session(
     Box::new(session)
 }
 
-/// Self-contained Panetiere subnet driver: builds this node's sessions, then owns
-/// the round loop. The runtime dispatches here for Panetiere subnets.
+/// Round driver shared by ordinary and scheduled Panetiere.
 pub(crate) async fn run_subnet(
     subnet: Subnet,
     relay_xk: Vec<(Pubkey, ExchangePublicKeyWire)>,
@@ -423,31 +428,60 @@ pub(crate) async fn run_subnet(
     epoch_unix_ms: u64,
     armed: bool,
 ) {
-    let cfg = match &subnet.protocol {
-        ProtocolConfig::Panetiere(c) => c.clone(),
-        _ => unreachable!("panetiere::run_subnet on a non-Panetiere subnet"),
+    let (mse, pp, set_formation) = match &subnet.protocol {
+        ProtocolConfig::Panetiere(cfg) => {
+            let (ch, pp) = params_for(cfg, subnet.relays.len());
+            (ch, pp, cfg.set_formation)
+        }
+        ProtocolConfig::ScheduledPanetiere(cfg) => {
+            let (ch, pp) = crate::panetiere_scheduled::params_for(cfg, subnet.relays.len());
+            (ch, pp, cfg.set_formation)
+        }
+        _ => unreachable!("panetiere driver on a non-Panetiere subnet"),
+    };
+    let scheduled = matches!(subnet.protocol, ProtocolConfig::ScheduledPanetiere(_));
+    let protocol = if scheduled {
+        "scheduled-panetiere"
+    } else {
+        "panetiere"
     };
     let identity_pk = inner.identity.pubkey();
-    let (mse, pp) = params_for(&cfg, subnet.relays.len());
     let leader_pk = subnet_leader_pk(&subnet);
 
     let mut sessions: HashMap<SessionKey, Box<dyn Session>> = HashMap::new();
     let mut cover_rate = subnet.cover_rate;
 
-    let consensus = cfg.set_formation == SetFormation::Consensus;
+    let consensus = set_formation == SetFormation::Consensus;
     if subnet.relays.contains(&identity_pk) {
         sessions.insert(
             SessionKey::Server,
-            server_session(
-                &pp,
-                &mse,
-                &cfg,
-                &relay_xk,
-                &subnet,
-                &inner.identity,
-                leader_pk,
-                inner.subnet_clients(&subnet),
-            ),
+            match &subnet.protocol {
+                ProtocolConfig::Panetiere(cfg) => server_session(
+                    &pp,
+                    &mse,
+                    cfg,
+                    &relay_xk,
+                    &subnet,
+                    &inner.identity,
+                    leader_pk,
+                    inner.subnet_clients(&subnet),
+                ),
+                ProtocolConfig::ScheduledPanetiere(cfg) => {
+                    crate::panetiere_scheduled::server_session(
+                        &pp,
+                        &mse,
+                        cfg.vector_bytes,
+                        cfg,
+                        &relay_xk,
+                        &subnet,
+                        &inner.identity,
+                        leader_pk,
+                        inner.sched_reservation_entries(subnet.id),
+                        inner.subnet_clients(&subnet),
+                    )
+                }
+                _ => unreachable!(),
+            },
         );
     } else {
         sessions.insert(
@@ -455,6 +489,31 @@ pub(crate) async fn run_subnet(
             Box::new(PanetiereWatchSession::new(leader_pk)),
         );
     }
+    let make_client = || match &subnet.protocol {
+        ProtocolConfig::Panetiere(cfg) => client_session(
+            &pp,
+            &mse,
+            &relay_xk,
+            &subnet,
+            &inner.identity,
+            cfg.setup_seed,
+            consensus,
+        ),
+        ProtocolConfig::ScheduledPanetiere(cfg) => crate::panetiere_scheduled::client_session(
+            &pp,
+            &mse,
+            cfg.vector_bytes,
+            &relay_xk,
+            &subnet,
+            &inner.identity,
+            leader_pk,
+            inner.sched_reservation_entries(subnet.id),
+            Arc::downgrade(&inner),
+            cfg.setup_seed,
+            consensus,
+        ),
+        _ => unreachable!(),
+    };
     let mut fault_monitor: Option<Box<dyn Session>> = if leader_pk == identity_pk {
         let mut roster = subnet.relays.clone();
         roster.sort();
@@ -475,8 +534,9 @@ pub(crate) async fn run_subnet(
         crate::panetiere::egress(subnet.id, &sorted_roster, bytes)
     };
 
-    let dur_ms = (subnet.protocol.round_duration().as_millis() as u64).max(1);
-    let schedule = checkpoint_schedule(dur_ms, false, consensus.then(|| relay_rounds(&pp)));
+    let dur_ms =
+        (subnet.protocol.round_duration().as_millis() as u64).max(if scheduled { 4 } else { 1 });
+    let schedule = checkpoint_schedule(dur_ms, scheduled, consensus.then(|| relay_rounds(&pp)));
 
     if armed
         && !crate::runtime::arm_until_cutover(
@@ -499,6 +559,7 @@ pub(crate) async fn run_subnet(
     let spawn_round = round;
     tracing::debug!(
         target: SCHED,
+        protocol,
         subnet = subnet.id,
         round,
         relay = subnet.relays.contains(&identity_pk),
@@ -513,17 +574,14 @@ pub(crate) async fn run_subnet(
     if let Some(m) = fault_monitor.as_mut() {
         m.begin_round(round, Instant::now());
     }
-    crate::runtime::sync_client_round(&inner, subnet.id, round, cover_rate, &mut sessions, || {
-        client_session(
-            &pp,
-            &mse,
-            &relay_xk,
-            &subnet,
-            &inner.identity,
-            cfg.setup_seed,
-            consensus,
-        )
-    });
+    crate::runtime::sync_client_round(
+        &inner,
+        subnet.id,
+        round,
+        cover_rate,
+        &mut sessions,
+        &make_client,
+    );
     let misbehavior = inner.misbehavior();
     let outs: Vec<(SessionKey, Vec<u8>)> = sessions
         .iter_mut()
@@ -602,6 +660,7 @@ pub(crate) async fn run_subnet(
                 if drain_cap.is_some() {
                     tracing::debug!(
                         target: SCHED,
+        protocol,
                         subnet = subnet.id,
                         round,
                         decoded = n_decoded,
@@ -612,7 +671,7 @@ pub(crate) async fn run_subnet(
                 if let Some(m) = fault_monitor.as_mut() {
                     faults.extend(m.end_round(round, Instant::now()).faults);
                 }
-                crate::runtime::log_round_outcome("panetiere", subnet.id, round, n_decoded, faults.len());
+                crate::runtime::log_round_outcome(protocol, subnet.id, round, n_decoded, faults.len());
                 let faults = faults
                     .into_iter()
                     .map(|f| (evidence_round(&f.evidence).unwrap_or(round), f))
@@ -631,6 +690,7 @@ pub(crate) async fn run_subnet(
                     if !sessions.contains_key(&SessionKey::Server) {
                         tracing::debug!(
                             target: SCHED,
+        protocol,
                             subnet = subnet.id,
                             round,
                             "panetiere worker: graceful exit"
@@ -639,6 +699,7 @@ pub(crate) async fn run_subnet(
                     }
                     tracing::debug!(
                         target: SCHED,
+        protocol,
                         subnet = subnet.id,
                         round,
                         "panetiere worker: graceful exit; draining one round"
@@ -652,6 +713,7 @@ pub(crate) async fn run_subnet(
                 if next > round + 1 {
                     tracing::debug!(
                         target: SCHED,
+        protocol,
                         from = round,
                         to = next,
                         "panetiere worker: lagged past a round boundary, skipping rounds"
@@ -665,9 +727,7 @@ pub(crate) async fn run_subnet(
                     if let Some(m) = fault_monitor.as_mut() {
                         m.begin_round(round, Instant::now());
                     }
-                    crate::runtime::sync_client_round(&inner, subnet.id, round, cover_rate, &mut sessions, || {
-                        client_session(&pp, &mse, &relay_xk, &subnet, &inner.identity, cfg.setup_seed, consensus)
-                    });
+                    crate::runtime::sync_client_round(&inner, subnet.id, round, cover_rate, &mut sessions, &make_client);
                     let misbehavior = inner.misbehavior();
                     let outs: Vec<(SessionKey, Vec<u8>)> = sessions
                         .iter_mut()
@@ -1354,8 +1414,7 @@ pub struct PanetiereObserverSession {
     /// including capacity rejections) — the committee's sizing signal.
     demand_by_round: std::collections::BTreeMap<u64, u32>,
     clients_by_round: std::collections::BTreeMap<u64, Vec<u32>>,
-    /// Total decoded payload bytes per round — the scheduler's upgrade signal
-    /// for scheduled mode.
+    /// Total decoded payload bytes per round, used to size scheduled vectors.
     decoded_bytes_by_round: std::collections::BTreeMap<u64, usize>,
     /// Integrity culprits caught from inconsistent shares, deduped, emitted at `end_round`.
     integrity_pending: Vec<Fault>,
@@ -3666,6 +3725,7 @@ mod observer_tests {
                 est_msgs,
                 cset,
                 n_relays,
+                cfg.threshold,
                 encoding,
                 SetFormation::Consensus,
             );

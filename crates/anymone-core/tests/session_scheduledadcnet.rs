@@ -1,178 +1,127 @@
-//! Happy-path test for `ScheduledAdcnetClient/ServerSession` (2-round flow).
-//!
-//! ADCNet's 2-round protocol takes two logical rounds to deliver one payload:
-//! round 1 carries the auction bid, round 2 carries the message at the
-//! winning slot. Each logical round needs two Session-trait cycles (clients
-//! → servers → partial-exchange → broadcast), so the full round-trip is four
-//! `begin_round`/`end_round` cycles.
-
 use std::time::Instant;
 
-use anymone_core::adcnet::{ScheduledAdcnetClientSession, ScheduledAdcnetServerSession};
+use adcnet::auction::iblt::IbltVector;
+use adcnet::crypto::ServerId;
+use adcnet::protocol::{AdcNetConfig, AggregationMode, RoundBroadcast};
+use anymone_core::adcnet::{
+    ScheduledAdcnetClientSession, ScheduledAdcnetServerSession, ScheduledAdcnetWatchSession,
+};
+use anymone_core::config::ScheduledAdcnetConfig;
 use anymone_core::session::Session;
 use anymone_core::Identity;
 
-use adcnet::auction::iblt::IbltVector;
-use adcnet::crypto::{generate_keypair, ExchangePrivateKey, ExchangePublicKey, ServerId};
-use adcnet::protocol::{AdcNetConfig, AggregationMode, RoundBroadcast};
-
 #[test]
 fn scheduled_adcnet_session_happy_path() {
-    let n_servers = 3usize;
-    let starting_round = 1i64;
-
+    let identities: Vec<_> = (0..3).map(|_| Identity::generate()).collect();
+    let leader = identities[0].pubkey();
+    let peers: Vec<_> = identities
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (ServerId(i as u32), id.to_adcnet_public_key()))
+        .collect();
+    let exchanges: Vec<_> = identities
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (ServerId(i as u32), id.exchange_pubkey()))
+        .collect();
     let config = AdcNetConfig {
         auction_slots: 16,
-        // Knapsack quantises to `KNAPSACK_CHUNK_BYTES` (1 KiB), so
-        // `message_length` must be ≥ 1 KiB or the auction returns zero
-        // winners and the round-2 message_vector ends up empty.
         message_length: 1024,
         aggregation: AggregationMode::Disabled,
         ..Default::default()
     };
-
-    // Server identities.
-    let server_signing: Vec<_> = (0..n_servers).map(|_| generate_keypair().1).collect();
-    let server_xks: Vec<_> = (0..n_servers)
-        .map(|_| ExchangePrivateKey::generate())
-        .collect();
-    let server_xpubs: Vec<ExchangePublicKey> = server_xks.iter().map(|k| k.public()).collect();
-    let server_ids: Vec<ServerId> = (1..=n_servers as u32).map(ServerId).collect();
-
-    // Client identity.
-    let (client_pub, client_signing_key) = generate_keypair();
-    let client_xk = ExchangePrivateKey::generate();
-
-    // Server-side client roster.
-    let clients_for_servers: Vec<_> = vec![(client_pub.clone(), client_xk.public())];
-    // Client-side server roster.
-    let servers_for_client: Vec<_> = server_ids
-        .iter()
-        .zip(server_xpubs.iter())
-        .map(|(sid, xpub)| (*sid, xpub.clone()))
-        .collect();
-    // Server-side peer roster (trusted signing pubkeys), required to accept
-    // one another's partial-decryption shares.
-    let peer_servers: Vec<_> = server_ids
-        .iter()
-        .zip(server_signing.iter())
-        .map(|(sid, sk)| {
-            (
-                *sid,
-                sk.public_key()
-                    .expect("server signing key must yield a public key"),
-            )
-        })
-        .collect();
-
-    // Empty initial broadcast for round 0 — clients/servers anchor on this.
-    let initial_bc = RoundBroadcast {
-        round_number: starting_round - 1,
-        auction_vector: IbltVector::new(config.auction_slots),
-        message_vector: Vec::new(),
+    let client_identity = Identity::generate();
+    let exchange = |id: &Identity| {
+        adcnet::crypto::ExchangePrivateKey::from_bytes(&id.exchange().scalar_bytes()).unwrap()
     };
-
     let mut client = ScheduledAdcnetClientSession::new(
         config.clone(),
-        client_signing_key,
-        client_xk,
-        &servers_for_client,
-        initial_bc,
-        starting_round,
+        client_identity.to_adcnet_signing_key(),
+        exchange(&client_identity),
+        &exchanges,
+        RoundBroadcast {
+            round_number: 0,
+            auction_vector: IbltVector::new(16),
+            message_vector: Vec::new(),
+        },
+        1,
+        leader,
     );
-    let mut servers: Vec<ScheduledAdcnetServerSession> = (0..n_servers)
-        .map(|i| {
+    let mut servers: Vec<_> = identities
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
             ScheduledAdcnetServerSession::new(
                 config.clone(),
-                server_ids[i],
-                server_signing[i].clone(),
-                server_xks[i].clone(),
-                &clients_for_servers,
-                &peer_servers,
-                starting_round,
+                ServerId(i as u32),
+                id.to_adcnet_signing_key(),
+                exchange(id),
+                &[],
+                &peers,
+                1,
+                leader,
             )
         })
         .collect();
-
-    let now = Instant::now();
-    let client_anymone_pk = Identity::generate().pubkey();
-    let other_anymone_pk = Identity::generate().pubkey();
-    let payload = b"hello via scheduled adcnet".to_vec();
-
-    // Stage payload; it'll be bid in cycle 1 and transmitted in cycle 3.
-    client.stage_message(payload.clone(), /* bid_value */ 32);
-
-    // --- Cycle 1 (ADCNet round 1 phase A): client sends bid, servers ingest ---
-    let out1 = client.begin_round(0, now);
-    assert_eq!(out1.len(), 1, "client emits one envelope per cycle");
-    for s in servers.iter_mut() {
-        for m in &out1 {
-            s.on_inbound(client_anymone_pk, m.clone());
-        }
-    }
-    let mid1: Vec<_> = servers.iter_mut().map(|s| s.end_round(0, now)).collect();
-    for o in &mid1 {
-        assert_eq!(o.outbound.len(), 1, "each server emits its partial");
-    }
-
-    // --- Cycle 2 (ADCNet round 1 phase B): cross-feed partials, broadcast ---
-    for i in 0..servers.len() {
-        for (j, o) in mid1.iter().enumerate() {
-            if i == j {
-                continue;
-            }
-            for m in &o.outbound {
-                servers[i].on_inbound(other_anymone_pk, m.clone());
-            }
-        }
-    }
-    let mid2: Vec<_> = servers.iter_mut().map(|s| s.end_round(1, now)).collect();
-    // At least one server should now have emitted the round-1 broadcast.
-    let bc1 = mid2
-        .iter()
-        .find_map(|o| o.outbound.iter().find(|_| !o.outbound.is_empty()))
-        .expect("server should emit the round-1 broadcast");
-    // Feed the broadcast into the client so it learns its winning slot.
-    client.on_inbound(other_anymone_pk, bc1.clone());
-
-    // --- Cycle 3 (ADCNet round 2 phase A): client sends payload ---
-    let out3 = client.begin_round(2, now);
-    assert!(!out3.is_empty(), "client emits payload envelope");
-    for s in servers.iter_mut() {
-        for m in &out3 {
-            s.on_inbound(client_anymone_pk, m.clone());
-        }
-    }
-    let mid3: Vec<_> = servers.iter_mut().map(|s| s.end_round(2, now)).collect();
-
-    // --- Cycle 4 (ADCNet round 2 phase B): cross-feed partials, decode ---
-    for i in 0..servers.len() {
-        for (j, o) in mid3.iter().enumerate() {
-            if i == j {
-                continue;
-            }
-            for m in &o.outbound {
-                servers[i].on_inbound(other_anymone_pk, m.clone());
-            }
-        }
-    }
-    let final_outcomes: Vec<_> = servers.iter_mut().map(|s| s.end_round(3, now)).collect();
-
-    let any = final_outcomes
-        .iter()
-        .find(|o| !o.decoded.is_empty())
-        .expect("at least one server should decode the round-2 broadcast");
-    // `extract_payloads` currently returns the full message_vector — search
-    // it for our payload bytes (the auction allocates a slot; the rest of
-    // the vector is zero-padded).
-    let vec = &any.decoded[0];
-    let found = (0..vec.len()).any(|start| {
-        start + payload.len() <= vec.len()
-            && &vec[start..start + payload.len()] == payload.as_slice()
-    });
-    assert!(
-        found,
-        "payload not found in decoded message_vector: {:?}",
-        vec
+    let mut watcher = ScheduledAdcnetWatchSession::new(
+        &ScheduledAdcnetConfig {
+            round_duration_ms: 200,
+            message_length: 1024,
+            auction_slots: 16,
+            min_message_size: 1,
+            client_set_min: 0,
+            client_set_max: 8,
+        },
+        leader,
     );
+    client.stage(b"first".to_vec());
+    client.stage(b"second".to_vec());
+    let mut decoded = Vec::new();
+    let now = Instant::now();
+    for round in 0..4 {
+        watcher.begin_round(round, now);
+        let outgoing = client.begin_round(round, now);
+        if round > 0 {
+            for bytes in &outgoing {
+                servers[0].on_inbound(client_identity.pubkey(), bytes.clone());
+            }
+        }
+        for server in &mut servers {
+            server.begin_round(round, now);
+        }
+        if round == 0 {
+            for bytes in outgoing {
+                servers[0].on_inbound(client_identity.pubkey(), bytes);
+            }
+        }
+        let sets = servers[0].checkpoint(round, 1, now);
+        let mut partials = Vec::new();
+        for server in &mut servers {
+            for set in &sets {
+                partials.extend(server.on_inbound(leader, set.clone()));
+            }
+        }
+        let mut broadcasts = Vec::new();
+        for bytes in partials {
+            broadcasts.extend(servers[0].on_inbound(leader, bytes));
+        }
+        broadcasts.extend(servers[0].end_round(round, now).outbound);
+        for bytes in broadcasts {
+            client.on_inbound(leader, bytes.clone());
+            watcher.on_inbound(leader, bytes.clone());
+            for server in &mut servers {
+                server.on_inbound(leader, bytes.clone());
+            }
+        }
+        decoded.extend(watcher.end_round(round, now).decoded);
+    }
+    assert_eq!(decoded.len(), 2);
+    for (actual, expected) in decoded
+        .iter()
+        .zip([b"first".as_slice(), b"second".as_slice()])
+    {
+        assert!(actual.starts_with(expected));
+        assert!(actual[expected.len()..].iter().all(|b| *b == 0));
+    }
+    assert!(!client.has_pending_transmissions());
 }
