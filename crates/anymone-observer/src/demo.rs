@@ -146,9 +146,6 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
     // --- prepare every config consumer (subscribe to anymone/config) BEFORE
     //     any registration is published, so nobody misses the first config ---
     let svc_id = Identity::generate();
-    let client_ids: Vec<Identity> = (0..args.clients)
-        .map(|_| Identity::generate())
-        .collect();
     let chat_tag = ServiceTag::from_label(CHAT_TAG_LABEL);
 
     let mut relay_preps = Vec::new();
@@ -157,10 +154,6 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
     }
     let svc_transport = handle(&svc_id);
     let svc_prep = Anymone::prepare(svc_id.clone(), svc_transport.clone(), gov.clone()).await;
-    let mut client_preps = Vec::new();
-    for id in &client_ids {
-        client_preps.push(Anymone::prepare(id.clone(), handle(id), gov.clone()).await);
-    }
 
     // --- observer on the same transport ------------------------------------
     let obs_id = Identity::generate();

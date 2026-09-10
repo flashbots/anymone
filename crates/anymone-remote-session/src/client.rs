@@ -212,20 +212,20 @@ impl RemoteSessionClient {
         &mut self,
         input: SessionInput,
     ) -> Result<SessionReply, RemoteTransportError> {
-        let stream = self
+        let mut stream = self
             .stream
-            .as_mut()
+            .take()
             .ok_or(RemoteTransportError::Disconnected)?;
         let result = async {
-            write_frame(stream, &input).await?;
-            match read_frame(stream).await? {
+            write_frame(&mut stream, &input).await?;
+            match read_frame(&mut stream).await? {
                 SessionReply::Error(error) => Err(RemoteTransportError::Rejected(error)),
                 reply => Ok(reply),
             }
         }
         .await;
-        if result.is_err() {
-            self.stream = None;
+        if result.is_ok() {
+            self.stream = Some(stream);
         }
         result
     }
@@ -312,4 +312,46 @@ mod tests {
         assert_eq!(client.retry_pending().await.unwrap(), expected);
         assert!(!client.adcnet_contribute(1, None).await.unwrap().is_empty());
     }
+
+    #[tokio::test]
+    async fn cancelled_action_reconnects_before_replaying() {
+        let relay = Identity::generate();
+        let subnet = Subnet::new(
+            0,
+            vec![relay.pubkey()],
+            ProtocolConfig::Adcnet(AdcnetConfig {
+                round_duration_ms: 1000,
+                max_payload_bytes: 64,
+                estimated_messages: 1,
+                client_set_min: 0,
+                client_set_max: 4,
+                aggregation: None,
+            }),
+        );
+        let session = RemoteAttestedSession::developer(
+            &subnet,
+            &[(relay.pubkey(), relay.exchange_keys())],
+            0,
+        ).unwrap();
+        let host = RemoteSessionHost::new(session).unwrap()
+            .listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let (mut client, _) = RemoteSessionClient::pair(host.pairing.clone()).await.unwrap();
+        let session = host.session();
+        let held = session.lock().await;
+        let action = ProtocolAction::Adcnet(AdcnetAction::Contribute {
+            round: 0,
+            payload: Some(b"cancelled request".to_vec()),
+        });
+        assert!(timeout(Duration::from_millis(25), client.perform(action.clone())).await.is_err());
+        assert!(client.stream.is_none());
+        assert!(client.pending.is_some());
+        drop(held);
+        let messages = client.perform(action).await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(client.status().await.unwrap().next_request, 1);
+        assert!(client.pending.is_none());
+        assert!(!client.adcnet_contribute(1, None).await.unwrap().is_empty());
+        host.shutdown().await;
+    }
+
 }

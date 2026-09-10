@@ -22,7 +22,6 @@ pub struct RemoteClientBackend {
 struct State {
     queue: VecDeque<Pending>,
     payload: Option<Vec<u8>>,
-    payload_inflight: bool,
     pending_messages: usize,
     cover_rate: f32,
     last_error: Option<String>,
@@ -44,7 +43,6 @@ impl State {
             action,
             consumes_payload,
         });
-        self.payload_inflight |= consumes_payload;
         true
     }
 }
@@ -151,7 +149,7 @@ impl Session for DesktopSession {
             state.last_error = Some("remote action queue full; desktop is backpressured".into());
             return Vec::new();
         }
-        let payload = if state.payload_inflight {
+        let payload = if state.queue.iter().any(|pending| pending.consumes_payload) {
             None
         } else {
             state.payload.clone()
@@ -275,7 +273,6 @@ impl Session for DesktopSession {
                         state.queue.pop_front();
                         if pending.consumes_payload {
                             state.payload = None;
-                            state.payload_inflight = false;
                         }
                         state.last_error = None;
                     }
@@ -285,9 +282,6 @@ impl Session for DesktopSession {
                         tracing::warn!(%error, "remote protocol action failed");
                         if matches!(error, RemoteTransportError::Protocol(_)) {
                             state.queue.pop_front();
-                            if pending.consumes_payload {
-                                state.payload_inflight = false;
-                            }
                             continue;
                         }
                         return if outputs.is_empty() {
