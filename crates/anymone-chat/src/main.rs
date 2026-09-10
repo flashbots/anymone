@@ -43,9 +43,8 @@ struct Args {
     #[arg(long, default_value = "1")]
     max_clients: usize,
 
-    /// Pairing JSON shared by a remote developer client host.
-    #[arg(long)]
-    remote_pairing: Option<PathBuf>,
+    #[command(flatten)]
+    remote: anymone_remote_session::desktop::RemoteArgs,
 
     /// Origin allowed to read `/chat/feed` via CORS. Defaults to `*`.
     #[arg(long)]
@@ -64,14 +63,11 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    anyhow::ensure!(args.remote_pairing.is_none() || args.max_clients == 1,
+    anyhow::ensure!(!args.remote.enabled() || args.max_clients == 1,
         "remote sessions require --max-clients 1");
-    let remote = if let Some(path) = &args.remote_pairing {
-        let pairing = serde_json::from_slice(&std::fs::read(path)?)?;
-        Some(anymone_remote_session::RemoteClientBackend::pair(pairing).await?)
-    } else { None };
     let bootstrap = BootstrapConfig::load(&args.config)
         .with_context(|| format!("loading {}", args.config.display()))?;
+    let remote = args.remote.connect().await?;
     let identity = Identity::load_or_generate(&bootstrap.identity_path)
         .with_context(|| format!("identity at {}", bootstrap.identity_path.display()))?;
 

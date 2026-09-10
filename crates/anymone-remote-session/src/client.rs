@@ -27,6 +27,53 @@ pub struct RemoteSessionClient {
 }
 
 impl RemoteSessionClient {
+    pub async fn pair_with_code(address: &str, code: &str) -> Result<(Self, HostStatus), RemoteTransportError> {
+        let code = zeroize::Zeroizing::new(code.chars().filter(|c| *c != ' ' && *c != '-').collect::<String>());
+        if code.len() != 8 || !code.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(RemoteTransportError::Rejected("enter the eight-digit code shown on the phone".into()));
+        }
+        let config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(crate::pairing::BootstrapVerifier))
+            .with_no_client_auth();
+        let mut stream = connect_with_config(address, config).await?;
+        timeout(Duration::from_secs(5), async {
+            let binding = stream.get_ref().1.export_keying_material([0u8; 32], crate::pairing::EXPORTER_LABEL, None)?;
+            let certificate_der = stream.get_ref().1.peer_certificates()
+                .and_then(|certs| certs.first()).ok_or(RemoteTransportError::PairingFailed)?.to_vec();
+            let controller_secret = rand::random();
+            let (pake, message) = crate::pairing::start(&code, true);
+            write_frame(&mut stream, &SessionInput::Pair(PairRequest::Code { message })).await?;
+            let message = match crate::host::read_frame_limited(&mut stream, 4096).await? {
+                SessionReply::CodeChallenge { message } if message.len() == 33 => message,
+                SessionReply::Error(error) => return Err(RemoteTransportError::Rejected(error)),
+                _ => return Err(RemoteTransportError::PairingFailed),
+            };
+            let key = zeroize::Zeroizing::new(pake.finish(&message).map_err(|_| RemoteTransportError::PairingFailed)?);
+            let proof = crate::pairing::proof(&key, crate::pairing::DESKTOP, &binding, &controller_secret);
+            write_frame(&mut stream, &SessionInput::CodeProof { controller_secret, proof }).await?;
+            let status = match read_frame(&mut stream).await? {
+                SessionReply::CodeAccepted { proof, status } => {
+                    crate::pairing::verify(&key, crate::pairing::PHONE, &binding, &controller_secret, &proof)?;
+                    status
+                }
+                SessionReply::Error(error) => return Err(RemoteTransportError::Rejected(error)),
+                _ => return Err(RemoteTransportError::PairingFailed),
+            };
+            let pairing = PairingInfo {
+                interface_version: crate::INTERFACE_VERSION,
+                address: address.to_string(),
+                certificate_sha256: Sha256::digest(&certificate_der).into(),
+                certificate_der,
+                pairing_token: [0; 32],
+            };
+            Ok((Self {
+                stream: Some(stream), controller_secret, pairing,
+                next_request: status.next_request, pending: None, session_id: status.session_id,
+            }, status))
+        }).await.map_err(|_| RemoteTransportError::Timeout)?
+    }
+
     pub async fn pair(
         pairing: PairingInfo,
     ) -> Result<(Self, HostStatus), RemoteTransportError> {
@@ -239,8 +286,12 @@ async fn connect_tls(pairing: &PairingInfo) -> Result<TlsStream<TcpStream>, Remo
     let config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
+    connect_with_config(&pairing.address, config).await
+}
+
+async fn connect_with_config(address: &str, config: rustls::ClientConfig) -> Result<TlsStream<TcpStream>, RemoteTransportError> {
     timeout(Duration::from_secs(5), async {
-        let tcp = TcpStream::connect(&pairing.address).await?;
+        let tcp = TcpStream::connect(address).await?;
         tcp.set_nodelay(true)?;
         let server_name = ServerName::try_from("anymone.local")
             .map_err(|e| RemoteTransportError::Encode(e.to_string()))?;
@@ -257,6 +308,70 @@ mod tests {
     use super::*;
     use crate::RemoteSessionHost;
     use anymone_core::{AdcnetConfig, Identity, ProtocolConfig, RemoteAttestedSession, Subnet};
+
+    #[tokio::test]
+    async fn code_pairing_configures_reconnects_and_closes() {
+        let host = RemoteSessionHost::new(None).unwrap().listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let wrong = if host.pairing_code.as_str() == "00000000" { "11111111" } else { "00000000" };
+        assert!(RemoteSessionClient::pair_with_code(&host.pairing.address, wrong).await.is_err());
+        assert!(!host.session().lock().await.status().paired);
+        assert_eq!(host.session().lock().await.status().pairing_attempts_remaining, 4);
+        let formatted = format!("{} {}", &host.pairing_code[..4], &host.pairing_code[4..]);
+        let (mut client, initial) = RemoteSessionClient::pair_with_code(&host.pairing.address, &formatted).await.unwrap();
+        assert!(initial.paired);
+        assert!(initial.client.is_none());
+        assert!(RemoteSessionClient::pair_with_code(&host.pairing.address, &host.pairing_code).await.is_err());
+        assert!(RemoteSessionClient::pair(host.pairing.clone()).await.is_err());
+        let relay = Identity::generate();
+        client.configure(HostConfig {
+            subnet: Subnet::new(0, vec![relay.pubkey()], ProtocolConfig::Adcnet(AdcnetConfig {
+                round_duration_ms: 1000, max_payload_bytes: 64, estimated_messages: 1,
+                client_set_min: 0, client_set_max: 4, aggregation: None,
+            })),
+            relay_exchange_keys: vec![(relay.pubkey(), relay.exchange_keys())],
+            starting_round: 0,
+        }).await.unwrap();
+        assert!(!client.adcnet_contribute(0, Some(b"code paired".to_vec())).await.unwrap().is_empty());
+        assert_eq!(client.reconnect().await.unwrap().session_id, initial.session_id);
+        client.close().await.unwrap();
+        assert!(host.session().lock().await.status().closed);
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn code_pairing_locks_after_five_attempts() {
+        let host = RemoteSessionHost::new(None).unwrap().listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let wrong = if host.pairing_code.as_str() == "00000000" { "11111111" } else { "00000000" };
+        for _ in 0..5 {
+            assert!(RemoteSessionClient::pair_with_code(&host.pairing.address, wrong).await.is_err());
+        }
+        assert_eq!(host.session().lock().await.status().pairing_attempts_remaining, 0);
+        assert!(RemoteSessionClient::pair_with_code(&host.pairing.address, &host.pairing_code).await.is_err());
+        assert!(!host.session().lock().await.status().paired);
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn code_pairing_rejects_tls_interception() {
+        let host = RemoteSessionHost::new(None).unwrap().listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let rcgen::CertifiedKey { cert, key_pair } = rcgen::generate_simple_self_signed(vec!["anymone.local".into()]).unwrap();
+        let server = rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(
+            vec![cert.der().clone()], rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into(),
+        ).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let pairing = host.pairing.clone();
+        let proxy = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut incoming = tokio_rustls::TlsAcceptor::from(Arc::new(server)).accept(tcp).await.unwrap();
+            let mut outgoing = connect_tls(&pairing).await.unwrap();
+            let _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await;
+        });
+        assert!(RemoteSessionClient::pair_with_code(&address, &host.pairing_code).await.is_err());
+        assert!(!host.session().lock().await.status().paired);
+        proxy.abort();
+        host.shutdown().await;
+    }
 
     #[tokio::test]
     async fn lost_reply_is_replayed_after_reconnect() {

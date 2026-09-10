@@ -23,9 +23,6 @@ enum Command {
     Discover {
         #[arg(long, default_value = "5", value_parser = clap::value_parser!(u64).range(1..=60))]
         seconds: u64,
-        /// Resolve a discovered Bonjour instance on macOS.
-        #[arg(long)]
-        instance: Option<String>,
     },
     Host {
         #[arg(long, default_value = "127.0.0.1:0")]
@@ -83,39 +80,18 @@ async fn main() -> Result<()> {
             };
             println!("{}", serde_json::to_string_pretty(&config)?);
         }
-        Command::Discover { seconds, instance } => {
-            let mut command = if cfg!(target_os = "macos") {
-                let mut command = tokio::process::Command::new("dns-sd");
-                if let Some(instance) = instance {
-                    command.args(["-L", &instance, "_anymone-remote._tcp", "local."]);
-                } else {
-                    command.args(["-B", "_anymone-remote._tcp", "local."]);
-                }
-                command
-            } else {
-                anyhow::ensure!(
-                    instance.is_none(),
-                    "--instance is only needed for macOS resolution"
-                );
-                let mut command = tokio::process::Command::new("avahi-browse");
-                command.args(["-rp", "_anymone-remote._tcp"]);
-                command
-            };
-            let mut child = command
-                .kill_on_drop(true)
-                .spawn()
-                .context("install avahi-utils on Linux, or use the macOS dns-sd utility")?;
-            match tokio::time::timeout(std::time::Duration::from_secs(seconds), child.wait()).await
-            {
-                Ok(result) => anyhow::ensure!(result?.success(), "discovery utility failed"),
-                Err(_) => {
-                    child.kill().await?;
-                }
+        Command::Discover { seconds } => {
+            let hosts = tokio::task::spawn_blocking(move || {
+                anymone_remote_session::desktop::discover(std::time::Duration::from_secs(seconds))
+            }).await??;
+            for host in hosts {
+                println!("{} {}", host.name.escape_debug(), host.address);
             }
         }
         Command::Host { listen } => {
             let handle = RemoteSessionHost::new(None)?.listen(listen).await?;
             println!("{}", serde_json::to_string(&handle.pairing)?);
+            eprintln!("Pairing code: {}", handle.pairing_code.as_str());
             tokio::signal::ctrl_c().await?;
         }
         Command::Drive {

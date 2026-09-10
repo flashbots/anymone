@@ -30,7 +30,9 @@ async fn remote_host_stops_connections_and_restarts_with_new_keys() {
         .await
         .unwrap();
     let pairing: PairingInfo = serde_json::from_str(&host.pairing_json().unwrap()).unwrap();
-    let (mut client, initial) = RemoteSessionClient::pair(pairing.clone()).await.unwrap();
+    let code = host.pairing_code().unwrap();
+    assert_eq!(code.len(), 8);
+    let (mut client, initial) = RemoteSessionClient::pair_with_code(&pairing.address, &code).await.unwrap();
     assert!(initial.client.is_none());
     let (configured, _) = client.configure(serde_json::from_str(&config).unwrap()).await.unwrap();
     assert!(configured.developer_mode);
@@ -42,6 +44,10 @@ async fn remote_host_stops_connections_and_restarts_with_new_keys() {
     let status: HostStatus =
         serde_json::from_str(&host.status_json().await.unwrap()).unwrap();
     assert_eq!(status.next_request, 2);
+    client.close().await.unwrap();
+    let status: serde_json::Value =
+        serde_json::from_str(&host.status_json().await.unwrap()).unwrap();
+    assert_eq!(status["closed"], true);
     host.stop().await;
     host.stop().await;
     assert!(host.pairing_json().is_err());

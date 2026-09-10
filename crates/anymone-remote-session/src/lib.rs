@@ -2,6 +2,9 @@ pub mod backend;
 pub mod client;
 pub mod host;
 pub mod wire;
+mod pairing;
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+pub mod desktop;
 
 pub use backend::RemoteClientBackend;
 pub use client::RemoteSessionClient;

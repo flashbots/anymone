@@ -85,7 +85,7 @@ async fn service_echo_through_all_remote_protocols() {
             .listen("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
-        let remote = RemoteClientBackend::pair(host.pairing.clone())
+        let remote = RemoteClientBackend::pair_with_code(&host.pairing.address, &host.pairing_code)
             .await
             .unwrap();
         assert!(remote.context().is_none());

@@ -21,15 +21,16 @@ The dashboard is at <http://localhost:7000>; the demo's chat is at
 <http://localhost:7001>. No deployment script or pre-existing committee is needed.
 
 On the phone's **Remote** screen, select its LAN IPv4 address and start the
-developer host. Allow Local Network access on iOS. Share its pairing JSON with
-the desktop and save it as `pairing.json`. No configuration file goes to the
-phone. In another terminal, from the same working directory, run:
+developer host. Allow Local Network access on iOS. Keep the phone's pairing code
+visible and run this in another terminal from the same working directory:
 
 ```sh
-cargo run --locked -p anymone-chat -- --config target/demo/client.toml --remote-pairing pairing.json --max-clients 1 --port 8080
+cargo run --locked -p anymone-chat -- --config target/demo/client.toml --remote --max-clients 1 --port 8080
 ```
 
-Send from <http://localhost:8080> and check delivery at the demo's chat on port
+Select the phone in the terminal and enter its eight-digit code. The desktop
+sends configuration automatically; no files need transferring. Send from
+<http://localhost:8080> and check delivery at the demo's chat on port
 7001, then send in the reverse direction. The standalone action driver below is
 an alternative test; it closes the phone session, so restart and pair the phone
 before switching to sustained chat.
@@ -50,19 +51,18 @@ because controller credentials live in the desktop process.
 Use matching Anymone protocol builds on the desktop, phone and relays. Start the
 deployment's committee and relays. Build the mobile app against the current
 `anymone-ffi` source. On **Remote**, select the LAN IPv4 address and start the
-developer host. Share its pairing JSON with the desktop and save it as
-`pairing.json`. Pairing data grants control of that host.
+developer host. The desktop discovers it and prompts for the code shown on the phone.
 
 Start a service client:
 
 ```sh
-cargo run --locked -p anymone-chat -- --config client.toml --remote-pairing pairing.json --max-clients 1
+cargo run --locked -p anymone-chat -- --config client.toml --remote --max-clients 1
 ```
 
 Or run the HTTP gateway:
 
 ```sh
-cargo run --locked -p anymone-gateway -- --config gateway.toml --tag example.channel --announce --remote-pairing pairing.json --max-clients 1
+cargo run --locked -p anymone-gateway -- --config gateway.toml --tag example.channel --announce --remote --max-clients 1
 curl -X POST --data-binary 'remote client test' http://localhost:8090/messages
 curl 'http://localhost:8090/messages?from=0'
 ```
@@ -75,23 +75,23 @@ Keep the app foregrounded. Backgrounding or stopping it closes the host and with
 
 ## Discovery and manual connections
 
-The phone advertises `_anymone-remote._tcp` using Bonjour or Android NSD. Discovery carries the endpoint and interface version, not the pairing secret. TLS pins the certificate from pairing data regardless of the chosen endpoint.
+The phone advertises `_anymone-remote._tcp` using Bonjour or Android NSD. Discovery carries the endpoint, interface version and code-pairing support, without credentials. `--remote` discovers hosts and prompts for a selection and code. Discovery runs in Rust on Linux and macOS, without external discovery utilities.
 
 ```sh
 cargo run --locked -p anymone-remote-session -- discover --seconds 5
 ```
 
-Linux needs `avahi-browse` from `avahi-utils`. On macOS the command uses `dns-sd`; resolve a listed instance with:
+If discovery is unavailable, connect directly and enter the same code:
 
 ```sh
-cargo run --locked -p anymone-remote-session -- discover --instance Anymone-INSTANCE --seconds 5
+cargo run --locked -p anymone-chat -- --config client.toml --remote 192.168.1.20:PHONE_PORT
 ```
 
-Manual connections work without discovery. The action driver accepts `--address IP:PORT`; for chat or gateway, set the pairing JSON's `address` to that endpoint while preserving its certificate and credentials. A phone network change may require restarting the listener on its new interface.
+The code authenticates a SPAKE2 exchange bound to the TLS connection. Both sides confirm the derived key before configuration or actions are accepted, and reconnects pin the authenticated certificate. Each host allows five code attempts and one controller. Restart the phone host to obtain a fresh code after exhaustion or a desktop process restart. Pairing files remain supported with `--remote-pairing FILE`; the phone exports them under **Automation**. A phone network change may require restarting its listener.
 
 ## Action driver
 
-The standalone driver uses a desktop configuration file. Export it from a running deployment, then pass it to the driver; the driver sends it to the phone before executing the typed actions. Chat and gateway do this automatically.
+The standalone driver uses a pairing JSON file exported under **Automation** and a desktop configuration file. Export configuration from a running deployment, then pass it to the driver; the driver sends it to the phone before executing the typed actions. Chat and gateway do this automatically.
 
 ```sh
 cargo run --locked -p anymone-remote-session -- export-config --bootstrap client.toml --subnet 0 > host-config.json
@@ -203,7 +203,7 @@ To run the desktop driver on a different computer, first open an SSH tunnel to t
 ssh -N -L 9443:127.0.0.1:9443 SDK_HOST
 ```
 
-Use the same driver address, `127.0.0.1:9443`, on that computer. For a sustained chat/gateway test through the tunnel, change only `address` in the pairing JSON to `127.0.0.1:9443`. Keep the emulator app foregrounded.
+Use the same driver address, `127.0.0.1:9443`, on that computer. For interactive chat/gateway through the tunnel, use `--remote 127.0.0.1:9443` and enter the emulator's displayed code. File-based automation still works by changing only `address` in the pairing JSON to `127.0.0.1:9443`. Keep the emulator app foregrounded. After the driver exits successfully, allow a few seconds for the debug result to report `stopped`; a polling failure reports `error` with its cause.
 
 ADB forwarding tests the native host and TLS/protocol integration. Test discovery separately on a reachable LAN; forwarding does not carry mDNS. See [Android emulator networking](https://developer.android.com/studio/run/emulator-networking-interconnect) for emulator network and forwarding behavior.
 
@@ -215,6 +215,6 @@ cargo test --locked -p anymone-ffi remote_host_tests
 cargo check --locked --workspace --all-targets
 ```
 
-The service test runs real relays, service framing and an echo reply through a TLS remote host for all four protocols. Transport tests cover pairing, certificate mismatch, configuration, updates, replay after a lost reply and close. The FFI tests check start, native output, status, stop and restart with new keys. The backend test checks that a disconnected host retains the staged payload without local output.
+The service test runs real relays, service framing and an echo reply through a code-paired TLS host for all four protocols. Transport tests cover code authentication, attempt exhaustion, TLS interception, certificate mismatch, configuration, updates, replay after a lost reply and close. The FFI tests check code pairing, native output, status, stop and restart with new keys. The backend test checks that a disconnected host retains the staged payload without local output. The multicast discovery test is opt-in because it requires local IPv4 multicast networking.
 
 On the phone, repeat with each protocol, verify the displayed participant survives reconnect, and confirm stop/restart changes it. For sustained runs, send uniquely numbered messages through chat or gateway and compare decoded results. Interrupt and restore only the desktop connection to test resumption; stopping the app tests a new session instead. Record latency and handset memory separately. Rust tests and binding generation do not validate native app packaging or device performance.

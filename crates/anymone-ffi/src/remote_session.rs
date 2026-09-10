@@ -53,6 +53,11 @@ impl RemoteProtocolHost {
         Ok(self.pairing.clone())
     }
 
+    pub fn pairing_code(&self) -> Result<String, RemoteHostError> {
+        let handle = self.handle.lock().unwrap();
+        Ok(handle.as_ref().ok_or_else(|| failed("host is stopped"))?.pairing_code.to_string())
+    }
+
     pub async fn status_json(&self) -> Result<String, RemoteHostError> {
         let session = self
             .handle

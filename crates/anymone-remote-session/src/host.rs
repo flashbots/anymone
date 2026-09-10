@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use rcgen::{generate_simple_self_signed, CertifiedKey};
 use rustls::pki_types::PrivatePkcs8KeyDer;
 use sha2::{Digest, Sha256};
@@ -27,6 +27,9 @@ pub struct HostState {
     next_request: u64,
     last_reply: Option<([u8; 32], Result<CommandResult, RemoteSessionError>)>,
     closed: bool,
+    paired: bool,
+    pairing_code: zeroize::Zeroizing<String>,
+    pairing_attempts_remaining: u8,
 }
 
 impl HostState {
@@ -35,6 +38,8 @@ impl HostState {
             session_id: self.session_id,
             next_request: self.next_request,
             closed: self.closed,
+            paired: self.paired,
+            pairing_attempts_remaining: self.pairing_attempts_remaining,
             client: self.client.as_ref().map(RemoteAttestedSession::status),
         }
     }
@@ -96,6 +101,7 @@ pub struct RemoteSessionHost {
 
 pub struct RemoteSessionHostHandle {
     pub pairing: PairingInfo,
+    pub pairing_code: zeroize::Zeroizing<String>,
     session: Arc<Mutex<HostState>>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -136,6 +142,9 @@ impl RemoteSessionHost {
                 next_request: 0,
                 last_reply: None,
                 closed: false,
+                paired: false,
+                pairing_code: zeroize::Zeroizing::new(format!("{:08}", rand::rngs::OsRng.gen_range(0..100_000_000u32))),
+                pairing_attempts_remaining: 5,
             })),
             pairing_token,
             controller: Arc::new(Mutex::new(None)),
@@ -158,6 +167,7 @@ impl RemoteSessionHost {
             pairing_token: self.pairing_token,
         };
         let session = self.session.clone();
+        let pairing_code = session.lock().await.pairing_code.clone();
         let task = tokio::spawn(async move {
             let acceptor = TlsAcceptor::from(self.tls.clone());
             let mut connections = JoinSet::new();
@@ -174,7 +184,9 @@ impl RemoteSessionHost {
                         let token = self.pairing_token;
                         connections.spawn(async move {
                             if let Ok(Ok(mut tls)) = timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
-                                let _ = serve_connection(&mut tls, session, controller, token).await;
+                                if let Ok(binding) = tls.get_ref().1.export_keying_material([0u8; 32], crate::pairing::EXPORTER_LABEL, None) {
+                                    let _ = serve_connection(&mut tls, session, controller, token, binding).await;
+                                }
                             }
                         });
                     }
@@ -183,6 +195,7 @@ impl RemoteSessionHost {
         });
         Ok(RemoteSessionHostHandle {
             pairing,
+            pairing_code,
             session,
             task,
         })
@@ -194,16 +207,48 @@ async fn serve_connection<S>(
     session: Arc<Mutex<HostState>>,
     controller: Arc<Mutex<Option<[u8; 32]>>>,
     pairing_token: [u8; 32],
+    binding: [u8; 32],
 ) -> Result<(), RemoteTransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let first: SessionInput = timeout(HANDSHAKE_TIMEOUT, read_frame(stream))
+    let first: SessionInput = timeout(HANDSHAKE_TIMEOUT, read_frame_limited(stream, 4096))
         .await
         .map_err(|_| RemoteTransportError::Timeout)??;
+    let mut code_proof = None;
     let accepted = {
         let mut held = controller.lock().await;
         match first {
+            SessionInput::Pair(PairRequest::Code { message }) if held.is_none() => {
+                let code = {
+                    let mut state = session.lock().await;
+                    if state.closed || state.pairing_attempts_remaining == 0 {
+                        write_frame(stream, &SessionReply::Error("pairing unavailable; restart the phone host".into())).await?;
+                        return Err(RemoteTransportError::PairingFailed);
+                    }
+                    state.pairing_attempts_remaining -= 1;
+                    state.pairing_code.clone()
+                };
+                let result = timeout(HANDSHAKE_TIMEOUT, async {
+                    if message.len() != 33 { return Err(RemoteTransportError::PairingFailed); }
+                    let (pake, response) = crate::pairing::start(&code, false);
+                    let key = zeroize::Zeroizing::new(pake.finish(&message).map_err(|_| RemoteTransportError::PairingFailed)?);
+                    write_frame(stream, &SessionReply::CodeChallenge { message: response }).await?;
+                    let SessionInput::CodeProof { controller_secret, proof } = read_frame_limited(stream, 4096).await?
+                    else { return Err(RemoteTransportError::PairingFailed); };
+                    crate::pairing::verify(&key, crate::pairing::DESKTOP, &binding, &controller_secret, &proof)?;
+                    let proof = crate::pairing::proof(&key, crate::pairing::PHONE, &binding, &controller_secret);
+                    Ok::<_, RemoteTransportError>((controller_secret, proof))
+                }).await;
+                match result {
+                    Ok(Ok((secret, proof))) => {
+                        *held = Some(secret);
+                        code_proof = Some(proof);
+                        true
+                    }
+                    _ => false,
+                }
+            }
             SessionInput::Pair(PairRequest::First {
                 token,
                 controller_secret,
@@ -221,8 +266,16 @@ where
         write_frame(stream, &SessionReply::Error("pairing failed".into())).await?;
         return Err(RemoteTransportError::PairingFailed);
     }
-    let status = session.lock().await.status();
-    write_frame(stream, &SessionReply::Paired(status)).await?;
+    let status = {
+        let mut state = session.lock().await;
+        state.paired = true;
+        state.status()
+    };
+    let reply = match code_proof {
+        Some(proof) => SessionReply::CodeAccepted { proof, status },
+        None => SessionReply::Paired(status),
+    };
+    write_frame(stream, &reply).await?;
     loop {
         let input = match read_frame::<_, SessionInput>(stream).await {
             Ok(input) => input,
@@ -237,7 +290,7 @@ where
         let reply = tokio::task::spawn_blocking(move || {
             let mut held = session.blocking_lock();
             match input {
-                SessionInput::Pair(_) => SessionReply::Error("connection is already paired".into()),
+                SessionInput::Pair(_) | SessionInput::CodeProof { .. } => SessionReply::Error("connection is already paired".into()),
                 SessionInput::Request { sequence, command } => SessionReply::Executed {
                     sequence,
                     result: held.execute(sequence, command),
@@ -280,10 +333,18 @@ where
     S: AsyncRead + Unpin,
     T: serde::de::DeserializeOwned,
 {
+    read_frame_limited(stream, MAX_FRAME_BYTES).await
+}
+
+pub(crate) async fn read_frame_limited<S, T>(stream: &mut S, limit: usize) -> Result<T, RemoteTransportError>
+where
+    S: AsyncRead + Unpin,
+    T: serde::de::DeserializeOwned,
+{
     use bincode::Options;
     let bytes = timeout(IO_TIMEOUT, async {
         let len = stream.read_u32().await? as usize;
-        if len > MAX_FRAME_BYTES {
+        if len > limit {
             return Err(RemoteTransportError::FrameTooLarge(len));
         }
         let mut bytes = vec![0u8; len];
@@ -294,7 +355,7 @@ where
     .map_err(|_| RemoteTransportError::Timeout)??;
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
-        .with_limit(MAX_FRAME_BYTES as u64)
+        .with_limit(limit as u64)
         .reject_trailing_bytes()
         .deserialize(&bytes)
         .map_err(|e| RemoteTransportError::Encode(e.to_string()))

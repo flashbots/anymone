@@ -8,6 +8,8 @@ pub struct HostStatus {
     pub session_id: [u8; 32],
     pub next_request: u64,
     pub closed: bool,
+    pub paired: bool,
+    pub pairing_attempts_remaining: u8,
     pub client: Option<RemoteSessionStatus>,
 }
 
@@ -35,6 +37,7 @@ pub struct PairingInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PairRequest {
+    Code { message: Vec<u8> },
     First {
         token: [u8; 32],
         controller_secret: [u8; 32],
@@ -47,6 +50,7 @@ pub enum PairRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum SessionInput {
     Pair(PairRequest),
+    CodeProof { controller_secret: [u8; 32], proof: [u8; 32] },
     Request {
         sequence: u64,
         command: SessionCommand,
@@ -57,6 +61,8 @@ pub enum SessionInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum SessionReply {
+    CodeChallenge { message: Vec<u8> },
+    CodeAccepted { proof: [u8; 32], status: HostStatus },
     Paired(HostStatus),
     Executed {
         sequence: u64,

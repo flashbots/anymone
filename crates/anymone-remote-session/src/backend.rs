@@ -52,6 +52,15 @@ impl State {
 impl RemoteClientBackend {
     pub async fn pair(pairing: PairingInfo) -> Result<Arc<Self>, RemoteTransportError> {
         let (client, host) = RemoteSessionClient::pair(pairing).await?;
+        Self::from_client(client, host)
+    }
+
+    pub async fn pair_with_code(address: &str, code: &str) -> Result<Arc<Self>, RemoteTransportError> {
+        let (client, host) = RemoteSessionClient::pair_with_code(address, code).await?;
+        Self::from_client(client, host)
+    }
+
+    pub(crate) fn from_client(client: RemoteSessionClient, host: crate::HostStatus) -> Result<Arc<Self>, RemoteTransportError> {
         if host.closed {
             return Err(RemoteTransportError::Rejected("host is closed".into()));
         }
