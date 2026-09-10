@@ -56,6 +56,7 @@ async fn late_clients_join_and_grow_anon_set() {
             min_services: 1,
             fault_threshold: 2,
             message_size: 64,
+            pin: Some(anymone_core::SchedulerProtocol::Adcnet),
             ..Default::default()
         },
         ..Default::default()
