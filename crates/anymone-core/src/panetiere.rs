@@ -319,7 +319,7 @@ pub(crate) fn seal_roster(
         .collect()
 }
 
-fn client_session(
+pub(crate) fn client_session(
     pp: &Arc<ProtocolParams>,
     mse: &ChannelParams,
     relay_xk: &[(Pubkey, ExchangePublicKeyWire)],
@@ -595,7 +595,7 @@ pub(crate) async fn run_subnet(
                 .map(move |out| (key, out))
         })
         .collect();
-    for (key, out) in outs {
+    for (key, out) in outs.into_iter().chain(crate::runtime::flush_sessions(&mut sessions).await) {
         publish_and_loop_back(
             &mut sessions,
             &mut fault_monitor,
@@ -625,7 +625,7 @@ pub(crate) async fn run_subnet(
                         s.checkpoint(round, k, Instant::now()).into_iter().map(move |out| (key, out))
                     })
                     .collect();
-                for (key, out) in outs {
+                for (key, out) in outs.into_iter().chain(crate::runtime::flush_sessions(&mut sessions).await) {
                     publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
                         .await;
                 }
@@ -642,7 +642,7 @@ pub(crate) async fn run_subnet(
                     decoded_all.extend(outcome.decoded);
                     faults.extend(outcome.faults);
                 }
-                for (key, out) in outs {
+                for (key, out) in outs.into_iter().chain(crate::runtime::flush_sessions(&mut sessions).await) {
                     publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
                         .await;
                 }
@@ -739,7 +739,7 @@ pub(crate) async fn run_subnet(
                             s.begin_round(round, Instant::now()).into_iter().map(move |out| (key, out))
                         })
                         .collect();
-                    for (key, out) in outs {
+                    for (key, out) in outs.into_iter().chain(crate::runtime::flush_sessions(&mut sessions).await) {
                         publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
                             .await;
                     }
@@ -852,6 +852,8 @@ pub(crate) enum PanetiereWire {
     Reservations {
         round: u64,
         entries: Vec<(u16, u16)>,
+        #[serde(with = "serde_bytes")]
+        signature: Vec<u8>,
     },
     /// Consensus set formation: lane `lane`'s coded share, share-root path and
     /// sealed opening as one boot-key-signed unit. Replaces `ClientSlice` +
@@ -1260,7 +1262,7 @@ pub(crate) fn describe(bytes: &[u8]) -> Option<String> {
             "Panetiere ClientSet round={round} clients={} demand={demand}",
             clients.len()
         )),
-        PanetiereWire::Reservations { round, entries } => Some(format!(
+        PanetiereWire::Reservations { round, entries, .. } => Some(format!(
             "Panetiere Reservations round={round} entries={}",
             entries.len()
         )),
@@ -1809,8 +1811,8 @@ impl PanetiereClientSession {
     }
 }
 
-impl Session for PanetiereClientSession {
-    fn begin_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
+impl PanetiereClientSession {
+    fn finalize_staged(&mut self, round: Round) -> Vec<Vec<u8>> {
         // Sealing (and Shamir sharing) needs every relay's exchange key; a
         // partial set would poison the servers' all-or-nothing rounds.
         if self.servers.len() != self.pp.cs.n_servers {
@@ -1924,53 +1926,81 @@ impl Session for PanetiereClientSession {
         out
     }
 
-    fn on_inbound(&mut self, _from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
-        let Some(set_pks) = self.set_pks.as_ref() else {
-            return Vec::new();
-        };
-        if let Ok(PanetiereWire::SetBatch { round, data }) =
-            bincode::deserialize::<PanetiereWire>(&payload)
-        {
-            let sid = session_id(&self.setup_seed, round);
-            if let (Some(state), Some(batch)) = (
-                self.set_rounds.get_mut(&round),
-                ReceiptBatch::unpack(&data).filter(|b| verify_batch(&sid, b, set_pks)),
-            ) {
-                state.note_batch(&batch, self.client_id);
+    pub fn finalize_round(
+        &mut self,
+        round: Round,
+        payload: Option<Vec<u8>>,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        let mut message = match payload {
+            Some(payload) => {
+                if payload.len() > self.mse.max_payload_bytes() {
+                    return Err("payload exceeds channel capacity".into());
+                }
+                channel::encode_message(&mut self.r_rng, &self.mse, &payload)
+                    .map_err(|e| format!("{e:?}"))?
             }
-        }
-        Vec::new()
+            None => channel::cover(&self.mse),
+        };
+        message.resize(message_polys(&self.pp), KahePoly::default());
+        self.pending = Some(message);
+        Ok(self.finalize_staged(round))
     }
 
-    fn checkpoint(&mut self, round: Round, k: u8, _now: Instant) -> Vec<Vec<u8>> {
-        if k == 1 && self.servers.len() == self.pp.cs.n_servers {
-            let next = round.saturating_add(1);
-            if !self
-                .client_round
-                .as_ref()
-                .is_some_and(|(prepared_round, _)| *prepared_round == next)
-            {
-                self.client_round = Some((
-                    next,
-                    client_round(
-                        &self.pp,
-                        &self.setup_seed,
-                        next,
-                        self.client_id,
-                        &self.servers,
-                        self.rng_seed,
-                    ),
-                ));
-            }
+    pub fn prepare_round(&mut self, round: Round) {
+        if self.servers.len() == self.pp.cs.n_servers
+            && !self.client_round.as_ref().is_some_and(|(r, _)| *r == round)
+        {
+            self.client_round = Some((
+                round,
+                client_round(
+                    &self.pp, &self.setup_seed, round, self.client_id,
+                    &self.servers, self.rng_seed,
+                ),
+            ));
         }
-        if k != K_REPAIR || self.set_pks.is_none() {
-            return Vec::new();
-        }
+    }
+
+    pub fn accept_receipt_batch(&mut self, round: Round, data: &[u8]) -> Result<(), String> {
+        let pks = self.set_pks.as_ref().ok_or("consensus mode is disabled")?;
+        let sid = session_id(&self.setup_seed, round);
+        let batch = ReceiptBatch::unpack(data)
+            .filter(|batch| verify_batch(&sid, batch, pks))
+            .ok_or("invalid receipt batch")?;
+        let state = self.set_rounds.get_mut(&round).ok_or("unknown receipt round")?;
+        state.note_batch(&batch, self.client_id);
+        Ok(())
+    }
+
+    pub fn build_repair(&mut self, round: Round) -> Vec<Vec<u8>> {
         let Some(state) = self.set_rounds.get_mut(&round) else {
             return Vec::new();
         };
         let sid = session_id(&self.setup_seed, round);
         fragment_wire(&self.pp, &sid, round, state, &self.post_key, &self.identity)
+    }
+}
+
+impl Session for PanetiereClientSession {
+    fn begin_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
+        self.finalize_staged(round)
+    }
+
+    fn on_inbound(&mut self, _from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
+        if let Ok(PanetiereWire::SetBatch { round, data }) = bincode::deserialize(&payload) {
+            let _ = self.accept_receipt_batch(round, &data);
+        }
+        Vec::new()
+    }
+
+    fn checkpoint(&mut self, round: Round, k: u8, _now: Instant) -> Vec<Vec<u8>> {
+        if k == 1 {
+            self.prepare_round(round.saturating_add(1));
+        }
+        if k == K_REPAIR {
+            self.build_repair(round)
+        } else {
+            Vec::new()
+        }
     }
 
     fn end_round(&mut self, _round: Round, _now: Instant) -> RoundOutcome {

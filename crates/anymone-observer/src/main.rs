@@ -7,6 +7,7 @@
 //! reconstructed `/state` JSON + the dashboard page. See `DASHBOARD.md`.
 
 mod demo;
+mod demo_network;
 mod loadgen;
 mod observatory;
 

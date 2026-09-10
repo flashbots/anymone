@@ -542,7 +542,7 @@ pub struct SchedulerParams {
     /// Fixed scheduled-Panetiere message-vector width; `0` derives it from
     /// capacity and observed traffic.
     pub vector_bytes: usize,
-    /// Protocol for every subnet; `None` selects ADCNet.
+    /// Protocol for every subnet; `None` selects ordinary Panetiere.
     pub pin: Option<SchedulerProtocol>,
     /// Whether the committee may route large ADCNet subnets through an
     /// aggregator layer above [`AGGREGATION_THRESHOLD`].
@@ -1604,7 +1604,7 @@ impl SchedulerCore {
     }
 
     fn subnet_protocols(&self) -> Vec<SchedulerProtocol> {
-        vec![self.params.pin.unwrap_or(SchedulerProtocol::Adcnet); self.subnet_count.max(1)]
+        vec![self.params.pin.unwrap_or(SchedulerProtocol::Panetiere); self.subnet_count.max(1)]
     }
 
     fn resize_scheduled_vectors(&mut self, protos: &[SchedulerProtocol]) {

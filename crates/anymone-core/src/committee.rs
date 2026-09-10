@@ -110,7 +110,7 @@ pub struct CommitteeParams {
     pub renegotiate_on_fault: bool,
     /// Hard floor / initial subnet capacity.
     pub min_capacity: u32,
-    /// Protocol for every subnet; `None` selects ADCNet.
+    /// Protocol for every subnet; `None` selects ordinary Panetiere.
     pub protocol: Option<crate::scheduling::SchedulerProtocol>,
     /// Whether large ADCNet subnets may route through an aggregator layer.
     pub aggregation: bool,

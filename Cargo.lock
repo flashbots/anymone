@@ -370,6 +370,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "anymone-core",
+ "anymone-remote-session",
  "axum 0.7.9",
  "clap",
  "rand 0.8.7",
@@ -459,8 +460,10 @@ name = "anymone-ffi"
 version = "0.1.0"
 dependencies = [
  "anymone-core",
+ "anymone-remote-session",
  "async-trait",
  "once_cell",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "uniffi",
@@ -472,6 +475,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "anymone-core",
+ "anymone-remote-session",
  "axum 0.7.9",
  "clap",
  "hex",
@@ -516,6 +520,29 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "anymone-remote-session"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "anymone-core",
+ "bincode",
+ "clap",
+ "hex",
+ "rand 0.8.7",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
 ]

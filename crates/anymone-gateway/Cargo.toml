@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 anymone-core = { path = "../anymone-core" }
+anymone-remote-session = { path = "../anymone-remote-session" }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true

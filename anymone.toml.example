@@ -31,6 +31,7 @@ exchange_pubkey = "00"
 # Committee scheduler tunables. Must be identical on every node (they shape the
 # published config all nodes decode against). Optional — omit for these defaults.
 [committee]
+protocol = "panetiere"     # ordinary Panetiere; also used when omitted
 committee_round_ms = 10000  # internal committee-Panetiere round
 public_round_ms = 4000      # public-subnet round (lands in every ProtocolConfig)
 min_relays = 1              # relays observed before the first config is staged

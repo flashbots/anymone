@@ -236,9 +236,9 @@ fn spawn_reannounce(transport: Arc<dyn Transport>, reg: Vec<u8>) -> JoinHandle<(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SchedulerProtocol {
-    /// ADCNet 1-round IBLT-message flow. Non-threshold; optimistic default.
+    /// ADCNet 1-round IBLT-message flow. Non-threshold.
     Adcnet,
-    /// Panetiere threshold ABC.
+    /// Panetiere threshold ABC. Default when no protocol is selected.
     Panetiere,
     /// Panetiere's staggered two-phase mode.
     ScheduledPanetiere,

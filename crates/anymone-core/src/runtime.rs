@@ -96,6 +96,7 @@ impl Drop for SubnetTasks {
 
 pub(crate) struct AnymoneInner {
     pub(crate) identity: Identity,
+    client_factory: RwLock<Option<Arc<dyn crate::session::ClientSessionFactory>>>,
     pub(crate) transport: Arc<dyn Transport>,
     /// Current signed config. Swapped in place on live reconfiguration; the
     /// per-round participation draw sees the latest subnet set immediately.
@@ -326,6 +327,7 @@ impl Anymone {
             subnets: Mutex::new(HashMap::new()),
             outbox: Mutex::new(VecDeque::new()),
             sched_entries: Mutex::new(HashMap::new()),
+            client_factory: RwLock::new(None),
             participation_seed,
             committee,
             events: broadcast::channel(EVENTS_CAPACITY).0,
@@ -507,6 +509,29 @@ impl Anymone {
             .first()
             .map(|s| s.protocol.round_duration())
             .unwrap_or(std::time::Duration::from_secs(1))
+    }
+
+    pub fn configuration(&self) -> AnymoneRoundConfiguration {
+        self.inner.config.read().unwrap().clone()
+    }
+
+    pub fn set_client_factory(
+        &self,
+        factory: Arc<dyn crate::session::ClientSessionFactory>,
+    ) -> Result<(), String> {
+        if !self.inner.joined.lock().unwrap().is_empty()
+            || !self.inner.outbox.lock().unwrap().is_empty()
+        {
+            return Err("install the client backend before opening pipes".into());
+        }
+        let config = self.inner.config.read().unwrap();
+        if !config.body.subnets.iter().any(|s| factory.accepts(s, &config.body.relay_exchange_keys)) {
+            return Err("remote protocol context does not match the adopted configuration".into());
+        }
+        let mut held = self.inner.client_factory.write().unwrap();
+        if held.is_some() { return Err("a client backend is already installed".into()); }
+        *held = Some(factory);
+        Ok(())
     }
 
     pub fn pubkey(&self) -> Pubkey {
@@ -1022,6 +1047,19 @@ pub(crate) async fn deliver(inner: &AnymoneInner, me: Pubkey, dest: Dest, bytes:
     }
 }
 
+pub(crate) async fn flush_sessions(
+    sessions: &mut HashMap<SessionKey, Box<dyn Session>>,
+) -> Vec<(SessionKey, Vec<u8>)> {
+    let mut outputs = Vec::new();
+    for (key, session) in sessions.iter_mut() {
+        match session.flush().await {
+            Ok(messages) => outputs.extend(messages.into_iter().map(|m| (*key, m))),
+            Err(error) => tracing::warn!(%error, "client backend paused"),
+        }
+    }
+    outputs
+}
+
 /// Publish `out` and also feed it to this node's other local sessions — the
 /// transport drops a node's own messages, so a node with two roles on the same
 /// subnet (e.g. leader + aggregator) would otherwise never see the other's output.
@@ -1041,7 +1079,12 @@ pub(crate) async fn publish_and_loop_back(
         if *key == producer {
             continue;
         }
-        for followup in s.on_inbound(identity_pk, out.clone()) {
+        let mut followups = s.on_inbound(identity_pk, out.clone());
+        match s.flush().await {
+            Ok(messages) => followups.extend(messages),
+            Err(error) => tracing::warn!(%error, "client backend paused"),
+        }
+        for followup in followups {
             let dest = egress(key, &followup);
             deliver(inner, identity_pk, dest, followup).await;
         }
@@ -1072,7 +1115,7 @@ pub(crate) async fn handle_inbound(
                 .map(move |out| (key, out))
         })
         .collect();
-    for (key, out) in outs {
+    for (key, out) in outs.into_iter().chain(flush_sessions(sessions).await) {
         publish_and_loop_back(
             sessions,
             fault_monitor,
@@ -1429,6 +1472,8 @@ pub(crate) fn participation_subnet(inner: &AnymoneInner, round: Round) -> Option
         .subnets
         .iter()
         .filter(|s| subnet_runnable(s) && (can_attest || !s.attested))
+        .filter(|s| inner.client_factory.read().unwrap().as_ref()
+            .is_none_or(|factory| factory.accepts(s, &cfg.body.relay_exchange_keys)))
         .map(|s| s.id)
         .collect();
     drop(cfg);
@@ -1457,6 +1502,16 @@ pub(crate) fn sync_client_round(
     sessions: &mut HashMap<SessionKey, Box<dyn Session>>,
     make: impl FnOnce() -> Box<dyn Session>,
 ) {
+    let factory = inner.client_factory.read().unwrap().clone();
+    if let Some(factory) = &factory {
+        let config = inner.config.read().unwrap();
+        if !config.body.subnets.iter().any(|s|
+            s.id == subnet && factory.accepts(s, &config.body.relay_exchange_keys)
+        ) {
+            sessions.remove(&SessionKey::Client);
+            return;
+        }
+    }
     let joined = !inner.joined.lock().unwrap().is_empty();
     if !joined && inner.outbox.lock().unwrap().is_empty() {
         if let Some(session) = sessions.get_mut(&SessionKey::Client) {
@@ -1492,9 +1547,11 @@ pub(crate) fn sync_client_round(
             subnet, round, queued, "sync: payload queued but this subnet was not drawn"
         );
     }
-    let sess = sessions.entry(SessionKey::Client).or_insert_with(make);
+    let sess = sessions.entry(SessionKey::Client).or_insert_with(|| {
+        match factory { Some(factory) => factory.create(), None => make() }
+    });
     sess.set_cover_rate(if submit { 1.0 } else { 0.0 });
-    if submit {
+    if submit && sess.can_stage() {
         let frame = inner.outbox.lock().unwrap().pop_front();
         if let Some(frame) = frame {
             trace!(
@@ -1575,6 +1632,7 @@ mod outbox_tests {
             subnets: Mutex::new(HashMap::new()),
             outbox: Mutex::new(VecDeque::new()),
             sched_entries: Mutex::new(HashMap::new()),
+            client_factory: RwLock::new(None),
             participation_seed: [42u8; 32],
             committee: None,
             events: broadcast::channel(1).0,
@@ -1715,6 +1773,7 @@ mod participation_tests {
             subnets: Mutex::new(HashMap::new()),
             outbox: Mutex::new(VecDeque::new()),
             sched_entries: Mutex::new(HashMap::new()),
+            client_factory: RwLock::new(None),
             participation_seed: [42u8; 32],
             committee: None,
             events: broadcast::channel(1).0,

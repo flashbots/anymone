@@ -8,10 +8,14 @@
 
 mod attest;
 mod client;
+mod remote_session;
+#[cfg(test)]
+mod remote_host_tests;
 mod secrets;
 
 pub use attest::{AttestationStatus, AttestationTokenFetcher, FetchError, MobileScheme};
 pub use client::{AnymoneClient, AnymoneEvent, AnymonePipe, IncomingMessage};
+pub use remote_session::{RemoteHostError, RemoteProtocolHost};
 pub use secrets::{SecretStore, SecretStoreError};
 
 uniffi::setup_scaffolding!();

@@ -3,7 +3,7 @@
 //! The runtime owns the clock and tells a session when a round starts and ends.
 //! Between those calls, the runtime feeds it peer-authenticated inbound bytes
 //! as they arrive. The session itself is otherwise inert — no transport, no
-//! async, no internal time.
+//! internal time. Desktop client backends may flush pending I/O asynchronously.
 //!
 //! Session outputs carry no addressing: each protocol's egress function maps
 //! a message's own content to its destination — a topic for one-to-many flows,
@@ -63,7 +63,23 @@ impl Default for GoodClients {
     }
 }
 
+
+pub trait ClientSessionFactory: Send + Sync {
+    fn accepts(
+        &self,
+        subnet: &crate::config::Subnet,
+        relay_keys: &[(Pubkey, crate::config::ExchangePublicKeyWire)],
+    ) -> bool;
+    fn create(&self) -> Box<dyn Session>;
+}
+
 pub trait Session: Send {
+    fn flush(&mut self) -> futures_util::future::BoxFuture<'_, Result<Vec<Vec<u8>>, String>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn can_stage(&self) -> bool { true }
+
     /// Set up state for `round`. Returns messages to broadcast at round start.
     fn begin_round(&mut self, round: Round, now: Instant) -> Vec<Vec<u8>>;
 

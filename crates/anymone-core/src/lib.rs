@@ -20,10 +20,12 @@ pub mod noop;
 pub mod panetiere;
 pub mod panetiere_scheduled;
 pub mod pipe;
+pub mod remote_session;
 pub mod runtime;
 pub mod scheduler_core;
 pub mod scheduling;
 pub mod session;
+#[path = "tee/mod.rs"]
 pub mod tee;
 pub mod transport;
 pub mod wire;
@@ -54,6 +56,10 @@ pub use panetiere::{
     PanetiereClientSession, PanetiereObserverSession, PanetiereServerSession, PanetiereWatchSession,
 };
 pub use pipe::{max_message_payload, Pipe, PipeIncoming, PipeReceiver, PipeSender, SendError};
+pub use remote_session::{
+    AdcnetAction, PanetiereAction, ProtocolAction, RemoteAttestedSession, RemoteProtocol,
+    RemoteSessionError, RemoteSessionStatus, ScheduledAdcnetAction, ScheduledPanetiereAction,
+};
 pub use runtime::{leader_of, subnet_leader_pk, Anymone, AnymonePrep, Event, OpenError};
 pub use scheduler_core::{SchedulerAction, SchedulerCore, SchedulerParams, SignedProposal};
 pub use scheduling::{

@@ -42,6 +42,11 @@ use crate::session::{GoodClients, Misbehavior, PeerId, RoundOutcome, Session};
 /// directly, so this channel is symbol-oriented and not byte-packed.
 const SCHED_TOKEN_SYMBOLS: usize = 2;
 
+fn reservation_signing_bytes(seed: &[u8; 32], round: Round, entries: &[(u16, u16)]) -> Vec<u8> {
+    bincode::serialize(&(b"anymone/panetiere/reservations/v1".as_slice(), seed, round, entries))
+        .expect("serialize reservation statement")
+}
+
 /// `Reservations{R}` is fulfilled at round `R + RESERVATION_TO_MSG_GAP`. Must
 /// be a fixed constant, not derived from a session's local clock: the relay
 /// decodes one combined plaintext per round and can't distinguish which grant
@@ -405,8 +410,8 @@ impl Drop for ScheduledPanetiereClientSession {
     }
 }
 
-impl Session for ScheduledPanetiereClientSession {
-    fn begin_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
+impl ScheduledPanetiereClientSession {
+    pub fn advance_round(&mut self, round: Round) -> Vec<Vec<u8>> {
         self.cur_round = Some(round);
         // On a non-relay node no server session shares this store, so nothing
         // else would ever prune it. Same cutoff, so the two are idempotent.
@@ -445,32 +450,31 @@ impl Session for ScheduledPanetiereClientSession {
         Vec::new()
     }
 
-    fn on_inbound(&mut self, from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
-        if let Some(set_pks) = self.set_pks.as_ref() {
-            if let Ok(PanetiereWire::SetBatch { round, data }) =
-                bincode::deserialize::<PanetiereWire>(&payload)
-            {
-                let sid = crate::panetiere::session_id(&self.setup_seed, round);
-                if let (Some(state), Some(batch)) = (
-                    self.set_rounds.get_mut(&round),
-                    crate::client_set::ReceiptBatch::unpack(&data)
-                        .filter(|b| verify_batch(&sid, b, set_pks)),
-                ) {
-                    state.note_batch(&batch, self.client_id);
-                }
-                return Vec::new();
-            }
+    pub fn accept_receipt_batch(&mut self, round: Round, data: &[u8]) -> Result<(), String> {
+        let pks = self.set_pks.as_ref().ok_or("consensus mode is disabled")?;
+        let sid = crate::panetiere::session_id(&self.setup_seed, round);
+        let batch = crate::client_set::ReceiptBatch::unpack(data)
+            .filter(|batch| verify_batch(&sid, batch, pks))
+            .ok_or("invalid receipt batch")?;
+        let state = self.set_rounds.get_mut(&round).ok_or("unknown receipt round")?;
+        state.note_batch(&batch, self.client_id);
+        Ok(())
+    }
+
+    pub fn accept_reservations(
+        &mut self,
+        round: Round,
+        entries: Vec<(u16, u16)>,
+        signature: &[u8],
+    ) -> Result<(), String> {
+        if !self.leader_pk.verify(
+            &reservation_signing_bytes(&self.setup_seed, round, &entries),
+            signature,
+        ) {
+            return Err("invalid reservation signature".into());
         }
-        if from != self.leader_pk {
-            return Vec::new();
-        }
-        let Ok(PanetiereWire::Reservations { round, entries }) =
-            bincode::deserialize::<PanetiereWire>(&payload)
-        else {
-            return Vec::new();
-        };
         if !crate::panetiere::round_in_window(round, self.cur_round) {
-            return Vec::new();
+            return Err("reservation round is outside the active window".into());
         }
         let (offs, _) = allocation(&entries, self.vector_bytes);
         // Fixed, round-number-only — see `RESERVATION_TO_MSG_GAP`.
@@ -488,7 +492,7 @@ impl Session for ScheduledPanetiereClientSession {
                 round,
                 "scheduled panetiere client: reservations for a round we did not reserve in"
             );
-            return Vec::new();
+            return Ok(());
         };
         for (rand, data) in mine {
             let idx = entries
@@ -523,41 +527,32 @@ impl Session for ScheduledPanetiereClientSession {
                 ),
             }
         }
-        Vec::new()
+        Ok(())
     }
 
-    fn checkpoint(&mut self, round: Round, k: u8, _now: Instant) -> Vec<Vec<u8>> {
-        if k == 2 && self.servers.len() == self.pp.cs.n_servers {
-            let next = round.saturating_add(1);
-            if !self
-                .client_round
-                .as_ref()
-                .is_some_and(|(prepared_round, _)| *prepared_round == next)
-            {
-                self.client_round = Some((
-                    next,
-                    client_round(
-                        &self.pp,
-                        &self.setup_seed,
-                        next,
-                        self.client_id,
-                        &self.servers,
-                        self.rng_seed,
-                    ),
-                ));
-            }
+    pub fn prepare_round(&mut self, round: Round) {
+        if self.servers.len() == self.pp.cs.n_servers
+            && !self.client_round.as_ref().is_some_and(|(r, _)| *r == round)
+        {
+            self.client_round = Some((
+                round,
+                client_round(
+                    &self.pp, &self.setup_seed, round, self.client_id,
+                    &self.servers, self.rng_seed,
+                ),
+            ));
+        }
+    }
+
+    pub fn build_repair(&mut self, round: Round) -> Vec<Vec<u8>> {
+        let Some(state) = self.set_rounds.get_mut(&round) else {
             return Vec::new();
-        }
-        if self.set_pks.is_some() && k == crate::panetiere::K_REPAIR {
-            let Some(state) = self.set_rounds.get_mut(&round) else {
-                return Vec::new();
-            };
-            let sid = crate::panetiere::session_id(&self.setup_seed, round);
-            return fragment_wire(&self.pp, &sid, round, state, &self.post_key, &self.identity);
-        }
-        if k != 1 {
-            return Vec::new();
-        }
+        };
+        let sid = crate::panetiere::session_id(&self.setup_seed, round);
+        fragment_wire(&self.pp, &sid, round, state, &self.post_key, &self.identity)
+    }
+
+    pub fn finalize_round(&mut self, round: Round) -> Vec<Vec<u8>> {
         if self.servers.len() != self.pp.cs.n_servers {
             tracing::debug!(
                 target: PANETIERE,
@@ -785,12 +780,56 @@ impl Session for ScheduledPanetiereClientSession {
         out
     }
 
+    pub fn pending_message_count(&self) -> usize {
+        self.staged.len() + self.deferred.len() + self.granted.len()
+            + self.reserved.values().map(Vec::len).sum::<usize>()
+    }
+
+    pub fn reserve_message(&mut self, payload: Vec<u8>) -> Result<(), String> {
+        if payload.len() > self.vector_bytes.min(u16::MAX as usize) {
+            return Err("payload exceeds reservation capacity".into());
+        }
+        self.staged.push(payload);
+        Ok(())
+    }
+}
+
+impl Session for ScheduledPanetiereClientSession {
+    fn begin_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
+        self.advance_round(round)
+    }
+
+    fn on_inbound(&mut self, _from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
+        match bincode::deserialize(&payload) {
+            Ok(PanetiereWire::SetBatch { round, data }) => {
+                let _ = self.accept_receipt_batch(round, &data);
+            }
+            Ok(PanetiereWire::Reservations { round, entries, signature }) => {
+                let _ = self.accept_reservations(round, entries, &signature);
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    fn checkpoint(&mut self, round: Round, k: u8, _now: Instant) -> Vec<Vec<u8>> {
+        match k {
+            1 => self.finalize_round(round),
+            2 => {
+                self.prepare_round(round.saturating_add(1));
+                Vec::new()
+            }
+            crate::panetiere::K_REPAIR => self.build_repair(round),
+            _ => Vec::new(),
+        }
+    }
+
     fn end_round(&mut self, _round: Round, _now: Instant) -> RoundOutcome {
         RoundOutcome::default()
     }
 
     fn stage(&mut self, payload: Vec<u8>) {
-        self.staged.push(payload);
+        let _ = self.reserve_message(payload);
     }
 
     fn has_pending_transmissions(&self) -> bool {
@@ -809,6 +848,8 @@ impl Session for ScheduledPanetiereClientSession {
 /// decode machinery, adding the sched/msg plaintext split and reservation hand-off.
 pub struct ScheduledPanetiereServerSession {
     inner: PanetiereServerSession,
+    identity: Identity,
+    setup_seed: [u8; 32],
     sched_mse: ChannelParams,
     sched_polys: usize,
     vector_bytes: usize,
@@ -856,12 +897,14 @@ impl ScheduledPanetiereServerSession {
             pp,
             sched_mse.clone(),
             server_id,
-            identity,
+            identity.clone(),
             mode,
             server_pubkeys,
         );
         ScheduledPanetiereServerSession {
             inner,
+            identity,
+            setup_seed: [0; 32],
             sched_mse,
             sched_polys,
             vector_bytes,
@@ -887,6 +930,7 @@ impl ScheduledPanetiereServerSession {
     }
 
     pub(crate) fn set_setup_seed(&mut self, setup_seed: [u8; 32]) {
+        self.setup_seed = setup_seed;
         self.inner.set_setup_seed(setup_seed);
     }
 
@@ -913,9 +957,15 @@ impl Session for ScheduledPanetiereServerSession {
 
     fn on_inbound(&mut self, from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
         if from == self.leader_pk {
-            if let Ok(PanetiereWire::Reservations { round, entries }) =
+            if let Ok(PanetiereWire::Reservations { round, entries, signature }) =
                 bincode::deserialize::<PanetiereWire>(&payload)
             {
+                if !self.leader_pk.verify(
+                    &reservation_signing_bytes(&self.setup_seed, round, &entries),
+                    &signature,
+                ) {
+                    return Vec::new();
+                }
                 if crate::panetiere::round_in_window(round, self.cur_round) {
                     self.entries_by_round
                         .lock()
@@ -995,6 +1045,9 @@ impl Session for ScheduledPanetiereServerSession {
             if self.publishes {
                 let wire = PanetiereWire::Reservations {
                     round: rd,
+                    signature: self.identity.sign(&reservation_signing_bytes(
+                        &self.setup_seed, rd, &entries,
+                    )),
                     entries: entries.clone(),
                 };
                 outbound.push(bincode::serialize(&wire).expect("serialise reservations"));
@@ -1124,7 +1177,8 @@ mod sizing_tests {
                 )
             })
             .collect();
-        let leader = Identity::generate().pubkey();
+        let leader_identity = Identity::generate();
+        let leader = leader_identity.pubkey();
         let mut c = ScheduledPanetiereClientSession::new(
             pp.clone(),
             sched_mse,
@@ -1142,6 +1196,9 @@ mod sizing_tests {
             bincode::serialize(&PanetiereWire::Reservations {
                 round: 0,
                 entries: vec![(1, vector_bytes as u16)],
+                signature: leader_identity.sign(&reservation_signing_bytes(
+                    &[0; 32], 0, &[(1, vector_bytes as u16)],
+                )),
             })
             .unwrap(),
         );

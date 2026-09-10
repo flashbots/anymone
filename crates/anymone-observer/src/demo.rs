@@ -1,21 +1,13 @@
-//! `anymone-observer demo` — a whole network in one process.
-//!
-//! Spins up a Panetiere-coordinated committee, a set of relays, an echo service,
-//! and a client that sends continuously — all over a single in-memory transport
-//! — then attaches the observer to the same transport and serves the global
-//! dashboard. No config files, no ports to wire: run it, open the dashboard.
-//!
-//! The transport is in-memory, so there's no real TCP mesh; the dashboard's
-//! mesh view falls back to logical edges (committee clique + relay↔service).
-//! Everything else — real Panetiere/ADCNet rounds, committee deliberation,
-//! goodput, config history — is the genuine protocol running live.
+//! In-process committee, relays, chat and traffic controls.
+//! With --output, use loopback network transports and export client bootstrap
+//! files so independent clients and services can join.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anymone_core::config::ExchangePublicKeyWire;
-use anymone_core::scheduling::{announce_relay_registration, announce_service_registration};
+use anymone_core::scheduling::{announce_relay_registration_at, announce_service_registration};
 use anymone_core::transport::Transport;
 use anymone_core::{
     committee_roster, spawn_panetiere_committee_scheduler, Anymone, GovernanceBootstrap, Identity,
@@ -33,6 +25,10 @@ const COMMITTEE_THRESHOLD: u32 = 2;
 
 #[derive(Parser, Debug)]
 pub struct DemoArgs {
+    /// Start loopback network listeners and export client.toml into a fresh directory.
+    #[arg(long)]
+    pub output: Option<std::path::PathBuf>,
+
     /// Port to serve the dashboard + `/state` on.
     #[arg(long, default_value = "7000")]
     pub dashboard_port: u16,
@@ -86,7 +82,7 @@ fn xk(id: &Identity) -> ExchangePublicKeyWire {
 
 pub async fn run_demo(args: DemoArgs) -> Result<()> {
     let net = InMemoryNetwork::new();
-    let handle = |id: &Identity| -> Arc<dyn Transport> { Arc::new(net.handle(id.pubkey())) };
+
 
     // --- committee ---------------------------------------------------------
     let committee_ids: Vec<Identity> = (0..COMMITTEE_SIZE).map(|_| Identity::generate()).collect();
@@ -94,6 +90,22 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
     let gov = GovernanceBootstrap {
         committee: committee_pks.clone(),
         threshold: COMMITTEE_THRESHOLD,
+    };
+
+    anyhow::ensure!(args.relays >= 2, "demo requires at least two relays");
+    let relay_ids: Vec<Identity> = (0..args.relays).map(|_| Identity::generate()).collect();
+    let network = args.output.as_ref().map(|output|
+        crate::demo_network::DemoNetwork::start(&committee_ids, &relay_ids, output)
+    ).transpose()?.map(Arc::new);
+    let handle = {
+        let net = net.clone();
+        let network = network.clone();
+        move |id: &Identity| -> Arc<dyn Transport> {
+            match &network {
+                Some(network) => network.handle(id),
+                None => Arc::new(net.handle(id.pubkey())),
+            }
+        }
     };
 
     let cover_target = Arc::new(AtomicU32::new(
@@ -133,9 +145,8 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
 
     // --- prepare every config consumer (subscribe to anymone/config) BEFORE
     //     any registration is published, so nobody misses the first config ---
-    let relay_ids: Vec<Identity> = (0..args.relays).map(|_| Identity::generate()).collect();
     let svc_id = Identity::generate();
-    let client_ids: Vec<Identity> = (0..args.clients.max(1))
+    let client_ids: Vec<Identity> = (0..args.clients)
         .map(|_| Identity::generate())
         .collect();
     let chat_tag = ServiceTag::from_label(CHAT_TAG_LABEL);
@@ -144,7 +155,8 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
     for id in &relay_ids {
         relay_preps.push(Anymone::prepare(id.clone(), handle(id), gov.clone()).await);
     }
-    let svc_prep = Anymone::prepare(svc_id.clone(), handle(&svc_id), gov.clone()).await;
+    let svc_transport = handle(&svc_id);
+    let svc_prep = Anymone::prepare(svc_id.clone(), svc_transport.clone(), gov.clone()).await;
     let mut client_preps = Vec::new();
     for id in &client_ids {
         client_preps.push(Anymone::prepare(id.clone(), handle(id), gov.clone()).await);
@@ -156,7 +168,7 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
     let observatory: crate::Shared = Arc::new(Mutex::new(Observatory::new(
         committee_pks.clone(),
         COMMITTEE_THRESHOLD,
-        "in-process demo · in-memory gossip".to_string(),
+        if network.is_some() { "in-process demo · loopback network" } else { "in-process demo · in-memory gossip" }.to_string(),
         args.committee_round_ms,
     )));
     crate::spawn_config_loop(
@@ -175,9 +187,9 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
 
     // --- publish registrations; committee now has quorum and emits a config -
     for id in &relay_ids {
-        announce_relay_registration(handle(id), id, xk(id)).await;
+        announce_relay_registration_at(handle(id), id, xk(id), network.as_ref().and_then(|n| n.relay_addresses.get(&id.pubkey()).cloned())).await;
     }
-    announce_service_registration(handle(&svc_id), &svc_id, chat_tag, xk(&svc_id)).await;
+    announce_service_registration(svc_transport, &svc_id, chat_tag, xk(&svc_id)).await;
 
     // --- start everyone (each awaits the now-published config) --------------
     // The `fault` knob drives one relay's misbehavior. It must be a non-leader
@@ -224,18 +236,24 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
         .start()
         .await
         .map_err(|e| anyhow!("chat backend start: {e}"))?;
+    if let Some(output) = &args.output {
+        use std::io::Write;
+        let config = serde_json::to_vec_pretty(&svc.configuration())?;
+        std::fs::OpenOptions::new().write(true).create_new(true)
+            .open(output.join("network-config.json"))?.write_all(&config)?;
+        eprintln!("Demo ready; client bootstrap: {}", output.join("client.toml").display());
+    }
     let chat_port = args.chat_port;
-    // Virtual clients for the chat backend come off the same in-memory network
-    // as everyone else here.
+    // Virtual clients use the same client transport as other demo participants.
     let chat_spawn: anymone_core::SpawnClient = {
-        let net = net.clone();
+        let handle = handle.clone();
         let gov = gov.clone();
         Arc::new(move || {
-            let net = net.clone();
+            let handle = handle.clone();
             let gov = gov.clone();
             Box::pin(async move {
                 let id = Identity::generate();
-                let transport: Arc<dyn Transport> = Arc::new(net.handle(id.pubkey()));
+                let transport = handle(&id);
                 Anymone::start(id, transport, gov).await.ok()
             })
         })
@@ -256,7 +274,7 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
     // knob sets the client population, which is the anonymity set — every open
     // pipe contributes cover every round. `--client-rate` is the chance a
     // client layers a real send on top, setting goodput independently.
-    let n_clients = args.clients.max(1);
+    let n_clients = args.clients;
     let round = Duration::from_millis(args.public_round_ms);
     let send_prob = args.client_rate.clamp(0.0, 1.0);
     let cover_pct = (args.cover_rate.clamp(0.0, 1.0) * 100.0).round() as usize;
@@ -264,7 +282,7 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
         crate::DemoControls::new()
             .with(
                 "clients",
-                crate::Knob::new("clients · anonymity set", n_clients, 1),
+                crate::Knob::new("clients · anonymity set", n_clients, 0),
             )
             .with(
                 "cover",
@@ -329,7 +347,7 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
     {
         let controls = controls.clone();
         let gov = gov.clone();
-        let net = net.clone();
+        let handle = handle.clone();
         tokio::spawn(async move {
             let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
             let mut next_index: usize = 0;
@@ -337,7 +355,7 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
                 let want = controls.knob("clients").map(|k| k.get()).unwrap_or(0);
                 while tasks.len() < want {
                     let id = Identity::generate();
-                    let transport: Arc<dyn Transport> = Arc::new(net.handle(id.pubkey()));
+                    let transport = handle(&id);
                     tasks.push(tokio::spawn(client_loop(
                         id,
                         transport,

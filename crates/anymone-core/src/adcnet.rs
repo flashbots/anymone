@@ -41,7 +41,7 @@ use crate::session::{GoodClients, LeaderAggregation, Misbehavior, PeerId, RoundO
 use crate::transport::{Dest, Subscription, Topic};
 
 /// Per-subnet ADCNet parameters (IBLT sizing), built once at subnet start.
-fn one_round_config(cfg: &AdcnetConfig) -> OneRoundConfig {
+pub(crate) fn one_round_config(cfg: &AdcnetConfig) -> OneRoundConfig {
     OneRoundConfig {
         iblt: IbltMsgParamsOwned {
             estimated_messages: cfg.estimated_messages,
@@ -82,7 +82,7 @@ fn relay_index(subnet: &Subnet, pk: Pubkey) -> Option<u32> {
 
 /// ECDH the node's exchange privkey against each relay's exchange pubkey,
 /// keyed by 0-based `ServerId`.
-fn client_shared_secrets(
+pub(crate) fn client_shared_secrets(
     relay_xk: &[(Pubkey, ExchangePublicKeyWire)],
     identity: &Identity,
     subnet: &Subnet,
@@ -134,6 +134,7 @@ fn client_session(
         _ => unreachable!(),
     }
 }
+
 
 fn server_session(
     one_round: &OneRoundConfig,
@@ -334,7 +335,7 @@ pub(crate) async fn run_subnet(
                 .map(move |out| (key, out))
         })
         .collect();
-    for (key, out) in outs {
+    for (key, out) in outs.into_iter().chain(crate::runtime::flush_sessions(&mut sessions).await) {
         publish_and_loop_back(
             &mut sessions,
             &mut fault_monitor,
@@ -362,7 +363,7 @@ pub(crate) async fn run_subnet(
                         s.checkpoint(round, 1, Instant::now()).into_iter().map(move |out| (key, out))
                     })
                     .collect();
-                for (key, out) in outs {
+                for (key, out) in outs.into_iter().chain(crate::runtime::flush_sessions(&mut sessions).await) {
                     publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
                         .await;
                 }
@@ -379,7 +380,7 @@ pub(crate) async fn run_subnet(
                     decoded_all.extend(outcome.decoded);
                     faults.extend(outcome.faults);
                 }
-                for (key, out) in outs {
+                for (key, out) in outs.into_iter().chain(crate::runtime::flush_sessions(&mut sessions).await) {
                     publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
                         .await;
                 }
@@ -428,7 +429,7 @@ pub(crate) async fn run_subnet(
                         s.begin_round(round, Instant::now()).into_iter().map(move |out| (key, out))
                     })
                     .collect();
-                for (key, out) in outs {
+                for (key, out) in outs.into_iter().chain(crate::runtime::flush_sessions(&mut sessions).await) {
                     publish_and_loop_back(&mut sessions, &mut fault_monitor, &inner, &egress, identity_pk, key, out)
                         .await;
                 }
@@ -1068,65 +1069,41 @@ impl AdcnetClientSession {
     }
 }
 
+impl AdcnetClientSession {
+    pub fn contribute(&mut self, round: Round, payload: Option<&[u8]>) -> Result<Vec<u8>, String> {
+        let round = u32::try_from(round).map_err(|_| "ADCNet round exceeds u32")?;
+        if payload.is_some_and(|p| p.len() > self.config.iblt.max_payload_bytes) {
+            return Err("payload exceeds channel capacity".into());
+        }
+        if self.signed_key.is_none() {
+            self.signed_key = Some(Signed::new(
+                &self.signing_key,
+                KeyExchange { xpub: self.client_xpub.clone() },
+            ).map_err(|e| e.to_string())?);
+        }
+        let contribution = client_contribute(
+            &self.config, round, &self.signing_key, &self.shared_secrets, payload, &mut self.rng,
+        ).map_err(|e| e.to_string())?;
+        bincode::serialize(&AdcnetWire::Client {
+            contribution,
+            key: self.signed_key.clone().expect("signed key present"),
+        }).map_err(|e| e.to_string())
+    }
+}
+
 impl Session for AdcnetClientSession {
     fn begin_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
-        // Sign our exchange key once, reuse it every round; skip the round if it fails.
-        if self.signed_key.is_none() {
-            match Signed::new(
-                &self.signing_key,
-                KeyExchange {
-                    xpub: self.client_xpub.clone(),
-                },
-            ) {
-                Ok(signed) => self.signed_key = Some(signed),
-                Err(e) => {
-                    // Never recovers on its own: this client is silent forever.
-                    warn!(
-                        target: ADCNET,
-                        round,
-                        error = ?e,
-                        "adcnet client: failed to sign the exchange key; cannot contribute"
-                    );
-                    return Vec::new();
-                }
-            }
-        }
-        let key = self.signed_key.clone().expect("signed key present");
-
-        let round_u32 = round as u32;
         let payload = self.pending.take();
         if payload.is_none() && self.rng.gen::<f32>() >= self.cover_rate {
-            trace!(
-                target: ADCNET,
-                round,
-                "adcnet client: nothing staged and cover coin missed; silent this round"
-            );
             return Vec::new();
         }
-        let contribution = match client_contribute(
-            &self.config,
-            round_u32,
-            &self.signing_key,
-            &self.shared_secrets,
-            payload.as_deref(),
-            &mut self.rng,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                debug!(target: ADCNET, round = round_u32, secrets = self.shared_secrets.len(), error = ?e, "adcnet client: contribute failed");
-                return Vec::new();
+        match self.contribute(round, payload.as_deref()) {
+            Ok(message) => vec![message],
+            Err(error) => {
+                debug!(target: ADCNET, round, %error, "adcnet client: contribute failed");
+                Vec::new()
             }
-        };
-        let out = bincode::serialize(&AdcnetWire::Client { contribution, key })
-            .expect("serialise client");
-        trace!(
-            target: ADCNET,
-            round = round_u32,
-            real = payload.is_some(),
-            now_ms = crate::config::now_unix_ms(),
-            "adcnet client: submit contribution"
-        );
-        vec![out]
+        }
     }
 
     fn on_inbound(&mut self, _from: PeerId, _payload: Vec<u8>) -> Vec<Vec<u8>> {
@@ -2197,6 +2174,16 @@ struct ScheduledResult {
     completed: bool,
 }
 
+pub fn is_scheduled_client_feedback(payload: &[u8]) -> bool {
+    use bincode::Options;
+    matches!(
+        bincode::DefaultOptions::new().with_fixint_encoding()
+            .with_limit(16 * 1024 * 1024).reject_trailing_bytes()
+            .deserialize::<ScheduledAdcnetWire>(payload),
+        Ok(ScheduledAdcnetWire::Broadcast(_))
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum ScheduledAdcnetWire {
     Client(ScheduledClient),
@@ -2205,7 +2192,7 @@ enum ScheduledAdcnetWire {
     Broadcast(Signed<ScheduledResult>),
 }
 
-fn empty_scheduled_broadcast(config: &UpstreamAdcNetConfig, round: i64) -> RoundBroadcast {
+pub(crate) fn empty_scheduled_broadcast(config: &UpstreamAdcNetConfig, round: i64) -> RoundBroadcast {
     RoundBroadcast {
         round_number: round,
         auction_vector: adcnet::auction::iblt::IbltVector::new(config.auction_slots),
@@ -2235,7 +2222,7 @@ pub(crate) fn scheduled_max_wire_estimate(
     client_set.max(partial)
 }
 
-fn scheduled_config(cfg: &crate::config::ScheduledAdcnetConfig) -> UpstreamAdcNetConfig {
+pub(crate) fn scheduled_config(cfg: &crate::config::ScheduledAdcnetConfig) -> UpstreamAdcNetConfig {
     UpstreamAdcNetConfig {
         auction_slots: cfg.auction_slots,
         message_length: cfg.message_length,
@@ -2304,11 +2291,11 @@ impl ScheduledAdcnetClientSession {
         self.pending.push_back((payload, bid_value));
     }
 
-    fn submit(&mut self) -> Vec<Vec<u8>> {
+    pub fn messages_for_current_round(&mut self) -> Result<Vec<Vec<u8>>, String> {
         if self.previous.round_number != self.current_round - 1
             || self.submitted_round == Some(self.current_round)
         {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         if self
             .inflight
@@ -2322,7 +2309,7 @@ impl ScheduledAdcnetClientSession {
             && self.inflight.is_none()
             && rand::thread_rng().gen::<f32>() >= self.cover_rate
         {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let bid = self.pending.front().map(|(payload, bid)| {
             adcnet::auction::auction::AuctionData::from_message(payload, *bid)
@@ -2336,17 +2323,15 @@ impl ScheduledAdcnetClientSession {
             config: &self.config,
             shared_secrets: &self.shared,
         };
-        let Ok((message, won)) = messager.prepare_message(
+        let (message, won) = messager.prepare_message(
             self.current_round,
             &self.previous,
             message,
             bid.as_ref(),
             &mut rand::thread_rng(),
-        ) else {
-            return Vec::new();
-        };
+        ).map_err(|e| e.to_string())?;
         tracing::trace!(target: ADCNET, round = self.current_round, won, pending = self.pending.len(), inflight = self.inflight.is_some(), "scheduled submit");
-        let signed = Signed::new(&self.signing_key, message).expect("sign scheduled contribution");
+        let signed = Signed::new(&self.signing_key, message).map_err(|e| e.to_string())?;
         let next = self.pending.pop_front();
         if let Some((payload, bid, _)) = self.inflight.take() {
             if !won {
@@ -2355,13 +2340,63 @@ impl ScheduledAdcnetClientSession {
         }
         self.inflight = next.map(|(p, bid)| (p, bid, self.current_round));
         self.submitted_round = Some(self.current_round);
-        vec![
+        Ok(vec![
             bincode::serialize(&ScheduledAdcnetWire::Client(ScheduledClient {
                 message: signed,
                 key: self.key.clone(),
             }))
             .expect("serialize scheduled client"),
-        ]
+        ])
+    }
+
+    pub fn schedule_message_for_next_round(&mut self, payload: Vec<u8>, bid: u32) -> Result<(), String> {
+        if payload.len().max(self.min_message_size) > self.config.message_length {
+            return Err("payload exceeds scheduled message capacity".into());
+        }
+        self.stage_message(payload, bid);
+        Ok(())
+    }
+
+    pub fn advance_to_round(&mut self, round: i64) -> Result<(), String> {
+        if round < self.current_round || round < 1 {
+            return Err("scheduled ADCNet round moved backwards".into());
+        }
+        self.current_round = round;
+        Ok(())
+    }
+
+    pub fn process_round_broadcast(&mut self, payload: &[u8]) -> Result<(), String> {
+        use bincode::Options;
+        let ScheduledAdcnetWire::Broadcast(signed) = bincode::DefaultOptions::new()
+            .with_fixint_encoding().with_limit(16 * 1024 * 1024).reject_trailing_bytes()
+            .deserialize(payload).map_err(|e| e.to_string())?
+        else {
+            return Err("expected a scheduled ADCNet broadcast".into());
+        };
+        let (result, signer) = signed.recover().map_err(|e| e.to_string())?;
+        let rb = &result.broadcast;
+        if signer.as_bytes() != self.leader.0
+            || rb.round_number < self.previous.round_number
+            || rb.round_number > self.current_round
+        {
+            return Err("invalid broadcast signer or round".into());
+        }
+        if rb.round_number == self.previous.round_number
+            && bincode::serialize(rb).map_err(|e| e.to_string())?
+                != bincode::serialize(&self.previous).map_err(|e| e.to_string())?
+        {
+            return Err("conflicting broadcast for the same round".into());
+        }
+        self.previous = rb.clone();
+        Ok(())
+    }
+
+    pub(crate) fn set_min_message_size(&mut self, size: usize) {
+        self.min_message_size = size;
+    }
+
+    pub fn pending_message_count(&self) -> usize {
+        self.pending.len() + usize::from(self.inflight.is_some())
     }
 }
 
@@ -2382,24 +2417,18 @@ impl Drop for ScheduledAdcnetClientSession {
 
 impl Session for ScheduledAdcnetClientSession {
     fn begin_round(&mut self, round: Round, _now: Instant) -> Vec<Vec<u8>> {
-        self.current_round = round as i64 + 1;
-        self.submit()
+        if self.advance_to_round(round as i64 + 1).is_err() {
+            return Vec::new();
+        }
+        self.messages_for_current_round().unwrap_or_default()
     }
 
     fn on_inbound(&mut self, _from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
-        if let Ok(ScheduledAdcnetWire::Broadcast(signed)) = bincode::deserialize(&payload) {
-            if let Ok((result, signer)) = signed.recover() {
-                let rb = &result.broadcast;
-                if signer.as_bytes() == self.leader.0
-                    && rb.round_number >= self.previous.round_number
-                    && rb.round_number <= self.current_round
-                {
-                    self.previous = rb.clone();
-                    return self.submit();
-                }
-            }
+        if self.process_round_broadcast(&payload).is_ok() {
+            self.messages_for_current_round().unwrap_or_default()
+        } else {
+            Vec::new()
         }
-        Vec::new()
     }
 
     fn end_round(&mut self, _round: Round, _now: Instant) -> RoundOutcome {

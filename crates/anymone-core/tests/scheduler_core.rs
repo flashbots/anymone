@@ -81,7 +81,7 @@ fn lead_params() -> SchedulerParams {
         sideline: true,
         renegotiate_on_fault: true,
         min_capacity: 8,
-        pin: None,
+        pin: Some(anymone_core::SchedulerProtocol::Adcnet),
         vector_bytes: 0,
         aggregation: true,
         encoding: anymone_core::config::Encoding::default(),
@@ -115,6 +115,28 @@ fn register_relays_and_service(core: &mut SchedulerCore, relays: &[Identity], se
         ServiceTag::from_label("anymone.echo"),
         xkw(service),
     ));
+}
+
+#[test]
+fn omitted_protocol_defaults_to_ordinary_panetiere() {
+    let committee: Vec<_> = (0..3).map(|_| Identity::generate()).collect();
+    let relays: Vec<_> = (0..3).map(|_| Identity::generate()).collect();
+    let service = Identity::generate();
+    let bootstrap: anymone_core::CommitteeParams = toml::from_str("").unwrap();
+    for params in [
+        SchedulerParams::default(),
+        bootstrap.into_config().scheduler,
+    ] {
+        assert!(params.pin.is_none());
+        let mut core = lead_core_with(&committee, 2, params);
+        register_relays_and_service(&mut core, &relays, &service);
+        let body = staged_body(&core.tick(0, 0)).expect("default proposal");
+        assert!(!body.subnets.is_empty());
+        assert!(body
+            .subnets
+            .iter()
+            .all(|s| matches!(s.protocol, ProtocolConfig::Panetiere(_))));
+    }
 }
 
 #[test]
@@ -723,7 +745,7 @@ fn live_core(committee: &[Identity]) -> SchedulerCore {
             sideline: true,
             renegotiate_on_fault: true,
             min_capacity: 8,
-            pin: None,
+            pin: Some(anymone_core::SchedulerProtocol::Adcnet),
             vector_bytes: 0,
             aggregation: true,
             encoding: anymone_core::config::Encoding::default(),
@@ -770,7 +792,7 @@ fn committee_schedules_second_subnet_when_one_nears_capacity() {
                 sideline: true,
                 renegotiate_on_fault: true,
                 min_capacity: 8,
-                pin: None,
+                pin: Some(anymone_core::SchedulerProtocol::Adcnet),
                 vector_bytes: 0,
                 aggregation: false,
                 encoding: anymone_core::config::Encoding::default(),
