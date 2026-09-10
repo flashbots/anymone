@@ -13,7 +13,8 @@ use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 
 use crate::host::{read_frame, write_frame};
-use crate::wire::{PairRequest, PairingInfo, SessionInput, SessionReply};
+use crate::wire::{CommandResult, HostStatus, PairRequest, PairingInfo, SessionCommand, SessionInput, SessionReply};
+use crate::HostConfig;
 use crate::RemoteTransportError;
 
 pub struct RemoteSessionClient {
@@ -21,14 +22,14 @@ pub struct RemoteSessionClient {
     controller_secret: [u8; 32],
     pairing: PairingInfo,
     next_request: u64,
-    pending: Option<(u64, ProtocolAction)>,
+    pending: Option<(u64, SessionCommand)>,
     session_id: [u8; 32],
 }
 
 impl RemoteSessionClient {
     pub async fn pair(
         pairing: PairingInfo,
-    ) -> Result<(Self, RemoteSessionStatus), RemoteTransportError> {
+    ) -> Result<(Self, HostStatus), RemoteTransportError> {
         if pairing.interface_version != crate::INTERFACE_VERSION
             || Sha256::digest(&pairing.certificate_der).as_slice() != pairing.certificate_sha256
         {
@@ -78,7 +79,7 @@ impl RemoteSessionClient {
         Err(last_error)
     }
 
-    pub async fn reconnect(&mut self) -> Result<RemoteSessionStatus, RemoteTransportError> {
+    pub async fn reconnect(&mut self) -> Result<HostStatus, RemoteTransportError> {
         self.stream = None;
         let mut stream = connect_tls(&self.pairing).await?;
         write_frame(
@@ -101,7 +102,7 @@ impl RemoteSessionClient {
         }
     }
 
-    pub async fn status(&mut self) -> Result<RemoteSessionStatus, RemoteTransportError> {
+    pub async fn status(&mut self) -> Result<HostStatus, RemoteTransportError> {
         match self.exchange(SessionInput::Status).await? {
             SessionReply::Status(status) => Ok(status),
             _ => Err(RemoteTransportError::UnexpectedReply),
@@ -157,51 +158,52 @@ impl RemoteSessionClient {
         self.action(ProtocolAction::ScheduledAdcnet(action)).await
     }
 
+    pub async fn configure(
+        &mut self,
+        config: HostConfig,
+    ) -> Result<(RemoteSessionStatus, Vec<Vec<u8>>), RemoteTransportError> {
+        match self.perform_command(SessionCommand::Configure(config)).await? {
+            CommandResult::Configured { status, returned_payloads } => Ok((status, returned_payloads)),
+            _ => Err(RemoteTransportError::UnexpectedReply),
+        }
+    }
+
+    pub(crate) fn pending_command(&self) -> Option<SessionCommand> {
+        self.pending.as_ref().map(|(_, command)| command.clone())
+    }
+
     pub(crate) async fn perform(
         &mut self,
         action: ProtocolAction,
     ) -> Result<Vec<Vec<u8>>, RemoteTransportError> {
-        if self.stream.is_none() {
-            self.reconnect().await?;
-        }
-        if let Some((_, pending)) = &self.pending {
-            if pending != &action {
-                return Err(RemoteTransportError::PendingRequest);
-            }
-            self.retry_pending().await
-        } else {
-            self.action(action).await
+        match self.perform_command(SessionCommand::Action(action)).await? {
+            CommandResult::Messages(messages) => Ok(messages),
+            _ => Err(RemoteTransportError::UnexpectedReply),
         }
     }
 
-    async fn action(
-        &mut self,
-        action: ProtocolAction,
-    ) -> Result<Vec<Vec<u8>>, RemoteTransportError> {
-        if self.pending.is_some() {
-            return Err(RemoteTransportError::PendingRequest);
+    async fn perform_command(&mut self, command: SessionCommand) -> Result<CommandResult, RemoteTransportError> {
+        if self.stream.is_none() { self.reconnect().await?; }
+        if let Some((_, pending)) = &self.pending {
+            if pending != &command { return Err(RemoteTransportError::PendingRequest); }
+        } else {
+            self.pending = Some((self.next_request, command));
         }
-        self.pending = Some((self.next_request, action));
         self.retry_pending().await
     }
 
-    pub async fn retry_pending(&mut self) -> Result<Vec<Vec<u8>>, RemoteTransportError> {
-        let (sequence, action) = self
-            .pending
-            .clone()
-            .ok_or(RemoteTransportError::NoPendingRequest)?;
-        match self
-            .exchange(SessionInput::Action { sequence, action })
-            .await?
-        {
-            SessionReply::Action {
-                sequence: received,
-                result,
-            } if received == sequence => {
+    async fn action(&mut self, action: ProtocolAction) -> Result<Vec<Vec<u8>>, RemoteTransportError> {
+        if self.pending.is_some() { return Err(RemoteTransportError::PendingRequest); }
+        self.perform(action).await
+    }
+
+    pub async fn retry_pending(&mut self) -> Result<CommandResult, RemoteTransportError> {
+        if self.stream.is_none() { self.reconnect().await?; }
+        let (sequence, command) = self.pending.clone().ok_or(RemoteTransportError::NoPendingRequest)?;
+        match self.exchange(SessionInput::Request { sequence, command }).await? {
+            SessionReply::Executed { sequence: received, result } if received == sequence => {
                 self.pending = None;
-                self.next_request = sequence
-                    .checked_add(1)
-                    .ok_or(RemoteTransportError::UnexpectedReply)?;
+                self.next_request = sequence.checked_add(1).ok_or(RemoteTransportError::UnexpectedReply)?;
                 result.map_err(RemoteTransportError::Protocol)
             }
             _ => Err(RemoteTransportError::UnexpectedReply),
@@ -289,18 +291,18 @@ mod tests {
             round: 0,
             payload: Some(b"lost reply".to_vec()),
         });
-        client.pending = Some((0, action.clone()));
+        client.pending = Some((0, SessionCommand::Action(action.clone())));
         let stream = client.stream.as_mut().unwrap();
         write_frame(
             stream,
-            &SessionInput::Action {
+            &SessionInput::Request {
                 sequence: 0,
-                action,
+                command: SessionCommand::Action(action),
             },
         )
         .await
         .unwrap();
-        let SessionReply::Action {
+        let SessionReply::Executed {
             result: Ok(expected),
             ..
         } = read_frame(stream).await.unwrap()
@@ -351,6 +353,61 @@ mod tests {
         assert_eq!(client.status().await.unwrap().next_request, 1);
         assert!(client.pending.is_none());
         assert!(!client.adcnet_contribute(1, None).await.unwrap().is_empty());
+        host.shutdown().await;
+    }
+
+
+    #[tokio::test]
+    async fn configuration_replay_preserves_keys_state_and_returned_payloads() {
+        let relay = Identity::generate();
+        let mut config = HostConfig {
+            subnet: Subnet::new(0, vec![relay.pubkey()],
+                ProtocolConfig::ScheduledAdcnet(anymone_core::ScheduledAdcnetConfig {
+                    round_duration_ms: 1000, message_length: 1024, auction_slots: 4,
+                    min_message_size: 1, client_set_min: 0, client_set_max: 4,
+                })),
+            relay_exchange_keys: vec![(relay.pubkey(), relay.exchange_keys())],
+            starting_round: 0,
+        };
+        let host = RemoteSessionHost::new(None).unwrap()
+            .listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let (mut client, initial) = RemoteSessionClient::pair(host.pairing.clone()).await.unwrap();
+        assert!(initial.client.is_none());
+        let (configured, returned) = client.configure(config.clone()).await.unwrap();
+        assert!(returned.is_empty());
+        client.scheduled_adcnet(ScheduledAdcnetAction::ScheduleMessageForNextRound {
+            payload: b"preserved".to_vec(), bid: 1,
+        }).await.unwrap();
+        config.starting_round = 1;
+        let (same, returned) = client.configure(config.clone()).await.unwrap();
+        assert_eq!(same.participant, configured.participant);
+        assert_eq!(same.pending_messages, 1);
+        assert!(returned.is_empty());
+        let mut invalid = config.clone();
+        invalid.subnet.relays.clear();
+        assert!(client.configure(invalid).await.is_err());
+        assert_eq!(client.status().await.unwrap().client.unwrap().pending_messages, 1);
+        config.subnet.protocol = ProtocolConfig::Adcnet(AdcnetConfig {
+            round_duration_ms: 1000, max_payload_bytes: 64, estimated_messages: 1,
+            client_set_min: 0, client_set_max: 4, aggregation: None,
+        });
+        let sequence = client.next_request;
+        let command = SessionCommand::Configure(config.clone());
+        client.pending = Some((sequence, command.clone()));
+        let stream = client.stream.as_mut().unwrap();
+        write_frame(stream, &SessionInput::Request { sequence, command }).await.unwrap();
+        let SessionReply::Executed { result: Ok(expected), .. } = read_frame(stream).await.unwrap()
+        else { panic!("expected configuration reply") };
+        let CommandResult::Configured { status, returned_payloads } = &expected
+        else { panic!("expected configured client") };
+        assert_eq!(status.participant, configured.participant);
+        assert_eq!(returned_payloads, &vec![b"preserved".to_vec()]);
+        assert_eq!(client.reconnect().await.unwrap().session_id, initial.session_id);
+        assert_eq!(client.retry_pending().await.unwrap(), expected);
+        assert!(client.configure(config.clone()).await.unwrap().1.is_empty());
+        let message = client.adcnet_contribute(1, Some(b"next".to_vec())).await.unwrap();
+        client.configure(config).await.unwrap();
+        assert_eq!(client.adcnet_contribute(1, Some(b"next".to_vec())).await.unwrap(), message);
         host.shutdown().await;
     }
 

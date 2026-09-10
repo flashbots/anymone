@@ -28,12 +28,12 @@ enum Command {
         instance: Option<String>,
     },
     Host {
-        #[arg(long)]
-        config: PathBuf,
         #[arg(long, default_value = "127.0.0.1:0")]
         listen: SocketAddr,
     },
     Drive {
+        #[arg(long)]
+        config: PathBuf,
         #[arg(long)]
         pairing: PathBuf,
         /// Discovered endpoint; the pairing certificate remains pinned.
@@ -113,14 +113,13 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Command::Host { config, listen } => {
-            let config: HostConfig = read_json(&config)?;
-            let session = config.developer_session()?;
-            let handle = RemoteSessionHost::new(session)?.listen(listen).await?;
+        Command::Host { listen } => {
+            let handle = RemoteSessionHost::new(None)?.listen(listen).await?;
             println!("{}", serde_json::to_string(&handle.pairing)?);
             tokio::signal::ctrl_c().await?;
         }
         Command::Drive {
+            config,
             pairing,
             address,
             actions,
@@ -132,6 +131,9 @@ async fn main() -> Result<()> {
             }
             let actions: Vec<ProtocolAction> = read_json(&actions)?;
             let (mut client, status) = RemoteSessionClient::pair(pairing).await?;
+            eprintln!("{}", serde_json::to_string(&status)?);
+            let (status, returned) = client.configure(read_json(&config)?).await?;
+            anyhow::ensure!(returned.is_empty(), "configuration returned unsent payloads; use the service backend to requeue them");
             eprintln!("{}", serde_json::to_string(&status)?);
             for action in actions {
                 if reconnect_between_actions {

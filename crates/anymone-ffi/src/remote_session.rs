@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use anymone_remote_session::{HostConfig, RemoteSessionHost, RemoteSessionHostHandle};
+use anymone_remote_session::{ RemoteSessionHost, RemoteSessionHostHandle};
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 #[uniffi(flat_error)]
@@ -23,13 +23,8 @@ pub struct RemoteProtocolHost {
 impl RemoteProtocolHost {
     #[uniffi::constructor]
     pub async fn start_developer(
-        config_json: String,
         listen_address: String,
     ) -> Result<Arc<Self>, RemoteHostError> {
-        if config_json.len() > 1024 * 1024 {
-            return Err(failed("host configuration exceeds 1 MiB"));
-        }
-        let config: HostConfig = serde_json::from_str(&config_json).map_err(failed)?;
         let address = listen_address
             .parse::<std::net::SocketAddr>()
             .map_err(failed)?;
@@ -37,11 +32,7 @@ impl RemoteProtocolHost {
             return Err(failed("select a reachable interface address"));
         }
         crate::on_runtime(async move {
-            let session = tokio::task::spawn_blocking(move || config.developer_session())
-                .await
-                .map_err(failed)?
-                .map_err(failed)?;
-            let handle = RemoteSessionHost::new(session)
+            let handle = RemoteSessionHost::new(None)
                 .map_err(failed)?
                 .listen(address)
                 .await

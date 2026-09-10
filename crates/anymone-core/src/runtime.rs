@@ -702,12 +702,27 @@ pub(crate) enum SessionKey {
     Aggregator,
 }
 
-/// Serialized (id, sorted roster, protocol). Respawn a worker only when this
-/// changes — leadership/role derive from the roster, so it covers them too.
-fn subnet_sig(subnet: &Subnet) -> Vec<u8> {
+/// Protocol context that requires rebuilding a worker when it changes.
+fn subnet_sig(subnet: &Subnet, relay_keys: &[(Pubkey, crate::config::ExchangePublicKeyWire)]) -> Vec<u8> {
     let mut roster = subnet.relays.clone();
     roster.sort();
-    bincode::serialize(&(subnet.id, &roster, &subnet.protocol, subnet.attested)).unwrap_or_default()
+    let keys: Vec<_> = roster.iter().map(|pk| relay_keys.iter().find(|(key, _)| key == pk)).collect();
+    bincode::serialize(&(subnet.id, &roster, &subnet.protocol, subnet.attested, keys)).unwrap_or_default()
+}
+
+#[cfg(test)]
+#[test]
+fn worker_context_tracks_relay_keys() {
+    let relay = crate::Identity::generate();
+    let rotated = crate::Identity::generate();
+    let subnet = Subnet::new(0, vec![relay.pubkey()],
+        ProtocolConfig::Panetiere(crate::PanetiereConfig::default()));
+    let keys = vec![(relay.pubkey(), relay.exchange_keys())];
+    let before = subnet_sig(&subnet, &keys);
+    let mut extra = keys.clone();
+    extra.push((rotated.pubkey(), rotated.exchange_keys()));
+    assert_eq!(before, subnet_sig(&subnet, &extra));
+    assert_ne!(before, subnet_sig(&subnet, &[(relay.pubkey(), rotated.exchange_keys())]));
 }
 
 /// Reconcile running workers to `config`: spawn new/changed, drop removed, leave
@@ -782,7 +797,7 @@ async fn apply_config(
             warn!(target: SCHED, id, "skipping a repeated subnet id in config");
             continue;
         }
-        let sig = subnet_sig(&subnet);
+        let sig = subnet_sig(&subnet, &config.body.relay_exchange_keys);
         if current.get(&id) == Some(&sig) {
             continue; // unchanged — leave the running worker in place
         }
@@ -1548,7 +1563,14 @@ pub(crate) fn sync_client_round(
         );
     }
     let sess = sessions.entry(SessionKey::Client).or_insert_with(|| {
-        match factory { Some(factory) => factory.create(), None => make() }
+        match factory {
+            Some(factory) => {
+                let config = inner.config.read().unwrap();
+                let subnet = config.body.subnets.iter().find(|s| s.id == subnet).unwrap();
+                factory.create(subnet, &config.body.relay_exchange_keys, round)
+            }
+            None => make(),
+        }
     });
     sess.set_cover_rate(if submit { 1.0 } else { 0.0 });
     if submit && sess.can_stage() {

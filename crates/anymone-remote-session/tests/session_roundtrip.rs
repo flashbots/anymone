@@ -38,7 +38,7 @@ async fn tls_native_contribution_replay_resume_and_close() {
     let (mut client, status) = RemoteSessionClient::pair(handle.pairing.clone())
         .await
         .unwrap();
-    assert_eq!(status, expected);
+    assert_eq!(status.client.as_ref(), Some(&expected));
     assert!(RemoteSessionClient::pair(handle.pairing.clone())
         .await
         .is_err());
@@ -48,7 +48,7 @@ async fn tls_native_contribution_replay_resume_and_close() {
         .unwrap();
     assert!(!first.is_empty());
     assert_eq!(
-        client.reconnect().await.unwrap().participant,
+        client.reconnect().await.unwrap().client.unwrap().participant,
         expected.participant
     );
     assert_eq!(

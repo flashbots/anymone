@@ -13,16 +13,81 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 
-use anymone_core::RemoteAttestedSession;
+use anymone_core::{RemoteAttestedSession, RemoteSessionError};
 
-use crate::wire::{PairRequest, PairingInfo, SessionInput, SessionReply};
+use crate::wire::{CommandResult, HostStatus, PairRequest, PairingInfo, SessionCommand, SessionInput, SessionReply};
 use crate::{RemoteTransportError, MAX_FRAME_BYTES};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const IO_TIMEOUT: Duration = Duration::from_secs(60);
 
+pub struct HostState {
+    client: Option<RemoteAttestedSession>,
+    session_id: [u8; 32],
+    next_request: u64,
+    last_reply: Option<([u8; 32], Result<CommandResult, RemoteSessionError>)>,
+    closed: bool,
+}
+
+impl HostState {
+    pub fn status(&self) -> HostStatus {
+        HostStatus {
+            session_id: self.session_id,
+            next_request: self.next_request,
+            closed: self.closed,
+            client: self.client.as_ref().map(RemoteAttestedSession::status),
+        }
+    }
+
+    fn close(&mut self) {
+        if let Some(client) = &mut self.client { client.close(); }
+        self.last_reply = None;
+        self.closed = true;
+    }
+
+    fn execute(&mut self, sequence: u64, command: SessionCommand) -> Result<CommandResult, RemoteSessionError> {
+        if self.closed { return Err(RemoteSessionError::Closed); }
+        let bytes = bincode::serialize(&command).map_err(|e| RemoteSessionError::Protocol(e.to_string()))?;
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        if sequence.checked_add(1) == Some(self.next_request) {
+            if let Some((previous, result)) = &self.last_reply {
+                return if *previous == digest { result.clone() } else { Err(RemoteSessionError::RequestConflict) };
+            }
+        }
+        if sequence != self.next_request {
+            return Err(RemoteSessionError::RequestSequence { expected: self.next_request });
+        }
+        self.next_request = sequence.checked_add(1).ok_or(RemoteSessionError::SequenceExhausted)?;
+        let result = self.apply(command, bytes.len());
+        self.last_reply = Some((digest, result.clone()));
+        result
+    }
+
+    fn apply(&mut self, command: SessionCommand, size: usize) -> Result<CommandResult, RemoteSessionError> {
+        match command {
+            SessionCommand::Configure(config) => {
+                if size > 1024 * 1024 { return Err(RemoteSessionError::InvalidConfig); }
+                let returned_payloads = if let Some(client) = &mut self.client {
+                    client.reconfigure(&config.subnet, &config.relay_exchange_keys, config.starting_round)?
+                } else {
+                    self.client = Some(config.developer_session()?);
+                    Vec::new()
+                };
+                Ok(CommandResult::Configured {
+                    status: self.client.as_ref().unwrap().status(),
+                    returned_payloads,
+                })
+            }
+            SessionCommand::Action(action) => {
+                let client = self.client.as_mut().ok_or_else(|| RemoteSessionError::Protocol("configure the client first".into()))?;
+                client.apply(action).map(CommandResult::Messages)
+            }
+        }
+    }
+}
+
 pub struct RemoteSessionHost {
-    session: Arc<Mutex<RemoteAttestedSession>>,
+    session: Arc<Mutex<HostState>>,
     pairing_token: [u8; 32],
     controller: Arc<Mutex<Option<[u8; 32]>>>,
     tls: Arc<rustls::ServerConfig>,
@@ -31,12 +96,12 @@ pub struct RemoteSessionHost {
 
 pub struct RemoteSessionHostHandle {
     pub pairing: PairingInfo,
-    session: Arc<Mutex<RemoteAttestedSession>>,
+    session: Arc<Mutex<HostState>>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl RemoteSessionHostHandle {
-    pub fn session(&self) -> Arc<Mutex<RemoteAttestedSession>> {
+    pub fn session(&self) -> Arc<Mutex<HostState>> {
         self.session.clone()
     }
 
@@ -54,7 +119,7 @@ impl Drop for RemoteSessionHostHandle {
 }
 
 impl RemoteSessionHost {
-    pub fn new(session: RemoteAttestedSession) -> Result<Self, RemoteTransportError> {
+    pub fn new(session: impl Into<Option<RemoteAttestedSession>>) -> Result<Self, RemoteTransportError> {
         let CertifiedKey { cert, key_pair } =
             generate_simple_self_signed(vec!["anymone.local".to_string()])?;
         let certificate = cert.der().clone();
@@ -65,7 +130,13 @@ impl RemoteSessionHost {
         let mut pairing_token = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut pairing_token);
         Ok(Self {
-            session: Arc::new(Mutex::new(session)),
+            session: Arc::new(Mutex::new(HostState {
+                client: session.into(),
+                session_id: rand::random(),
+                next_request: 0,
+                last_reply: None,
+                closed: false,
+            })),
             pairing_token,
             controller: Arc::new(Mutex::new(None)),
             tls: Arc::new(tls),
@@ -120,7 +191,7 @@ impl RemoteSessionHost {
 
 async fn serve_connection<S>(
     stream: &mut S,
-    session: Arc<Mutex<RemoteAttestedSession>>,
+    session: Arc<Mutex<HostState>>,
     controller: Arc<Mutex<Option<[u8; 32]>>>,
     pairing_token: [u8; 32],
 ) -> Result<(), RemoteTransportError>
@@ -167,9 +238,9 @@ where
             let mut held = session.blocking_lock();
             match input {
                 SessionInput::Pair(_) => SessionReply::Error("connection is already paired".into()),
-                SessionInput::Action { sequence, action } => SessionReply::Action {
+                SessionInput::Request { sequence, command } => SessionReply::Executed {
                     sequence,
-                    result: held.execute(sequence, action),
+                    result: held.execute(sequence, command),
                 },
                 SessionInput::Status => SessionReply::Status(held.status()),
                 SessionInput::Close => {

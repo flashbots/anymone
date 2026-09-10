@@ -110,6 +110,7 @@ struct Reply {
 
 pub struct RemoteAttestedSession {
     client: Option<Client>,
+    identity: Option<Identity>,
     status: RemoteSessionStatus,
     last_reply: Option<Reply>,
     finalized: Option<FinalizedRound>,
@@ -123,8 +124,16 @@ impl RemoteAttestedSession {
         relay_exchange_keys: &[(Pubkey, ExchangePublicKeyWire)],
         starting_round: Round,
     ) -> Result<Self, RemoteSessionError> {
+        Self::with_identity(subnet, relay_exchange_keys, starting_round, Identity::generate())
+    }
+
+    fn with_identity(
+        subnet: &Subnet,
+        relay_exchange_keys: &[(Pubkey, ExchangePublicKeyWire)],
+        starting_round: Round,
+        identity: Identity,
+    ) -> Result<Self, RemoteSessionError> {
         validate_config(subnet, starting_round)?;
-        let identity = Identity::generate();
         let mut seed = [0; 32];
         let mut session_id = [0; 32];
         rand::rngs::OsRng.fill_bytes(&mut seed);
@@ -240,7 +249,38 @@ impl RemoteAttestedSession {
             finalized: None,
             repair: None,
             max_payload,
+            identity: Some(identity),
         })
+    }
+
+    pub fn reconfigure(
+        &mut self,
+        subnet: &Subnet,
+        keys: &[(Pubkey, ExchangePublicKeyWire)],
+        starting_round: Round,
+    ) -> Result<Vec<Vec<u8>>, RemoteSessionError> {
+        if self.status.closed { return Err(RemoteSessionError::Closed); }
+        validate_config(subnet, starting_round)?;
+        let current = &self.status;
+        if subnet.id == current.subnet.id
+            && subnet.protocol == current.subnet.protocol
+            && subnet.relays == current.subnet.relays
+            && subnet.relays.iter().all(|pk|
+                keys.iter().find(|(key, _)| key == pk)
+                    == current.relay_exchange_keys.iter().find(|(key, _)| key == pk))
+        {
+            self.status.subnet = subnet.clone();
+            return Ok(Vec::new());
+        }
+        let mut replacement = Self::with_identity(subnet, keys, starting_round, self.identity.as_ref().unwrap().clone())?;
+        replacement.status.session_id = self.status.session_id;
+        let pending = match self.client.as_mut() {
+            Some(Client::ScheduledPanetiere(client)) => client.take_pending_messages(),
+            Some(Client::ScheduledAdcnet(client)) => client.take_pending_messages(),
+            _ => Vec::new(),
+        };
+        *self = replacement;
+        Ok(pending)
     }
 
     pub fn status(&self) -> RemoteSessionStatus {
@@ -255,10 +295,17 @@ impl RemoteAttestedSession {
 
     pub fn close(&mut self) {
         self.client = None;
+        self.identity = None;
         self.finalized = None;
         self.repair = None;
         self.last_reply = None;
         self.status.closed = true;
+    }
+
+    pub fn apply(&mut self, action: ProtocolAction) -> Result<Vec<Vec<u8>>, RemoteSessionError> {
+        if self.status.closed { return Err(RemoteSessionError::Closed); }
+        let input = action_digest(&action)?;
+        self.execute_action(action, input)
     }
 
     pub fn execute(
@@ -371,7 +418,7 @@ impl RemoteAttestedSession {
                     Some(Client::ScheduledAdcnet(client)) => client.pending_message_count(),
                     _ => 0,
                 };
-                if pending >= 64 {
+                if pending >= 64 || (pending + 1).saturating_mul(self.max_payload) > 8 * 1024 * 1024 {
                     return Err(RemoteSessionError::QueueFull);
                 }
             }

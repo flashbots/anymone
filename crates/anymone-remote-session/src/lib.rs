@@ -6,9 +6,9 @@ pub mod wire;
 pub use backend::RemoteClientBackend;
 pub use client::RemoteSessionClient;
 pub use host::{RemoteSessionHost, RemoteSessionHostHandle};
-pub use wire::{PairingInfo, SessionInput, SessionReply};
+pub use wire::{CommandResult, HostStatus, PairingInfo, SessionCommand, SessionInput, SessionReply};
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HostConfig {
     pub subnet: anymone_core::Subnet,
     pub relay_exchange_keys: Vec<(
@@ -19,6 +19,17 @@ pub struct HostConfig {
 }
 
 impl HostConfig {
+    pub fn protocol(&self) -> anymone_core::RemoteProtocol {
+        use anymone_core::{ProtocolConfig as P, RemoteProtocol as R};
+        match self.subnet.protocol {
+            P::Panetiere(_) => R::Panetiere,
+            P::ScheduledPanetiere(_) => R::ScheduledPanetiere,
+            P::Adcnet(_) => R::Adcnet,
+            P::ScheduledAdcnet(_) => R::ScheduledAdcnet,
+            P::Noop(_) => unreachable!("remote factory rejects Noop"),
+        }
+    }
+
     pub fn developer_session(
         &self,
     ) -> Result<anymone_core::RemoteAttestedSession, anymone_core::RemoteSessionError> {
@@ -33,7 +44,7 @@ impl HostConfig {
 use thiserror::Error;
 
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
-pub const INTERFACE_VERSION: u16 = 3;
+pub const INTERFACE_VERSION: u16 = 0;
 
 #[derive(Debug, Error)]
 pub enum RemoteTransportError {

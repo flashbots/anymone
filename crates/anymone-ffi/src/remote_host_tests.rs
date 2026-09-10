@@ -1,6 +1,6 @@
 use crate::RemoteProtocolHost;
-use anymone_core::{AdcnetConfig, Identity, ProtocolConfig, RemoteSessionStatus, Subnet};
-use anymone_remote_session::{HostConfig, PairingInfo, RemoteSessionClient};
+use anymone_core::{AdcnetConfig, Identity, ProtocolConfig, Subnet};
+use anymone_remote_session::{HostStatus, HostConfig, PairingInfo, RemoteSessionClient};
 
 fn config() -> String {
     let relay = Identity::generate();
@@ -26,46 +26,43 @@ fn config() -> String {
 #[tokio::test]
 async fn remote_host_stops_connections_and_restarts_with_new_keys() {
     let config = config();
-    let host = RemoteProtocolHost::start_developer(config.clone(), "127.0.0.1:0".into())
+    let host = RemoteProtocolHost::start_developer("127.0.0.1:0".into())
         .await
         .unwrap();
     let pairing: PairingInfo = serde_json::from_str(&host.pairing_json().unwrap()).unwrap();
     let (mut client, initial) = RemoteSessionClient::pair(pairing.clone()).await.unwrap();
-    assert!(initial.developer_mode);
+    assert!(initial.client.is_none());
+    let (configured, _) = client.configure(serde_json::from_str(&config).unwrap()).await.unwrap();
+    assert!(configured.developer_mode);
     assert!(!client
         .adcnet_contribute(0, Some(b"mobile".to_vec()))
         .await
         .unwrap()
         .is_empty());
-    let status: RemoteSessionStatus =
+    let status: HostStatus =
         serde_json::from_str(&host.status_json().await.unwrap()).unwrap();
-    assert_eq!(status.next_request, 1);
+    assert_eq!(status.next_request, 2);
     host.stop().await;
     host.stop().await;
     assert!(host.pairing_json().is_err());
     assert!(host.status_json().await.is_err());
     assert!(client.status().await.is_err());
-    let restarted = RemoteProtocolHost::start_developer(config, pairing.address)
+    let restarted = RemoteProtocolHost::start_developer(pairing.address)
         .await
         .unwrap();
-    let next: RemoteSessionStatus =
+    let next: HostStatus =
         serde_json::from_str(&restarted.status_json().await.unwrap()).unwrap();
     assert_ne!(initial.session_id, next.session_id);
-    assert_ne!(initial.participant, next.participant);
+    assert!(next.client.is_none());
+    let pairing: PairingInfo = serde_json::from_str(&restarted.pairing_json().unwrap()).unwrap();
+    let (mut next_client, _) = RemoteSessionClient::pair(pairing).await.unwrap();
+    let (next_protocol, _) = next_client.configure(serde_json::from_str(&config).unwrap()).await.unwrap();
+    assert_ne!(configured.participant, next_protocol.participant);
     assert_eq!(next.next_request, 0);
     restarted.stop().await;
 }
 
 #[tokio::test]
-async fn invalid_configuration_and_wildcard_address_are_rejected() {
-    assert!(
-        RemoteProtocolHost::start_developer("{}".into(), "127.0.0.1:0".into())
-            .await
-            .is_err()
-    );
-    assert!(
-        RemoteProtocolHost::start_developer(config(), "0.0.0.0:0".into())
-            .await
-            .is_err()
-    );
+async fn wildcard_address_is_rejected() {
+    assert!(RemoteProtocolHost::start_developer("0.0.0.0:0".into()).await.is_err());
 }

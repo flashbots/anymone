@@ -1,6 +1,27 @@
 use serde::{Deserialize, Serialize};
 
 use anymone_core::{ProtocolAction, RemoteSessionError, RemoteSessionStatus};
+use crate::HostConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HostStatus {
+    pub session_id: [u8; 32],
+    pub next_request: u64,
+    pub closed: bool,
+    pub client: Option<RemoteSessionStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum SessionCommand {
+    Configure(HostConfig),
+    Action(ProtocolAction),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum CommandResult {
+    Configured { status: RemoteSessionStatus, returned_payloads: Vec<Vec<u8>> },
+    Messages(Vec<Vec<u8>>),
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PairingInfo {
@@ -26,9 +47,9 @@ pub enum PairRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum SessionInput {
     Pair(PairRequest),
-    Action {
+    Request {
         sequence: u64,
-        action: ProtocolAction,
+        command: SessionCommand,
     },
     Status,
     Close,
@@ -36,12 +57,12 @@ pub enum SessionInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum SessionReply {
-    Paired(RemoteSessionStatus),
-    Action {
+    Paired(HostStatus),
+    Executed {
         sequence: u64,
-        result: Result<Vec<Vec<u8>>, RemoteSessionError>,
+        result: Result<CommandResult, RemoteSessionError>,
     },
-    Status(RemoteSessionStatus),
+    Status(HostStatus),
     Closed,
     Error(String),
 }

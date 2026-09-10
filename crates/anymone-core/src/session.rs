@@ -70,7 +70,8 @@ pub trait ClientSessionFactory: Send + Sync {
         subnet: &crate::config::Subnet,
         relay_keys: &[(Pubkey, crate::config::ExchangePublicKeyWire)],
     ) -> bool;
-    fn create(&self) -> Box<dyn Session>;
+    fn create(&self, subnet: &crate::config::Subnet,
+        relay_keys: &[(Pubkey, crate::config::ExchangePublicKeyWire)], round: Round) -> Box<dyn Session>;
 }
 
 pub trait Session: Send {

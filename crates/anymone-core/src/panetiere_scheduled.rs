@@ -372,19 +372,7 @@ impl ScheduledPanetiereClientSession {
 /// of `granted`, so this re-sends without duplicating.
 impl Drop for ScheduledPanetiereClientSession {
     fn drop(&mut self) {
-        let staged = std::mem::take(&mut self.staged);
-        let deferred = std::mem::take(&mut self.deferred);
-        let reserved = std::mem::take(&mut self.reserved);
-        let granted = std::mem::take(&mut self.granted);
-        // Oldest first: `granted` and `reserved` have already waited rounds.
-        let unsent: Vec<Vec<u8>> = granted
-            .into_iter()
-            .map(|(_, _, p)| p)
-            .chain(reserved.into_values().flatten().map(|(_, p)| p))
-            .chain(deferred)
-            .chain(staged)
-            .filter(|p| !p.is_empty())
-            .collect();
+        let unsent = self.take_pending_messages();
         if unsent.is_empty() {
             return;
         }
@@ -411,6 +399,22 @@ impl Drop for ScheduledPanetiereClientSession {
 }
 
 impl ScheduledPanetiereClientSession {
+    pub(crate) fn take_pending_messages(&mut self) -> Vec<Vec<u8>> {
+        let staged = std::mem::take(&mut self.staged);
+        let deferred = std::mem::take(&mut self.deferred);
+        let reserved = std::mem::take(&mut self.reserved);
+        let granted = std::mem::take(&mut self.granted);
+        // Oldest first: `granted` and `reserved` have already waited rounds.
+        granted
+            .into_iter()
+            .map(|(_, _, p)| p)
+            .chain(reserved.into_values().flatten().map(|(_, p)| p))
+            .chain(deferred)
+            .chain(staged)
+            .filter(|p| !p.is_empty())
+            .collect()
+    }
+
     pub fn advance_round(&mut self, round: Round) -> Vec<Vec<u8>> {
         self.cur_round = Some(round);
         // On a non-relay node no server session shares this store, so nothing

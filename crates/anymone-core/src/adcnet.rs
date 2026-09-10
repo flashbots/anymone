@@ -2398,6 +2398,13 @@ impl ScheduledAdcnetClientSession {
     pub fn pending_message_count(&self) -> usize {
         self.pending.len() + usize::from(self.inflight.is_some())
     }
+
+    pub(crate) fn take_pending_messages(&mut self) -> Vec<Vec<u8>> {
+        if let Some((payload, bid, _)) = self.inflight.take() {
+            self.pending.push_front((payload, bid));
+        }
+        self.pending.drain(..).map(|(payload, _)| payload).collect()
+    }
 }
 
 impl Drop for ScheduledAdcnetClientSession {
@@ -2405,11 +2412,9 @@ impl Drop for ScheduledAdcnetClientSession {
         let Some(inner) = self.node.as_ref().and_then(|node| node.upgrade()) else {
             return;
         };
-        if let Some((payload, bid, _)) = self.inflight.take() {
-            self.pending.push_front((payload, bid));
-        }
+        let pending = self.take_pending_messages();
         let mut outbox = inner.outbox.lock().unwrap();
-        for (payload, _) in self.pending.drain(..).rev() {
+        for payload in pending.into_iter().rev() {
             outbox.push_front(payload);
         }
     }
