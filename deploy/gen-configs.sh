@@ -33,8 +33,7 @@ if [[ -e "$OUT" && "${FORCE:-0}" != "1" ]]; then
 fi
 ID="$OUT/identities"
 CFG="$OUT/configs"
-# Only the generated trees; $OUT also holds hand-written launchers (run-local.sh,
-# run-local-txbus.sh) that must survive regeneration.
+# Preserve files outside the generated identity and config directories.
 rm -rf "$ID" "$CFG"
 mkdir -p "$ID" "$CFG"
 
@@ -138,10 +137,10 @@ backbone_cfg chat 7130 "" 1
 backbone_cfg observer 7150 "" 1
 client_cfg client
 
-# Tx-bus demo (run-local-txbus.sh): the RPC gateway plus two forwarding bridges,
+# Tx-bus configs: the RPC gateway plus two forwarding bridges,
 # and a committee pinned to scheduled Panetiere with 16 KiB messages so
 # transactions that size ride the bus. Separate committee configs reusing the
-# same identities, so run-local.sh keeps its ADCNet→Panetiere escalation ladder.
+# same identities, with independent protocol settings.
 TXBUS_COMMITTEE='protocol = "scheduled-panetiere"
 message_size = 16384
 vector_bytes = 65536

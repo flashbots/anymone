@@ -553,11 +553,9 @@ function card(s, rps, series) {
       if (te >= t0 && t1 > t0) escFrac = (te - t0) / (t1 - t0);
     }
   }
-  // Panetiere reached without an observed escalation transition can only be a
-  // governance pin (an unpinned network always starts on ADCNet).
   const escTag = s.escalated_at != null
-    ? `<span class="escalated">↑ escalated @r${s.escalated_at}</span>`
-    : (s.protocol === "Panetiere" && !s._committee ? `<span class="pinned">📌 pinned</span>` : "");
+    ? `<span class="escalated">protocol changed @r${s.escalated_at}</span>`
+    : "";
 
   el.innerHTML = `
     <div class="card-head">

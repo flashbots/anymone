@@ -45,8 +45,8 @@ impl Session for NoopClientSession {
     fn begin_round(&mut self, _round: Round, _now: Instant) -> Vec<Vec<u8>> {
         match self.pending.take() {
             Some(p) if p.len() <= self.cfg.message_size => vec![p],
-            // TODO: oversize payloads are dropped silently here; the runtime is
-            // responsible for fragmenting before staging.
+            // Pipe sends reject oversize payloads; direct session callers must
+            // enforce the same limit before staging.
             Some(_) => vec![],
             None => vec![],
         }

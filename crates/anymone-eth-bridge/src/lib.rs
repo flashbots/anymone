@@ -4,8 +4,7 @@
 //! submit-and-watch page; egress forwards bus traffic to any target node's
 //! `eth_sendRawTransaction`. Both directions share one bus pipe, driven by
 //! [`bus_loop`] — the shape `anymone-chat` uses for its room. Neither
-//! direction touches chain state or links against reth — see
-//! `reth_anon_mempool_design.md` §3/§6.
+//! direction touches chain state or links against reth.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -402,7 +401,7 @@ async fn send_raw<B: BusSend>(st: &AppState<B>, req: RpcRequest) -> Json<Value> 
         return err_response(req.id, code, reject.to_string());
     }
     // Success means "staged into the next round", not "delivered" — the
-    // sender's hash-only contract (design §3); anything past this point is a
+    // sender's hash-only contract; anything past this point is a
     // receipt-polling concern, safe post-broadcast since the tx is public.
     // The page's own confirmation is the tx coming back off the bus.
     if let Err(msg) = st.pipe.send_unlinkable(raw).await {

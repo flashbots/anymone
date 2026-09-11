@@ -1,10 +1,4 @@
-//! Integrity-proof hooks for sessions.
-//!
-//! Each protocol's session module wires integrity proofs internally — the
-//! runtime doesn't see them. The traits here are the lowest common
-//! denominator: attest some bytes, verify some bytes. The real TDX-based
-//! prover isn't implemented yet; `NoopProver` is enough to compile sessions
-//! that take `Option<&dyn TeeProver>`.
+//! Unused integrity-proof interfaces. The crate loads `tee/mod.rs` instead.
 
 pub trait TeeProver: Send + Sync {
     /// Produce an opaque attestation over `statement`.
@@ -16,8 +10,7 @@ pub trait TeeVerifier: Send + Sync {
     fn verify(&self, statement: &[u8], proof: &[u8]) -> bool;
 }
 
-/// Trivial prover: empty attestations, always verifies. Use only for tests
-/// and for subnets configured with integrity mode `None`.
+/// Empty attestations with unconditional verification; provides no integrity.
 pub struct NoopProver;
 
 impl TeeProver for NoopProver {

@@ -1,6 +1,5 @@
 //! anymone — anonymous broadcast channel meta-protocol.
 //!
-//! See `IMPLEMENTATION.md` at the repo root for design and milestones.
 //! Protocol and runtime library used by the node and application binaries.
 
 pub mod adcnet;

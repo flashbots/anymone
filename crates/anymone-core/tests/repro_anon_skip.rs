@@ -1,8 +1,5 @@
-//! INVESTIGATION SCRATCH (delete or fold after diagnosis): live deployment
-//! shows each client silently skipping ~20% of rounds (canonical set 7-11 of
-//! 12) at cover 1.0 on a single Panetiere subnet. This reproduces that topology
-//! in-memory: 4 relays, 12 subscribe-only clients, and an observer counting
-//! every leader ClientSet.
+//! Checks that settled Panetiere rounds include every subscribed client.
+//! Uses four relays, twelve clients by default, and a ClientSet observer.
 
 use std::sync::Arc;
 use std::time::Duration;

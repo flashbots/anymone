@@ -170,7 +170,7 @@ impl PipeSender {
     }
 
     /// Reject payloads too big for one message rather than truncating/dropping
-    /// them downstream; fragmentation across rounds is a later batch. The
+    /// them downstream. The
     /// per-round draw can land the frame on any runnable subnet, so it must fit
     /// the smallest.
     fn check_size_against(anymone: &AnymoneInner, payload_len: usize) -> Result<(), SendError> {

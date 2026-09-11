@@ -3,7 +3,7 @@
 //! (bus ingress, for wallets); `--forward-to <rpc-url>` forwards bus traffic
 //! to any node's `eth_sendRawTransaction` (bus egress, for node operators).
 //! Enable either or both in one process — no reth dependency, works against
-//! any client. See `reth_anon_mempool_design.md` §3/§6.
+//! any client.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -44,7 +44,7 @@ struct Args {
     forward_to: Option<String>,
 
     /// Reject any tx whose effective gas price is under this (wei). Bus spam
-    /// floor — see design §8; no peer-reputation fallback exists once a tx
+    /// floor; no peer-reputation fallback exists once a tx
     /// leaves this process, so this is the only gate before the bus.
     #[arg(long, default_value = "1000000000")]
     min_gas_price: u128,
@@ -66,7 +66,7 @@ struct Args {
     /// the tag needs its own announcer. Set on exactly one identity per
     /// deployment: the committee's service registry is last-write-wins per
     /// tag, so two different identities both announcing the same tag make
-    /// the committee's proposal flap between them (design §5).
+    /// the committee's proposal flap between them.
     #[arg(long)]
     announce: bool,
 }
