@@ -446,6 +446,7 @@ mod sizing_tests {
             },
         );
         let body = AnymoneRoundConfigurationBody {
+            endpoints: Default::default(),
             round: 0,
             epoch_unix_ms: 0,
             services: vec![],
@@ -630,6 +631,8 @@ pub struct SchedulerCore {
     relay_xpubs: HashMap<Pubkey, ExchangePublicKeyWire>,
     /// Client-facing address per relay that advertised one.
     relay_client_addrs: HashMap<Pubkey, String>,
+    node_rpc_urls: HashMap<Pubkey, String>,
+    service_descriptor_urls: HashMap<ServiceTag, String>,
     /// Registered follow-only nodes; secondary peers, never in a subnet roster.
     watchers: HashSet<Pubkey>,
 
@@ -704,6 +707,8 @@ impl SchedulerCore {
             scheduled_vectors: std::collections::BTreeMap::new(),
             services: HashMap::new(),
             relay_client_addrs: HashMap::new(),
+            node_rpc_urls: HashMap::new(),
+            service_descriptor_urls: HashMap::new(),
             watchers: HashSet::new(),
             relay_xpubs: HashMap::new(),
             observers: std::collections::BTreeMap::new(),
@@ -749,6 +754,7 @@ impl SchedulerCore {
                 pubkey,
                 exchange_pubkey,
                 client_addr,
+                rpc_url,
                 ..
             } => {
                 if self.integrity_offenders.contains_key(&pubkey) {
@@ -771,6 +777,10 @@ impl SchedulerCore {
                             "registration: first announcement from a relay"
                         );
                     }
+                    match rpc_url {
+                        Some(url) => self.node_rpc_urls.insert(pubkey, url),
+                        None => self.node_rpc_urls.remove(&pubkey),
+                    };
                     self.relay_xpubs.insert(pubkey, exchange_pubkey);
                     match client_addr {
                         Some(addr) => self.relay_client_addrs.insert(pubkey, addr),
@@ -782,8 +792,13 @@ impl SchedulerCore {
                 tag,
                 pubkey,
                 exchange_pubkey: _,
+                descriptor_url,
                 ..
             } => {
+                match descriptor_url {
+                    Some(url) => self.service_descriptor_urls.insert(tag, url),
+                    None => self.service_descriptor_urls.remove(&tag),
+                };
                 if self.services.insert(tag, pubkey).is_none() {
                     tracing::debug!(
                         target: GOV,
@@ -1524,6 +1539,11 @@ impl SchedulerCore {
             );
             return false;
         }
+        if !body.endpoints.nodes.iter().all(|(key, url)| self.node_rpc_urls.get(key) == Some(url)
+            && body.relay_exchange_keys.iter().any(|(relay, _)| relay == key))
+            || !body.endpoints.services.iter().all(|(tag, url)| self.service_descriptor_urls.get(tag) == Some(url)
+                && body.services.iter().any(|service| service.tag == *tag))
+        { return false; }
         if !self.exchange_keys_match(&body.relay_exchange_keys) {
             tracing::debug!(
                 target: GOV,
@@ -1772,7 +1792,13 @@ impl SchedulerCore {
         relay_client_addrs.sort();
         let mut watchers: Vec<Pubkey> = self.watchers.iter().copied().collect();
         watchers.sort();
+        let mut nodes: Vec<_> = self.node_rpc_urls.iter().filter(|(key, _)| placed.contains(key))
+            .map(|(key, url)| (*key, url.clone())).collect();
+        let mut services: Vec<_> = self.service_descriptor_urls.iter().filter(|(tag, _)| self.services.contains_key(tag))
+            .map(|(tag, url)| (*tag, url.clone())).collect();
+        nodes.sort(); services.sort();
         AnymoneRoundConfigurationBody {
+            endpoints: crate::discovery::Endpoints { nodes, services },
             round: self.public_round,
             epoch_unix_ms: self
                 .epoch_unix_ms

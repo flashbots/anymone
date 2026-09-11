@@ -1,0 +1,27 @@
+[package]
+name = "anymone-rpc-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anymone-core = { path = "../anymone-core" }
+anymone-remote-session = { path = "../anymone-remote-session" }
+anymone-eth-service = { path = "../anymone-eth-service" }
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+hex.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+rand = "=0.9.5"
+reqwest = { workspace = true, features = ["rustls-tls", "stream"] }
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
+subtle = "=2.6.1"
+
+[dev-dependencies]
+ed25519-dalek = "=2.2.0"

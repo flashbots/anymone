@@ -10,6 +10,8 @@ members = [
     "crates/anymone-eth-bridge",
     "crates/anymone-gateway",
     "crates/anymone-remote-session",
+    "crates/anymone-eth-service",
+    "crates/anymone-rpc-client",
 ]
 
 [workspace.package]

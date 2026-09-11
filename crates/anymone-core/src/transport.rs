@@ -187,6 +187,9 @@ pub trait Transport: Send + Sync + 'static {
     /// Store the signed config this node serves to config-pull requests.
     fn serve_config(&self, bytes: Vec<u8>);
 
+    /// The locally adopted config, when this transport serves config pulls.
+    fn cached_config(&self) -> Option<Vec<u8>> { None }
+
     /// Pull the latest signed config from a peer; `None` if none answers yet.
     async fn fetch_config(&self) -> Option<Vec<u8>>;
 
@@ -325,6 +328,10 @@ impl Transport for InMemoryHandle {
             .find(|(pk, _)| **pk != self.identity)
             .or_else(|| configs.iter().next())
             .map(|(_, bytes)| bytes.clone())
+    }
+
+    fn cached_config(&self) -> Option<Vec<u8>> {
+        self.net.configs.lock().unwrap().get(&self.identity).cloned()
     }
 
     fn local_pubkey(&self) -> Pubkey {

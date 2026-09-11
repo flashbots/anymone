@@ -25,12 +25,14 @@ pub enum Registration {
         /// a peer can't redirect another relay's clients.
         #[serde(default)]
         client_addr: Option<String>,
+        rpc_url: Option<String>,
         signature: Vec<u8>, // must match pubkey
     },
     Service {
         tag: ServiceTag,
         pubkey: Pubkey,
         exchange_pubkey: ExchangePublicKeyWire,
+        descriptor_url: Option<String>,
         signature: Vec<u8>, // must match pubkey
     },
     /// A node that only follows the network (observers, dashboards). Carries no
@@ -48,20 +50,14 @@ fn relay_sign_msg(
     pubkey: &Pubkey,
     xk: &ExchangePublicKeyWire,
     client_addr: Option<&str>,
+    rpc_url: Option<&str>,
 ) -> Vec<u8> {
     let mut msg = b"anymone-relay".to_vec();
     msg.extend_from_slice(&pubkey.0);
     msg.extend_from_slice(&xk.ecdh);
     msg.extend_from_slice(&xk.kem);
     msg.extend_from_slice(&xk.set_sig);
-    // Tagged, so an absent address can't be confused with an empty one.
-    match client_addr {
-        Some(a) => {
-            msg.push(1);
-            msg.extend_from_slice(a.as_bytes());
-        }
-        None => msg.push(0),
-    }
+    msg.extend_from_slice(&bincode::serialize(&(client_addr, rpc_url)).expect("endpoints serialize"));
     msg
 }
 
@@ -74,13 +70,14 @@ fn watcher_sign_msg(pubkey: &Pubkey) -> Vec<u8> {
 
 /// Domain-tagged message a service signs: `"anymone-service" || tag || pubkey
 /// || ecdh_pubkey || kem_pubkey`.
-fn service_sign_msg(tag: &ServiceTag, pubkey: &Pubkey, xk: &ExchangePublicKeyWire) -> Vec<u8> {
+fn service_sign_msg(tag: &ServiceTag, pubkey: &Pubkey, xk: &ExchangePublicKeyWire, descriptor_url: Option<&str>) -> Vec<u8> {
     let mut msg = b"anymone-service".to_vec();
     msg.extend_from_slice(&tag.0);
     msg.extend_from_slice(&pubkey.0);
     msg.extend_from_slice(&xk.ecdh);
     msg.extend_from_slice(&xk.kem);
     msg.extend_from_slice(&xk.set_sig);
+    msg.extend_from_slice(&bincode::serialize(&descriptor_url).expect("endpoint serializes"));
     msg
 }
 
@@ -96,16 +93,23 @@ impl Registration {
         exchange_pubkey: ExchangePublicKeyWire,
         client_addr: Option<String>,
     ) -> Self {
+        Self::relay_endpoints(identity, exchange_pubkey, client_addr, None)
+    }
+
+    pub fn relay_endpoints(identity: &Identity, exchange_pubkey: ExchangePublicKeyWire,
+                           client_addr: Option<String>, rpc_url: Option<String>) -> Self {
         let pubkey = identity.pubkey();
         let signature = identity.sign(&relay_sign_msg(
             &pubkey,
             &exchange_pubkey,
             client_addr.as_deref(),
+            rpc_url.as_deref(),
         ));
         Registration::Relay {
             pubkey,
             exchange_pubkey,
             client_addr,
+            rpc_url,
             signature,
         }
     }
@@ -125,12 +129,18 @@ impl Registration {
         tag: ServiceTag,
         exchange_pubkey: ExchangePublicKeyWire,
     ) -> Self {
+        Self::service_at(identity, tag, exchange_pubkey, None)
+    }
+
+    pub fn service_at(identity: &Identity, tag: ServiceTag, exchange_pubkey: ExchangePublicKeyWire,
+                      descriptor_url: Option<String>) -> Self {
         let pubkey = identity.pubkey();
-        let signature = identity.sign(&service_sign_msg(&tag, &pubkey, &exchange_pubkey));
+        let signature = identity.sign(&service_sign_msg(&tag, &pubkey, &exchange_pubkey, descriptor_url.as_deref()));
         Registration::Service {
             tag,
             pubkey,
             exchange_pubkey,
+            descriptor_url,
             signature,
         }
     }
@@ -148,17 +158,20 @@ impl Registration {
                 pubkey,
                 exchange_pubkey,
                 client_addr,
+                rpc_url,
                 signature,
-            } => pubkey.verify(
-                &relay_sign_msg(pubkey, exchange_pubkey, client_addr.as_deref()),
+            } => crate::discovery::valid_endpoint(rpc_url.as_deref()) && pubkey.verify(
+                &relay_sign_msg(pubkey, exchange_pubkey, client_addr.as_deref(), rpc_url.as_deref()),
                 signature,
             ),
             Registration::Service {
                 tag,
                 pubkey,
                 exchange_pubkey,
+                descriptor_url,
                 signature,
-            } => pubkey.verify(&service_sign_msg(tag, pubkey, exchange_pubkey), signature),
+            } => crate::discovery::valid_endpoint(descriptor_url.as_deref()) && pubkey.verify(
+                &service_sign_msg(tag, pubkey, exchange_pubkey, descriptor_url.as_deref()), signature),
             Registration::Watcher { pubkey, signature } => {
                 pubkey.verify(&watcher_sign_msg(pubkey), signature)
             }
@@ -190,7 +203,7 @@ pub async fn announce_relay_registration_at(
     exchange_pubkey: ExchangePublicKeyWire,
     client_addr: Option<String>,
 ) -> JoinHandle<()> {
-    spawn_reannounce(
+    announce_registration_bytes(
         transport,
         Registration::relay_at(identity, exchange_pubkey, client_addr).encode(),
     )
@@ -202,7 +215,7 @@ pub async fn announce_watcher_registration(
     transport: Arc<dyn Transport>,
     identity: &Identity,
 ) -> JoinHandle<()> {
-    spawn_reannounce(transport, Registration::watcher(identity).encode())
+    announce_registration_bytes(transport, Registration::watcher(identity).encode())
 }
 
 /// Re-broadcast a service registration for the node's lifetime (see
@@ -213,13 +226,17 @@ pub async fn announce_service_registration(
     tag: ServiceTag,
     exchange_pubkey: ExchangePublicKeyWire,
 ) -> JoinHandle<()> {
-    spawn_reannounce(
+    announce_registration_bytes(
         transport,
         Registration::service(identity, tag, exchange_pubkey).encode(),
     )
 }
 
-fn spawn_reannounce(transport: Arc<dyn Transport>, reg: Vec<u8>) -> JoinHandle<()> {
+pub fn announce_registration(transport: Arc<dyn Transport>, registration: Registration) -> JoinHandle<()> {
+    announce_registration_bytes(transport, registration.encode())
+}
+
+fn announce_registration_bytes(transport: Arc<dyn Transport>, reg: Vec<u8>) -> JoinHandle<()> {
     tokio::spawn(async move {
         // `interval`, not a `sleep` loop: a `sleep` restarts its countdown after
         // each publish completes, so cadence skews forward by however long the

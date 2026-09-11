@@ -32,6 +32,8 @@ pub fn now_unix_ms() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AnymoneRoundConfigurationBody {
     pub round: Round,
+    #[serde(default)]
+    pub endpoints: crate::discovery::Endpoints,
     /// Round-clock epoch (unix ms). The scheduler stamps the fixed genesis 0;
     /// `round` is the config version, not the clock.
     pub epoch_unix_ms: u64,
@@ -498,6 +500,12 @@ fn tagged_bytes(tag: &[u8], body: &AnymoneRoundConfigurationBody) -> Vec<u8> {
 }
 
 impl AnymoneRoundConfiguration {
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        bincode::DefaultOptions::new().with_fixint_encoding()
+            .with_limit(crate::transport::MAX_TRANSMIT_SIZE as u64)
+            .reject_trailing_bytes().deserialize(bytes).ok()
+    }
+
     pub fn new(body: AnymoneRoundConfigurationBody) -> Self {
         AnymoneRoundConfiguration {
             body,
@@ -563,6 +571,7 @@ impl AnymoneRoundConfiguration {
         services: Vec<ServiceEntry>,
     ) -> Self {
         let body = AnymoneRoundConfigurationBody {
+            endpoints: Default::default(),
             round,
             epoch_unix_ms: now_unix_ms(),
             services,
@@ -590,6 +599,7 @@ mod tests {
 
     fn body() -> AnymoneRoundConfigurationBody {
         AnymoneRoundConfigurationBody {
+            endpoints: Default::default(),
             round: 42,
             epoch_unix_ms: 0,
             services: vec![ServiceEntry {

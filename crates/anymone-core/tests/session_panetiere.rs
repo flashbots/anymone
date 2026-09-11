@@ -724,6 +724,7 @@ fn adcnet_config_body(n_subnets: usize) -> AnymoneRoundConfigurationBody {
         })
         .collect();
     AnymoneRoundConfigurationBody {
+        endpoints: Default::default(),
         round: 1,
         epoch_unix_ms: now_unix_ms(),
         services: vec![ServiceEntry {

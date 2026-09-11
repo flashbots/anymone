@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anymone_core::config::ExchangePublicKeyWire;
-use anymone_core::scheduling::{announce_relay_registration_at, announce_service_registration};
+use anymone_core::scheduling::{announce_registration, announce_service_registration};
 use anymone_core::transport::Transport;
 use anymone_core::{
     committee_roster, spawn_panetiere_committee_scheduler, Anymone, GovernanceBootstrap, Identity,
@@ -28,6 +28,22 @@ pub struct DemoArgs {
     /// Start loopback network listeners and export client.toml into a fresh directory.
     #[arg(long)]
     pub output: Option<std::path::PathBuf>,
+
+    /// Start the Ethereum service and RPC client using this execution upstream.
+    #[arg(long, requires = "output")]
+    pub rpc_url: Option<String>,
+
+    /// Forward ERC-4337 calls to an existing bundler on the same chain.
+    #[arg(long, requires = "rpc_url")]
+    pub bundler_url: Option<String>,
+
+    /// Phone pairing export; otherwise start a software developer session.
+    #[arg(long, requires = "rpc_url")]
+    pub pairing: Option<std::path::PathBuf>,
+
+    /// Loopback discovery port when --output is used.
+    #[arg(long, default_value = "7700")]
+    pub discovery_port: u16,
 
     /// Port to serve the dashboard + `/state` on.
     #[arg(long, default_value = "7000")]
@@ -80,7 +96,10 @@ fn xk(id: &Identity) -> ExchangePublicKeyWire {
     id.exchange_keys()
 }
 
-pub async fn run_demo(args: DemoArgs) -> Result<()> {
+pub async fn run_demo(mut args: DemoArgs) -> Result<()> {
+    if let Some(output) = &mut args.output {
+        *output = std::env::current_dir()?.join(&*output);
+    }
     let net = InMemoryNetwork::new();
 
 
@@ -97,6 +116,9 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
     let network = args.output.as_ref().map(|output|
         crate::demo_network::DemoNetwork::start(&committee_ids, &relay_ids, output)
     ).transpose()?.map(Arc::new);
+    if let (Some(network), Some(output)) = (&network, &args.output) {
+        network.start_discovery(&relay_ids[0], output, args.discovery_port).await?;
+    }
     let handle = {
         let net = net.clone();
         let network = network.clone();
@@ -119,6 +141,8 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
             min_relays: args.relays,
             min_services: 1,
             fault_threshold: 2,
+            message_size: if args.rpc_url.is_some() { 4096 } else { 256 },
+            min_capacity: if args.rpc_url.is_some() { 20 } else { anymone_core::SchedulerParams::default().min_capacity },
             // Panetiere-only demo: pin the protocol so the subnet runs Panetiere
             // from the first config instead of starting on ADCNet and escalating.
             // Sidelining on a corrupt-share fault still runs (the fault knob).
@@ -180,7 +204,10 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
 
     // --- publish registrations; committee now has quorum and emits a config -
     for id in &relay_ids {
-        announce_relay_registration_at(handle(id), id, xk(id), network.as_ref().and_then(|n| n.relay_addresses.get(&id.pubkey()).cloned())).await;
+        let stream = network.as_ref().and_then(|n| n.relay_addresses.get(&id.pubkey()).cloned());
+        let rpc = network.as_ref().filter(|_| id.pubkey() == relay_ids[0].pubkey())
+            .map(|_| format!("http://127.0.0.1:{}", args.discovery_port));
+        announce_registration(handle(id), anymone_core::Registration::relay_endpoints(id, xk(id), stream, rpc));
     }
     announce_service_registration(svc_transport, &svc_id, chat_tag, xk(&svc_id)).await;
 
@@ -376,7 +403,24 @@ pub async fn run_demo(args: DemoArgs) -> Result<()> {
         "demo network running; open the dashboard"
     );
     let _committee_tasks = committee_tasks; // keep schedulers alive
-    crate::serve(observatory, args.dashboard_port, Some(controls)).await
+    let mut rpc = match (&args.output, &args.rpc_url) {
+        (Some(output), Some(url)) => Some(tokio::select! {
+            result = crate::demo_rpc::RpcDemo::start(
+                output, url, args.bundler_url.as_deref(), args.pairing.as_deref()) => result?,
+            result = tokio::signal::ctrl_c() => { result?; return Ok(()); },
+        }),
+        _ => None,
+    };
+    tokio::select! {
+        result = crate::serve(observatory, args.dashboard_port, Some(controls)) => result,
+        result = tokio::signal::ctrl_c() => { result?; Ok(()) },
+        result = async {
+            match &mut rpc {
+                Some(rpc) => rpc.supervise().await,
+                None => std::future::pending().await,
+            }
+        } => result,
+    }
 }
 
 const HANDLES: &[&str] = &[

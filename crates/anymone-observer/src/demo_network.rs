@@ -18,7 +18,12 @@ impl DemoNetwork {
         if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::create_dir(output).context("choose a fresh --output directory for this demo")?;
+        let mut directory = std::fs::DirBuilder::new();
+        #[cfg(unix)] {
+            use std::os::unix::fs::DirBuilderExt;
+            directory.mode(0o700);
+        }
+        directory.create(output).context("choose a fresh --output directory for this demo")?;
         let ids: Vec<_> = committee.iter().chain(relays).collect();
         let sockets: Vec<_> = (0..ids.len() * 2)
             .map(|_| TcpListener::bind("127.0.0.1:0"))
@@ -89,6 +94,37 @@ impl DemoNetwork {
                 .map(|(pk, addr)| (pk, addr.to_string()))
                 .collect(),
         })
+    }
+
+
+    pub async fn start_discovery(&self, relay: &Identity, output: &Path, port: u16) -> Result<()> {
+        use anymone_core::{discovery::{Genesis, NetworkInfo}, BootstrapConfig};
+        use axum::{http::StatusCode, routing::get, Json, Router};
+
+        let bootstrap = BootstrapConfig::load(&output.join("client.toml"))?;
+        let genesis = Genesis::new(bootstrap.governance);
+        genesis.validate()?;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        std::fs::write(output.join("genesis.json"), serde_json::to_vec_pretty(&genesis)?)?;
+        let pinned = format!("{endpoint}#{}", hex::encode(genesis.hash()));
+        std::fs::write(output.join("discovery-url.txt"), format!("{pinned}\n"))?;
+        let transport = self.handle(relay);
+        let app = Router::new().route("/network", get(move || {
+            let (genesis, transport) = (genesis.clone(), transport.clone());
+            async move {
+                let bytes = transport.cached_config().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+                let config = anymone_core::AnymoneRoundConfiguration::decode(&bytes)
+                    .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+                genesis.verify_config(&config).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+                Ok::<_, StatusCode>(Json(NetworkInfo { genesis, config }))
+            }
+        }));
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, app).await { tracing::error!(%error, "demo discovery stopped"); }
+        });
+        println!("Demo discovery: {pinned}");
+        Ok(())
     }
 
     pub fn handle(&self, id: &Identity) -> Arc<dyn Transport> {

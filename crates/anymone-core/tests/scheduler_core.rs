@@ -118,6 +118,26 @@ fn register_relays_and_service(core: &mut SchedulerCore, relays: &[Identity], se
 }
 
 #[test]
+fn discovery_endpoints_follow_signed_registrations() {
+    let committee: Vec<_> = (0..3).map(|_| Identity::generate()).collect();
+    let relays: Vec<_> = (0..3).map(|_| Identity::generate()).collect();
+    let service = Identity::generate();
+    let tag = ServiceTag::from_label("anymone.echo");
+    let mut core = lead_core(&committee, 2);
+    register_relays_and_service(&mut core, &relays, &service);
+    core.on_registration(Registration::relay_endpoints(&relays[0], xkw(&relays[0]),
+        Some("127.0.0.1:7600".into()), Some("https://node.example".into())));
+    core.on_registration(Registration::service_at(&service, tag, xkw(&service),
+        Some("https://service.example/descriptor".into())));
+    let body = staged_body(&core.tick(0, 0)).unwrap();
+    assert_eq!(body.endpoints.nodes, vec![(relays[0].pubkey(), "https://node.example".into())]);
+    assert_eq!(body.endpoints.services, vec![(tag, "https://service.example/descriptor".into())]);
+    let mut forged = body;
+    forged.endpoints.services[0].1 = "https://forged.example/descriptor".into();
+    assert!(core.on_decoded_body(sign_proposal(&lead_of(&committee), forged)).is_empty());
+}
+
+#[test]
 fn omitted_protocol_defaults_to_ordinary_panetiere() {
     let committee: Vec<_> = (0..3).map(|_| Identity::generate()).collect();
     let relays: Vec<_> = (0..3).map(|_| Identity::generate()).collect();
@@ -461,6 +481,7 @@ fn multisig_assembles_via_committee_sig() {
 
     // A multisig-valid but empty-relay body must be rejected, not panic in leader_of.
     let empty_relay_cfg = AnymoneRoundConfiguration::new(AnymoneRoundConfigurationBody {
+        endpoints: Default::default(),
         round: cfg.body.round,
         epoch_unix_ms: cfg.body.epoch_unix_ms,
         services: vec![],

@@ -460,6 +460,7 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
     }];
 
     let v0 = AnymoneRoundConfiguration::new(AnymoneRoundConfigurationBody {
+        endpoints: Default::default(),
         round: 0,
         epoch_unix_ms: now_unix_ms(),
         services: services.clone(),
@@ -482,6 +483,7 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
         ProtocolConfig::Adcnet(c)
     };
     let v1 = AnymoneRoundConfiguration::new(AnymoneRoundConfigurationBody {
+        endpoints: Default::default(),
         round: 1,
         epoch_unix_ms: now_unix_ms(),
         services,
@@ -659,6 +661,7 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
     // graceful cutover completes. The subnet must keep running afterwards.
     for (v, max) in [(2u64, 80), (3, 88), (4, 96)] {
         let cfg = AnymoneRoundConfiguration::new(AnymoneRoundConfigurationBody {
+            endpoints: Default::default(),
             round: v,
             epoch_unix_ms: now_unix_ms(),
             services: vec![ServiceEntry {

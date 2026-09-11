@@ -5,13 +5,15 @@
 //! seed that peers dial to find each other. `keygen` mints node identities for
 //! a deployment's config.
 
+mod discovery;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use anymone_core::transport::Transport;
 use anymone_core::{
-    announce_relay_registration_at, announce_service_registration,
+    announce_service_registration,
     spawn_panetiere_committee_scheduler, Anymone, BootstrapConfig, GoodClients,
     GovernanceBootstrap, Identity, Misbehavior, ServiceTag,
 };
@@ -39,6 +41,8 @@ enum Cmd {
 
 #[derive(Parser, Debug)]
 struct RunArgs {
+    #[command(flatten)]
+    discovery: discovery::DiscoveryArgs,
     /// Path to the bootstrap TOML config.
     #[arg(long)]
     config: PathBuf,
@@ -58,6 +62,8 @@ struct RunArgs {
 
 #[derive(Parser, Debug)]
 struct BootnodeArgs {
+    #[command(flatten)]
+    discovery: discovery::DiscoveryArgs,
     /// Path to the bootstrap TOML config (only identity_path + network are read).
     #[arg(long)]
     config: PathBuf,
@@ -243,8 +249,9 @@ async fn bootnode(args: BootnodeArgs) -> Result<()> {
         .with_context(|| format!("identity at {}", bootstrap.identity_path.display()))?;
     tracing::info!(pubkey = %identity.pubkey(), "starting bootnode");
 
-    let _transport =
+    let transport =
         anymone_core::backend::start_node_transport(&identity, &bootstrap, GoodClients::all())?;
+    discovery::start(&args.discovery, &bootstrap, transport.clone()).await?;
     tracing::info!("bootnode online; waiting for ctrl-c");
     tokio::signal::ctrl_c().await.ok();
     Ok(())
@@ -276,6 +283,7 @@ async fn run(args: RunArgs) -> Result<()> {
     // Endpoint comes up before Anymone start (which blocks on the first
     // config), so scrapes work during bootstrap. The relay's misbehavior route
     // answers 503 until its slot is filled below.
+    discovery::start(&args.discovery, &bootstrap, transport.clone()).await?;
     let misbehavior_slot: Option<AnymoneSlot> =
         (args.role == Role::Relay).then(|| Arc::new(std::sync::RwLock::new(None)));
     if let Some(port) = args.peers_port {
@@ -305,13 +313,11 @@ async fn run(args: RunArgs) -> Result<()> {
             // announcement itself rides a stream connection when one is
             // configured — a relay outside every tracked set can't reach the
             // committee over the backbone.
-            let _reannounce = announce_relay_registration_at(
+            let _reannounce = anymone_core::scheduling::announce_registration(
                 anymone_core::backend::registration_transport(&identity, &bootstrap, &transport),
-                &identity,
-                xk,
-                bootstrap.network.stream_listen.clone(),
-            )
-            .await;
+                anymone_core::Registration::relay_endpoints(&identity, xk,
+                    bootstrap.network.stream_listen.clone(), args.discovery.rpc_url),
+            );
             let anymone = Arc::new({
                 let mut prep = Anymone::prepare(identity, transport, gov).await;
                 prep.set_tee(tee);

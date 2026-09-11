@@ -11,6 +11,7 @@ pub mod client_set;
 pub mod committee;
 pub mod config;
 pub mod cw;
+pub mod discovery;
 pub mod faults;
 pub mod governance;
 pub mod identity;

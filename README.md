@@ -30,6 +30,10 @@ The protocol dependencies are pinned to Git revisions in `crates/anymone-core/Ca
 
 ## Run a local demo
 
+For anonymous Ethereum reads and signed submissions, see the
+[Ethereum RPC demo](crates/anymone-eth-service/demo.md), including phone sessions,
+Kohaku and connecting to a remote network through discovery.
+
 ```sh
 cargo run --locked -p anymone-observer -- demo
 ```

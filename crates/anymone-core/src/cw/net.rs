@@ -273,6 +273,8 @@ impl Transport for CommonwareNetwork {
         *self.shared.served_config.lock().unwrap() = Some(bytes);
     }
 
+    fn cached_config(&self) -> Option<Vec<u8>> { self.shared.served_config() }
+
     async fn fetch_config(&self) -> Option<Vec<u8>> {
         let (tx, rx) = oneshot::channel();
         self.send_cmd(Cmd::FetchConfig(tx));

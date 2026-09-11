@@ -8,6 +8,7 @@
 
 mod demo;
 mod demo_network;
+mod demo_rpc;
 mod loadgen;
 mod observatory;
 

@@ -678,6 +678,7 @@ mod tests {
 
     fn cfg(round: u64) -> AnymoneRoundConfiguration {
         AnymoneRoundConfiguration::new(AnymoneRoundConfigurationBody {
+            endpoints: Default::default(),
             round,
             epoch_unix_ms: 0,
             services: vec![],
