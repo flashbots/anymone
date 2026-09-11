@@ -1,5 +1,9 @@
 # Anymone
 
+> [!WARNING]
+> This repository is under active development, and it has not been audited. Do not use it for any production use case.
+> Do use it to experiment with the protocol 💖
+
 Anymone provides anonymous broadcast channels shared by applications. A scheduling committee publishes signed subnet configurations; relays run the selected protocol; clients submit messages and cover traffic. Services receive messages by tag and reply through the same channels.
 
 This repository contains the Rust runtime, node binaries, applications, and UniFFI bindings.
