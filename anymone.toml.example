@@ -4,11 +4,25 @@
 identity_path = "/var/lib/anymone/identity"
 
 [network]
-listen = "/ip4/0.0.0.0/tcp/7100"
-# Every node seeds from the bootnode alone; Kademlia discovers the rest.
-bootstrap_peers = [
-    "/dns4/anymone-bootnode.example/tcp/7100/p2p/12D3KooWReplaceMe",
+listen_addr = "0.0.0.0:7100"
+# Replace with this node's reachable IP and port, including any NAT mapping.
+dialable_addr = "192.0.2.10:7100"
+# Commonware discovers addresses for authorized peers through signed address gossip.
+# Supply bootstrap peers as ed25519:<hex>@IP:port; replace these placeholders.
+bootstrappers = [
+    "ed25519:0000000000000000000000000000000000000000000000000000000000000000@192.0.2.1:7100",
 ]
+# Additional backbone identities admitted before the first signed config.
+# The governance committee and bootstrappers are included automatically.
+genesis_peers = []
+# Optional separate listener for encrypted client connections.
+# stream_listen = "0.0.0.0:7600"
+# Required for client-plane processes; use each node's client-facing port.
+# stream_bootstrappers = [
+#     "ed25519:0000000000000000000000000000000000000000000000000000000000000000@192.0.2.1:7600",
+# ]
+# Enable for local deployments to allow private IPs and faster discovery.
+local = false
 
 [governance]
 # Scheduling committee. Configs require >= threshold signatures. Each member
@@ -16,17 +30,18 @@ bootstrap_peers = [
 # internal Panetiere seals openings to.
 threshold = 2
 
+# Replace all placeholder keys below with each member's actual public keys.
 [[governance.committee]]
 pubkey = "ed25519:0000000000000000000000000000000000000000000000000000000000000000"
-exchange_pubkey = "00"
+exchange_pubkey = { ecdh = "00", kem = "00", set_sig = "00" }
 
 [[governance.committee]]
 pubkey = "ed25519:0000000000000000000000000000000000000000000000000000000000000001"
-exchange_pubkey = "00"
+exchange_pubkey = { ecdh = "00", kem = "00", set_sig = "00" }
 
 [[governance.committee]]
 pubkey = "ed25519:0000000000000000000000000000000000000000000000000000000000000002"
-exchange_pubkey = "00"
+exchange_pubkey = { ecdh = "00", kem = "00", set_sig = "00" }
 
 # Committee scheduler tunables. Must be identical on every node (they shape the
 # published config all nodes decode against). Optional — omit for these defaults.
