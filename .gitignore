@@ -2,3 +2,7 @@
 .DS_Store
 *.swp
 anymone.toml
+
+# Local RPC client state and connection profile
+/rpc-client-state/
+/anymone-sepolia.json
