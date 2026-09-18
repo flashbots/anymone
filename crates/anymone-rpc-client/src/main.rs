@@ -36,6 +36,11 @@ struct ApiState {
 
 #[tokio::main(worker_threads = 8)]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_|
+            tracing_subscriber::EnvFilter::new("anymone_rpc_client=info,anymone_remote_session=info")))
+        .with_target(false)
+        .init();
     match Args::parse().command {
         Command::Decrypt { capability, response } => {
             let secret = Zeroizing::new(std::fs::read(capability)?);
@@ -68,13 +73,18 @@ async fn serve(config: ClientProfile, discovery: Option<discovery::Discovery>) -
     anyhow::ensure!(token.trim().len() >= 32, "broker token must contain at least 32 characters");
     let listen = profile.listen;
     let listener = tokio::net::TcpListener::bind(listen).await?;
+    tracing::info!(%listen, "RPC client listening");
     let host = listen.to_string();
     let upload = remote_session.clone().map(|session| session as Arc<dyn Upload>);
     let broker = Broker::new(profile, upload)?;
     broker.start_reader().await?;
     if let Some(discovery) = discovery { discovery.follow(broker.clone(), remote_session.clone()); }
     if connect_on_start {
-        if let Some(remote) = &remote_session { remote.connect().await?; }
+        if let Some(remote) = &remote_session {
+            tracing::info!("connecting to phone");
+            remote.connect().await?;
+            tracing::info!("phone connected");
+        }
     }
     let state = Arc::new(ApiState { broker, remote_session, token: Zeroizing::new(token.trim().to_owned()), host,
         permits: tokio::sync::Semaphore::new(8) });
@@ -89,14 +99,21 @@ async fn serve(config: ClientProfile, discovery: Option<discovery::Discovery>) -
             s.broker.start_reader().await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
             if let Some(remote) = &s.remote_session {
                 remote.connect().await.map_err(|error| {
-                    eprintln!("phone connection: {error:#}");
+                    tracing::error!(error = %error, "phone connection failed");
                     StatusCode::SERVICE_UNAVAILABLE
                 })?;
+                tracing::info!("phone connected");
             }
             Ok::<_, StatusCode>(Json(s.broker.status().await))
         }))
         .route("/session/disconnect", post(|State(s): State<Arc<ApiState>>| async move {
-            if let Some(remote) = &s.remote_session { remote.disconnect().await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?; }
+            if let Some(remote) = &s.remote_session {
+                remote.disconnect().await.map_err(|error| {
+                    tracing::error!(%error, "phone disconnect failed");
+                    StatusCode::SERVICE_UNAVAILABLE
+                })?;
+                tracing::info!("phone disconnected");
+            }
             Ok::<_, StatusCode>(StatusCode::NO_CONTENT)
         }))
         .route("/rpc/:service/:route", post(rpc))
@@ -127,7 +144,10 @@ async fn rpc(State(state): State<Arc<ApiState>>, Path((service, route)): Path<(S
     match state.broker.rpc(&service, &route, &body).await {
         Ok(Some(value)) => Json(value).into_response(),
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => {
+            tracing::error!(%error, %service, %route, "RPC failed");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
     }
 }
 

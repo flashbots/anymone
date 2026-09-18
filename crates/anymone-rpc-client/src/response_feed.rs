@@ -15,6 +15,7 @@ pub async fn follow(broker: Arc<Broker>, stop_at: u64) -> Result<()> {
     let mut next = broker.store.cursor(&feed.feed)?.unwrap_or(oldest).max(oldest);
     let period = Duration::from_millis((feed.epoch_seconds.saturating_mul(1000) / 2).max(1));
     let mut tick = 0usize;
+    let mut last_problem = None;
     let mut timer = tokio::time::interval(period);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     while now() < stop_at {
@@ -26,11 +27,35 @@ pub async fn follow(broker: Arc<Broker>, stop_at: u64) -> Result<()> {
         let profile = broker.profile();
         let mirror = &profile.feed_mirrors[tick % profile.feed_mirrors.len()];
         tick = tick.wrapping_add(1);
-        let Ok(response) = client.get(format!("{}/epochs/{epoch}", mirror.trim_end_matches('/'))).send().await else { continue; };
+        let response = match client.get(format!("{}/epochs/{epoch}", mirror.trim_end_matches('/'))).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                report_problem(&mut last_problem, format!("fetching epoch {epoch} from {mirror}: {error}"));
+                continue;
+            }
+        };
         let limit = feed.max_epoch_bytes as usize;
-        let Ok(bytes) = bounded_response(response, limit).await else { continue; };
-        let Ok(batch) = bincode::deserialize::<EpochBatch>(&bytes) else { continue; };
-        if batch.validate(feed, epoch, now()).is_err() { continue; }
+        let bytes = match bounded_response(response, limit).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                report_problem(&mut last_problem, format!("reading epoch {epoch} from {mirror}: {error}"));
+                continue;
+            }
+        };
+        let batch = match bincode::deserialize::<EpochBatch>(&bytes) {
+            Ok(batch) => batch,
+            Err(error) => {
+                report_problem(&mut last_problem, format!("decoding epoch {epoch} from {mirror}: {error}"));
+                continue;
+            }
+        };
+        if let Err(error) = batch.validate(feed, epoch, now()) {
+            report_problem(&mut last_problem, format!("validating epoch {epoch} from {mirror}: {error}"));
+            continue;
+        }
+        if let Some(problem) = last_problem.take() {
+            tracing::info!(previous = %problem, "response feed recovered");
+        }
         let caps = broker.store.pending(now())?;
         let mut locators = HashMap::new();
         for (index, (cap, _)) in caps.iter().enumerate() {
@@ -45,13 +70,24 @@ pub async fn follow(broker: Arc<Broker>, stop_at: u64) -> Result<()> {
                 let limit = limit.or_else(|| initial.services.values().chain(profile.services.values())
                     .find(|service| service.signed.descriptor.signing_key == cap.context.service)
                     .map(|service| service.signed.descriptor.limits.max_response_bytes));
-                if let Some(limit) = limit { let _ = broker.store.record(cap, packet, limit, now()); }
+                if let Some(limit) = limit {
+                    if let Err(error) = broker.store.record(cap, packet, limit, now()) {
+                        tracing::warn!(epoch, %error, "response packet rejected");
+                    }
+                }
             }
         }
         broker.store.advance(&feed.feed, epoch)?;
         next = epoch.saturating_add(1);
     }
     Ok(())
+}
+
+fn report_problem(previous: &mut Option<String>, problem: String) {
+    if previous.as_deref() != Some(problem.as_str()) {
+        tracing::warn!(%problem, "response feed unavailable");
+        *previous = Some(problem);
+    }
 }
 
 #[cfg(test)]

@@ -44,9 +44,14 @@ impl RemoteSession {
         match result {
             Ok(participant) => {
                 *self.participant.write().map_err(|_| anyhow::anyhow!("session lock poisoned"))? = Some(participant);
+                tracing::info!("remote protocol session started");
                 Ok(())
             }
-            Err(error) => { let _ = remote.close().await; Err(error) }
+            Err(error) => {
+                tracing::error!(%error, "remote protocol session failed to start");
+                let _ = remote.close().await;
+                Err(error)
+            }
         }
     }
 
@@ -94,14 +99,16 @@ impl RemoteSession {
         let _connecting = self.connecting.lock().await;
         let participant = self.participant.write().map_err(|_| anyhow::anyhow!("session lock poisoned"))?.take();
         if let Some(participant) = participant { participant.remote.close().await?; }
+        tracing::info!("remote protocol session stopped");
         Ok(())
     }
 
     pub fn status(&self) -> Result<Value> {
         let participant = self.participant.read().map_err(|_| anyhow::anyhow!("session lock poisoned"))?;
-        Ok(json!({"connected":participant.is_some(),
+        let error = participant.as_ref().and_then(|participant| participant.remote.last_error());
+        Ok(json!({"connected":participant.is_some() && error.is_none(),
             "configured":participant.as_ref().is_some_and(|p| p.remote.context().is_some()),
-            "error":participant.as_ref().is_some_and(|p| p.remote.last_error().is_some())}))
+            "error":error}))
     }
 }
 

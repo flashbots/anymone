@@ -96,13 +96,11 @@ pub fn discover(duration: Duration) -> Result<Vec<DiscoveredHost>> {
     let receiver = daemon.0.browse(SERVICE_TYPE).context("browsing remote hosts")?;
     let deadline = Instant::now() + duration;
     let mut hosts = BTreeMap::new();
-    let version = crate::INTERFACE_VERSION.to_string();
     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
         let Ok(event) = receiver.recv_timeout(left) else { break };
         match event {
             ServiceEvent::ServiceResolved(info) => {
-                if info.get_property_val_str("version") != Some(version.as_str())
-                    || info.get_property_val_str("pairing") != Some("code") { continue; }
+                if info.get_property_val_str("pairing") != Some("code") { continue; }
                 if hosts.len() >= 64 { continue; }
                 if let Some(ip) = info.get_addresses_v4().into_iter().min() {
                     let name = info.get_fullname().trim_end_matches(SERVICE_TYPE).trim_end_matches('.').to_string();
@@ -132,7 +130,7 @@ mod tests {
         let daemon = Discovery(ServiceDaemon::new().unwrap());
         let info = mdns_sd::ServiceInfo::new(
             SERVICE_TYPE, &name, &format!("{name}.local."), "", port,
-            [("version", "0"), ("pairing", "code")].as_slice(),
+            [("pairing", "code")].as_slice(),
         ).unwrap().enable_addr_auto();
         daemon.0.register(info).unwrap();
         let hosts = tokio::task::spawn_blocking(|| discover(Duration::from_secs(5))).await.unwrap().unwrap();

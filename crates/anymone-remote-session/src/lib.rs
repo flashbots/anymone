@@ -47,7 +47,6 @@ impl HostConfig {
 use thiserror::Error;
 
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
-pub const INTERFACE_VERSION: u16 = 0;
 
 #[derive(Debug, Error)]
 pub enum RemoteTransportError {

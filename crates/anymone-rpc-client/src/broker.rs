@@ -54,8 +54,11 @@ impl Broker {
         let stop_at = now().saturating_add(self.profile().session_seconds);
         let broker = self.clone();
         *reader = Some(Reader { stop_at, task: tokio::spawn(async move {
-            crate::response_feed::follow(broker, stop_at).await
+            let result = crate::response_feed::follow(broker, stop_at).await;
+            if let Err(error) = &result { tracing::error!(%error, "response reader stopped"); }
+            result
         }) });
+        tracing::info!(stop_at, "response reader started");
         Ok(())
     }
 
@@ -98,14 +101,24 @@ impl Broker {
             request_digest: RequestEnvelope::payload_digest(route, bytes)?, expires_at }, delivery);
         let request = RequestEnvelope { capability: capability.clone(), backend_route: route.to_owned(), payload: bytes.to_vec() };
         request.validate(descriptor, operation, now())?;
+        let operation_id = hex::encode(operation);
+        tracing::info!(operation = %operation_id, %service, %route, "RPC operation created");
         let fragments = seal_fragments(&descriptor.request_key, operation, expires_at, &request.to_bytes()?, capacity)?;
         self.store.insert(&capability, descriptor.limits.max_response_bytes, now())?;
-        if upload.send(&descriptor.tag, fragments).is_err() { return Ok(unknown(bytes, operation)); }
+        if let Err(error) = upload.send(&descriptor.tag, fragments) {
+            tracing::error!(operation = %operation_id, %error, "RPC upload failed");
+            return Ok(unknown(bytes, operation, "upload_failed"));
+        }
+        tracing::info!(operation = %operation_id, "RPC request uploaded; waiting for response");
         while now() < expires_at {
-            if let Some(bytes) = self.store.response(&operation)? { return Ok(serde_json::from_slice(&bytes)?); }
+            if let Some(bytes) = self.store.response(&operation)? {
+                tracing::info!(operation = %operation_id, "RPC response received");
+                return Ok(serde_json::from_slice(&bytes)?);
+            }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        Ok(unknown(bytes, operation))
+        tracing::warn!(operation = %operation_id, "RPC response deadline elapsed");
+        Ok(unknown(bytes, operation, "response_deadline_elapsed"))
     }
 }
 
@@ -120,9 +133,9 @@ pub async fn bounded_response(mut response: reqwest::Response, limit: usize) -> 
     Ok(bytes)
 }
 
-fn unknown(bytes: &[u8], operation: [u8; 32]) -> Option<Value> {
+fn unknown(bytes: &[u8], operation: [u8; 32], stage: &str) -> Option<Value> {
     let error = |id| json!({"jsonrpc":"2.0","id":id,"error":{"code":-32098,"message":"Operation outcome unknown",
-        "data":{"outcome":"Unknown","operation":hex::encode(operation)}}});
+        "data":{"outcome":"Unknown","operation":hex::encode(operation),"stage":stage}}});
     let reply = |item: &Value| match RpcCall::parse(item) {
         Ok(call) => call.id.map(&error),
         Err(_) => Some(error(Value::Null)),
@@ -154,6 +167,13 @@ mod broker_tests {
             self.0.send((tag.to_owned(), fragments))?;
             Ok(())
         }
+    }
+
+    #[test]
+    fn unknown_outcome_identifies_the_failed_stage() {
+        let request = br#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId"}"#;
+        let response = unknown(request, [7; 32], "upload_failed").unwrap();
+        assert_eq!(response["error"]["data"]["stage"], "upload_failed");
     }
 
     #[tokio::test]

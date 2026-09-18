@@ -9,6 +9,9 @@ pub struct HostStatus {
     pub next_request: u64,
     pub closed: bool,
     pub paired: bool,
+    pub connected: bool,
+    pub last_activity: String,
+    pub last_error: Option<String>,
     pub pairing_attempts_remaining: u8,
     pub client: Option<RemoteSessionStatus>,
 }
@@ -27,7 +30,6 @@ pub enum CommandResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PairingInfo {
-    pub interface_version: u16,
     pub address: String,
     #[serde(with = "serde_bytes")]
     pub certificate_der: Vec<u8>,

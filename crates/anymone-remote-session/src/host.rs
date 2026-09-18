@@ -13,7 +13,10 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 
-use anymone_core::{RemoteAttestedSession, RemoteSessionError};
+use anymone_core::{
+    AdcnetAction, PanetiereAction, ProtocolAction, RemoteAttestedSession, RemoteSessionError,
+    ScheduledAdcnetAction, ScheduledPanetiereAction,
+};
 
 use crate::wire::{CommandResult, HostStatus, PairRequest, PairingInfo, SessionCommand, SessionInput, SessionReply};
 use crate::{RemoteTransportError, MAX_FRAME_BYTES};
@@ -28,6 +31,10 @@ pub struct HostState {
     last_reply: Option<([u8; 32], Result<CommandResult, RemoteSessionError>)>,
     closed: bool,
     paired: bool,
+    connected: bool,
+    connection_generation: u64,
+    last_activity: String,
+    last_error: Option<String>,
     pairing_code: zeroize::Zeroizing<String>,
     pairing_attempts_remaining: u8,
 }
@@ -39,6 +46,9 @@ impl HostState {
             next_request: self.next_request,
             closed: self.closed,
             paired: self.paired,
+            connected: self.connected,
+            last_activity: self.last_activity.clone(),
+            last_error: self.last_error.clone(),
             pairing_attempts_remaining: self.pairing_attempts_remaining,
             client: self.client.as_ref().map(RemoteAttestedSession::status),
         }
@@ -48,24 +58,51 @@ impl HostState {
         if let Some(client) = &mut self.client { client.close(); }
         self.last_reply = None;
         self.closed = true;
+        self.last_activity = "Desktop closed the session".into();
     }
 
     fn execute(&mut self, sequence: u64, command: SessionCommand) -> Result<CommandResult, RemoteSessionError> {
-        if self.closed { return Err(RemoteSessionError::Closed); }
-        let bytes = bincode::serialize(&command).map_err(|e| RemoteSessionError::Protocol(e.to_string()))?;
+        let operation = command_name(&command);
+        if self.closed { return self.request_error(sequence, operation, RemoteSessionError::Closed); }
+        let bytes = match bincode::serialize(&command) {
+            Ok(bytes) => bytes,
+            Err(error) => return self.request_error(sequence, operation, RemoteSessionError::Protocol(error.to_string())),
+        };
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
         if sequence.checked_add(1) == Some(self.next_request) {
             if let Some((previous, result)) = &self.last_reply {
-                return if *previous == digest { result.clone() } else { Err(RemoteSessionError::RequestConflict) };
+                if *previous == digest { return result.clone(); }
             }
+            return self.request_error(sequence, operation, RemoteSessionError::RequestConflict);
         }
         if sequence != self.next_request {
-            return Err(RemoteSessionError::RequestSequence { expected: self.next_request });
+            return self.request_error(sequence, operation, RemoteSessionError::RequestSequence { expected: self.next_request });
         }
-        self.next_request = sequence.checked_add(1).ok_or(RemoteSessionError::SequenceExhausted)?;
+        self.next_request = match sequence.checked_add(1) {
+            Some(next) => next,
+            None => return self.request_error(sequence, operation, RemoteSessionError::SequenceExhausted),
+        };
         let result = self.apply(command, bytes.len());
+        match &result {
+            Ok(_) => self.last_activity = format!("Request {sequence} completed: {operation}"),
+            Err(error) => {
+                self.last_activity = format!("Request {sequence} failed: {operation}");
+                self.last_error = Some(error.to_string());
+            }
+        }
         self.last_reply = Some((digest, result.clone()));
         result
+    }
+
+    fn request_error(
+        &mut self,
+        sequence: u64,
+        operation: &str,
+        error: RemoteSessionError,
+    ) -> Result<CommandResult, RemoteSessionError> {
+        self.last_activity = format!("Request {sequence} failed: {operation}");
+        self.last_error = Some(error.to_string());
+        Err(error)
     }
 
     fn apply(&mut self, command: SessionCommand, size: usize) -> Result<CommandResult, RemoteSessionError> {
@@ -88,6 +125,37 @@ impl HostState {
                 client.apply(action).map(CommandResult::Messages)
             }
         }
+    }
+}
+
+fn command_name(command: &SessionCommand) -> &'static str {
+    match command {
+        SessionCommand::Configure(_) => "configure protocol client",
+        SessionCommand::Action(ProtocolAction::Panetiere(action)) => match action {
+            PanetiereAction::PrepareRound { .. } => "prepare Panetiere round",
+            PanetiereAction::FinalizeRound { .. } => "finalize Panetiere round",
+            PanetiereAction::AcceptReceiptBatch { .. } => "accept Panetiere receipts",
+            PanetiereAction::BuildRepair { .. } => "build Panetiere repair",
+        },
+        SessionCommand::Action(ProtocolAction::ScheduledPanetiere(action)) => match action {
+            ScheduledPanetiereAction::SetCoverRate { .. } => "set Panetiere cover rate",
+            ScheduledPanetiereAction::AdvanceRound { .. } => "advance Panetiere round",
+            ScheduledPanetiereAction::ReserveMessage { .. } => "reserve Panetiere message",
+            ScheduledPanetiereAction::PrepareRound { .. } => "prepare Panetiere round",
+            ScheduledPanetiereAction::FinalizeRound { .. } => "finalize Panetiere round",
+            ScheduledPanetiereAction::AcceptReservations { .. } => "accept Panetiere reservations",
+            ScheduledPanetiereAction::AcceptReceiptBatch { .. } => "accept Panetiere receipts",
+            ScheduledPanetiereAction::BuildRepair { .. } => "build Panetiere repair",
+        },
+        SessionCommand::Action(ProtocolAction::Adcnet(AdcnetAction::Contribute { .. })) =>
+            "contribute to ADCNet round",
+        SessionCommand::Action(ProtocolAction::ScheduledAdcnet(action)) => match action {
+            ScheduledAdcnetAction::SetCoverRate { .. } => "set ADCNet cover rate",
+            ScheduledAdcnetAction::AdvanceToRound { .. } => "advance ADCNet round",
+            ScheduledAdcnetAction::ScheduleMessageForNextRound { .. } => "schedule ADCNet message",
+            ScheduledAdcnetAction::ProcessRoundBroadcast { .. } => "process ADCNet broadcast",
+            ScheduledAdcnetAction::MessagesForCurrentRound => "collect ADCNet round messages",
+        },
     }
 }
 
@@ -143,6 +211,10 @@ impl RemoteSessionHost {
                 last_reply: None,
                 closed: false,
                 paired: false,
+                connected: false,
+                connection_generation: 0,
+                last_activity: "Waiting for desktop".into(),
+                last_error: None,
                 pairing_code: zeroize::Zeroizing::new(format!("{:08}", rand::rngs::OsRng.gen_range(0..100_000_000u32))),
                 pairing_attempts_remaining: 5,
             })),
@@ -160,7 +232,6 @@ impl RemoteSessionHost {
         let listener = TcpListener::bind(address).await?;
         let address = listener.local_addr()?;
         let pairing = PairingInfo {
-            interface_version: crate::INTERFACE_VERSION,
             address: address.to_string(),
             certificate_der: self.certificate_der.clone(),
             certificate_sha256: Sha256::digest(&self.certificate_der).into(),
@@ -185,7 +256,9 @@ impl RemoteSessionHost {
                         connections.spawn(async move {
                             if let Ok(Ok(mut tls)) = timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
                                 if let Ok(binding) = tls.get_ref().1.export_keying_material([0u8; 32], crate::pairing::EXPORTER_LABEL, None) {
-                                    let _ = serve_connection(&mut tls, session, controller, token, binding).await;
+                                    if let Err(error) = serve_connection(&mut tls, session, controller, token, binding).await {
+                                        tracing::warn!(%error, "desktop connection failed");
+                                    }
                                 }
                             }
                         });
@@ -216,6 +289,7 @@ where
         .await
         .map_err(|_| RemoteTransportError::Timeout)??;
     let mut code_proof = None;
+    let mut connection_activity = "Desktop connected";
     let accepted = {
         let mut held = controller.lock().await;
         match first {
@@ -223,6 +297,8 @@ where
                 let code = {
                     let mut state = session.lock().await;
                     if state.closed || state.pairing_attempts_remaining == 0 {
+                        state.last_activity = "Desktop pairing rejected".into();
+                        state.last_error = Some("pairing unavailable; restart the phone host".into());
                         write_frame(stream, &SessionReply::Error("pairing unavailable; restart the phone host".into())).await?;
                         return Err(RemoteTransportError::PairingFailed);
                     }
@@ -244,6 +320,7 @@ where
                     Ok(Ok((secret, proof))) => {
                         *held = Some(secret);
                         code_proof = Some(proof);
+                        connection_activity = "Desktop paired";
                         true
                     }
                     _ => false,
@@ -254,58 +331,83 @@ where
                 controller_secret,
             }) if token == pairing_token && held.is_none_or(|saved| saved == controller_secret) => {
                 *held = Some(controller_secret);
+                connection_activity = "Desktop connected with pairing data";
                 true
             }
             SessionInput::Pair(PairRequest::Resume { controller_secret }) => {
-                *held == Some(controller_secret)
+                let accepted = *held == Some(controller_secret);
+                if accepted { connection_activity = "Desktop reconnected"; }
+                accepted
             }
             _ => false,
         }
     };
     if !accepted {
+        let mut state = session.lock().await;
+        state.last_activity = "Desktop pairing failed".into();
+        state.last_error = Some("pairing failed".into());
+        drop(state);
         write_frame(stream, &SessionReply::Error("pairing failed".into())).await?;
         return Err(RemoteTransportError::PairingFailed);
     }
-    let status = {
+    let (status, connection_generation) = {
         let mut state = session.lock().await;
         state.paired = true;
-        state.status()
+        state.connected = true;
+        state.connection_generation = state.connection_generation.wrapping_add(1);
+        state.last_activity = connection_activity.into();
+        (state.status(), state.connection_generation)
     };
     let reply = match code_proof {
         Some(proof) => SessionReply::CodeAccepted { proof, status },
         None => SessionReply::Paired(status),
     };
-    write_frame(stream, &reply).await?;
-    loop {
-        let input = match read_frame::<_, SessionInput>(stream).await {
-            Ok(input) => input,
-            Err(RemoteTransportError::Io(error))
-                if error.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                return Ok(())
-            }
-            Err(error) => return Err(error),
-        };
-        let session = session.clone();
-        let reply = tokio::task::spawn_blocking(move || {
-            let mut held = session.blocking_lock();
-            match input {
-                SessionInput::Pair(_) | SessionInput::CodeProof { .. } => SessionReply::Error("connection is already paired".into()),
-                SessionInput::Request { sequence, command } => SessionReply::Executed {
-                    sequence,
-                    result: held.execute(sequence, command),
-                },
-                SessionInput::Status => SessionReply::Status(held.status()),
-                SessionInput::Close => {
-                    held.close();
-                    SessionReply::Closed
-                }
-            }
-        })
-        .await
-        .map_err(|e| RemoteTransportError::Rejected(e.to_string()))?;
+    let result = async {
         write_frame(stream, &reply).await?;
+        loop {
+            let input = match read_frame::<_, SessionInput>(stream).await {
+                Ok(input) => input,
+                Err(RemoteTransportError::Io(error))
+                    if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    return Ok(())
+                }
+                Err(error) => return Err(error),
+            };
+            let session = session.clone();
+            let reply = tokio::task::spawn_blocking(move || {
+                let mut held = session.blocking_lock();
+                if held.connection_generation != connection_generation {
+                    return SessionReply::Error("connection replaced by reconnect".into());
+                }
+                match input {
+                    SessionInput::Pair(_) | SessionInput::CodeProof { .. } => SessionReply::Error("connection is already paired".into()),
+                    SessionInput::Request { sequence, command } => SessionReply::Executed {
+                        sequence,
+                        result: held.execute(sequence, command),
+                    },
+                    SessionInput::Status => SessionReply::Status(held.status()),
+                    SessionInput::Close => {
+                        held.close();
+                        SessionReply::Closed
+                    }
+                }
+            })
+            .await
+            .map_err(|e| RemoteTransportError::Rejected(e.to_string()))?;
+            write_frame(stream, &reply).await?;
+        }
     }
+    .await;
+    let mut state = session.lock().await;
+    if state.connection_generation == connection_generation {
+        state.connected = false;
+        state.last_activity = "Desktop disconnected".into();
+        if let Err(error) = &result {
+            state.last_error = Some(error.to_string());
+        }
+    }
+    result
 }
 
 pub(crate) async fn write_frame<S, T>(stream: &mut S, value: &T) -> Result<(), RemoteTransportError>

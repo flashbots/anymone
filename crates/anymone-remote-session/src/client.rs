@@ -61,7 +61,6 @@ impl RemoteSessionClient {
                 _ => return Err(RemoteTransportError::PairingFailed),
             };
             let pairing = PairingInfo {
-                interface_version: crate::INTERFACE_VERSION,
                 address: address.to_string(),
                 certificate_sha256: Sha256::digest(&certificate_der).into(),
                 certificate_der,
@@ -77,9 +76,7 @@ impl RemoteSessionClient {
     pub async fn pair(
         pairing: PairingInfo,
     ) -> Result<(Self, HostStatus), RemoteTransportError> {
-        if pairing.interface_version != crate::INTERFACE_VERSION
-            || Sha256::digest(&pairing.certificate_der).as_slice() != pairing.certificate_sha256
-        {
+        if Sha256::digest(&pairing.certificate_der).as_slice() != pairing.certificate_sha256 {
             return Err(RemoteTransportError::PairingFailed);
         }
         let controller_secret = rand::random();
@@ -319,6 +316,8 @@ mod tests {
         let formatted = format!("{} {}", &host.pairing_code[..4], &host.pairing_code[4..]);
         let (mut client, initial) = RemoteSessionClient::pair_with_code(&host.pairing.address, &formatted).await.unwrap();
         assert!(initial.paired);
+        assert!(initial.connected);
+        assert_eq!(initial.last_activity, "Desktop paired");
         assert!(initial.client.is_none());
         assert!(RemoteSessionClient::pair_with_code(&host.pairing.address, &host.pairing_code).await.is_err());
         assert!(RemoteSessionClient::pair(host.pairing.clone()).await.is_err());
@@ -332,6 +331,7 @@ mod tests {
             starting_round: 0,
         }).await.unwrap();
         assert!(!client.adcnet_contribute(0, Some(b"code paired".to_vec())).await.unwrap().is_empty());
+        assert!(client.status().await.unwrap().last_activity.contains("contribute to ADCNet round"));
         assert_eq!(client.reconnect().await.unwrap().session_id, initial.session_id);
         client.close().await.unwrap();
         assert!(host.session().lock().await.status().closed);
