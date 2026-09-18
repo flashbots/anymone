@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 
-use crate::{HostStatus, RemoteClientBackend, RemoteSessionClient};
+use crate::{HostStatus, RemoteClientBackend, RemoteSessionClient, RemoteTransportError};
 
 pub const SERVICE_TYPE: &str = "_anymone-remote._tcp.local.";
 
@@ -58,8 +58,24 @@ impl RemoteArgs {
             let code = zeroize::Zeroizing::new(prompt("Pairing code shown on the phone: ")?);
             Ok((address, code))
         }).await??;
-        let paired = RemoteSessionClient::pair_with_code(&address, &code).await
-            .context("code pairing failed; check the code, or restart Remote if its code is unavailable")?;
+        let paired = match RemoteSessionClient::pair_with_code(&address, &code).await {
+            Ok(paired) => paired,
+            Err(RemoteTransportError::Io(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                return Err(error).with_context(|| format!(
+                    "phone at {address} refused the connection; check STATE and ISSUE on the phone, then refresh discovery or the ADB forward"
+                ));
+            }
+            Err(RemoteTransportError::Timeout) => {
+                anyhow::bail!(
+                    "phone at {address} did not answer; check STATE and ISSUE on the phone and verify both devices can reach each other"
+                );
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!(
+                    "pairing with phone at {address} failed; check the code shown by the current session"
+                ));
+            }
+        };
         eprintln!("Connected to phone at {address}.");
         Ok(paired)
     }
@@ -102,10 +118,19 @@ pub fn discover(duration: Duration) -> Result<Vec<DiscoveredHost>> {
             ServiceEvent::ServiceResolved(info) => {
                 if info.get_property_val_str("pairing") != Some("code") { continue; }
                 if hosts.len() >= 64 { continue; }
-                if let Some(ip) = info.get_addresses_v4().into_iter().min() {
+                let address = if let Some(ip) = info.get_property_val_str("address")
+                    .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+                {
+                    SocketAddr::new(ip, info.get_port())
+                } else if let Some(ip) = info.get_addresses_v4().into_iter().min() {
+                    SocketAddr::new(ip.into(), info.get_port())
+                } else {
+                    continue;
+                };
+                {
                     let name = info.get_fullname().trim_end_matches(SERVICE_TYPE).trim_end_matches('.').to_string();
                     hosts.insert(info.get_fullname().to_string(), DiscoveredHost {
-                        name, address: SocketAddr::new(ip.into(), info.get_port()),
+                        name, address,
                     });
                 }
             }
@@ -130,11 +155,12 @@ mod tests {
         let daemon = Discovery(ServiceDaemon::new().unwrap());
         let info = mdns_sd::ServiceInfo::new(
             SERVICE_TYPE, &name, &format!("{name}.local."), "", port,
-            [("pairing", "code")].as_slice(),
+            [("pairing", "code"), ("address", "127.0.0.1")].as_slice(),
         ).unwrap().enable_addr_auto();
         daemon.0.register(info).unwrap();
         let hosts = tokio::task::spawn_blocking(|| discover(Duration::from_secs(5))).await.unwrap().unwrap();
         let discovered = hosts.iter().find(|found| found.name == name).expect("advertised host discovered");
+        assert_eq!(discovered.address.ip(), std::net::Ipv4Addr::LOCALHOST);
         let (mut client, status) = RemoteSessionClient::pair_with_code(&discovered.address.to_string(), &host.pairing_code).await.unwrap();
         assert!(status.paired);
         client.close().await.unwrap();

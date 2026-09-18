@@ -28,9 +28,6 @@ impl RemoteProtocolHost {
         let address = listen_address
             .parse::<std::net::SocketAddr>()
             .map_err(failed)?;
-        if address.ip().is_unspecified() {
-            return Err(failed("select a reachable interface address"));
-        }
         crate::on_runtime(async move {
             let handle = RemoteSessionHost::new(None)
                 .map_err(failed)?

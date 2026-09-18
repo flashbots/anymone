@@ -69,6 +69,11 @@ async fn remote_host_stops_connections_and_restarts_with_new_keys() {
 }
 
 #[tokio::test]
-async fn wildcard_address_is_rejected() {
-    assert!(RemoteProtocolHost::start_developer("0.0.0.0:0".into()).await.is_err());
+async fn wildcard_address_binds_every_interface() {
+    let host = RemoteProtocolHost::start_developer("0.0.0.0:0".into()).await.unwrap();
+    let pairing: PairingInfo = serde_json::from_str(&host.pairing_json().unwrap()).unwrap();
+    let address: std::net::SocketAddr = pairing.address.parse().unwrap();
+    assert!(address.ip().is_unspecified());
+    assert_ne!(address.port(), 0);
+    host.stop().await;
 }
