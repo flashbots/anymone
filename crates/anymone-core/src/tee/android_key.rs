@@ -75,7 +75,7 @@ impl AndroidKeyVerifier {
         (!out.is_empty()).then_some(out)
     }
 
-    fn chain_reaches_root(&self, chain: &[&[u8]]) -> bool {
+    fn chain_reaches_root(&self, chain: &[&[u8]], now: ASN1Time) -> bool {
         let mut ders = chain.to_vec();
         // The device chain already ends at Google's root; a chain that stops
         // earlier still has to reach the pinned one.
@@ -97,7 +97,7 @@ impl AndroidKeyVerifier {
                 tracing::debug!(target: TEE, "android key: broken certificate chain");
                 return false;
             }
-            if !in_validity_period(&child) || !in_validity_period(&issuer) {
+            if !in_validity_period(&child, now) || !in_validity_period(&issuer, now) {
                 return false;
             }
             if !may_issue(&issuer) {
@@ -180,6 +180,14 @@ impl AndroidKeyVerifier {
 
 impl TeeVerifier for AndroidKeyVerifier {
     fn verify(&self, statement: &[u8], att: &Attestation) -> bool {
+        self.verify_at(statement, att, ASN1Time::now())
+    }
+}
+
+impl AndroidKeyVerifier {
+    // Keep the clock explicit internally so captured evidence remains testable
+    // after its certificates expire. The public verifier always uses wall time.
+    fn verify_at(&self, statement: &[u8], att: &Attestation, now: ASN1Time) -> bool {
         if att.scheme != AttestationScheme::AndroidKeyAttestation {
             return false;
         }
@@ -187,7 +195,7 @@ impl TeeVerifier for AndroidKeyVerifier {
             tracing::debug!(target: TEE, "android key: undecodable certificate chain");
             return false;
         };
-        if !self.chain_reaches_root(&chain) {
+        if !self.chain_reaches_root(&chain, now) {
             return false;
         }
 
@@ -235,8 +243,8 @@ impl TeeVerifier for AndroidKeyVerifier {
     }
 }
 
-fn in_validity_period(cert: &X509Certificate) -> bool {
-    if cert.validity().is_valid() {
+fn in_validity_period(cert: &X509Certificate, now: ASN1Time) -> bool {
+    if cert.validity().is_valid_at(now) {
         return true;
     }
     tracing::debug!(
@@ -655,3 +663,7 @@ mod tests {
         assert!(!verifier.verify(&[5u8; 32], &att(evidence, 7)));
     }
 }
+
+#[cfg(test)]
+#[path = "android_key_device_tests.rs"]
+mod device_tests;

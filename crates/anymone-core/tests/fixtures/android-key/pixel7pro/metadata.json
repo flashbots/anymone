@@ -1,0 +1,16 @@
+{
+  "scheme": "android-key-attestation",
+  "statement_hex": "0505050505050505050505050505050505050505050505050505050505050505",
+  "round": 7,
+  "challenge_hex": "0a04bae1366a3c81c701c67000201e82bcf060eea553aa9525f49e06e57a9be8",
+  "package_name": "net.flashbots.anymone.fixture",
+  "certificate_digests_hex": [
+    "c5e27697921828eb445ef3eb55742082c7f079709699f85a64e53283fa9c6a31"
+  ],
+  "captured_at_unix_seconds": 1790925003,
+  "manufacturer": "Google",
+  "model": "Pixel 7 Pro",
+  "android_release": "16",
+  "security_patch": "2026-06-01",
+  "require_strongbox": false
+}
