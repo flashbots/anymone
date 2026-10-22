@@ -146,7 +146,7 @@ impl RemoteAttestedSession {
                 let (channel, params) = crate::panetiere::params_for(cfg, subnet.relays.len());
                 let mut client =
                     PanetiereClientSession::new(params, channel, identity.clone(), servers, seed);
-                client.set_setup_seed(cfg.setup_seed);
+                client.set_scope(&cfg.setup_seed, subnet.id);
                 if let Some(pks) = set_pks {
                     client.set_consensus(pks);
                 }
@@ -172,7 +172,7 @@ impl RemoteAttestedSession {
                     seed,
                     Default::default(),
                 );
-                client.set_setup_seed(cfg.setup_seed);
+                client.set_scope(&cfg.setup_seed, subnet.id);
                 client.advance_round(starting_round);
                 if let Some(pks) = set_pks {
                     client.set_consensus(pks);
@@ -820,7 +820,7 @@ mod tests {
             set_formation: SetFormation::Consensus,
             ..pan_config()
         };
-        let (mut session, _, ids) = fixture(ProtocolConfig::Panetiere(cfg.clone()));
+        let (mut session, subnet, ids) = fixture(ProtocolConfig::Panetiere(cfg.clone()));
         let (channel, pp) = crate::panetiere::params_for(&cfg, ids.len());
         let roster = ids
             .iter()
@@ -837,6 +837,7 @@ mod tests {
             },
             roster,
         );
+        server.set_scope(&cfg.setup_seed, subnet.id);
         server.set_consensus_keys(
             ids[0].exchange().set_signing_key().clone(),
             ids.iter()
@@ -995,6 +996,7 @@ mod tests {
                     SetMode::SelfDerived,
                     roster.clone(),
                 );
+                server.set_scope(&cfg.setup_seed, subnet.id);
                 server.set_good_clients(GoodClients::new(move |pk| *pk == participant));
                 server
             })
@@ -1104,7 +1106,7 @@ mod tests {
             client_set_max: 1,
             ..Default::default()
         };
-        let (mut session, _, ids) = fixture(ProtocolConfig::ScheduledPanetiere(cfg.clone()));
+        let (mut session, subnet, ids) = fixture(ProtocolConfig::ScheduledPanetiere(cfg.clone()));
         let (channel, pp) = crate::panetiere_scheduled::params_for(&cfg, ids.len());
         let leader = ids[0].pubkey();
         let roster: HashMap<_, _> = ids
@@ -1116,7 +1118,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, id)| {
-                ScheduledPanetiereServerSession::new(
+                let mut server = ScheduledPanetiereServerSession::new(
                     pp.clone(),
                     channel.clone(),
                     cfg.vector_bytes,
@@ -1130,7 +1132,9 @@ mod tests {
                     leader,
                     roster.clone(),
                     Default::default(),
-                )
+                );
+                server.set_scope(&cfg.setup_seed, subnet.id);
+                server
             })
             .collect();
         let payload = b"scheduled remote panetiere".to_vec();
