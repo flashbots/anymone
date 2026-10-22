@@ -72,6 +72,7 @@ fn run_adcnet_aggregated(
                 shared,
                 cid.exchange_pubkey(),
                 seed,
+                0,
             )
         })
         .collect();
@@ -97,6 +98,7 @@ fn run_adcnet_aggregated(
                 } else {
                     None
                 },
+                0,
             )
         })
         .collect();
@@ -107,7 +109,7 @@ fn run_adcnet_aggregated(
         .map(|(g, id)| {
             (
                 id.pubkey(),
-                AdcnetAggregatorSession::new(g as u32, group_count, id.clone()),
+                AdcnetAggregatorSession::new(g as u32, group_count, id.clone(), 0),
             )
         })
         .collect();
@@ -197,6 +199,7 @@ fn run_realtime(aggregated: bool, payload: &[u8]) -> Vec<u64> {
                 shared,
                 cid.exchange_pubkey(),
                 seed,
+                0,
             )
         })
         .collect();
@@ -222,6 +225,7 @@ fn run_realtime(aggregated: bool, payload: &[u8]) -> Vec<u64> {
                 } else {
                     None
                 },
+                0,
             )
         })
         .collect();
@@ -232,7 +236,7 @@ fn run_realtime(aggregated: bool, payload: &[u8]) -> Vec<u64> {
             .map(|(g, id)| {
                 (
                     id.pubkey(),
-                    AdcnetAggregatorSession::new(g as u32, group_count, id.clone()),
+                    AdcnetAggregatorSession::new(g as u32, group_count, id.clone(), 0),
                 )
             })
             .collect()

@@ -193,6 +193,7 @@ impl RemoteAttestedSession {
                     shared,
                     identity.exchange_pubkey(),
                     seed,
+                    subnet.id,
                 );
                 (
                     Client::Adcnet(client),
@@ -220,6 +221,7 @@ impl RemoteAttestedSession {
                     initial,
                     starting_round as i64 + 1,
                     crate::subnet_leader_pk(subnet),
+                    subnet.id,
                 );
                 client.set_min_message_size(cfg.min_message_size as usize);
                 (
@@ -1059,6 +1061,7 @@ mod tests {
                     i == 0,
                     leader,
                     None,
+                    0,
                 );
                 server.set_good_clients(GoodClients::new(move |pk| *pk == participant));
                 server
@@ -1255,6 +1258,7 @@ mod tests {
                     &peers,
                     1,
                     leader,
+                    0,
                 )
             })
             .collect();
