@@ -4,6 +4,7 @@
 //! ([`ScheduledAdcnetClientSession`] / [`ScheduledAdcnetServerSession`], which
 //! use the upstream auction, blinding, and share-combining primitives).
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -466,7 +467,8 @@ enum AdcnetWire {
         key: Signed<KeyExchange>, // NIKE pubkey
         binding: Signed<SubnetBinding>,
     },
-    Server(Signed<ServerShare>),
+    /// A relay's decryption share, signed together with the subnet it is for.
+    Server(Signed<SubnetShare>),
     /// Leader-announced canonical client set for `round`.
     ///
     /// Because in adcnet the leader alone decides the canonical
@@ -496,12 +498,14 @@ enum AdcnetWire {
 }
 
 fn group_aggregate_signing_bytes(
+    subnet: SubnetId,
     round: u32,
     group: u32,
     blinded: &[u64],
     clients: &[Signed<KeyExchange>],
 ) -> Vec<u8> {
     let mut m = Vec::new();
+    m.extend_from_slice(&subnet.to_le_bytes());
     m.extend_from_slice(&round.to_le_bytes());
     m.extend_from_slice(&group.to_le_bytes());
     for v in blinded {
@@ -543,8 +547,8 @@ pub(crate) fn describe(bytes: &[u8]) -> Option<String> {
         },
         AdcnetWire::Server(signed) => match signed.recover() {
             Ok((s, _)) => Some(format!(
-                "ADCNet Server sid={} round={}",
-                s.server_id.0, s.round
+                "ADCNet Server sid={} round={} subnet={}",
+                s.share.server_id.0, s.share.round, s.subnet
             )),
             Err(_) => Some("ADCNet Server <bad sig>".into()),
         },
@@ -614,7 +618,7 @@ fn observe_adcnet(bytes: &[u8]) -> AdcnetObserved {
     match bincode::deserialize::<AdcnetWire>(bytes) {
         Ok(AdcnetWire::Server(signed)) => match signed.recover() {
             Ok((s, signer)) => AdcnetObserved::Share {
-                round: s.round as u64,
+                round: s.share.round as u64,
                 signer: signer.clone(),
             },
             Err(_) => AdcnetObserved::Other,
@@ -919,18 +923,7 @@ mod observer_tests {
         // server_id is derived from the signer, not the wire: `other` is roster
         // index 1, so a share it signs is always credited to slot 1 — even when it
         // stamps the leader's slot 0. A relay can't occupy or vouch for another slot.
-        let stamp_r = |sid: u32, round: u32| {
-            let sh = Signed::new(
-                &other.to_adcnet_signing_key(),
-                ServerShare {
-                    server_id: ServerId(sid),
-                    round,
-                    share: vec![],
-                },
-            )
-            .unwrap();
-            bincode::serialize(&AdcnetWire::Server(sh)).unwrap()
-        };
+        let stamp_r = |sid: u32, round: u32| share_wire(&other, 0, sid, round, vec![]);
         let stamp = |sid: u32| stamp_r(sid, 3);
         obs.on_inbound(other.pubkey(), stamp(0));
         assert_eq!(
@@ -1000,16 +993,7 @@ mod observer_tests {
         };
         let n = iblt.as_params().encoded_len();
         let id = Identity::generate();
-        let share = Signed::new(
-            &id.to_adcnet_signing_key(),
-            ServerShare {
-                server_id: ServerId(0),
-                round: 1,
-                share: vec![0u64; n],
-            },
-        )
-        .unwrap();
-        let share_wire = bincode::serialize(&AdcnetWire::Server(share)).unwrap();
+        let share_wire = share_wire(&id, 0, 0, 1, vec![0u64; n]);
         assert!(
             est >= share_wire.len(),
             "estimate {est} < real share {}",
@@ -1296,7 +1280,11 @@ impl Session for AdcnetAggregatorSession {
                 let clients: Vec<Signed<KeyExchange>> =
                     members.iter().map(|(_, v)| v.1.clone()).collect();
                 let signature = self.identity.sign(&group_aggregate_signing_bytes(
-                    round, self.group, &blinded, &clients,
+                    self.subnet,
+                    round,
+                    self.group,
+                    &blinded,
+                    &clients,
                 ));
                 let wire = AdcnetWire::GroupAggregate {
                     round,
@@ -1746,10 +1734,21 @@ impl Session for AdcnetServerSession {
                 if self.is_leader {
                     // Every rejection here costs the round one share towards the
                     // combine threshold.
-                    let Ok((s, signer)) = signed.recover() else {
+                    let Ok((bound, signer)) = signed.recover() else {
                         debug!(target: ADCNET, "adcnet leader: share signature did not recover, dropped");
                         return Vec::new();
                     };
+                    if bound.subnet != self.subnet {
+                        debug!(
+                            target: ADCNET,
+                            s_round = bound.share.round,
+                            subnet = bound.subnet,
+                            own = self.subnet,
+                            "adcnet leader: share bound to another subnet, dropped"
+                        );
+                        return Vec::new();
+                    }
+                    let s = &bound.share;
                     {
                         if s.round.saturating_add(ROUND_WINDOW) < self.cur_round
                             || s.round > self.cur_round.saturating_add(FUTURE_ROUND_SLACK)
@@ -1775,10 +1774,24 @@ impl Session for AdcnetServerSession {
                         };
                         let mut share = s.clone();
                         share.server_id = ServerId(sid);
-                        self.shares_by_round
+                        // A slot is filled once; a later share for it would replace
+                        // the one already counted towards the combine.
+                        match self
+                            .shares_by_round
                             .entry(share.round)
                             .or_default()
-                            .insert(ServerId(sid), share);
+                            .entry(ServerId(sid))
+                        {
+                            Entry::Vacant(slot) => {
+                                slot.insert(share);
+                            }
+                            Entry::Occupied(_) => debug!(
+                                target: ADCNET,
+                                s_round = share.round,
+                                server_id = sid,
+                                "adcnet leader: slot already holds a share, dropped"
+                            ),
+                        }
                     }
                 }
             }
@@ -1898,7 +1911,13 @@ impl Session for AdcnetServerSession {
                 if *roster != signer
                     || clients.len() > group_cap
                     || !signer.verify(
-                        &group_aggregate_signing_bytes(round, group, &blinded, &clients),
+                        &group_aggregate_signing_bytes(
+                            self.subnet,
+                            round,
+                            group,
+                            &blinded,
+                            &clients,
+                        ),
                         &signature,
                     )
                     || round.saturating_add(ROUND_WINDOW) < self.cur_round
@@ -2085,16 +2104,40 @@ impl Session for AdcnetServerSession {
                     }
                 }
             }
-            match server_contribute(&self.config, t, self.server_id, &self.signing_key, &secrets) {
+            let share = match server_contribute(
+                &self.config,
+                t,
+                self.server_id,
+                &self.signing_key,
+                &secrets,
+            ) {
+                Ok(signed) => signed.object,
+                // Retried next round (`shared_rounds` is not marked), but until it
+                // succeeds this relay is missing from the combine.
+                Err(e) => {
+                    warn!(
+                        target: ADCNET,
+                        round = t,
+                        server_id = self.server_id.0,
+                        set = set.len(),
+                        error = ?e,
+                        "adcnet: server_contribute failed; no share for this round"
+                    );
+                    continue;
+                }
+            };
+            if self.is_leader {
+                self.shares_by_round
+                    .entry(t)
+                    .or_default()
+                    .insert(self.server_id, share.clone());
+            }
+            let bound = SubnetShare {
+                subnet: self.subnet,
+                share,
+            };
+            match Signed::new(&self.signing_key, bound) {
                 Ok(signed) => {
-                    if self.is_leader {
-                        if let Ok((own, _)) = signed.recover() {
-                            self.shares_by_round
-                                .entry(t)
-                                .or_default()
-                                .insert(self.server_id, own.clone());
-                        }
-                    }
                     trace!(
                         target: ADCNET,
                         round = t,
@@ -2107,15 +2150,13 @@ impl Session for AdcnetServerSession {
                     );
                     self.shared_rounds.insert(t);
                 }
-                // Retried next round (`shared_rounds` is not marked), but until it
-                // succeeds this relay is missing from the combine.
                 Err(e) => warn!(
                     target: ADCNET,
                     round = t,
                     server_id = self.server_id.0,
                     set = set.len(),
                     error = ?e,
-                    "adcnet: server_contribute failed; no share for this round"
+                    "adcnet: signing the share failed; no share for this round"
                 ),
             }
         }
@@ -2906,6 +2947,37 @@ fn is_bound<T: Serialize>(
     })
 }
 
+/// A relay's share signed together with its subnet. Shares and group
+/// aggregates from one subnet are self-consistent, so a relay on both could
+/// otherwise forward a whole round into another subnet and have its leader
+/// decode it there.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SubnetShare {
+    subnet: SubnetId,
+    share: ServerShare,
+}
+
+#[cfg(test)]
+fn share_wire(
+    signer: &Identity,
+    subnet: SubnetId,
+    server_id: u32,
+    round: u32,
+    share: Vec<u64>,
+) -> Vec<u8> {
+    let share = ServerShare {
+        server_id: ServerId(server_id),
+        round,
+        share,
+    };
+    let signed = Signed::new(
+        &signer.to_adcnet_signing_key(),
+        SubnetShare { subnet, share },
+    )
+    .expect("test share signs");
+    bincode::serialize(&AdcnetWire::Server(signed)).expect("test share serialises")
+}
+
 /// Blinding pads derive from the relays' ECDH secrets, which every subnet
 /// shares; keying them per subnet keeps a contribution that is replayed into
 /// another subnet from unblinding there.
@@ -3138,6 +3210,85 @@ mod subnet_binding_tests {
             .unwrap();
         aggregator.on_inbound(sender.pubkey(), own);
         assert_eq!(aggregator.rounds[&0].len(), 1);
+    }
+
+    fn aggregated_leader(relay: &Identity, subnet: SubnetId) -> AdcnetServerSession {
+        let mut leader = leader(relay, subnet);
+        leader.aggregation = Some(LeaderAggregation {
+            roster: HashMap::from([(0, relay.pubkey())]),
+        });
+        leader
+    }
+
+    fn decoded(outbound: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        outbound
+            .iter()
+            .filter_map(|bytes| match bincode::deserialize::<AdcnetWire>(bytes) {
+                Ok(AdcnetWire::Decoded { payloads, .. }) => Some(payloads),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[test]
+    fn leader_rejects_a_round_forwarded_from_another_subnet() {
+        let relay = Identity::generate();
+        let sender = Identity::generate();
+        let now = Instant::now();
+
+        let mut aggregator = AdcnetAggregatorSession::new(0, 1, relay.clone(), 0);
+        aggregator.begin_round(0, now);
+        let contribution = client(&sender, &relay, 0)
+            .contribute(0, Some(b"hi"))
+            .unwrap();
+        aggregator.on_inbound(sender.pubkey(), contribution);
+        let aggregates = aggregator.checkpoint(0, 1, now);
+        assert_eq!(aggregates.len(), 1);
+
+        let mut source = aggregated_leader(&relay, 0);
+        source.begin_round(0, now);
+        source.on_inbound(relay.pubkey(), aggregates[0].clone());
+        let outbound = source.end_round(0, now).outbound;
+        assert_eq!(decoded(&outbound), vec![b"hi".to_vec()]);
+        let shares: Vec<Vec<u8>> = outbound
+            .into_iter()
+            .filter(|bytes| is_server_share(bytes))
+            .collect();
+        assert_eq!(shares.len(), 1);
+
+        let mut same_subnet = aggregated_leader(&relay, 0);
+        same_subnet.begin_round(0, now);
+        same_subnet.on_inbound(relay.pubkey(), aggregates[0].clone());
+        same_subnet.on_inbound(relay.pubkey(), shares[0].clone());
+        assert_eq!(
+            decoded(&same_subnet.end_round(0, now).outbound),
+            vec![b"hi".to_vec()],
+            "the forwarded round decodes where it belongs"
+        );
+
+        let mut destination = aggregated_leader(&relay, 1);
+        destination.begin_round(0, now);
+        destination.on_inbound(relay.pubkey(), aggregates[0].clone());
+        destination.on_inbound(relay.pubkey(), shares[0].clone());
+        assert!(destination.agg_by_round.is_empty());
+        assert!(destination.shares_by_round.is_empty());
+        assert!(decoded(&destination.end_round(0, now).outbound).is_empty());
+    }
+
+    #[test]
+    fn leader_keeps_the_first_share_for_a_slot() {
+        let relay = Identity::generate();
+        let other = Identity::generate();
+        let mut leader = leader(&relay, 0);
+        leader.roster.push(other.pubkey());
+        leader.roster.sort();
+        let slot = ServerId(leader.server_id_of(&other.to_adcnet_public_key()).unwrap());
+
+        let share = |value: u64| share_wire(&other, 0, slot.0, 0, vec![value]);
+        leader.on_inbound(other.pubkey(), share(1));
+        leader.on_inbound(other.pubkey(), share(2));
+        assert_eq!(leader.shares_by_round[&0][&slot].share, vec![1]);
     }
 
     #[test]
