@@ -28,7 +28,7 @@ use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, trace, warn};
 
-use crate::config::{AdcnetConfig, ExchangePublicKeyWire, ProtocolConfig, Round, Subnet};
+use crate::config::{AdcnetConfig, ExchangePublicKeyWire, ProtocolConfig, Round, Subnet, SubnetId};
 use crate::faults::Fault;
 use crate::identity::Pubkey;
 use crate::log_target::{ADCNET, SCHED};
@@ -109,6 +109,7 @@ fn client_session(
             client_shared_secrets(relay_xk, identity, subnet),
             identity.exchange_pubkey(),
             seed,
+            subnet.id,
         )),
         ProtocolConfig::ScheduledAdcnet(cfg) => {
             let config = scheduled_config(cfg);
@@ -126,6 +127,7 @@ fn client_session(
                 initial,
                 round as i64 + 1,
                 subnet_leader_pk(subnet),
+                subnet.id,
             );
             client.min_message_size = cfg.min_message_size as usize;
             client.node = Some(Arc::downgrade(inner));
@@ -167,6 +169,7 @@ fn server_session(
         is_leader,
         leader_pk,
         aggregation,
+        subnet.id,
     );
     session.set_good_clients(good_clients);
     Box::new(session)
@@ -220,6 +223,7 @@ pub(crate) async fn run_subnet(
                     &peers,
                     1,
                     leader_pk,
+                    subnet.id,
                 );
                 server.client_set_max = cfg.client_set_max as usize;
                 server.good_clients = inner.subnet_clients(&subnet);
@@ -237,8 +241,12 @@ pub(crate) async fn run_subnet(
     }
     if let Some(a) = subnet_aggregation(&subnet) {
         if let Some(group) = aggregator_group_of(a, identity_pk) {
-            let mut agg_session =
-                AdcnetAggregatorSession::new(group, a.groups.len() as u32, inner.identity.clone());
+            let mut agg_session = AdcnetAggregatorSession::new(
+                group,
+                a.groups.len() as u32,
+                inner.identity.clone(),
+                subnet.id,
+            );
             agg_session.set_client_set_max(
                 (subnet.protocol.client_set_max() as usize / a.groups.len().max(1)).max(1),
             );
@@ -456,6 +464,7 @@ enum AdcnetWire {
     Client {
         contribution: Signed<ClientContribution>,
         key: Signed<KeyExchange>, // NIKE pubkey
+        binding: Signed<SubnetBinding>,
     },
     Server(Signed<ServerShare>),
     /// Leader-announced canonical client set for `round`.
@@ -958,6 +967,7 @@ mod observer_tests {
             true,
             leader_pk,
             None,
+            0,
         );
         leader_srv.begin_round(3, Instant::now());
         leader_srv.on_inbound(other.pubkey(), stamp(0));
@@ -1042,6 +1052,7 @@ pub struct AdcnetClientSession {
     rng: ChaCha20Rng,
     /// Idle-round cover probability, drawn against the private `rng`.
     cover_rate: f32,
+    subnet: SubnetId,
 }
 
 impl AdcnetClientSession {
@@ -1051,16 +1062,21 @@ impl AdcnetClientSession {
         shared_secrets: HashMap<ServerId, SharedKey>,
         client_xpub: ExchangePublicKey,
         rng_seed: [u8; 32],
+        subnet: SubnetId,
     ) -> Self {
         AdcnetClientSession {
             config,
             signing_key,
-            shared_secrets,
+            shared_secrets: shared_secrets
+                .into_iter()
+                .map(|(id, shared)| (id, subnet_shared_key(&shared, subnet)))
+                .collect(),
             client_xpub: client_xpub.to_sec1_bytes(),
             signed_key: None,
             pending: None,
             rng: ChaCha20Rng::from_seed(rng_seed),
             cover_rate: 1.0,
+            subnet,
         }
     }
 
@@ -1084,9 +1100,11 @@ impl AdcnetClientSession {
         let contribution = client_contribute(
             &self.config, round, &self.signing_key, &self.shared_secrets, payload, &mut self.rng,
         ).map_err(|e| e.to_string())?;
+        let binding = bind(&self.signing_key, self.subnet, &contribution)?;
         bincode::serialize(&AdcnetWire::Client {
             contribution,
             key: self.signed_key.clone().expect("signed key present"),
+            binding,
         }).map_err(|e| e.to_string())
     }
 }
@@ -1138,10 +1156,11 @@ pub struct AdcnetAggregatorSession {
     /// Screened here too: the leader sees an aggregate, not the clients behind
     /// it, so a client the leader would refuse must not reach the group sum.
     good_clients: GoodClients,
+    subnet: SubnetId,
 }
 
 impl AdcnetAggregatorSession {
-    pub fn new(group: u32, group_count: u32, identity: Identity) -> Self {
+    pub fn new(group: u32, group_count: u32, identity: Identity, subnet: SubnetId) -> Self {
         AdcnetAggregatorSession {
             group,
             group_count,
@@ -1151,6 +1170,7 @@ impl AdcnetAggregatorSession {
             cur_round: 0,
             client_set_max: usize::MAX,
             good_clients: GoodClients::all(),
+            subnet,
         }
     }
 
@@ -1175,8 +1195,11 @@ impl Session for AdcnetAggregatorSession {
     }
 
     fn on_inbound(&mut self, _from: PeerId, payload: Vec<u8>) -> Vec<Vec<u8>> {
-        if let Ok(AdcnetWire::Client { contribution, key }) =
-            bincode::deserialize::<AdcnetWire>(&payload)
+        if let Ok(AdcnetWire::Client {
+            contribution,
+            key,
+            binding,
+        }) = bincode::deserialize::<AdcnetWire>(&payload)
         {
             let (Ok((c, signer)), Ok((_, key_signer))) = (contribution.recover(), key.recover())
             else {
@@ -1202,6 +1225,15 @@ impl Session for AdcnetAggregatorSession {
                     c_round = c.round,
                     group = self.group,
                     "adcnet aggregator: key and contribution signers differ, dropped"
+                );
+                return Vec::new();
+            }
+            if !is_bound(&binding, self.subnet, signer, &contribution) {
+                debug!(
+                    target: ADCNET,
+                    c_round = c.round,
+                    group = self.group,
+                    "adcnet aggregator: contribution not bound to this subnet, dropped"
                 );
                 return Vec::new();
             }
@@ -1342,6 +1374,7 @@ pub struct AdcnetServerSession {
     aggregation: Option<LeaderAggregation>,
     /// Leader aggregated mode: round → group → (summed blinded, member signers).
     agg_by_round: HashMap<u32, HashMap<u32, (Vec<u64>, Vec<PublicKey>)>>,
+    subnet: SubnetId,
 }
 
 /// Rounds of per-round state to keep behind the current round — enough to cover
@@ -1366,6 +1399,7 @@ impl AdcnetServerSession {
         is_leader: bool,
         leader_pk: PeerId,
         aggregation: Option<LeaderAggregation>,
+        subnet: SubnetId,
     ) -> Self {
         AdcnetServerSession {
             config,
@@ -1393,6 +1427,7 @@ impl AdcnetServerSession {
             misbehavior: None,
             aggregation,
             agg_by_round: HashMap::new(),
+            subnet,
         }
     }
 
@@ -1428,7 +1463,7 @@ impl AdcnetServerSession {
     ) {
         if let Ok(xp) = ExchangePublicKey::from_sec1_bytes(&ke.xpub) {
             if !self.shared_secrets.contains_key(signer) {
-                let secret = self.exchange.ecdh(&xp);
+                let secret = subnet_shared_key(&self.exchange.ecdh(&xp), self.subnet);
                 self.shared_secrets.insert(signer.clone(), secret);
             }
             self.client_keys.entry(signer.clone()).or_insert(signed);
@@ -1609,7 +1644,11 @@ impl Session for AdcnetServerSession {
             }
         };
         match msg {
-            AdcnetWire::Client { contribution, key } => {
+            AdcnetWire::Client {
+                contribution,
+                key,
+                binding,
+            } => {
                 // Non-leaders never read client data (they share off the ClientSet).
                 if self.is_leader {
                     let (Ok((c, signer)), Ok((ke, key_signer))) =
@@ -1628,6 +1667,14 @@ impl Session for AdcnetServerSession {
                             target: ADCNET,
                             c_round = c.round,
                             "adcnet leader: key and contribution signers differ, dropped"
+                        );
+                        return Vec::new();
+                    }
+                    if !is_bound(&binding, self.subnet, signer, &contribution) {
+                        debug!(
+                            target: ADCNET,
+                            c_round = c.round,
+                            "adcnet leader: contribution not bound to this subnet, dropped"
                         );
                         return Vec::new();
                     }
@@ -2160,6 +2207,7 @@ impl Session for AdcnetWatchSession {
 struct ScheduledClient {
     message: Signed<ClientRoundMessage>,
     key: Signed<KeyExchange>,
+    binding: Signed<SubnetBinding>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2247,9 +2295,11 @@ pub struct ScheduledAdcnetClientSession {
     min_message_size: usize,
     submitted_round: Option<i64>,
     node: Option<std::sync::Weak<AnymoneInner>>,
+    subnet: SubnetId,
 }
 
 impl ScheduledAdcnetClientSession {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: UpstreamAdcNetConfig,
         signing_key: PrivateKey,
@@ -2258,6 +2308,7 @@ impl ScheduledAdcnetClientSession {
         initial_broadcast: RoundBroadcast,
         starting_round: i64,
         leader: Pubkey,
+        subnet: SubnetId,
     ) -> Self {
         let key = Signed::new(
             &signing_key,
@@ -2283,6 +2334,7 @@ impl ScheduledAdcnetClientSession {
             min_message_size: 1,
             submitted_round: None,
             node: None,
+            subnet,
         }
     }
 
@@ -2332,6 +2384,7 @@ impl ScheduledAdcnetClientSession {
         ).map_err(|e| e.to_string())?;
         tracing::trace!(target: ADCNET, round = self.current_round, won, pending = self.pending.len(), inflight = self.inflight.is_some(), "scheduled submit");
         let signed = Signed::new(&self.signing_key, message).map_err(|e| e.to_string())?;
+        let binding = bind(&self.signing_key, self.subnet, &signed)?;
         let next = self.pending.pop_front();
         if let Some((payload, bid, _)) = self.inflight.take() {
             if !won {
@@ -2340,12 +2393,13 @@ impl ScheduledAdcnetClientSession {
         }
         self.inflight = next.map(|(p, bid)| (p, bid, self.current_round));
         self.submitted_round = Some(self.current_round);
+        let wire = ScheduledAdcnetWire::Client(ScheduledClient {
+            message: signed,
+            key: self.key.clone(),
+            binding,
+        });
         Ok(vec![
-            bincode::serialize(&ScheduledAdcnetWire::Client(ScheduledClient {
-                message: signed,
-                key: self.key.clone(),
-            }))
-            .expect("serialize scheduled client"),
+            bincode::serialize(&wire).expect("serialize scheduled client")
         ])
     }
 
@@ -2467,9 +2521,11 @@ pub struct ScheduledAdcnetServerSession {
     published: bool,
     previous: RoundBroadcast,
     misbehavior: Option<Misbehavior>,
+    subnet: SubnetId,
 }
 
 impl ScheduledAdcnetServerSession {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: UpstreamAdcNetConfig,
         server_id: ServerId,
@@ -2479,6 +2535,7 @@ impl ScheduledAdcnetServerSession {
         peer_servers: &[(ServerId, PublicKey)],
         starting_round: i64,
         leader: Pubkey,
+        subnet: SubnetId,
     ) -> Self {
         assert!(matches!(config.aggregation, AggregationMode::Disabled));
         let svc = ServerService::new(config.clone(), server_id, signing_key, exchange_key);
@@ -2507,6 +2564,7 @@ impl ScheduledAdcnetServerSession {
             pending_broadcast: None,
             published: false,
             misbehavior: None,
+            subnet,
         }
     }
 
@@ -2533,6 +2591,7 @@ impl ScheduledAdcnetServerSession {
         .process_previous_auction(&self.previous.auction_vector, &[])
         .total_allocated;
         if signer != key_signer
+            || !is_bound(&client.binding, self.subnet, signer, &client.message)
             || !self.good_clients.allows(&pk)
             || message.round_number != round
             || message.all_server_ids != self.roster
@@ -2812,6 +2871,53 @@ fn extract_payloads(
     message_slots::read_slots(&rb.message_vector, &winners)
 }
 
+/// Ties a client's signed message to one subnet. Committee-built subnets share
+/// their relays, so without it a relay could replay a client's message into
+/// another subnet in the same round and link the client to it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SubnetBinding {
+    subnet: SubnetId,
+    digest: [u8; 32],
+}
+
+fn digest<T: Serialize>(message: &T) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let bytes = bincode::serialize(message).ok()?;
+    Some(Sha256::digest(bytes).into())
+}
+
+fn bind<T: Serialize>(
+    key: &PrivateKey,
+    subnet: SubnetId,
+    message: &T,
+) -> Result<Signed<SubnetBinding>, String> {
+    let digest = digest(message).ok_or("message did not serialise for binding")?;
+    Signed::new(key, SubnetBinding { subnet, digest }).map_err(|e| e.to_string())
+}
+
+fn is_bound<T: Serialize>(
+    binding: &Signed<SubnetBinding>,
+    subnet: SubnetId,
+    signer: &PublicKey,
+    message: &T,
+) -> bool {
+    binding.recover().is_ok_and(|(b, binding_signer)| {
+        binding_signer == signer && b.subnet == subnet && digest(message) == Some(b.digest)
+    })
+}
+
+/// Blinding pads derive from the relays' ECDH secrets, which every subnet
+/// shares; keying them per subnet keeps a contribution that is replayed into
+/// another subnet from unblinding there.
+fn subnet_shared_key(shared: &SharedKey, subnet: SubnetId) -> SharedKey {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"anymone/adcnet/pad");
+    h.update(subnet.to_le_bytes());
+    h.update(shared.as_bytes());
+    SharedKey::from_bytes(&h.finalize())
+}
+
 #[cfg(test)]
 mod scheduled_tests {
     use super::*;
@@ -2846,6 +2952,7 @@ mod scheduled_tests {
             &peers,
             1,
             leader.pubkey(),
+            0,
         );
         let mut client = ScheduledAdcnetClientSession::new(
             config.clone(),
@@ -2858,6 +2965,7 @@ mod scheduled_tests {
             empty_scheduled_broadcast(&config, 0),
             1,
             leader.pubkey(),
+            0,
         );
         let now = Instant::now();
         client.stage(b"payload".to_vec());
@@ -2911,5 +3019,186 @@ mod scheduled_tests {
         watcher.begin_round(0, now);
         watcher.on_inbound(leader.pubkey(), bytes);
         assert!(watcher.previous.is_none());
+    }
+}
+
+#[cfg(test)]
+mod subnet_binding_tests {
+    use super::*;
+
+    fn one_round() -> OneRoundConfig {
+        OneRoundConfig {
+            iblt: IbltMsgParamsOwned {
+                estimated_messages: 4,
+                max_payload_bytes: 64,
+            },
+        }
+    }
+
+    fn leader(relay: &Identity, subnet: SubnetId) -> AdcnetServerSession {
+        AdcnetServerSession::new(
+            one_round(),
+            ServerId(0),
+            relay.to_adcnet_signing_key(),
+            relay.exchange().clone(),
+            1,
+            vec![relay.pubkey()],
+            0,
+            usize::MAX,
+            true,
+            relay.pubkey(),
+            None,
+            subnet,
+        )
+    }
+
+    fn client(client: &Identity, relay: &Identity, subnet: SubnetId) -> AdcnetClientSession {
+        let shared = HashMap::from([(
+            ServerId(0),
+            client.exchange().ecdh(&relay.exchange_pubkey()),
+        )]);
+        AdcnetClientSession::new(
+            one_round(),
+            client.to_adcnet_signing_key(),
+            shared,
+            client.exchange_pubkey(),
+            [5u8; 32],
+            subnet,
+        )
+    }
+
+    fn accepted(leader: &AdcnetServerSession) -> usize {
+        leader.clients_by_round.get(&0).map_or(0, Vec::len)
+    }
+
+    #[test]
+    fn leader_rejects_a_contribution_bound_to_another_subnet() {
+        let relay = Identity::generate();
+        let sender = Identity::generate();
+        let mut leader = leader(&relay, 1);
+
+        let other = client(&sender, &relay, 0)
+            .contribute(0, Some(b"hi"))
+            .unwrap();
+        leader.on_inbound(relay.pubkey(), other);
+        assert_eq!(accepted(&leader), 0);
+
+        let own = client(&sender, &relay, 1)
+            .contribute(0, Some(b"hi"))
+            .unwrap();
+        leader.on_inbound(sender.pubkey(), own);
+        assert_eq!(accepted(&leader), 1);
+    }
+
+    #[test]
+    fn binding_does_not_transfer_to_another_contribution() {
+        let relay = Identity::generate();
+        let sender = Identity::generate();
+        let mut leader = leader(&relay, 0);
+        let mut session = client(&sender, &relay, 0);
+        let decode = |bytes: Vec<u8>| bincode::deserialize::<AdcnetWire>(&bytes).unwrap();
+
+        let AdcnetWire::Client { binding, .. } = decode(session.contribute(0, Some(b"a")).unwrap())
+        else {
+            panic!("expected a client contribution");
+        };
+        let original = session.contribute(0, Some(b"b")).unwrap();
+        let AdcnetWire::Client {
+            contribution, key, ..
+        } = decode(original.clone())
+        else {
+            panic!("expected a client contribution");
+        };
+        let swapped = AdcnetWire::Client {
+            contribution,
+            key,
+            binding,
+        };
+        leader.on_inbound(sender.pubkey(), bincode::serialize(&swapped).unwrap());
+        assert_eq!(accepted(&leader), 0);
+
+        leader.on_inbound(sender.pubkey(), original);
+        assert_eq!(accepted(&leader), 1);
+    }
+
+    #[test]
+    fn aggregator_rejects_a_contribution_bound_to_another_subnet() {
+        let relay = Identity::generate();
+        let sender = Identity::generate();
+        let mut aggregator = AdcnetAggregatorSession::new(0, 1, relay.clone(), 1);
+
+        let other = client(&sender, &relay, 0)
+            .contribute(0, Some(b"hi"))
+            .unwrap();
+        aggregator.on_inbound(relay.pubkey(), other);
+        assert!(aggregator.rounds.get(&0).is_none_or(HashMap::is_empty));
+
+        let own = client(&sender, &relay, 1)
+            .contribute(0, Some(b"hi"))
+            .unwrap();
+        aggregator.on_inbound(sender.pubkey(), own);
+        assert_eq!(aggregator.rounds[&0].len(), 1);
+    }
+
+    #[test]
+    fn blinding_keys_differ_per_subnet() {
+        let relay = Identity::generate();
+        let sender = Identity::generate();
+        let key = |subnet| client(&sender, &relay, subnet).shared_secrets[&ServerId(0)].clone();
+        assert_ne!(key(0).as_bytes(), key(1).as_bytes());
+
+        let mut leader = leader(&relay, 1);
+        let contribution = client(&sender, &relay, 1).contribute(0, None).unwrap();
+        leader.on_inbound(sender.pubkey(), contribution);
+        let relay_key = &leader.shared_secrets[&sender.to_adcnet_public_key()];
+        assert_eq!(relay_key.as_bytes(), key(1).as_bytes());
+    }
+
+    #[test]
+    fn scheduled_relay_rejects_a_message_bound_to_another_subnet() {
+        let relay = Identity::generate();
+        let sender = Identity::generate();
+        let exchange =
+            |id: &Identity| ExchangePrivateKey::from_bytes(&id.exchange().scalar_bytes()).unwrap();
+        let cfg = crate::config::ScheduledAdcnetConfig {
+            round_duration_ms: 200,
+            message_length: 1024,
+            auction_slots: 16,
+            min_message_size: 1,
+            client_set_min: 0,
+            client_set_max: 8,
+        };
+        let config = scheduled_config(&cfg);
+        let message_from = |subnet| {
+            let mut client = ScheduledAdcnetClientSession::new(
+                config.clone(),
+                sender.to_adcnet_signing_key(),
+                exchange(&sender),
+                &[(ServerId(0), relay.exchange_pubkey())],
+                empty_scheduled_broadcast(&config, 0),
+                1,
+                relay.pubkey(),
+                subnet,
+            );
+            client.stage(b"payload".to_vec());
+            client.begin_round(0, Instant::now()).pop().unwrap()
+        };
+        let mut server = ScheduledAdcnetServerSession::new(
+            config.clone(),
+            ServerId(0),
+            relay.to_adcnet_signing_key(),
+            exchange(&relay),
+            &[],
+            &[(ServerId(0), relay.to_adcnet_public_key())],
+            1,
+            relay.pubkey(),
+            1,
+        );
+
+        server.on_inbound(relay.pubkey(), message_from(0));
+        assert!(server.clients.is_empty());
+
+        server.on_inbound(sender.pubkey(), message_from(1));
+        assert_eq!(server.clients.len(), 1);
     }
 }

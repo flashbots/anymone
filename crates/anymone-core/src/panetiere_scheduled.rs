@@ -32,8 +32,8 @@ use crate::identity::{Identity, Pubkey};
 use crate::log_target::PANETIERE;
 use crate::panetiere::{
     bundle_wire, client_round, client_slice_wire, derive_post_key, fragment_wire, server_index,
-    set_roster, verify_batch, ClientSetState, PanetiereServerSession, PanetiereWire, SetMode,
-    PANETIERE_ROUND_RETENTION,
+    set_roster, subnet_scope, verify_batch, ClientSetState, PanetiereServerSession, PanetiereWire,
+    SetMode, PANETIERE_ROUND_RETENTION,
 };
 use crate::runtime::AnymoneInner;
 use crate::session::{GoodClients, Misbehavior, PeerId, RoundOutcome, Session};
@@ -194,7 +194,7 @@ pub(crate) fn client_session(
         entries_by_round,
     );
     session.set_node(node);
-    session.set_setup_seed(setup_seed);
+    session.set_scope(&setup_seed, subnet.id);
     if consensus {
         match set_roster(relay_xk, subnet) {
             Some(pks) => session.set_consensus(pks),
@@ -256,7 +256,7 @@ pub(crate) fn server_session(
     );
     session.set_client_set_max(cfg.client_set_max as usize);
     session.set_subnet(subnet.id);
-    session.set_setup_seed(cfg.setup_seed);
+    session.set_scope(&cfg.setup_seed, subnet.id);
     session.set_good_clients(good_clients);
     if consensus {
         match set_roster(relay_xk, subnet) {
@@ -300,8 +300,9 @@ pub struct ScheduledPanetiereClientSession {
     rand_rng: ChaCha20Rng,
     /// Signs the RS bulletin post; see [`derive_post_key`].
     post_key: panetiere::sig::SigningKey,
-    /// Subnet's `setup_seed`; with the round it forms the `sid` openings bind to.
-    setup_seed: [u8; 32],
+    /// [`subnet_scope`] of the subnet's `setup_seed` and id; with the round it
+    /// forms the `sid` that openings and client signatures bind to.
+    scope: [u8; 32],
     client_round: Option<(Round, RsClientRound)>,
     /// Consensus set formation: the roster receipts verify under, and the
     /// rounds whose bundles are still collecting them.
@@ -345,7 +346,7 @@ impl ScheduledPanetiereClientSession {
             cover_rng: ChaCha20Rng::from_seed(cover_seed),
             rand_rng: ChaCha20Rng::from_seed(rand_seed),
             post_key: derive_post_key(rng_seed),
-            setup_seed: [0u8; 32],
+            scope: [0u8; 32],
             client_round: None,
             set_pks: None,
             set_rounds: BTreeMap::new(),
@@ -356,8 +357,8 @@ impl ScheduledPanetiereClientSession {
         self.node = Some(node);
     }
 
-    pub(crate) fn set_setup_seed(&mut self, setup_seed: [u8; 32]) {
-        self.setup_seed = setup_seed;
+    pub(crate) fn set_scope(&mut self, setup_seed: &[u8; 32], subnet: SubnetId) {
+        self.scope = subnet_scope(setup_seed, subnet);
         self.client_round = None;
     }
 
@@ -456,7 +457,7 @@ impl ScheduledPanetiereClientSession {
 
     pub fn accept_receipt_batch(&mut self, round: Round, data: &[u8]) -> Result<(), String> {
         let pks = self.set_pks.as_ref().ok_or("consensus mode is disabled")?;
-        let sid = crate::panetiere::session_id(&self.setup_seed, round);
+        let sid = crate::panetiere::session_id(&self.scope, round);
         let batch = crate::client_set::ReceiptBatch::unpack(data)
             .filter(|batch| verify_batch(&sid, batch, pks))
             .ok_or("invalid receipt batch")?;
@@ -472,7 +473,7 @@ impl ScheduledPanetiereClientSession {
         signature: &[u8],
     ) -> Result<(), String> {
         if !self.leader_pk.verify(
-            &reservation_signing_bytes(&self.setup_seed, round, &entries),
+            &reservation_signing_bytes(&self.scope, round, &entries),
             signature,
         ) {
             return Err("invalid reservation signature".into());
@@ -541,7 +542,7 @@ impl ScheduledPanetiereClientSession {
             self.client_round = Some((
                 round,
                 client_round(
-                    &self.pp, &self.setup_seed, round, self.client_id,
+                    &self.pp, &self.scope, round, self.client_id,
                     &self.servers, self.rng_seed,
                 ),
             ));
@@ -552,7 +553,7 @@ impl ScheduledPanetiereClientSession {
         let Some(state) = self.set_rounds.get_mut(&round) else {
             return Vec::new();
         };
-        let sid = crate::panetiere::session_id(&self.setup_seed, round);
+        let sid = crate::panetiere::session_id(&self.scope, round);
         fragment_wire(&self.pp, &sid, round, state, &self.post_key, &self.identity)
     }
 
@@ -699,12 +700,12 @@ impl ScheduledPanetiereClientSession {
         // shares are a fixed block width, so every round rides the full width.
         plaintext.resize(message_polys(&self.pp), KahePoly::default());
 
-        let sid = crate::panetiere::session_id(&self.setup_seed, round);
+        let sid = crate::panetiere::session_id(&self.scope, round);
         let client_round = match self.client_round.take() {
             Some((prepared_round, client_round)) if prepared_round == round => client_round,
             _ => client_round(
                 &self.pp,
-                &self.setup_seed,
+                &self.scope,
                 round,
                 self.client_id,
                 &self.servers,
@@ -719,7 +720,7 @@ impl ScheduledPanetiereClientSession {
                 round_out,
                 &self.post_key,
             );
-            let out = bundle_wire(&self.pp, round, &round_out, &self.identity);
+            let out = bundle_wire(&self.pp, &sid, round, &round_out, &self.identity);
             self.set_rounds
                 .insert(round, ClientSetState::new(round_out));
             self.set_rounds
@@ -736,7 +737,7 @@ impl ScheduledPanetiereClientSession {
                 signature: self
                     .identity
                     .sign(&crate::panetiere::client_public_signing_bytes(
-                        round, cid, &entry,
+                        &sid, cid, &entry,
                     )),
                 entry,
                 signer: self.identity.pubkey(),
@@ -751,6 +752,7 @@ impl ScheduledPanetiereClientSession {
         {
             out.push(
                 bincode::serialize(&client_slice_wire(
+                    &sid,
                     round,
                     cid,
                     lane as u32,
@@ -770,7 +772,7 @@ impl ScheduledPanetiereClientSession {
                     signature: self
                         .identity
                         .sign(&crate::panetiere::client_opening_signing_bytes(
-                            round,
+                            &sid,
                             cid,
                             server_id.0,
                             &sealed,
@@ -853,7 +855,8 @@ impl Session for ScheduledPanetiereClientSession {
 pub struct ScheduledPanetiereServerSession {
     inner: PanetiereServerSession,
     identity: Identity,
-    setup_seed: [u8; 32],
+    /// [`subnet_scope`] of the subnet's `setup_seed` and id; reservations bind to it.
+    scope: [u8; 32],
     sched_mse: ChannelParams,
     sched_polys: usize,
     vector_bytes: usize,
@@ -908,7 +911,7 @@ impl ScheduledPanetiereServerSession {
         ScheduledPanetiereServerSession {
             inner,
             identity,
-            setup_seed: [0; 32],
+            scope: [0; 32],
             sched_mse,
             sched_polys,
             vector_bytes,
@@ -933,9 +936,9 @@ impl ScheduledPanetiereServerSession {
         self.subnet = subnet;
     }
 
-    pub(crate) fn set_setup_seed(&mut self, setup_seed: [u8; 32]) {
-        self.setup_seed = setup_seed;
-        self.inner.set_setup_seed(setup_seed);
+    pub(crate) fn set_scope(&mut self, setup_seed: &[u8; 32], subnet: SubnetId) {
+        self.scope = subnet_scope(setup_seed, subnet);
+        self.inner.set_scope(setup_seed, subnet);
     }
 
     pub(crate) fn set_good_clients(&mut self, good_clients: GoodClients) {
@@ -965,7 +968,7 @@ impl Session for ScheduledPanetiereServerSession {
                 bincode::deserialize::<PanetiereWire>(&payload)
             {
                 if !self.leader_pk.verify(
-                    &reservation_signing_bytes(&self.setup_seed, round, &entries),
+                    &reservation_signing_bytes(&self.scope, round, &entries),
                     &signature,
                 ) {
                     return Vec::new();
@@ -1050,7 +1053,7 @@ impl Session for ScheduledPanetiereServerSession {
                 let wire = PanetiereWire::Reservations {
                     round: rd,
                     signature: self.identity.sign(&reservation_signing_bytes(
-                        &self.setup_seed, rd, &entries,
+                        &self.scope, rd, &entries,
                     )),
                     entries: entries.clone(),
                 };
