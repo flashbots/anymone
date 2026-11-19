@@ -46,6 +46,7 @@ fn scheduled_adcnet_session_happy_path() {
         },
         1,
         leader,
+        0,
     );
     let mut servers: Vec<_> = identities
         .iter()
@@ -60,6 +61,7 @@ fn scheduled_adcnet_session_happy_path() {
                 &peers,
                 1,
                 leader,
+                0,
             )
         })
         .collect();

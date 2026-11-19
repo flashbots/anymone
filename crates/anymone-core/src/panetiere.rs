@@ -45,6 +45,7 @@ use crate::client_set::{
 };
 use crate::config::{
     Encoding, ExchangePublicKeyWire, PanetiereConfig, ProtocolConfig, Round, SetFormation, Subnet,
+    SubnetId,
 };
 use crate::faults::{Attribution, Fault, FaultKind, OutputFaultTracker};
 use crate::identity::{Identity, Pubkey};
@@ -249,7 +250,7 @@ pub(crate) const K_REPAIR: u8 = 3;
 
 pub(crate) fn client_round(
     pp: &ProtocolParams,
-    setup_seed: &[u8; 32],
+    scope: &[u8; 32],
     round: Round,
     client_id: ClientId,
     servers: &[(ServerId, pke::PublicKey)],
@@ -258,13 +259,7 @@ pub(crate) fn client_round(
     let mut seed = rng_seed;
     seed[24..32].copy_from_slice(&round.to_le_bytes());
     let mut rng = ChaCha20Rng::from_seed(seed);
-    RsClientRound::new(
-        &mut rng,
-        pp,
-        &session_id(setup_seed, round),
-        client_id,
-        servers,
-    )
+    RsClientRound::new(&mut rng, pp, &session_id(scope, round), client_id, servers)
 }
 
 /// A batch verifies under the client-set key of the lane it names.
@@ -282,14 +277,26 @@ pub(crate) fn verify_batch(
     })
 }
 
+/// Binds a subnet's sessions to that subnet. Committee-built subnets share one
+/// `setup_seed`, so without the id a client's signed round would verify on
+/// every subnet and a relay could replay it into another one.
+pub(crate) fn subnet_scope(setup_seed: &[u8; 32], subnet: SubnetId) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"anymone/panetiere/scope");
+    h.update(setup_seed);
+    h.update(subnet.to_le_bytes());
+    h.finalize().into()
+}
+
 /// Panetière `sid` for one round of one subnet. The round must stay in the
 /// hash: openings are bound to the sid, so a constant one permits cross-round
 /// replay.
-pub(crate) fn session_id(setup_seed: &[u8; 32], round: Round) -> SessionId {
+pub(crate) fn session_id(scope: &[u8; 32], round: Round) -> SessionId {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(b"anymone/panetiere/sid");
-    h.update(setup_seed);
+    h.update(scope);
     h.update(round.to_le_bytes());
     SessionId(h.finalize().into())
 }
@@ -343,7 +350,7 @@ pub(crate) fn client_session(
     rand::rngs::OsRng.fill_bytes(&mut seed);
     let mut session =
         PanetiereClientSession::new(pp.clone(), mse.clone(), identity.clone(), servers, seed);
-    session.set_setup_seed(setup_seed);
+    session.set_scope(&setup_seed, subnet.id);
     if consensus {
         match set_roster(relay_xk, subnet) {
             Some(pks) => session.set_consensus(pks),
@@ -399,7 +406,7 @@ fn server_session(
         server_pubkeys,
     );
     session.set_client_set_max(cfg.client_set_max as usize);
-    session.set_setup_seed(cfg.setup_seed);
+    session.set_scope(&cfg.setup_seed, subnet.id);
     session.set_good_clients(good_clients);
     if consensus {
         match set_roster(relay_xk, subnet) {
@@ -977,30 +984,34 @@ pub(crate) fn server_public_signing_bytes(
     m
 }
 
-pub(crate) fn client_public_signing_bytes(round: u64, client_id: u32, entry: &[u8]) -> Vec<u8> {
+pub(crate) fn client_public_signing_bytes(
+    sid: &SessionId,
+    client_id: u32,
+    entry: &[u8],
+) -> Vec<u8> {
     let mut m = b"anymone/panetiere/client-public".to_vec();
     m.extend_from_slice(
-        &bincode::serialize(&(round, client_id, entry)).expect("serialise signing bytes"),
+        &bincode::serialize(&(sid.0, client_id, entry)).expect("serialise signing bytes"),
     );
     m
 }
 
 pub(crate) fn client_opening_signing_bytes(
-    round: u64,
+    sid: &SessionId,
     client_id: u32,
     target_server: u32,
     sealed: &[u8],
 ) -> Vec<u8> {
     let mut m = b"anymone/panetiere/client-opening".to_vec();
     m.extend_from_slice(
-        &bincode::serialize(&(round, client_id, target_server, sealed))
+        &bincode::serialize(&(sid.0, client_id, target_server, sealed))
             .expect("serialise signing bytes"),
     );
     m
 }
 
 pub(crate) fn client_slice_signing_bytes(
-    round: u64,
+    sid: &SessionId,
     client_id: u32,
     lane: u32,
     share: &[u8],
@@ -1008,34 +1019,34 @@ pub(crate) fn client_slice_signing_bytes(
 ) -> Vec<u8> {
     let mut m = b"anymone/panetiere/client-slice".to_vec();
     m.extend_from_slice(
-        &bincode::serialize(&(round, client_id, lane, share, path))
+        &bincode::serialize(&(sid.0, client_id, lane, share, path))
             .expect("serialise signing bytes"),
     );
     m
 }
 
 pub(crate) fn client_bundle_signing_bytes(
-    round: u64,
+    sid: &SessionId,
     client_id: u32,
     lane: u32,
     data: &[u8],
 ) -> Vec<u8> {
     let mut m = b"anymone/panetiere/client-bundle".to_vec();
     m.extend_from_slice(
-        &bincode::serialize(&(round, client_id, lane, data)).expect("serialise signing bytes"),
+        &bincode::serialize(&(sid.0, client_id, lane, data)).expect("serialise signing bytes"),
     );
     m
 }
 
 pub(crate) fn client_fragment_signing_bytes(
-    round: u64,
+    sid: &SessionId,
     client_id: u32,
     target_server: u32,
     data: &[u8],
 ) -> Vec<u8> {
     let mut m = b"anymone/panetiere/client-fragment".to_vec();
     m.extend_from_slice(
-        &bincode::serialize(&(round, client_id, target_server, data))
+        &bincode::serialize(&(sid.0, client_id, target_server, data))
             .expect("serialise signing bytes"),
     );
     m
@@ -1044,6 +1055,7 @@ pub(crate) fn client_fragment_signing_bytes(
 /// One lane's slice message, signed by the client's node identity. Shared by
 /// both flows: the RS emission is identical, only the plaintext layout differs.
 pub(crate) fn client_slice_wire(
+    sid: &SessionId,
     round: Round,
     client_id: u32,
     lane: u32,
@@ -1061,7 +1073,7 @@ pub(crate) fn client_slice_wire(
         client_id,
         lane,
         signature: identity.sign(&client_slice_signing_bytes(
-            round, client_id, lane, &share, &path,
+            sid, client_id, lane, &share, &path,
         )),
         share,
         path,
@@ -1132,6 +1144,7 @@ impl ClientSetState {
 /// each lane's three parts as one signed unit.
 pub(crate) fn bundle_wire(
     pp: &ProtocolParams,
+    sid: &SessionId,
     round: Round,
     round_out: &ClientSetRound,
     identity: &Identity,
@@ -1143,7 +1156,7 @@ pub(crate) fn bundle_wire(
         bincode::serialize(&PanetiereWire::ClientPublic {
             round,
             client_id: cid,
-            signature: identity.sign(&client_public_signing_bytes(round, cid, &entry)),
+            signature: identity.sign(&client_public_signing_bytes(sid, cid, &entry)),
             entry,
             signer: identity.pubkey(),
         })
@@ -1158,7 +1171,7 @@ pub(crate) fn bundle_wire(
                 round,
                 client_id: cid,
                 lane,
-                signature: identity.sign(&client_bundle_signing_bytes(round, cid, lane, &data)),
+                signature: identity.sign(&client_bundle_signing_bytes(sid, cid, lane, &data)),
                 data,
                 signer: identity.pubkey(),
             })
@@ -1210,7 +1223,7 @@ pub(crate) fn fragment_wire(
                 client_id: cid,
                 target_server,
                 signature: identity.sign(&client_fragment_signing_bytes(
-                    round,
+                    sid,
                     cid,
                     target_server,
                     &data,
@@ -1756,8 +1769,9 @@ pub struct PanetiereClientSession {
     /// binds `(sid, client_id)` and the Ed25519 wire signature already ties it
     /// to this node's identity, so no cross-round continuity is needed.
     post_key: sig::SigningKey,
-    /// Subnet's `setup_seed`; with the round it forms the `sid` openings bind to.
-    setup_seed: [u8; 32],
+    /// [`subnet_scope`] of the subnet's `setup_seed` and id; with the round it
+    /// forms the `sid` that openings and client signatures bind to.
+    scope: [u8; 32],
     client_round: Option<(Round, RsClientRound)>,
     /// Consensus set formation: the roster receipts verify under. `None` in
     /// leader mode, where the client neither collects nor needs them.
@@ -1793,15 +1807,15 @@ impl PanetiereClientSession {
             cover_rng: ChaCha20Rng::from_seed(cover_seed),
             r_rng: ChaCha20Rng::from_seed(r_seed),
             post_key,
-            setup_seed: [0u8; 32],
+            scope: [0u8; 32],
             client_round: None,
             set_pks: None,
             set_rounds: std::collections::BTreeMap::new(),
         }
     }
 
-    pub(crate) fn set_setup_seed(&mut self, setup_seed: [u8; 32]) {
-        self.setup_seed = setup_seed;
+    pub(crate) fn set_scope(&mut self, setup_seed: &[u8; 32], subnet: SubnetId) {
+        self.scope = subnet_scope(setup_seed, subnet);
         self.client_round = None;
     }
 
@@ -1844,12 +1858,12 @@ impl PanetiereClientSession {
                 return Vec::new();
             }
         };
-        let sid = session_id(&self.setup_seed, round);
+        let sid = session_id(&self.scope, round);
         let client_round = match self.client_round.take() {
             Some((prepared_round, client_round)) if prepared_round == round => client_round,
             _ => client_round(
                 &self.pp,
-                &self.setup_seed,
+                &self.scope,
                 round,
                 self.client_id,
                 &self.servers,
@@ -1866,7 +1880,7 @@ impl PanetiereClientSession {
                 real = had_pending,
                 "panetiere client: emitting bundles"
             );
-            let out = bundle_wire(&self.pp, round, &round_out, &self.identity);
+            let out = bundle_wire(&self.pp, &sid, round, &round_out, &self.identity);
             self.set_rounds
                 .insert(round, ClientSetState::new(round_out));
             self.set_rounds
@@ -1890,7 +1904,7 @@ impl PanetiereClientSession {
             client_id: cid,
             signature: self
                 .identity
-                .sign(&client_public_signing_bytes(round, cid, &entry)),
+                .sign(&client_public_signing_bytes(&sid, cid, &entry)),
             entry,
             signer: self.identity.pubkey(),
         };
@@ -1903,7 +1917,8 @@ impl PanetiereClientSession {
             .zip(round_out.share_paths.iter())
             .enumerate()
         {
-            let slice = client_slice_wire(round, cid, lane as u32, share, path, &self.identity);
+            let slice =
+                client_slice_wire(&sid, round, cid, lane as u32, share, path, &self.identity);
             out.push(bincode::serialize(&slice).expect("serialise client slice"));
         }
 
@@ -1913,7 +1928,7 @@ impl PanetiereClientSession {
                 client_id: cid,
                 target_server: server_id.0,
                 signature: self.identity.sign(&client_opening_signing_bytes(
-                    round,
+                    &sid,
                     cid,
                     server_id.0,
                     &sealed,
@@ -1953,7 +1968,7 @@ impl PanetiereClientSession {
             self.client_round = Some((
                 round,
                 client_round(
-                    &self.pp, &self.setup_seed, round, self.client_id,
+                    &self.pp, &self.scope, round, self.client_id,
                     &self.servers, self.rng_seed,
                 ),
             ));
@@ -1962,7 +1977,7 @@ impl PanetiereClientSession {
 
     pub fn accept_receipt_batch(&mut self, round: Round, data: &[u8]) -> Result<(), String> {
         let pks = self.set_pks.as_ref().ok_or("consensus mode is disabled")?;
-        let sid = session_id(&self.setup_seed, round);
+        let sid = session_id(&self.scope, round);
         let batch = ReceiptBatch::unpack(data)
             .filter(|batch| verify_batch(&sid, batch, pks))
             .ok_or("invalid receipt batch")?;
@@ -1975,7 +1990,7 @@ impl PanetiereClientSession {
         let Some(state) = self.set_rounds.get_mut(&round) else {
             return Vec::new();
         };
-        let sid = session_id(&self.setup_seed, round);
+        let sid = session_id(&self.scope, round);
         fragment_wire(&self.pp, &sid, round, state, &self.post_key, &self.identity)
     }
 }
@@ -2160,8 +2175,9 @@ pub struct PanetiereServerSession {
     /// Upper bound on distinct clients admitted per round (also the canonical
     /// set size ceiling); unbounded until [`Self::set_client_set_max`] is called.
     client_set_max: usize,
-    /// Subnet's `setup_seed`; with the round it forms the `sid` openings bind to.
-    setup_seed: [u8; 32],
+    /// [`subnet_scope`] of the subnet's `setup_seed` and id; with the round it
+    /// forms the `sid` that openings and client signatures bind to.
+    scope: [u8; 32],
     good_clients: GoodClients,
     /// Consensus set formation: this relay's receipt-signing key and the roster
     /// peers' receipts and chain links verify under. `None` forms no set at all
@@ -2207,14 +2223,14 @@ impl PanetiereServerSession {
             cur_round: None,
             first_round: None,
             client_set_max: usize::MAX,
-            setup_seed: [0u8; 32],
+            scope: [0u8; 32],
             good_clients: GoodClients::all(),
             set_keys: None,
         }
     }
 
-    pub(crate) fn set_setup_seed(&mut self, setup_seed: [u8; 32]) {
-        self.setup_seed = setup_seed;
+    pub(crate) fn set_scope(&mut self, setup_seed: &[u8; 32], subnet: SubnetId) {
+        self.scope = subnet_scope(setup_seed, subnet);
     }
 
     /// This relay's receipt signer and the roster in `ServerId` order.
@@ -2573,12 +2589,13 @@ impl Session for PanetiereServerSession {
                     );
                     return Vec::new();
                 }
+                let sid = session_id(&self.scope, round);
                 if !self.accept_client(
                     round,
                     client_id,
                     signer,
                     &signature,
-                    &client_public_signing_bytes(round, client_id, &entry),
+                    &client_public_signing_bytes(&sid, client_id, &entry),
                     "public",
                 ) {
                     return Vec::new();
@@ -2621,7 +2638,6 @@ impl Session for PanetiereServerSession {
                     Some(parsed) => {
                         // Verify the client's own P-256 signature at ingest, so a
                         // forged post can never reach decode as a `BadSignature`.
-                        let sid = session_id(&self.setup_seed, round);
                         let signed = RsClientBulletinEntry::signing_bytes(
                             &sid,
                             cid,
@@ -2679,12 +2695,13 @@ impl Session for PanetiereServerSession {
                     );
                 }
                 if target_server == self.server_id.0 {
+                    let sid = session_id(&self.scope, round);
                     if !self.accept_client(
                         round,
                         client_id,
                         signer,
                         &signature,
-                        &client_opening_signing_bytes(round, client_id, target_server, &sealed),
+                        &client_opening_signing_bytes(&sid, client_id, target_server, &sealed),
                         "opening",
                     ) {
                         return Vec::new();
@@ -2722,7 +2739,6 @@ impl Session for PanetiereServerSession {
                             return Vec::new();
                         }
                     }
-                    let sid = session_id(&self.setup_seed, round);
                     let Some(opening) = unseal_opening(
                         self.identity.exchange().pke(),
                         &sid,
@@ -2766,12 +2782,13 @@ impl Session for PanetiereServerSession {
                 if lane != self.server_id.0 {
                     return Vec::new();
                 }
+                let sid = session_id(&self.scope, round);
                 if !self.accept_client(
                     round,
                     client_id,
                     signer,
                     &signature,
-                    &client_slice_signing_bytes(round, client_id, lane, &share, &path),
+                    &client_slice_signing_bytes(&sid, client_id, lane, &share, &path),
                     "slice",
                 ) {
                     return Vec::new();
@@ -2954,12 +2971,13 @@ impl Session for PanetiereServerSession {
                 if lane != self.server_id.0 || !self.consensus() {
                     return Vec::new();
                 }
+                let sid = session_id(&self.scope, round);
                 if !self.accept_client(
                     round,
                     client_id,
                     signer,
                     &signature,
-                    &client_bundle_signing_bytes(round, client_id, lane, &data),
+                    &client_bundle_signing_bytes(&sid, client_id, lane, &data),
                     "bundle",
                 ) {
                     return Vec::new();
@@ -2983,7 +3001,6 @@ impl Session for PanetiereServerSession {
                 if used != data.len() {
                     return Vec::new();
                 }
-                let sid = session_id(&self.setup_seed, round);
                 let (signer_key, pks) = self.set_keys.clone().expect("consensus checked above");
                 let server_id = self.server_id;
                 let max = self.client_set_max.saturating_mul(2);
@@ -3023,12 +3040,13 @@ impl Session for PanetiereServerSession {
                 if target_server != self.server_id.0 || !self.consensus() {
                     return Vec::new();
                 }
+                let sid = session_id(&self.scope, round);
                 if !self.accept_client(
                     round,
                     client_id,
                     signer,
                     &signature,
-                    &client_fragment_signing_bytes(round, client_id, target_server, &data),
+                    &client_fragment_signing_bytes(&sid, client_id, target_server, &data),
                     "fragment",
                 ) {
                     return Vec::new();
@@ -3040,7 +3058,6 @@ impl Session for PanetiereServerSession {
                 };
                 let cid = ClientId(client_id);
                 let pp = self.pp.clone();
-                let sid = session_id(&self.setup_seed, round);
                 let (signer_key, pks) = self.set_keys.clone().expect("consensus checked above");
                 let server_id = self.server_id;
                 let max = self.client_set_max.saturating_mul(2);
@@ -3208,7 +3225,7 @@ impl PanetiereServerSession {
     /// bare on broadcast, where clients read whether their bundle landed, and
     /// chain-signed on shares, where it originates Dolev–Strong round 1.
     fn publish_batch(&mut self, round: Round) -> Vec<Vec<u8>> {
-        let sid = session_id(&self.setup_seed, round);
+        let sid = session_id(&self.scope, round);
         let Some(state) = self.rounds.get_mut(&round) else {
             return Vec::new();
         };
@@ -3232,7 +3249,7 @@ impl PanetiereServerSession {
     /// One Dolev–Strong round over everything buffered since the last: accept
     /// what carries `ds_round` distinct signatures, forward each once.
     fn absorb_relays(&mut self, round: Round, ds_round: usize) -> Vec<Vec<u8>> {
-        let sid = session_id(&self.setup_seed, round);
+        let sid = session_id(&self.scope, round);
         let Some(state) = self.rounds.get_mut(&round) else {
             return Vec::new();
         };
@@ -3255,7 +3272,7 @@ impl PanetiereServerSession {
                 continue;
             };
             state.finalized = true;
-            let sid = session_id(&self.setup_seed, r);
+            let sid = session_id(&self.scope, r);
             let fixed = set.finalize(&self.pp, self.identity.exchange().pke(), &sid);
             if !fixed.excluded.is_empty() {
                 tracing::debug!(
@@ -3519,7 +3536,7 @@ impl PanetiereServerSession {
                 Some(set) => vec![set],
                 None => candidate_sets(&collect_outputs(state)),
             };
-            let sid = session_id(&self.setup_seed, *r);
+            let sid = session_id(&self.scope, *r);
             let mut plain = None;
             let mut culprits: Vec<NodeId> = Vec::new();
             for set in candidates {
@@ -4083,5 +4100,78 @@ impl Session for PanetiereWatchSession {
             decoded,
             faults: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod subnet_scope_tests {
+    use super::*;
+
+    /// A client's round, signed for one subnet, must not be admitted by a
+    /// relay of another subnet even when both share their relays and seed.
+    #[test]
+    fn relay_rejects_a_round_signed_for_another_subnet() {
+        let mut relays: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
+        relays.sort_by_key(Identity::pubkey);
+        let server_pubkeys: HashMap<ServerId, Pubkey> = relays
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (ServerId(i as u32), id.pubkey()))
+            .collect();
+        let seal_keys: Vec<(ServerId, pke::PublicKey)> = relays
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (ServerId(i as u32), id.exchange().pke().public()))
+            .collect();
+        let cfg = PanetiereConfig {
+            message_size: 64,
+            estimated_messages: 1,
+            client_set_max: 4,
+            ..Default::default()
+        };
+        let (mse, pp) = params_for(&cfg, relays.len());
+
+        let client_id = Identity::generate();
+        let mut client = PanetiereClientSession::new(
+            pp.clone(),
+            mse.clone(),
+            client_id.clone(),
+            seal_keys,
+            [9u8; 32],
+        );
+        client.set_scope(&cfg.setup_seed, 0);
+        client.stage(b"subnet zero only".to_vec());
+        let messages = client.begin_round(0, Instant::now());
+
+        let relay_for = |subnet: SubnetId| {
+            let mut relay = PanetiereServerSession::new(
+                pp.clone(),
+                mse.clone(),
+                ServerId(0),
+                relays[0].clone(),
+                SetMode::Leader,
+                server_pubkeys.clone(),
+            );
+            relay.set_scope(&cfg.setup_seed, subnet);
+            for m in &messages {
+                relay.on_inbound(client_id.pubkey(), m.clone());
+            }
+            relay
+        };
+
+        let other = relay_for(1);
+        let untouched = |bucket: &PanetiereRoundState| {
+            bucket.owners.is_empty()
+                && bucket.publics.is_empty()
+                && bucket.inbox_items.is_empty()
+                && bucket.lane_items.is_empty()
+        };
+        assert!(other.rounds.get(&0).is_none_or(untouched));
+
+        let own = relay_for(0);
+        let bucket = &own.rounds[&0];
+        assert_eq!(bucket.publics.len(), 1);
+        assert_eq!(bucket.inbox_items.len(), 1);
+        assert_eq!(bucket.lane_items.len(), 1);
     }
 }

@@ -69,6 +69,7 @@ fn adcnet_session_happy_path() {
         client_shared,
         client_id.exchange_pubkey(),
         [42u8; 32],
+        0,
     );
     let mut servers: Vec<AdcnetServerSession> = (0..n_servers)
         .map(|i| {
@@ -84,6 +85,7 @@ fn adcnet_session_happy_path() {
                 i == 0,
                 leader_pk,
                 None,
+                0,
             )
         })
         .collect();
@@ -152,6 +154,7 @@ fn adcnet_session_happy_path() {
                     i == 0,
                     leader_pk,
                     None,
+                    0,
                 );
                 let gate = gate.clone();
                 s.set_good_clients(GoodClients::new(move |pk| gate.contains(pk)));
@@ -171,6 +174,7 @@ fn adcnet_session_happy_path() {
             shared,
             client_id.exchange_pubkey(),
             [42u8; 32],
+            0,
         );
         client.stage_message(payload.clone());
 
@@ -224,6 +228,7 @@ fn adcnet_session_happy_path() {
             shared,
             client_id.exchange_pubkey(),
             [7u8; 32],
+            0,
         );
         c.set_cover_rate(rate);
         c
@@ -258,6 +263,7 @@ fn adcnet_session_happy_path() {
         true,
         cap_relay_pk,
         None,
+        0,
     );
     for cid in (0..2).map(|_| Identity::generate()) {
         let shared: HashMap<ServerId, SharedKey> = HashMap::from([(
@@ -270,6 +276,7 @@ fn adcnet_session_happy_path() {
             shared,
             cid.exchange_pubkey(),
             [3u8; 32],
+            0,
         );
         c.stage_message(b"x".to_vec());
         for m in c.begin_round(0, now) {
@@ -326,6 +333,7 @@ impl Subnet {
             client_shared,
             client_id.exchange_pubkey(),
             [9u8; 32],
+            0,
         );
         let relays: Vec<AdcnetServerSession> = (0..n_servers)
             .map(|i| {
@@ -341,6 +349,7 @@ impl Subnet {
                     i == 0,
                     leader_pk,
                     None,
+                    0,
                 )
             })
             .collect();

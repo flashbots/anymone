@@ -680,6 +680,7 @@ impl Subnet {
                     client_shared,
                     client_id.exchange_pubkey(),
                     seed,
+                    0,
                 )
             })
             .collect();
@@ -698,6 +699,7 @@ impl Subnet {
                     i == 0,
                     leader_pk,
                     None,
+                    0,
                 )
             })
             .collect();
