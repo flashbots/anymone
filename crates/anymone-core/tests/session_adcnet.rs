@@ -284,7 +284,7 @@ fn adcnet_session_happy_path() {
         }
     }
     let out = cap_leader.end_round(0, now);
-    let mut cap_observer = AdcnetObserverSession::new(vec![cap_relay_pk], cap_relay_pk, 2);
+    let mut cap_observer = AdcnetObserverSession::new(0, vec![cap_relay_pk], cap_relay_pk, 2);
     cap_observer.begin_round(0, now);
     for m in &out.outbound {
         cap_observer.on_inbound(cap_relay_pk, m.clone());
@@ -353,7 +353,7 @@ impl Subnet {
                 )
             })
             .collect();
-        let observer = AdcnetObserverSession::new(relay_pks.clone(), leader_pk, fault_threshold);
+        let observer = AdcnetObserverSession::new(0, relay_pks.clone(), leader_pk, fault_threshold);
 
         Subnet {
             client,

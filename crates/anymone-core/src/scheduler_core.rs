@@ -1431,7 +1431,7 @@ impl SchedulerCore {
                 }
                 let leader = crate::runtime::leader_of(roster, *id);
                 if let Some(o) =
-                    build_observer(*proto, roster.clone(), leader, self.params.fault_threshold)
+                    build_observer(*id, *proto, roster.clone(), leader, self.params.fault_threshold)
                 {
                     observers.insert(*id, o);
                     self.observer_grace.insert(*id, OBSERVER_FAULT_GRACE);
@@ -1968,6 +1968,7 @@ impl PublicObserver {
 }
 
 fn build_observer(
+    subnet: SubnetId,
     proto: Option<SchedulerProtocol>,
     roster: Vec<Pubkey>,
     leader: Pubkey,
@@ -1977,6 +1978,7 @@ fn build_observer(
         Some(SchedulerProtocol::Adcnet) | Some(SchedulerProtocol::ScheduledAdcnet) => {
             Some(PublicObserver::Adcnet(AdcnetObserverSession::for_protocol(
                 proto == Some(SchedulerProtocol::ScheduledAdcnet),
+                subnet,
                 roster,
                 leader,
                 fault_threshold,

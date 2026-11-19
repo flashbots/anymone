@@ -473,6 +473,7 @@ async fn watch_subnet(subnet: Subnet, transport: Arc<dyn Transport>, obs: Shared
         ProtocolConfig::Adcnet(_) | ProtocolConfig::ScheduledAdcnet(_) => {
             Some(AdcnetObserverSession::for_protocol(
                 matches!(subnet.protocol, ProtocolConfig::ScheduledAdcnet(_)),
+                subnet.id,
                 roster.clone(),
                 leader,
                 FAULT_THRESHOLD,

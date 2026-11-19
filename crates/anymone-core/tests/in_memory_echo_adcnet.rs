@@ -187,7 +187,7 @@ async fn adcnet_echo_roundtrip_in_memory() {
             .await;
         let anon = anon.clone();
         tokio::spawn(async move {
-            let mut o = AdcnetObserverSession::new(roster, leader, 2);
+            let mut o = AdcnetObserverSession::new(0, roster, leader, 2);
             while let Some(m) = sub.recv().await {
                 o.on_inbound(m.from, m.payload);
                 anon.fetch_max(o.anonymity_set().unwrap_or(0) as u64, Ordering::Relaxed);
@@ -515,7 +515,7 @@ async fn rehome_sheds_clients_from_the_old_subnet() {
             r[0]
         };
         tokio::spawn(async move {
-            let mut o = AdcnetObserverSession::new(roster, leader, 2);
+            let mut o = AdcnetObserverSession::new(0, roster, leader, 2);
             while let Some(m) = sub0.recv().await {
                 o.on_inbound(m.from, m.payload);
                 anon0.store(o.anonymity_set().unwrap_or(0) as u64, Ordering::Relaxed);
@@ -738,7 +738,7 @@ async fn pipe_drop_retires_client_without_further_sends() {
         let anon_broadcasts = anon_broadcasts.clone();
         let roster = relay_pks.clone();
         tokio::spawn(async move {
-            let mut o = AdcnetObserverSession::new(roster, leader, 2);
+            let mut o = AdcnetObserverSession::new(0, roster, leader, 2);
             let mut last_round = None;
             while let Some(m) = sub0.recv().await {
                 o.on_inbound(m.from, m.payload);

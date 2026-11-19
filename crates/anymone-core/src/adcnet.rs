@@ -262,6 +262,7 @@ pub(crate) async fn run_subnet(
         roster.sort();
         Some(Box::new(AdcnetObserverSession::for_protocol(
             scheduled,
+            subnet.id,
             roster,
             leader_pk,
             FAULT_THRESHOLD,
@@ -601,6 +602,13 @@ enum AdcnetObserved {
         round: u64,
         signer: PublicKey,
     },
+    /// A relay published a share bound to `subnet`, not the observed one. It
+    /// earns no credit: a relay withholding here must not pass off its share
+    /// from elsewhere, which would hide the fault from attribution.
+    ForeignShare {
+        round: u64,
+        subnet: SubnetId,
+    },
     /// The leader broadcast the decoded output for `round`.
     Output {
         round: u64,
@@ -614,9 +622,13 @@ enum AdcnetObserved {
     Other,
 }
 
-fn observe_adcnet(bytes: &[u8]) -> AdcnetObserved {
+fn observe_adcnet(bytes: &[u8], subnet: SubnetId) -> AdcnetObserved {
     match bincode::deserialize::<AdcnetWire>(bytes) {
         Ok(AdcnetWire::Server(signed)) => match signed.recover() {
+            Ok((s, _)) if s.subnet != subnet => AdcnetObserved::ForeignShare {
+                round: s.share.round as u64,
+                subnet: s.subnet,
+            },
             Ok((s, signer)) => AdcnetObserved::Share {
                 round: s.share.round as u64,
                 signer: signer.clone(),
@@ -678,6 +690,8 @@ fn observe_scheduled_adcnet(bytes: &[u8], leader: Pubkey) -> AdcnetObserved {
 /// protocol-agnostic [`OutputFaultTracker`].
 pub struct AdcnetObserverSession {
     scheduled: bool,
+    /// Only shares bound to this subnet are credited.
+    subnet: SubnetId,
     tracker: crate::faults::OutputFaultTracker,
     /// Sorted roster; a share is credited to its signer's slot here.
     roster: Vec<PeerId>,
@@ -694,18 +708,20 @@ pub struct AdcnetObserverSession {
 const ANON_SET_HISTORY: usize = 16;
 
 impl AdcnetObserverSession {
-    pub fn new(roster: Vec<PeerId>, leader: PeerId, fault_threshold: u64) -> Self {
-        Self::for_protocol(false, roster, leader, fault_threshold)
+    pub fn new(subnet: SubnetId, roster: Vec<PeerId>, leader: PeerId, fault_threshold: u64) -> Self {
+        Self::for_protocol(false, subnet, roster, leader, fault_threshold)
     }
 
     pub fn for_protocol(
         scheduled: bool,
+        subnet: SubnetId,
         roster: Vec<PeerId>,
         leader: PeerId,
         fault_threshold: u64,
     ) -> Self {
         AdcnetObserverSession {
             scheduled,
+            subnet,
             tracker: crate::faults::OutputFaultTracker::new(roster.clone(), fault_threshold),
             roster,
             anon_set_by_round: std::collections::BTreeMap::new(),
@@ -785,7 +801,7 @@ impl Session for AdcnetObserverSession {
         let observed = if self.scheduled {
             observe_scheduled_adcnet(&payload, self.leader)
         } else {
-            observe_adcnet(&payload)
+            observe_adcnet(&payload, self.subnet)
         };
         // Observed rounds are u32 wire values widened to u64; compare wrapped.
         let future = |round: u64| {
@@ -860,6 +876,13 @@ impl Session for AdcnetObserverSession {
                     "adcnet observer: leader-only message from a non-leader, ignored"
                 );
             }
+            AdcnetObserved::ForeignShare { round, subnet } => debug!(
+                target: ADCNET,
+                round,
+                subnet,
+                own = self.subnet,
+                "adcnet observer: share bound to another subnet, no liveness credit"
+            ),
             AdcnetObserved::Other => {}
         }
         Vec::new()
@@ -879,12 +902,30 @@ mod observer_tests {
     use super::*;
     use crate::identity::Identity;
 
+    /// A relay that withholds its share here and replays its share from
+    /// another subnet instead must still read as withholding.
+    #[test]
+    fn shares_bound_to_another_subnet_earn_no_credit() {
+        let leader = Identity::generate();
+        let other = Identity::generate();
+        let leader_pk = leader.pubkey();
+        let mut obs = AdcnetObserverSession::new(0, vec![leader_pk, other.pubkey()], leader_pk, 2);
+        obs.begin_round(3, Instant::now());
+        obs.on_inbound(other.pubkey(), share_wire(&other, 1, 1, 3, vec![]));
+        assert!(
+            obs.relays_shared_recent(8).is_empty(),
+            "a share bound to subnet 1 is withholding on subnet 0"
+        );
+        obs.on_inbound(other.pubkey(), share_wire(&other, 0, 1, 3, vec![]));
+        assert_eq!(obs.relays_shared_recent(8), vec![1]);
+    }
+
     #[test]
     fn anon_set_and_output_only_from_leader() {
         let leader = Identity::generate();
         let other = Identity::generate();
         let leader_pk = leader.pubkey();
-        let mut obs = AdcnetObserverSession::new(vec![leader_pk, other.pubkey()], leader_pk, 2);
+        let mut obs = AdcnetObserverSession::new(0, vec![leader_pk, other.pubkey()], leader_pk, 2);
         let signed = Signed::new(
             &leader.to_adcnet_signing_key(),
             KeyExchange {
